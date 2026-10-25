@@ -42,8 +42,32 @@ pub enum DomainError {
     #[error("vault is locked")]
     VaultLocked,
 
-    #[error("invalid encryption password or corrupted vault: {detail}")]
-    InvalidMasterPassword { detail: String },
+    #[error("vault key file is not configured")]
+    KeyFileNotConfigured,
+
+    #[error("vault key file already exists at {path}")]
+    KeyFileExists { path: String },
+
+    #[error("vault key file was not found at {path}")]
+    KeyFileMissing { path: String },
+
+    #[error("vault key file is invalid at {path}: {detail}")]
+    KeyFileInvalid { path: String, detail: String },
+
+    #[error("the key file does not match this vault")]
+    VaultKeyMismatch,
+
+    #[error("invalid key storage directory: {detail}")]
+    InvalidKeyDirectory { detail: String },
+
+    #[error("the vault must be locked before a key-loss reset")]
+    VaultMustBeLocked,
+
+    #[error("this vault has no recovery code configured")]
+    RecoveryCodeNotConfigured,
+
+    #[error("the recovery code is invalid")]
+    InvalidRecoveryCode,
 
     #[error("invalid admin credentials")]
     InvalidAdminCredentials,
@@ -56,12 +80,6 @@ pub enum DomainError {
 
     #[error("new password equals current password")]
     PasswordUnchanged,
-
-    #[error("key derivation failed")]
-    KeyDerivation {
-        #[source]
-        source: argon2::Error,
-    },
 
     #[error("password hashing failed")]
     PasswordHash {
@@ -236,12 +254,20 @@ fn error_code(error: &DomainError) -> &'static str {
         DomainError::VaultNotInitialized => "VAULT_NOT_INITIALIZED",
         DomainError::VaultAlreadyInitialized => "VAULT_ALREADY_INITIALIZED",
         DomainError::VaultLocked => "VAULT_LOCKED",
-        DomainError::InvalidMasterPassword { .. } => "VAULT_INVALID_MASTER_PASSWORD",
+        DomainError::KeyFileNotConfigured => "VAULT_KEY_FILE_NOT_CONFIGURED",
+        DomainError::KeyFileExists { .. } => "VAULT_KEY_FILE_EXISTS",
+        DomainError::KeyFileMissing { .. } => "VAULT_KEY_FILE_MISSING",
+        DomainError::KeyFileInvalid { .. } => "VAULT_KEY_FILE_INVALID",
+        DomainError::VaultKeyMismatch => "VAULT_KEY_MISMATCH",
+        DomainError::InvalidKeyDirectory { .. } => "VAULT_INVALID_KEY_DIRECTORY",
+        DomainError::VaultMustBeLocked => "VAULT_MUST_BE_LOCKED",
+        DomainError::RecoveryCodeNotConfigured => "VAULT_RECOVERY_CODE_NOT_CONFIGURED",
+        DomainError::InvalidRecoveryCode => "VAULT_INVALID_RECOVERY_CODE",
         DomainError::InvalidAdminCredentials => "AUTH_INVALID_CREDENTIALS",
         DomainError::WeakPassword { .. } => "VALIDATION_WEAK_PASSWORD",
         DomainError::InvalidUsername { .. } => "VALIDATION_INVALID_USERNAME",
         DomainError::PasswordUnchanged => "AUTH_PASSWORD_UNCHANGED",
-        DomainError::KeyDerivation { .. } | DomainError::Crypto { .. } => "CRYPTO_FAILED",
+        DomainError::Crypto { .. } => "CRYPTO_FAILED",
         DomainError::PasswordHash { .. } => "AUTH_HASH_FAILED",
         DomainError::Serialization { .. } => "SERIALIZATION_FAILED",
         DomainError::Corrupted { .. } => "VAULT_DATA_CORRUPTED",
@@ -292,9 +318,35 @@ fn user_message(error: &DomainError) -> String {
         DomainError::VaultLocked => {
             "保险箱已锁定，请先解锁 / The vault is locked. Unlock it first.".to_owned()
         }
-        DomainError::InvalidMasterPassword { .. } => {
-            "解锁保险箱失败：数据加密密码错误或数据已损坏 / Failed to unlock the vault: incorrect encryption password or corrupted data."
+        DomainError::KeyFileNotConfigured => {
+            "尚未配置保险箱密钥文件 / No vault key file is configured.".to_owned()
+        }
+        DomainError::KeyFileExists { .. } => {
+            "该目录已存在密钥文件，请选择其他目录 / A key file already exists in this directory; choose another directory."
                 .to_owned()
+        }
+        DomainError::KeyFileMissing { .. } => {
+            "找不到保险箱密钥文件，请重新选择备份密钥 / The vault key file is missing; select a backup key file."
+                .to_owned()
+        }
+        DomainError::KeyFileInvalid { .. } => {
+            "保险箱密钥文件无效 / The vault key file is invalid.".to_owned()
+        }
+        DomainError::VaultKeyMismatch => {
+            "密钥文件与当前保险箱不匹配 / The key file does not match this vault.".to_owned()
+        }
+        DomainError::InvalidKeyDirectory { .. } => {
+            "密钥保存目录无效 / The key storage directory is invalid.".to_owned()
+        }
+        DomainError::VaultMustBeLocked => {
+            "请先锁定保险箱再执行重置 / Lock the vault before resetting it.".to_owned()
+        }
+        DomainError::RecoveryCodeNotConfigured => {
+            "该保险箱未配置恢复码，无法执行重置 / This vault has no recovery code configured."
+                .to_owned()
+        }
+        DomainError::InvalidRecoveryCode => {
+            "恢复码无效 / The recovery code is invalid.".to_owned()
         }
         DomainError::InvalidAdminCredentials => {
             "管理员登录失败：用户名或密码错误 / Admin login failed: invalid username or password."
@@ -306,7 +358,7 @@ fn user_message(error: &DomainError) -> String {
             "新密码不能与当前密码相同 / The new password must differ from the current password."
                 .to_owned()
         }
-        DomainError::KeyDerivation { .. } | DomainError::Crypto { .. } => {
+        DomainError::Crypto { .. } => {
             "保险箱加密操作失败 / Vault cryptographic operation failed.".to_owned()
         }
         DomainError::PasswordHash { .. } => {
@@ -456,6 +508,10 @@ fn error_context(error: &DomainError) -> Option<Value> {
         } => Some(json!({ "operation": operation, "status": status })),
         DomainError::Discovery { operation, .. } => Some(json!({ "operation": operation })),
         DomainError::ServerBind { address, .. } => Some(json!({ "address": address })),
+        DomainError::KeyFileExists { path }
+        | DomainError::KeyFileMissing { path }
+        | DomainError::KeyFileInvalid { path, .. } => Some(json!({ "path": path })),
+        DomainError::InvalidKeyDirectory { detail } => Some(json!({ "detail": detail })),
         _ => None,
     }
 }

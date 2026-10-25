@@ -6,36 +6,42 @@ use serde::{Deserialize, Serialize};
 
 /// Minimum accepted password length, in Unicode scalar values.
 pub const MIN_PASSWORD_CHARS: usize = 6;
-/// Upper bound to avoid unbounded KDF work from oversized IPC payloads.
+/// Upper bound to avoid unbounded password work from oversized IPC payloads.
 pub const MAX_PASSWORD_CHARS: usize = 1024;
 /// Upper bound for the administrator username chosen during setup.
 pub const MAX_USERNAME_CHARS: usize = 64;
 
-/// Argon2id salt length in bytes.
-pub const KDF_SALT_LEN: usize = 16;
 /// XChaCha20-Poly1305 key length in bytes.
 pub const VAULT_KEY_LEN: usize = 32;
 /// XChaCha20-Poly1305 nonce length in bytes.
 pub const NONCE_LEN: usize = 24;
 
-/// Fixed KDF parameters. These are never read from the database, so a local
-/// attacker cannot weaken the work factor by editing SQLite metadata.
-pub const KDF_ALGORITHM: &str = "argon2id-v1";
-/// Memory cost in KiB (64 MiB).
-pub const KDF_M_COST: u32 = 65_536;
-/// Time cost.
-pub const KDF_T_COST: u32 = 3;
-/// Parallelism.
-pub const KDF_P_COST: u32 = 1;
-
 /// SQLite database file name inside the application data directory.
-pub const DB_FILE_NAME: &str = "peerdav.sqlite3";
+pub const DB_FILE_NAME: &str = "peerdav.pd";
 /// Current vault schema version.
-pub const SCHEMA_VERSION: &str = "1";
+pub const SCHEMA_VERSION: &str = "2";
 
 pub const META_SCHEMA_VERSION: &str = "schema_version";
-pub const META_KDF_ALGORITHM: &str = "kdf_algorithm";
-pub const META_KDF_SALT: &str = "kdf_salt";
+/// Absolute path of the user-owned key file.
+pub const META_KEY_FILE: &str = "vault.keyFile";
+/// SHA-256 fingerprint of the one-time recovery code. The code itself is
+/// shown once and never persisted.
+pub const META_RECOVERY_HASH: &str = "vault.recoveryHash";
+
+/// Key file format shared with the desktop UI.
+pub const KEY_FILE_TYPE: &str = "peerdav-vault";
+pub const KEY_FILE_VERSION: u32 = 1;
+pub const KEY_FILE_NAME: &str = "peerdav-vault.key";
+
+/// Persisted WebDAV server lifecycle and configuration. The server is restored
+/// on every app start when `SERVER_ENABLED_META` is `"1"`, including while the
+/// vault is locked: it serves from the non-secret share and authorization
+/// catalog and never needs the vault key.
+pub const SERVER_ENABLED_META: &str = "server.enabled";
+pub const SERVER_BIND_META: &str = "server.bindAddress";
+pub const SERVER_PORT_META: &str = "server.port";
+pub const SERVER_DISCOVERY_PORT_META: &str = "server.discoveryPort";
+pub const SERVER_NAME_META: &str = "server.name";
 
 /// Reserved secret record holding the encrypted unlock verifier.
 pub const SECRET_VAULT_VERIFIER: &str = "__vault_verifier__";
@@ -45,26 +51,52 @@ pub const SECRET_ADMIN: &str = "__admin__";
 pub const VAULT_VERIFIER_PLAINTEXT: &[u8] = b"peerdav-vault-verifier-v1";
 
 /// Public vault state returned to the frontend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VaultStatus {
     pub initialized: bool,
     pub unlocked: bool,
+    /// Configured key file path, if any.
+    pub key_file: Option<String>,
+    /// Stable reason code when automatic key loading failed.
+    pub key_error: Option<String>,
 }
 
-/// Result of first-run initialization. Echoes the normalized admin username;
-/// no password material is returned to the frontend.
+/// Result of first-run initialization. The recovery code is returned exactly
+/// once; only its hash is persisted.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeVaultResult {
     pub admin_username: String,
     pub vault_status: VaultStatus,
+    pub recovery_code: String,
+}
+
+/// Result of a key-loss reset. Returns the new recovery code exactly once and
+/// the archived database path for operator visibility.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetVaultResult {
+    pub admin_username: String,
+    pub vault_status: VaultStatus,
+    pub recovery_code: String,
+    pub archived_database: String,
 }
 
 /// Result of an admin login or password change.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminLoginResult {
+    pub username: String,
+    pub must_change_password: bool,
+}
+
+/// In-memory admin session restored by the UI after a webview reload. It lives
+/// only in process memory and is cleared when the vault is locked or the admin
+/// logs out.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminSessionInfo {
     pub username: String,
     pub must_change_password: bool,
 }

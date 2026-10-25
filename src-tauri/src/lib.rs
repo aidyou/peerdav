@@ -8,6 +8,7 @@ mod db;
 mod discovery;
 mod error;
 mod fs;
+mod keyfile;
 mod logging;
 pub mod paths;
 mod peer;
@@ -54,6 +55,11 @@ pub fn run() {
 
     let application = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
             let data_dir = match paths::dev_data_root() {
                 Some(dir) => dir,
@@ -102,15 +108,18 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::vault_status,
             commands::initialize_vault,
-            commands::unlock_vault,
+            commands::reload_vault_key,
+            commands::reset_vault,
             commands::lock_vault,
             commands::quit_app,
             commands::admin_login,
+            commands::admin_session,
+            commands::admin_logout,
             commands::change_admin_password,
-            commands::change_master_password,
             commands::server_status,
             commands::start_server,
             commands::stop_server,
+            commands::resume_server,
             commands::list_shares,
             commands::create_share,
             commands::update_share_permissions,
@@ -121,6 +130,7 @@ pub fn run() {
             commands::list_authorizations,
             commands::revoke_authorization,
             commands::scan_lan,
+            commands::local_networks,
             commands::list_peers,
             commands::request_peer_access,
             commands::connect_peer,

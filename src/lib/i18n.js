@@ -36,6 +36,25 @@ export function normalizeLocale(value) {
   return SUPPORTED_LOCALES.includes(value) ? value : null;
 }
 
+/**
+ * Picks a locale from the host environment when the user has not chosen one.
+ * Any Chinese tag (simplified or traditional) maps to the single Chinese
+ * catalogue; every other language falls back to English.
+ */
+export function detectSystemLocale() {
+  const nav = globalThis.navigator;
+  const tags =
+    nav && Array.isArray(nav.languages) && nav.languages.length
+      ? nav.languages
+      : [nav?.language];
+  for (const tag of tags) {
+    if (typeof tag === "string" && tag.toLowerCase().startsWith("zh")) {
+      return "zh-CN";
+    }
+  }
+  return "en";
+}
+
 function readStoredLocale(storage) {
   let stored = null;
   try {
@@ -43,7 +62,7 @@ function readStoredLocale(storage) {
   } catch {
     stored = null;
   }
-  return normalizeLocale(stored) ?? DEFAULT_LOCALE;
+  return normalizeLocale(stored) ?? detectSystemLocale();
 }
 
 function applyDocumentLang(next) {

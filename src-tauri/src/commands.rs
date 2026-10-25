@@ -12,11 +12,12 @@ use crate::peer::PeerManager;
 use crate::server::{ServerConfig, ServerController};
 use crate::traits::ServerEvents;
 use crate::types::{
-    AccessRule, AdminLoginResult, ApprovePendingResult, AuthorizationInfo, ConflictPolicy,
-    DEFAULT_DISCOVERY_PORT, DEFAULT_SERVER_PORT, DiscoveredPeer, ERROR_EVENT, ExternalEditInfo,
-    InitializeVaultResult, PENDING_REQUEST_EVENT, PeerAccessRequest, PeerHealth, PeerInfo,
-    PeerListing, PeerShare, PendingRequestInfo, PreviewPayload, ServerStatus, ShareInfo,
-    SharePermissions, TransferResult, VaultStatus,
+    AccessRule, AdminLoginResult, AdminSessionInfo, ApprovePendingResult, AuthorizationInfo,
+    ConflictPolicy, DEFAULT_DISCOVERY_PORT, DEFAULT_SERVER_PORT, DiscoveredPeer, ERROR_EVENT,
+    ExternalEditInfo, InitializeVaultResult, PENDING_REQUEST_EVENT, PeerAccessRequest, PeerHealth,
+    PeerInfo, PeerListing, PeerShare, PendingRequestInfo, PreviewPayload, ResetVaultResult,
+    SERVER_BIND_META, SERVER_DISCOVERY_PORT_META, SERVER_ENABLED_META, SERVER_NAME_META,
+    SERVER_PORT_META, ServerStatus, ShareInfo, SharePermissions, TransferResult, VaultStatus,
 };
 use crate::vault::Vault;
 
@@ -59,21 +60,14 @@ pub async fn vault_status(vault: State<'_, SharedVault>) -> Result<VaultStatus, 
 #[tauri::command]
 pub async fn initialize_vault(
     vault: State<'_, SharedVault>,
-    master_password: String,
+    key_directory: String,
     admin_username: String,
     admin_password: String,
 ) -> Result<InitializeVaultResult, AppError> {
     let vault = Arc::clone(vault.inner());
-    let master_password = Zeroizing::new(master_password);
     let admin_password = Zeroizing::new(admin_password);
-    run_blocking(move || {
-        vault.initialize(
-            master_password.as_str(),
-            &admin_username,
-            admin_password.as_str(),
-        )
-    })
-    .await
+    run_blocking(move || vault.initialize(&key_directory, &admin_username, admin_password.as_str()))
+        .await
 }
 
 #[tauri::command]
@@ -82,13 +76,34 @@ pub fn quit_app(app: tauri::AppHandle) {
 }
 
 #[tauri::command]
-pub async fn unlock_vault(
+pub async fn reload_vault_key(
     vault: State<'_, SharedVault>,
-    master_password: String,
+    path: Option<String>,
 ) -> Result<VaultStatus, AppError> {
     let vault = Arc::clone(vault.inner());
-    let master_password = Zeroizing::new(master_password);
-    run_blocking(move || vault.unlock(master_password.as_str())).await
+    run_blocking(move || vault.reload_key(path.as_deref())).await
+}
+
+#[tauri::command]
+pub async fn reset_vault(
+    vault: State<'_, SharedVault>,
+    recovery_code: String,
+    key_directory: String,
+    admin_username: String,
+    admin_password: String,
+) -> Result<ResetVaultResult, AppError> {
+    let vault = Arc::clone(vault.inner());
+    let recovery_code = Zeroizing::new(recovery_code);
+    let admin_password = Zeroizing::new(admin_password);
+    run_blocking(move || {
+        vault.reset_lost_key(
+            recovery_code.as_str(),
+            &key_directory,
+            &admin_username,
+            admin_password.as_str(),
+        )
+    })
+    .await
 }
 
 #[tauri::command]
@@ -115,6 +130,23 @@ pub async fn admin_login(
     run_blocking(move || vault.admin_login(&username, password.as_str())).await
 }
 
+/// Returns the in-memory admin session so the UI can restore the signed-in
+/// state after a webview reload. `None` means the admin must sign in again.
+#[tauri::command]
+pub async fn admin_session(
+    vault: State<'_, SharedVault>,
+) -> Result<Option<AdminSessionInfo>, AppError> {
+    let vault = Arc::clone(vault.inner());
+    run_blocking(move || vault.admin_session()).await
+}
+
+/// Clears the in-memory admin session without locking the vault.
+#[tauri::command]
+pub async fn admin_logout(vault: State<'_, SharedVault>) -> Result<(), AppError> {
+    let vault = Arc::clone(vault.inner());
+    run_blocking(move || vault.admin_logout()).await
+}
+
 #[tauri::command]
 pub async fn change_admin_password(
     vault: State<'_, SharedVault>,
@@ -131,24 +163,8 @@ pub async fn change_admin_password(
     .await
 }
 
-#[tauri::command]
-pub async fn change_master_password(
-    vault: State<'_, SharedVault>,
-    current_password: String,
-    new_password: String,
-) -> Result<VaultStatus, AppError> {
-    let vault = Arc::clone(vault.inner());
-    let current_password = Zeroizing::new(current_password);
-    let new_password = Zeroizing::new(new_password);
-    run_blocking(move || {
-        vault.change_master_password(current_password.as_str(), new_password.as_str())
-    })
-    .await
-}
-
-/// Admin commands re-verify the admin username/password every time. The app
-/// never keeps a long-lived login state; the UI may retain the password in
-/// memory for its own session but it is sent with each operation.
+/// Admin commands accept the current in-memory session when the UI omits the
+/// password after a reload; otherwise the supplied credentials are verified.
 async fn verify_admin(
     vault: SharedVault,
     username: String,
@@ -177,7 +193,7 @@ pub async fn start_server(
     server_name: Option<String>,
 ) -> Result<ServerStatus, AppError> {
     let vault = Arc::clone(vault.inner());
-    verify_admin(vault, username, password).await?;
+    verify_admin(Arc::clone(&vault), username, password).await?;
 
     let server = Arc::clone(server.inner());
     let server_name = server_name
@@ -190,7 +206,25 @@ pub async fn start_server(
         discovery_port: discovery_port.unwrap_or(DEFAULT_DISCOVERY_PORT),
         server_name,
     };
-    server.start(config).await.map_err(AppError::from)
+    // `start` consumes the config, so keep the values needed for persistence.
+    let persisted = (
+        config.bind_address.clone(),
+        config.port,
+        config.discovery_port,
+        config.server_name.clone(),
+    );
+    let status = server.start(config).await.map_err(AppError::from)?;
+    let (bind_address, port, discovery_port, server_name) = persisted;
+    run_blocking(move || {
+        vault.set_setting(SERVER_ENABLED_META, "1")?;
+        vault.set_setting(SERVER_BIND_META, &bind_address)?;
+        vault.set_setting(SERVER_PORT_META, &port.to_string())?;
+        vault.set_setting(SERVER_DISCOVERY_PORT_META, &discovery_port.to_string())?;
+        vault.set_setting(SERVER_NAME_META, &server_name)?;
+        Ok(())
+    })
+    .await?;
+    Ok(status)
 }
 
 #[tauri::command]
@@ -201,10 +235,68 @@ pub async fn stop_server(
     password: String,
 ) -> Result<ServerStatus, AppError> {
     let vault = Arc::clone(vault.inner());
-    verify_admin(vault, username, password).await?;
+    verify_admin(Arc::clone(&vault), username, password).await?;
 
     let server = Arc::clone(server.inner());
-    Ok(server.stop().await)
+    let status = server.stop().await;
+    run_blocking(move || vault.set_setting(SERVER_ENABLED_META, "0")).await?;
+    Ok(status)
+}
+
+/// Restores the WebDAV server after an app start when the user left it enabled
+/// in the previous session. It intentionally runs while the vault is locked:
+/// the WebDAV service only needs the non-secret share and authorization
+/// catalog, while the vault key protects sensitive records. Missing opt-in or
+/// an already running server only reports the current status.
+#[tauri::command]
+pub async fn resume_server(
+    vault: State<'_, SharedVault>,
+    server: State<'_, SharedServer>,
+) -> Result<ServerStatus, AppError> {
+    let server = Arc::clone(server.inner());
+    if server.status().running {
+        return Ok(server.status());
+    }
+
+    let vault = Arc::clone(vault.inner());
+    let config = run_blocking(move || {
+        if vault.get_setting(SERVER_ENABLED_META)?.as_deref() != Some("1") {
+            return Ok(None);
+        }
+        let bind_address = vault
+            .get_setting(SERVER_BIND_META)?
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "0.0.0.0".to_owned());
+        let port = vault
+            .get_setting(SERVER_PORT_META)?
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(DEFAULT_SERVER_PORT);
+        let discovery_port = vault
+            .get_setting(SERVER_DISCOVERY_PORT_META)?
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(DEFAULT_DISCOVERY_PORT);
+        let server_name = vault
+            .get_setting(SERVER_NAME_META)?
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "PeerDav".to_owned());
+        Ok(Some(ServerConfig {
+            bind_address,
+            port,
+            discovery_port,
+            server_name,
+        }))
+    })
+    .await?;
+
+    let Some(config) = config else {
+        return Ok(server.status());
+    };
+
+    match server.start(config).await {
+        Ok(status) => Ok(status),
+        Err(DomainError::ServerAlreadyRunning) => Ok(server.status()),
+        Err(error) => Err(AppError::from(error)),
+    }
 }
 
 #[tauri::command]
@@ -356,6 +448,13 @@ pub async fn scan_lan(
         .scan_lan(port, timeout_ms)
         .await
         .map_err(AppError::from)
+}
+
+/// Returns the local IPv4 LAN subnets used as the default allow rule for a
+/// newly created share.
+#[tauri::command]
+pub async fn local_networks() -> Result<Vec<String>, AppError> {
+    Ok(crate::discovery::local_ipv4_networks())
 }
 
 #[tauri::command]

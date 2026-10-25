@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::DomainError;
 use crate::types::{
-    AuthorizationRecord, META_KDF_SALT, PeerRecord, RuleKind, RuleMatcher, SecretRecord,
+    AuthorizationRecord, META_SCHEMA_VERSION, PeerRecord, RuleKind, RuleMatcher, SecretRecord,
     SharePermissions, ShareRecord, ShareRuleRecord,
 };
 
@@ -111,7 +111,7 @@ impl Database {
         self.conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM meta WHERE key = ?1)",
-                params![META_KDF_SALT],
+                params![META_SCHEMA_VERSION],
                 |row| row.get(0),
             )
             .map_err(database_error("check initialization"))
@@ -126,6 +126,17 @@ impl Database {
             )
             .optional()
             .map_err(database_error("read metadata"))
+    }
+
+    pub(crate) fn write_meta(&self, key: &str, value: &str) -> Result<(), DomainError> {
+        self.conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .map_err(database_error("write metadata"))?;
+        Ok(())
     }
 
     pub(crate) fn read_secret(&self, name: &str) -> Result<Option<SecretRecord>, DomainError> {
@@ -179,7 +190,7 @@ impl Database {
         let already_initialized: bool = transaction
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM meta WHERE key = ?1)",
-                params![META_KDF_SALT],
+                params![META_SCHEMA_VERSION],
                 |row| row.get(0),
             )
             .map_err(database_error("check initialization in transaction"))?;
@@ -211,55 +222,22 @@ impl Database {
             .map_err(database_error("commit initialization"))
     }
 
-    /// Re-encrypts every secret and updates metadata in one transaction.
-    /// Returning early rolls everything back, leaving the old key valid.
-    pub(crate) fn reencrypt_all<F>(
+    /// Replaces only the encrypted secret catalog and updates vault metadata.
+    /// Shares, share rules, authorizations, peers, and server settings are
+    /// intentionally left untouched for a key-loss reset.
+    pub(crate) fn reset_sensitive(
         &mut self,
         meta_updates: &[(&str, String)],
-        mut reencrypt: F,
-    ) -> Result<(), DomainError>
-    where
-        F: FnMut(&str, &[u8], &[u8]) -> Result<(Vec<u8>, Vec<u8>), DomainError>,
-    {
+        secrets: &[(&str, Vec<u8>, Vec<u8>)],
+    ) -> Result<(), DomainError> {
         let transaction = self
             .conn
             .transaction()
-            .map_err(database_error("begin re-encryption transaction"))?;
+            .map_err(database_error("begin vault reset transaction"))?;
 
-        let records = {
-            let mut statement = transaction
-                .prepare("SELECT name, nonce, ciphertext FROM secrets ORDER BY name")
-                .map_err(database_error("prepare secret scan"))?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
-                    ))
-                })
-                .map_err(database_error("scan secrets"))?;
-
-            let mut collected = Vec::new();
-            for row in rows {
-                collected.push(row.map_err(database_error("read secret row"))?);
-            }
-            collected
-        };
-
-        for (name, nonce, ciphertext) in &records {
-            let (new_nonce, new_ciphertext) = reencrypt(name, nonce, ciphertext)?;
-            transaction
-                .execute(
-                    "UPDATE secrets SET
-                         nonce = ?1,
-                         ciphertext = ?2,
-                         updated_at = CAST(strftime('%s', 'now') AS INTEGER)
-                     WHERE name = ?3",
-                    params![new_nonce, new_ciphertext, name],
-                )
-                .map_err(database_error("update re-encrypted secret"))?;
-        }
+        transaction
+            .execute("DELETE FROM secrets", [])
+            .map_err(database_error("clear encrypted secrets"))?;
 
         for (key, value) in meta_updates {
             transaction
@@ -268,12 +246,22 @@ impl Database {
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     params![*key, value],
                 )
-                .map_err(database_error("update vault metadata"))?;
+                .map_err(database_error("update reset metadata"))?;
+        }
+
+        for (name, nonce, ciphertext) in secrets {
+            transaction
+                .execute(
+                    "INSERT INTO secrets (name, nonce, ciphertext, updated_at)
+                     VALUES (?1, ?2, ?3, CAST(strftime('%s', 'now') AS INTEGER))",
+                    params![*name, nonce, ciphertext],
+                )
+                .map_err(database_error("write reset secret"))?;
         }
 
         transaction
             .commit()
-            .map_err(database_error("commit re-encryption"))
+            .map_err(database_error("commit vault reset"))
     }
 
     pub(crate) fn insert_share(

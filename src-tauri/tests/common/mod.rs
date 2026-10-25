@@ -54,6 +54,13 @@ pub fn dev_test_dir(scope: &str) -> DevTestDir {
     DevTestDir { path }
 }
 
+/// Creates a test key directory inside the test root and returns its path.
+pub fn key_dir(root: &Path) -> String {
+    let directory = root.join("keys");
+    std::fs::create_dir_all(&directory).expect("create key directory");
+    directory.to_string_lossy().into_owned()
+}
+
 fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|character| {

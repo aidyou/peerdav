@@ -5,6 +5,7 @@ import zhCN from "../../locales/zh-CN.js";
 import {
   DEFAULT_LOCALE,
   LOCALE_STORAGE_KEY,
+  detectSystemLocale,
   initLocale,
   locale,
   localizeMessage,
@@ -29,16 +30,48 @@ function throwingStorage() {
   };
 }
 
+function setSystemLanguage(...tags) {
+  Object.defineProperty(globalThis.navigator, "language", {
+    value: tags[0] ?? "",
+    configurable: true,
+  });
+  Object.defineProperty(globalThis.navigator, "languages", {
+    value: tags,
+    configurable: true,
+  });
+}
+
+// Most suites assume a Chinese host so the rendered-text assertions stay valid.
+setSystemLanguage("zh-CN");
+
 describe("locale state", () => {
   beforeEach(() => {
     localStorage.clear();
+    setSystemLanguage("zh-CN");
     initLocale();
   });
 
-  it("defaults to simplified Chinese with no stored value", () => {
+  it("defaults to the system language when nothing is stored", () => {
+    localStorage.clear();
+    setSystemLanguage("en-US");
+    expect(detectSystemLocale()).toBe("en");
+    expect(initLocale()).toBe("en");
+    expect(locale.value).toBe("en");
+    expect(document.documentElement.lang).toBe("en");
+
+    setSystemLanguage("zh-TW");
+    expect(detectSystemLocale()).toBe("zh-CN");
+    expect(initLocale()).toBe("zh-CN");
+
+    setSystemLanguage("zh-CN");
     expect(initLocale()).toBe(DEFAULT_LOCALE);
     expect(locale.value).toBe("zh-CN");
-    expect(document.documentElement.lang).toBe("zh-CN");
+  });
+
+  it("honours a stored locale over the system language", () => {
+    setSystemLanguage("en-US");
+    localStorage.setItem(LOCALE_STORAGE_KEY, "zh-CN");
+    expect(initLocale()).toBe("zh-CN");
   });
 
   it("restores a stored locale on start", () => {
@@ -88,6 +121,7 @@ describe("locale state", () => {
 describe("catalogues", () => {
   beforeEach(() => {
     localStorage.clear();
+    setSystemLanguage("zh-CN");
     initLocale();
   });
 
@@ -115,6 +149,7 @@ describe("catalogues", () => {
 describe("bilingual backend messages", () => {
   beforeEach(() => {
     localStorage.clear();
+    setSystemLanguage("zh-CN");
     initLocale();
   });
 
@@ -145,6 +180,7 @@ describe("bilingual backend messages", () => {
 describe("error mapping", () => {
   beforeEach(() => {
     localStorage.clear();
+    setSystemLanguage("zh-CN");
     initLocale();
   });
 

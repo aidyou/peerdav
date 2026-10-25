@@ -268,6 +268,47 @@ pub fn advertised_hosts(bind_address: &str) -> Vec<String> {
     hosts
 }
 
+/// Private IPv4 subnets of the local non-loopback interfaces, in CIDR form.
+///
+/// These are the networks a PeerDav share should allow by default, so a user
+/// does not have to look up their own LAN subnet manually.
+pub fn local_ipv4_networks() -> Vec<String> {
+    let mut networks = Vec::new();
+    if let Ok(interfaces) = get_if_addrs() {
+        for interface in interfaces {
+            let IfAddr::V4(address) = interface.addr else {
+                continue;
+            };
+            if address.ip.is_loopback()
+                || address.ip.is_unspecified()
+                || address.is_link_local()
+                || !address.ip.is_private()
+            {
+                continue;
+            }
+            if let Some(network) = ipv4_network(address.ip, address.netmask) {
+                push_network(&mut networks, network);
+            }
+        }
+    }
+    networks
+}
+
+fn ipv4_network(ip: Ipv4Addr, netmask: Ipv4Addr) -> Option<String> {
+    let mask = u32::from(netmask);
+    if mask == 0 {
+        return None;
+    }
+    let network = Ipv4Addr::from(u32::from(ip) & mask);
+    Some(format!("{network}/{}", mask.count_ones()))
+}
+
+fn push_network(networks: &mut Vec<String>, network: String) {
+    if !networks.contains(&network) {
+        networks.push(network);
+    }
+}
+
 fn push_host(hosts: &mut Vec<String>, host: String) {
     if hosts.len() < MAX_DISCOVERY_HOSTS && !hosts.contains(&host) {
         hosts.push(host);
@@ -475,6 +516,25 @@ mod tests {
         assert_eq!(
             choose_url(&[Ipv4Addr::LOCALHOST.to_string()], 4918),
             Some("http://127.0.0.1:4918".to_owned())
+        );
+    }
+
+    #[test]
+    fn ipv4_networks_are_derived_from_interface_masks() {
+        assert_eq!(
+            ipv4_network(
+                "192.168.1.42".parse().unwrap(),
+                "255.255.255.0".parse().unwrap()
+            ),
+            Some("192.168.1.0/24".to_owned())
+        );
+        assert_eq!(
+            ipv4_network("10.4.7.9".parse().unwrap(), "255.255.0.0".parse().unwrap()),
+            Some("10.4.0.0/16".to_owned())
+        );
+        assert_eq!(
+            ipv4_network("192.168.1.42".parse().unwrap(), Ipv4Addr::UNSPECIFIED),
+            None
         );
     }
 

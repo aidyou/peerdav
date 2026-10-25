@@ -20,9 +20,8 @@ use tokio::net::TcpStream;
 
 mod common;
 
-use common::{DevTestDir, dev_test_dir};
+use common::{DevTestDir, dev_test_dir, key_dir};
 
-const MASTER_PASSWORD: &str = "master password server 2026";
 const ADMIN_USERNAME: &str = "peerdav-admin";
 const ADMIN_PASSWORD: &str = "admin password server 2026";
 const CLIENT_USERNAME: &str = "peerdav";
@@ -57,9 +56,9 @@ impl Harness {
     async fn new(permissions: SharePermissions, rules: Vec<AccessRule>) -> Self {
         let directory = dev_test_dir("server_flow");
         let vault =
-            Arc::new(Vault::open(&directory.path().join("peerdav.sqlite3")).expect("open vault"));
+            Arc::new(Vault::open(&directory.path().join("peerdav.pd")).expect("open vault"));
         vault
-            .initialize(MASTER_PASSWORD, ADMIN_USERNAME, ADMIN_PASSWORD)
+            .initialize(&key_dir(directory.path()), ADMIN_USERNAME, ADMIN_PASSWORD)
             .expect("initialize");
 
         let events = Arc::new(Recording::default());
@@ -1301,9 +1300,85 @@ async fn shares_and_authorizations_survive_controller_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn locked_vault_can_still_serve_authorized_clients() {
+    let harness = Harness::new(full_permissions(), vec![loopback_rule()]).await;
+    let code = harness.issue_code().await;
+
+    let put = harness
+        .request(
+            Method::PUT,
+            &harness.share_path("before-lock.txt"),
+            Some(&code),
+            b"before lock",
+        )
+        .await;
+    assert!(
+        put.status.is_success(),
+        "authorized write before lock failed: {}",
+        put.status
+    );
+
+    harness.shutdown().await;
+    harness.vault.lock().expect("lock vault");
+    assert!(
+        !harness.vault.status().expect("vault status").unlocked,
+        "the vault must stay locked for this test"
+    );
+
+    let reloaded = Arc::new(
+        ServerController::new(Arc::clone(&harness.vault), harness.events.clone())
+            .expect("reload controller while locked"),
+    );
+    assert_eq!(reloaded.list_shares().len(), 1);
+    assert_eq!(reloaded.list_authorizations().len(), 1);
+
+    let status = reloaded
+        .start(ServerConfig {
+            bind_address: "127.0.0.1".to_owned(),
+            port: 0,
+            ..ServerConfig::default()
+        })
+        .await
+        .expect("start server while locked");
+    let address: SocketAddr = status
+        .bind_address
+        .expect("address")
+        .parse()
+        .expect("socket addr");
+
+    let read = send(
+        address,
+        Method::GET,
+        &format!("/share/{}/before-lock.txt", harness.share_id),
+        Some(&code),
+        b"",
+    )
+    .await;
+    assert_eq!(read.status, StatusCode::OK);
+    assert_eq!(read.body, b"before lock");
+
+    let write = send(
+        address,
+        Method::PUT,
+        &format!("/share/{}/after-lock.txt", harness.share_id),
+        Some(&code),
+        b"after lock",
+    )
+    .await;
+    assert!(
+        write.status.is_success(),
+        "authorized write while locked failed: {}",
+        write.status
+    );
+
+    reloaded.stop().await;
+    drop(harness.directory);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn server_lifecycle_and_structured_bind_failures() {
     let directory = dev_test_dir("server_flow");
-    let vault = Arc::new(Vault::open(&directory.path().join("peerdav.sqlite3")).expect("vault"));
+    let vault = Arc::new(Vault::open(&directory.path().join("peerdav.pd")).expect("vault"));
     let events = Arc::new(Recording::default());
     let controller =
         Arc::new(ServerController::new(Arc::clone(&vault), events).expect("controller"));
@@ -1417,9 +1492,9 @@ async fn proppatch_and_unknown_methods_are_rejected() {
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_reverification_requires_unlocked_vault_and_correct_password() {
     let directory = dev_test_dir("server_flow");
-    let vault = Vault::open(&directory.path().join("peerdav.sqlite3")).expect("vault");
+    let vault = Vault::open(&directory.path().join("peerdav.pd")).expect("vault");
     let initialized = vault
-        .initialize(MASTER_PASSWORD, ADMIN_USERNAME, ADMIN_PASSWORD)
+        .initialize(&key_dir(directory.path()), ADMIN_USERNAME, ADMIN_PASSWORD)
         .expect("initialize");
 
     vault
@@ -1435,7 +1510,7 @@ async fn admin_reverification_requires_unlocked_vault_and_correct_password() {
         vault.verify_admin(&initialized.admin_username, ADMIN_PASSWORD),
         Err(DomainError::VaultLocked)
     ));
-    vault.unlock(MASTER_PASSWORD).expect("unlock");
+    vault.reload_key(None).expect("reload key");
     vault
         .verify_admin(&initialized.admin_username, ADMIN_PASSWORD)
         .expect("verified after unlock");

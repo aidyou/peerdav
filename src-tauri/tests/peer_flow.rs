@@ -20,9 +20,8 @@ use peerdav_lib::{
 
 mod common;
 
-use common::{DevTestDir, dev_test_dir};
+use common::{DevTestDir, dev_test_dir, key_dir};
 
-const MASTER_PASSWORD: &str = "master password peer 2026";
 const ADMIN_USERNAME: &str = "peerdav-admin";
 const ADMIN_PASSWORD: &str = "admin password peer 2026";
 
@@ -61,9 +60,9 @@ impl Harness {
     async fn with_limits(rules: Vec<AccessRule>, with_discovery: bool, limits: PeerLimits) -> Self {
         let directory = dev_test_dir("peer_flow");
         let vault =
-            Arc::new(Vault::open(&directory.path().join("peerdav.sqlite3")).expect("open vault"));
+            Arc::new(Vault::open(&directory.path().join("peerdav.pd")).expect("open vault"));
         let initialized = vault
-            .initialize(MASTER_PASSWORD, ADMIN_USERNAME, ADMIN_PASSWORD)
+            .initialize(&key_dir(directory.path()), ADMIN_USERNAME, ADMIN_PASSWORD)
             .expect("initialize");
         let admin_username = initialized.admin_username.clone();
 
@@ -237,7 +236,7 @@ async fn self_connect_needs_approval_and_admin_credentials_are_not_a_code() {
     let serialized = serde_json::to_string(&info).expect("serialize peer");
     assert!(!serialized.contains(&approved.authorization_code));
     let database =
-        std::fs::read(harness.directory.path().join("peerdav.sqlite3")).expect("read database");
+        std::fs::read(harness.directory.path().join("peerdav.pd")).expect("read database");
     assert!(
         !contains_bytes(&database, approved.authorization_code.as_bytes()),
         "the authorization code must not appear in SQLite"

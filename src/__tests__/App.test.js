@@ -21,6 +21,16 @@ vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => windowMock,
 }));
 
+vi.mock("@tauri-apps/plugin-autostart", () => ({
+  isEnabled: vi.fn(async () => false),
+  enable: vi.fn(async () => {}),
+  disable: vi.fn(async () => {}),
+}));
+
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: vi.fn(async () => "/tmp/peerdav-keys"),
+}));
+
 vi.mock("../lib/invoke", async (importOriginal) => {
   const actual = await importOriginal();
   return { ...actual, invoke: vi.fn() };
@@ -28,7 +38,21 @@ vi.mock("../lib/invoke", async (importOriginal) => {
 
 import App from "../App.vue";
 import { LOCALE_STORAGE_KEY, initLocale } from "../lib/i18n";
+import { THEME_STORAGE_KEY, initTheme } from "../lib/theme";
+import { ACCENT_STORAGE_KEY, initAccent } from "../lib/accent";
+import { SETTINGS_SEEN_STORAGE_KEY } from "../lib/workspace";
 import { invoke } from "../lib/invoke";
+
+// Pin the host to a Chinese locale so initLocale() resolves to zh-CN and the
+// rendered-text assertions stay stable.
+Object.defineProperty(window.navigator, "language", {
+  value: "zh-CN",
+  configurable: true,
+});
+Object.defineProperty(window.navigator, "languages", {
+  value: ["zh-CN"],
+  configurable: true,
+});
 
 const SERVER_STATUS = {
   running: false,
@@ -47,15 +71,30 @@ const PEER = {
   shares: [],
 };
 
+const DISCOVERED = {
+  serverId: "server-1",
+  name: "Lab",
+  url: "http://192.168.1.20:4918",
+  hosts: ["192.168.1.20"],
+  port: 4918,
+  shareCount: 2,
+};
+
 function mockCommands(overrides = {}) {
   const handlers = {
     vault_status: async () => ({ initialized: true, unlocked: true }),
     server_status: async () => ({ ...SERVER_STATUS }),
+    resume_server: async () => ({ ...SERVER_STATUS }),
     list_peers: async () => [],
+    local_networks: async () => ["192.168.1.0/24"],
+    request_peer_access: async () => ({ requested: true }),
+    connect_peer: async () => PEER,
+    list_peer_shares: async () => [],
     admin_login: async () => ({
       username: "admin",
       mustChangePassword: false,
     }),
+    admin_session: async () => null,
     list_shares: async () => [],
     list_pending_requests: async () => [],
     list_authorizations: async () => [],
@@ -108,8 +147,13 @@ async function clickButton(wrapper, label) {
 }
 
 async function switchLanguage(wrapper, locale) {
-  const index = locale === "en" ? 1 : 0;
-  await wrapper.findAll(".language-switch button").at(index).trigger("click");
+  await wrapper
+    .find('[data-menu="language"] .titlebar-menu__trigger')
+    .trigger("click");
+  await flushPromises();
+  await wrapper
+    .find(`[data-menu="language"] .titlebar-menu__item[data-value="${locale}"]`)
+    .trigger("click");
   await flushPromises();
 }
 
@@ -140,8 +184,14 @@ describe("App single-language rendering", () => {
     expect(wrapper.text()).not.toContain("首次初始化");
     expect(localStorage.getItem(LOCALE_STORAGE_KEY)).toBe("en");
     expect(document.documentElement.lang).toBe("en");
+    await wrapper
+      .find('[data-menu="language"] .titlebar-menu__trigger')
+      .trigger("click");
+    await flushPromises();
     expect(
-      wrapper.findAll(".language-switch button").at(1).attributes("aria-pressed"),
+      wrapper
+        .find('[data-menu="language"] .titlebar-menu__item[data-value="en"]')
+        .attributes("aria-checked"),
     ).toBe("true");
 
     wrapper.unmount();
@@ -227,9 +277,8 @@ describe("first-time setup", () => {
   };
 
   async function fillSetup(wrapper, { confirm = "admin password 2026" } = {}) {
-    const encryptionInputs = wrapper.find("form").findAll("input");
-    await encryptionInputs[0].setValue("correct horse battery 2026");
-    await encryptionInputs[1].setValue("correct horse battery 2026");
+    await findButton(wrapper, "选择目录").trigger("click");
+    await flushPromises();
     await findButton(wrapper, "下一步").trigger("click");
     await flushPromises();
 
@@ -239,52 +288,27 @@ describe("first-time setup", () => {
     await adminInputs[2].setValue(confirm);
   }
 
-  it("requires a 6-character encryption password before the admin step", async () => {
+  it("requires a key directory before the admin step", async () => {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    open.mockResolvedValueOnce(null);
     const wrapper = await mountReady(NOT_INITIALIZED);
 
-    const inputs = wrapper.find("form").findAll("input");
-    await inputs[0].setValue("short");
-    await inputs[1].setValue("short");
+    await findButton(wrapper, "选择目录").trigger("click");
+    await flushPromises();
     await findButton(wrapper, "下一步").trigger("click");
     await flushPromises();
 
-    expect(wrapper.find(".alert-error").text()).toBe(
-      "密码长度至少为 6 个字符。",
-    );
+    expect(wrapper.find(".alert-error").text()).toBe("请先选择密钥保存目录。");
     expect(wrapper.find('input[autocomplete="username"]').exists()).toBe(false);
 
     wrapper.unmount();
-  });
-
-  it("enforces the password composition rules before the admin step", async () => {
-    const cases = [
-      ["abcdef", "密码必须包含至少一个数字。"],
-      ["123456", "密码必须包含至少一个英文字母。"],
-      [" abc123", "密码首尾不能包含空格。"],
-      ["密码abc123", "密码只能包含英文字母、数字和符号。"],
-    ];
-
-    for (const [password, message] of cases) {
-      const wrapper = await mountReady(NOT_INITIALIZED);
-      const inputs = wrapper.find("form").findAll("input");
-      await inputs[0].setValue(password);
-      await inputs[1].setValue(password);
-      await findButton(wrapper, "下一步").trigger("click");
-      await flushPromises();
-
-      expect(wrapper.find(".alert-error").text()).toBe(message);
-      expect(wrapper.find('input[autocomplete="username"]').exists()).toBe(
-        false,
-      );
-
-      wrapper.unmount();
-    }
   });
 
   it("creates the vault with the admin credentials entered by the user", async () => {
     const initialize = vi.fn(async (args) => ({
       adminUsername: args.adminUsername,
       vaultStatus: { initialized: true, unlocked: true },
+      recoveryCode: "abcde-fghij-klmno-pqrst-uvwxy-zabcd-efghi-jklmn",
     }));
     const wrapper = await mountReady({
       ...NOT_INITIALIZED,
@@ -296,7 +320,7 @@ describe("first-time setup", () => {
     await flushPromises();
 
     expect(initialize).toHaveBeenCalledWith({
-      masterPassword: "correct horse battery 2026",
+      keyDirectory: "/tmp/peerdav-keys",
       adminUsername: "owner",
       adminPassword: "admin password 2026",
     });
@@ -304,6 +328,21 @@ describe("first-time setup", () => {
       wrapper.find('input[autocomplete="username"]').element.value,
     ).toBe("owner");
     expect(wrapper.text()).toContain("管理员登录");
+    expect(wrapper.text()).toContain("保存恢复码");
+    expect(wrapper.text()).toContain(
+      "abcde-fghij-klmno-pqrst-uvwxy-zabcd-efghi-jklmn",
+    );
+
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    await clickButton(wrapper, "复制恢复码");
+    expect(writeText).toHaveBeenCalledWith(
+      "abcde-fghij-klmno-pqrst-uvwxy-zabcd-efghi-jklmn",
+    );
+    expect(document.body.textContent).toContain("恢复码已复制。");
 
     wrapper.unmount();
   });
@@ -497,12 +536,13 @@ describe("share management", () => {
       "正在编辑“Docs”；名称和目录不可修改。",
     );
 
-    const lockedTextInputs = wrapper
+    const sharePane = wrapper.find("#pane-shares");
+    const lockedTextInputs = sharePane
       .findAll('input[type="text"]')
       .filter((input) => input.element.disabled);
     expect(lockedTextInputs).toHaveLength(2);
-    expect(lockedTextInputs[0].element.value).toBe("Docs");
-    expect(lockedTextInputs[1].element.value).toBe("/srv/docs");
+    expect(lockedTextInputs[0].element.value).toBe("/srv/docs");
+    expect(lockedTextInputs[1].element.value).toBe("Docs");
 
     const saveButton = findButton(wrapper, "保存修改");
     expect(saveButton.attributes("type")).toBe("submit");
@@ -531,6 +571,335 @@ describe("share management", () => {
         ],
       }),
     );
+
+    wrapper.unmount();
+  });
+
+  it("places the directory first, derives its name, and defaults allow rules to the local subnet", async () => {
+    const createShare = vi.fn(async (args) => args);
+    const wrapper = await mountReady({
+      local_networks: async () => ["10.0.5.0/24"],
+      create_share: createShare,
+    });
+    await signIn(wrapper);
+    await flushPromises();
+
+    const form = wrapper.find("#pane-shares form");
+    const inputs = form.findAll('input[type="text"]');
+    expect(inputs[0].element.value).toBe("");
+    expect(inputs[1].element.value).toBe("");
+
+    await findButton(wrapper, "选择").trigger("click");
+    await flushPromises();
+
+    expect(inputs[0].element.value).toBe("/tmp/peerdav-keys");
+    expect(inputs[1].element.value).toBe("peerdav-keys");
+
+    await form.trigger("submit");
+    await flushPromises();
+
+    expect(createShare).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "peerdav-keys",
+        rootPath: "/tmp/peerdav-keys",
+        rules: [
+          {
+            kind: "allow",
+            matcher: { type: "network", value: "10.0.5.0/24" },
+          },
+        ],
+      }),
+    );
+
+    wrapper.unmount();
+  });
+});
+
+describe("home workspace", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    initLocale();
+    invoke.mockReset();
+  });
+
+  it("lists authorized servers and opens their file browser", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    const wrapper = await mountReady({
+      admin_session: async () => ({
+        username: "admin",
+        mustChangePassword: false,
+      }),
+      list_peers: async () => [PEER],
+    });
+
+    expect(wrapper.text()).toContain("已授权的服务器");
+    expect(wrapper.text()).toContain("Office");
+    expect(wrapper.text()).toContain("http://192.168.1.10:4918");
+
+    await wrapper.find("button.server-card").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".peer-browser").exists()).toBe(true);
+    expect(wrapper.text()).toContain("目录为空。");
+
+    wrapper.unmount();
+  });
+
+  it("shows discovered servers when none are authorized and requests access on add", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    const requestAccess = vi.fn(async () => ({ requested: true }));
+    const wrapper = await mountReady({
+      admin_session: async () => ({
+        username: "admin",
+        mustChangePassword: false,
+      }),
+      scan_lan: async () => [DISCOVERED],
+      request_peer_access: requestAccess,
+    });
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("发现的服务器");
+    expect(wrapper.text()).toContain("Lab");
+    expect(wrapper.text()).toContain("2 个共享");
+
+    await clickButton(wrapper, "添加");
+    await flushPromises();
+    expect(requestAccess).toHaveBeenCalledWith({
+      url: "http://192.168.1.20:4918",
+    });
+    expect(wrapper.text()).toContain(
+      "已发送访问请求，请在服务端批准后输入授权码。",
+    );
+
+    wrapper.unmount();
+  });
+});
+
+describe("titlebar appearance controls", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    initLocale();
+    initTheme();
+    initAccent();
+    invoke.mockReset();
+  });
+
+  it("renders localized labels in the titlebar menus", async () => {
+    const wrapper = await mountReady(VAULT_NOT_INITIALIZED);
+
+    await wrapper
+      .find('[data-menu="language"] .titlebar-menu__trigger')
+      .trigger("click");
+    await flushPromises();
+
+    const labels = wrapper
+      .findAll('[data-menu="language"] .titlebar-menu__item')
+      .map((item) => item.text());
+    expect(labels).toEqual(["简体中文", "English"]);
+
+    wrapper.unmount();
+  });
+
+  it("switches the theme through the titlebar menu and persists it", async () => {
+    const wrapper = await mountReady(VAULT_NOT_INITIALIZED);
+
+    await wrapper
+      .find('[data-menu="theme"] .titlebar-menu__trigger')
+      .trigger("click");
+    await flushPromises();
+    await wrapper
+      .find('[data-menu="theme"] .titlebar-menu__item[data-value="dark"]')
+      .trigger("click");
+    await flushPromises();
+
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(document.documentElement.classList.contains("dark")).toBe(true);
+    expect(localStorage.getItem(THEME_STORAGE_KEY)).toBe("dark");
+
+    wrapper.unmount();
+  });
+
+  it("switches the accent through the titlebar menu and persists it", async () => {
+    const wrapper = await mountReady(VAULT_NOT_INITIALIZED);
+
+    await wrapper
+      .find('[data-menu="accent"] .titlebar-menu__trigger')
+      .trigger("click");
+    await flushPromises();
+    await wrapper
+      .find('[data-menu="accent"] .titlebar-menu__item[data-value="purple"]')
+      .trigger("click");
+    await flushPromises();
+
+    expect(document.documentElement.dataset.accent).toBe("purple");
+    expect(localStorage.getItem(ACCENT_STORAGE_KEY)).toBe("purple");
+
+    wrapper.unmount();
+  });
+});
+
+describe("startup launch", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    initLocale();
+    invoke.mockReset();
+  });
+
+  it("reads and enables the OS autostart setting", async () => {
+    const { enable, isEnabled } = await import(
+      "@tauri-apps/plugin-autostart"
+    );
+    isEnabled.mockClear();
+    enable.mockClear();
+
+    const wrapper = await mountReady();
+    await signIn(wrapper);
+
+    expect(isEnabled).toHaveBeenCalled();
+
+    await wrapper.find(".settings-toggle .el-switch").trigger("click");
+    await flushPromises();
+
+    expect(enable).toHaveBeenCalledTimes(1);
+
+    wrapper.unmount();
+  });
+
+  it("resumes the enabled server while the vault is locked", async () => {
+    const wrapper = await mountReady({
+      vault_status: async () => ({ initialized: true, unlocked: false }),
+    });
+
+    expect(invoke.mock.calls.map(([command]) => command)).toContain(
+      "resume_server",
+    );
+    expect(wrapper.text()).toContain("加载保险箱密钥");
+    expect(wrapper.text()).toContain("生成密钥");
+    expect(wrapper.text()).not.toContain("重新加载密钥");
+
+    wrapper.unmount();
+  });
+
+  it("offers key generation when the configured key file is invalid", async () => {
+    const wrapper = await mountReady({
+      vault_status: async () => ({
+        initialized: true,
+        unlocked: false,
+        keyFile: "/tmp/empty.key",
+        keyError: "invalid_key_file",
+      }),
+    });
+
+    expect(wrapper.text()).toContain("生成密钥");
+    expect(wrapper.text()).toContain("重新加载密钥");
+
+    wrapper.unmount();
+  });
+
+  it("resets only after a recovery code and shows the next code", async () => {
+    const reset = vi.fn(async () => ({
+      adminUsername: "recovered",
+      vaultStatus: { initialized: true, unlocked: true },
+      recoveryCode: "new-recovery-code",
+      archivedDatabase: "/tmp/peerdav.reset-1.pd",
+    }));
+    const wrapper = await mountReady({
+      vault_status: async () => ({
+        initialized: true,
+        unlocked: false,
+        keyFile: "/tmp/old.key",
+        keyError: "key_file_missing",
+      }),
+      reset_vault: reset,
+    });
+
+    await clickButton(wrapper, "密钥丢失？重置保险箱");
+    const form = wrapper.find("form.inset-form");
+    const inputs = form.findAll("input");
+    await inputs[0].setValue("old-recovery-code");
+    await findButton(wrapper, "选择目录").trigger("click");
+    await flushPromises();
+    await inputs[2].setValue("recovered");
+    await inputs[3].setValue("new admin password 2026");
+    await inputs[4].setValue("new admin password 2026");
+    await inputs[5].setValue("RESET");
+    await form.trigger("submit");
+    await flushPromises();
+
+    expect(reset).toHaveBeenCalledWith({
+      recoveryCode: "old-recovery-code",
+      keyDirectory: "/tmp/peerdav-keys",
+      adminUsername: "recovered",
+      adminPassword: "new admin password 2026",
+    });
+    expect(wrapper.text()).toContain("管理员登录");
+    expect(wrapper.text()).toContain("new-recovery-code");
+
+    wrapper.unmount();
+  });
+});
+
+describe("admin session restore", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    initLocale();
+    initTheme();
+    initAccent();
+    invoke.mockReset();
+  });
+
+  it("restores the signed-in admin after a reload", async () => {
+    const wrapper = await mountReady({
+      admin_session: async () => ({
+        username: "admin",
+        mustChangePassword: false,
+      }),
+    });
+
+    expect(wrapper.text()).not.toContain("管理员登录");
+    expect(wrapper.text()).toContain("首页");
+    expect(wrapper.text()).toContain("已授权的服务器与文件访问入口");
+
+    wrapper.unmount();
+  });
+
+  it("starts on Home for a returning admin after the first login", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+
+    const wrapper = await mountReady();
+    await signIn(wrapper);
+
+    expect(wrapper.text()).toContain("首页");
+    expect(wrapper.text()).not.toContain("当前管理员");
+    expect(document.body.textContent).toContain("管理员登录成功。");
+
+    wrapper.unmount();
+  });
+
+  it("shows Settings on the first login and remembers it", async () => {
+    const wrapper = await mountReady();
+    await signIn(wrapper);
+
+    expect(wrapper.text()).toContain("当前管理员");
+    expect(localStorage.getItem(SETTINGS_SEEN_STORAGE_KEY)).toBe("1");
+
+    wrapper.unmount();
+  });
+
+  it("resumes the persisted server when the vault is already unlocked", async () => {
+    const wrapper = await mountReady();
+
+    expect(invoke.mock.calls.map(([command]) => command)).toContain(
+      "resume_server",
+    );
+
+    wrapper.unmount();
+  });
+
+  it("stays on the sign-in screen when no admin session exists", async () => {
+    const wrapper = await mountReady();
+
+    expect(wrapper.text()).toContain("管理员登录");
 
     wrapper.unmount();
   });
