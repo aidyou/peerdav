@@ -1,29 +1,35 @@
 //! Tauri command boundary. Every command maps a domain error exactly once
 //! through [`AppError::from`] and never builds user-facing strings itself.
 
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_opener::OpenerExt;
 use zeroize::Zeroizing;
 
 use crate::error::{AppError, DomainError};
-use crate::peer::PeerManager;
+use crate::peer::{PeerManager, TransferProgressCallback};
 use crate::server::{ServerConfig, ServerController};
-use crate::traits::ServerEvents;
+use crate::traits::{PeerEvents, ServerEvents};
 use crate::types::{
     AccessRule, AdminLoginResult, AdminSessionInfo, ApprovePendingResult, AuthorizationInfo,
     ConflictPolicy, DEFAULT_DISCOVERY_PORT, DEFAULT_SERVER_PORT, DiscoveredPeer, ERROR_EVENT,
-    ExternalEditInfo, InitializeVaultResult, PENDING_REQUEST_EVENT, PeerAccessRequest, PeerHealth,
-    PeerInfo, PeerListing, PeerShare, PendingRequestInfo, PreviewPayload, ResetVaultResult,
+    ExternalEditInfo, InitializeVaultResult, PEER_REVOKED_EVENT, PENDING_CANCELED_EVENT,
+    PENDING_REQUEST_EVENT, PeerAccessRequest, PeerHealth, PeerInfo, PeerListing,
+    PeerRevocationInfo, PeerShare, PendingRequestInfo, PreviewPayload, ResetVaultResult,
     SERVER_BIND_META, SERVER_DISCOVERY_PORT_META, SERVER_ENABLED_META, SERVER_NAME_META,
-    SERVER_PORT_META, ServerStatus, ShareInfo, SharePermissions, TransferResult, VaultStatus,
+    SERVER_PORT_META, ServerStatus, ShareInfo, SharePermissions, TRANSFER_PROGRESS_EVENT,
+    TransferProgress, TransferResult, UploadCandidate, VaultStatus,
 };
 use crate::vault::Vault;
 
 pub type SharedVault = Arc<Vault>;
 pub type SharedServer = Arc<ServerController>;
 pub type SharedPeers = Arc<PeerManager>;
+
+const MAX_UPLOAD_FILES: usize = 10_000;
 
 /// Forwards server background events to the same structured UI outlet used by
 /// command failures.
@@ -47,6 +53,26 @@ impl ServerEvents for AppEvents {
     fn pending_request(&self, request: &PendingRequestInfo) {
         if let Err(emit_error) = self.app.emit(PENDING_REQUEST_EVENT, request) {
             log::error!("failed to emit {PENDING_REQUEST_EVENT}: {emit_error}");
+        }
+    }
+
+    fn pending_canceled(&self, request: &PendingRequestInfo) {
+        if let Err(emit_error) = self.app.emit(PENDING_CANCELED_EVENT, request) {
+            log::error!("failed to emit {PENDING_CANCELED_EVENT}: {emit_error}");
+        }
+    }
+}
+
+impl PeerEvents for AppEvents {
+    fn error(&self, error: &AppError) {
+        if let Err(emit_error) = self.app.emit(ERROR_EVENT, error) {
+            log::error!("failed to emit {ERROR_EVENT}: {emit_error}");
+        }
+    }
+
+    fn peer_revoked(&self, peer: &PeerRevocationInfo) {
+        if let Err(emit_error) = self.app.emit(PEER_REVOKED_EVENT, peer) {
+            log::error!("failed to emit {PEER_REVOKED_EVENT}: {emit_error}");
         }
     }
 }
@@ -424,8 +450,10 @@ pub async fn list_authorizations(
 
 #[tauri::command]
 pub async fn revoke_authorization(
+    app: AppHandle,
     vault: State<'_, SharedVault>,
     server: State<'_, SharedServer>,
+    peers: State<'_, SharedPeers>,
     username: String,
     password: String,
     authorization_id: String,
@@ -434,7 +462,33 @@ pub async fn revoke_authorization(
     verify_admin(vault, username, password).await?;
 
     let server = Arc::clone(server.inner());
-    run_blocking(move || server.revoke_authorization(&authorization_id)).await
+    run_blocking(move || server.revoke_authorization(&authorization_id)).await?;
+
+    // A revoked authorization is removed from this process immediately. Remote
+    // installations are reconciled by their own periodic backend sync.
+    let peers = Arc::clone(peers.inner());
+    if let Err(error) = peers.sync_saved_peers().await {
+        let app_error = AppError::from(error);
+        log::error!(
+            "failed to reconcile peers after authorization revoke [{}]: {}",
+            app_error.code,
+            app_error.detail.as_deref().unwrap_or(&app_error.message)
+        );
+        if let Err(emit_error) = app.emit(ERROR_EVENT, &app_error) {
+            log::error!("failed to emit {ERROR_EVENT}: {emit_error}");
+        }
+    }
+    Ok(())
+}
+
+/// Synchronizes saved peers against their server bindings. The backend invokes
+/// this automatically, while the UI can request an immediate check after a
+/// relevant server change.
+#[tauri::command]
+pub async fn sync_peers(peers: State<'_, SharedPeers>) -> Result<usize, AppError> {
+    let peers = Arc::clone(peers.inner());
+    peers.start_background();
+    peers.sync_saved_peers().await.map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -460,6 +514,7 @@ pub async fn local_networks() -> Result<Vec<String>, AppError> {
 #[tauri::command]
 pub async fn list_peers(peers: State<'_, SharedPeers>) -> Result<Vec<PeerInfo>, AppError> {
     let peers = Arc::clone(peers.inner());
+    peers.start_background();
     run_blocking(move || peers.list_peers()).await
 }
 
@@ -470,6 +525,39 @@ pub async fn request_peer_access(
 ) -> Result<PeerAccessRequest, AppError> {
     let peers = Arc::clone(peers.inner());
     peers.request_access(&url).await.map_err(AppError::from)
+}
+
+#[tauri::command]
+pub async fn wait_for_peer_access(
+    peers: State<'_, SharedPeers>,
+    url: String,
+    request_id: String,
+    label: Option<String>,
+) -> Result<PeerInfo, AppError> {
+    let peers = Arc::clone(peers.inner());
+    let code = Zeroizing::new(
+        peers
+            .wait_for_access(&url, &request_id)
+            .await
+            .map_err(AppError::from)?,
+    );
+    peers
+        .connect(&url, code.as_str(), label.as_deref())
+        .await
+        .map_err(AppError::from)
+}
+
+#[tauri::command]
+pub async fn cancel_peer_access(
+    peers: State<'_, SharedPeers>,
+    url: String,
+    request_id: String,
+) -> Result<(), AppError> {
+    let peers = Arc::clone(peers.inner());
+    peers
+        .cancel_access(&url, &request_id)
+        .await
+        .map_err(AppError::from)
 }
 
 #[tauri::command]
@@ -546,6 +634,221 @@ pub async fn download_peer_file(
         )
         .await
         .map_err(AppError::from)
+}
+
+#[tauri::command]
+pub async fn download_peer_file_to(
+    app: AppHandle,
+    peers: State<'_, SharedPeers>,
+    peer_id: String,
+    share_id: String,
+    remote_path: String,
+    local_path: String,
+    transfer_id: String,
+) -> Result<TransferResult, AppError> {
+    let peers = Arc::clone(peers.inner());
+    let file_name = remote_path
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("file")
+        .to_owned();
+    let last_emit = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
+    let transfer_id_for_progress = transfer_id.clone();
+    let progress: TransferProgressCallback = Arc::new(move |transferred, total| {
+        let now = Instant::now();
+        let should_emit = {
+            let Ok(mut last) = last_emit.lock() else {
+                return;
+            };
+            if transferred == total || now.duration_since(*last) >= Duration::from_millis(100) {
+                *last = now;
+                true
+            } else {
+                false
+            }
+        };
+        if !should_emit {
+            return;
+        }
+        let payload = TransferProgress {
+            transfer_id: transfer_id_for_progress.clone(),
+            direction: "download".to_owned(),
+            file_name: file_name.clone(),
+            transferred,
+            total,
+        };
+        if let Err(error) = app.emit(TRANSFER_PROGRESS_EVENT, &payload) {
+            log::warn!("failed to emit {TRANSFER_PROGRESS_EVENT}: {error}");
+        }
+    });
+    peers
+        .download_to_with_progress(
+            &peer_id,
+            &share_id,
+            &remote_path,
+            &local_path,
+            Some(progress),
+        )
+        .await
+        .map_err(AppError::from)
+}
+
+#[tauri::command]
+pub async fn collect_upload_paths(paths: Vec<String>) -> Result<Vec<UploadCandidate>, AppError> {
+    run_blocking(move || collect_upload_candidates(&paths)).await
+}
+
+fn collect_upload_candidates(paths: &[String]) -> Result<Vec<UploadCandidate>, DomainError> {
+    let mut candidates = Vec::new();
+    for raw in paths {
+        let path = std::fs::canonicalize(raw)
+            .map_err(|error| local_upload_io("resolve upload path", raw, error))?;
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| local_upload_io("inspect upload path", &path, error))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_file() {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| DomainError::RemotePathInvalid {
+                    detail: "the selected file has no usable name".to_owned(),
+                })?;
+            candidates.push(candidate_for(&path, Path::new(name))?);
+        } else if metadata.is_dir() {
+            let root = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| DomainError::RemotePathInvalid {
+                    detail: "the selected folder has no usable name".to_owned(),
+                })?;
+            walk_upload_dir(&path, Path::new(root), &mut candidates)?;
+        } else {
+            return Err(DomainError::RemotePathInvalid {
+                detail: "only regular files and folders can be uploaded".to_owned(),
+            });
+        }
+    }
+    candidates.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    if candidates.len() > MAX_UPLOAD_FILES {
+        return Err(DomainError::UploadQueueTooLarge {
+            count: candidates.len(),
+            limit: MAX_UPLOAD_FILES,
+        });
+    }
+    Ok(candidates)
+}
+
+fn walk_upload_dir(
+    directory: &Path,
+    relative: &Path,
+    candidates: &mut Vec<UploadCandidate>,
+) -> Result<(), DomainError> {
+    if candidates.len() > MAX_UPLOAD_FILES {
+        return Err(DomainError::UploadQueueTooLarge {
+            count: candidates.len(),
+            limit: MAX_UPLOAD_FILES,
+        });
+    }
+    let mut entries = std::fs::read_dir(directory)
+        .map_err(|error| local_upload_io("read upload folder", directory, error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| local_upload_io("read upload folder", directory, error))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| local_upload_io("inspect upload entry", &path, error))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let relative_path = relative.join(entry.file_name());
+        if file_type.is_dir() {
+            walk_upload_dir(&path, &relative_path, candidates)?;
+        } else if file_type.is_file() {
+            candidates.push(candidate_for(&path, &relative_path)?);
+        }
+    }
+    Ok(())
+}
+
+fn candidate_for(path: &Path, relative: &Path) -> Result<UploadCandidate, DomainError> {
+    let size = std::fs::metadata(path)
+        .map_err(|error| local_upload_io("inspect upload file", path, error))?
+        .len();
+    Ok(UploadCandidate {
+        local_path: path.display().to_string(),
+        relative_path: relative.to_string_lossy().replace('\\', "/"),
+        size,
+    })
+}
+
+fn local_upload_io(
+    operation: &'static str,
+    path: impl AsRef<Path>,
+    source: std::io::Error,
+) -> DomainError {
+    DomainError::Io {
+        operation,
+        path: Some(PathBuf::from(path.as_ref())),
+        source,
+    }
+}
+
+#[tauri::command]
+pub async fn open_local_file(app: AppHandle, path: String) -> Result<(), AppError> {
+    ensure_downloaded_file(&path).await?;
+    app.opener()
+        .open_path(&path, None::<&str>)
+        .map_err(|error| {
+            AppError::from(DomainError::ExternalOpen {
+                path: path.clone(),
+                detail: error.to_string(),
+            })
+        })
+}
+
+#[tauri::command]
+pub async fn reveal_local_file(app: AppHandle, path: String) -> Result<(), AppError> {
+    ensure_downloaded_file(&path).await?;
+    app.opener().reveal_item_in_dir(&path).map_err(|error| {
+        AppError::from(DomainError::ExternalReveal {
+            path: path.clone(),
+            detail: error.to_string(),
+        })
+    })
+}
+
+async fn ensure_downloaded_file(path: &str) -> Result<(), AppError> {
+    let target = Path::new(path);
+    if path.trim().is_empty() {
+        return Err(AppError::from(DomainError::Io {
+            operation: "inspect downloaded file",
+            path: None,
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "the file path is empty"),
+        }));
+    }
+    let metadata = tokio::fs::symlink_metadata(target).await.map_err(|error| {
+        AppError::from(DomainError::Io {
+            operation: "inspect downloaded file",
+            path: Some(target.to_path_buf()),
+            source: error,
+        })
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(AppError::from(DomainError::Io {
+            operation: "inspect downloaded file",
+            path: Some(target.to_path_buf()),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the path is not a regular file",
+            ),
+        }));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -646,5 +949,43 @@ where
         Err(error) => Err(AppError::from(DomainError::Internal {
             detail: format!("blocking vault task failed: {error}"),
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collects_nested_upload_files_with_relative_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let docs = temp.path().join("docs");
+        std::fs::create_dir_all(docs.join("sub")).expect("nested dir");
+        std::fs::write(docs.join("a.txt"), b"a").expect("root file");
+        std::fs::write(docs.join("sub").join("b.txt"), b"bb").expect("nested file");
+
+        let candidates =
+            collect_upload_candidates(&[docs.display().to_string()]).expect("collect uploads");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].relative_path, "docs/a.txt");
+        assert_eq!(candidates[1].relative_path, "docs/sub/b.txt");
+        assert_eq!(candidates[0].size, 1);
+        assert_eq!(candidates[1].size, 2);
+    }
+
+    #[tokio::test]
+    async fn downloaded_file_actions_only_accept_regular_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let file = temp.path().join("saved.txt");
+        std::fs::write(&file, b"saved").expect("saved file");
+        ensure_downloaded_file(file.to_str().expect("utf8"))
+            .await
+            .expect("regular file");
+
+        let missing = temp.path().join("missing.txt");
+        let error = ensure_downloaded_file(missing.to_str().expect("utf8"))
+            .await
+            .expect_err("missing file");
+        assert_eq!(error.code, "IO_FAILED");
     }
 }

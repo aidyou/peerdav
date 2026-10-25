@@ -569,6 +569,59 @@ fn app_error_mapping_is_structured_and_bilingual() {
     assert!(error.message.contains("at least 6"));
 }
 
+#[test]
+fn existing_database_gains_peer_binding_columns() {
+    let directory = dev_test_dir("vault_flow");
+    let path = directory.path().join("peerdav.pd");
+    {
+        let connection = Connection::open(&path).expect("open old sqlite");
+        connection
+            .execute_batch(
+                "CREATE TABLE authorizations (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     label TEXT NOT NULL,
+                     code_hash TEXT NOT NULL UNIQUE,
+                     created_at INTEGER NOT NULL,
+                     revoked_at INTEGER
+                 );
+                 CREATE TABLE peers (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     label TEXT NOT NULL,
+                     url TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     last_connected_at INTEGER
+                 );
+                 INSERT INTO peers (id, label, url, created_at)
+                 VALUES ('peer-1', 'Old peer', 'http://127.0.0.1:4918', 1);",
+            )
+            .expect("create old schema");
+    }
+
+    let vault = Vault::open(&path).expect("migrate vault");
+    drop(vault);
+
+    let connection = Connection::open(&path).expect("open migrated sqlite");
+    assert!(column_exists(&connection, "authorizations", "client_id"));
+    assert!(column_exists(&connection, "peers", "authorization_id"));
+    let label: String = connection
+        .query_row("SELECT label FROM peers WHERE id = 'peer-1'", [], |row| {
+            row.get(0)
+        })
+        .expect("old peer row preserved");
+    assert_eq!(label, "Old peer");
+}
+
+fn column_exists(connection: &Connection, table: &str, column: &str) -> bool {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .expect("prepare table info");
+    statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("query table info")
+        .filter_map(Result::ok)
+        .any(|name| name == column)
+}
+
 fn read_meta(path: &Path, key: &str) -> Option<String> {
     let connection = Connection::open(path).expect("open sqlite");
     read_meta_connection(&connection, key)

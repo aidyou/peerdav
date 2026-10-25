@@ -152,6 +152,15 @@ pub enum DomainError {
     #[error("the peer rejected the authorization code")]
     PeerAuthorizationRejected,
 
+    #[error("the access approval request expired before the client claimed it")]
+    PeerAccessExpired,
+
+    #[error("timed out waiting for administrator approval")]
+    PeerAccessTimeout,
+
+    #[error("the client canceled the access request")]
+    PeerAccessCanceled,
+
     #[error("peer request `{operation}` failed: {detail}")]
     PeerRequest {
         operation: &'static str,
@@ -182,6 +191,12 @@ pub enum DomainError {
 
     #[error("failed to open `{path}` with the system application: {detail}")]
     ExternalOpen { path: String, detail: String },
+
+    #[error("failed to reveal `{path}` in the file manager: {detail}")]
+    ExternalReveal { path: String, detail: String },
+
+    #[error("the upload queue contains {count} files, exceeding the limit of {limit}")]
+    UploadQueueTooLarge { count: usize, limit: usize },
 
     #[error("discovery operation `{operation}` failed: {detail}")]
     Discovery {
@@ -286,6 +301,9 @@ fn error_code(error: &DomainError) -> &'static str {
         DomainError::InvalidPeerUrl { .. } => "PEER_INVALID_URL",
         DomainError::PeerAuthorizationRequired => "PEER_AUTHORIZATION_REQUIRED",
         DomainError::PeerAuthorizationRejected => "PEER_AUTHORIZATION_REJECTED",
+        DomainError::PeerAccessExpired => "PEER_ACCESS_EXPIRED",
+        DomainError::PeerAccessTimeout => "PEER_ACCESS_TIMEOUT",
+        DomainError::PeerAccessCanceled => "PEER_ACCESS_CANCELED",
         DomainError::PeerRequest { .. } => "PEER_REQUEST_FAILED",
         DomainError::RemoteNotFound { .. } => "PEER_REMOTE_NOT_FOUND",
         DomainError::PeerNotFound { .. } => "PEER_NOT_FOUND",
@@ -295,6 +313,8 @@ fn error_code(error: &DomainError) -> &'static str {
         DomainError::TransferConflict { .. } => "TRANSFER_CONFLICT",
         DomainError::ExternalEditNotFound { .. } => "PEER_EDIT_NOT_FOUND",
         DomainError::ExternalOpen { .. } => "PEER_OPEN_FAILED",
+        DomainError::ExternalReveal { .. } => "PEER_REVEAL_FAILED",
+        DomainError::UploadQueueTooLarge { .. } => "UPLOAD_QUEUE_TOO_LARGE",
         DomainError::Discovery { .. } => "DISCOVERY_FAILED",
         DomainError::Internal { .. } => "INTERNAL_ERROR",
     }
@@ -410,12 +430,22 @@ fn user_message(error: &DomainError) -> String {
                 .to_owned()
         }
         DomainError::PeerAuthorizationRequired => {
-            "尚未获得授权：请在服务器端批准该请求，然后输入授权码 / Not authorized yet: approve the request on the server, then enter the authorization code."
+            "尚未获得授权：请在服务器端批准该访问申请 / Not authorized yet: approve the access request on the server."
                 .to_owned()
         }
         DomainError::PeerAuthorizationRejected => {
             "授权码无效或已被撤销 / The authorization code is invalid or has been revoked."
                 .to_owned()
+        }
+        DomainError::PeerAccessExpired => {
+            "授权申请已失效，请重新申请 / The access request expired. Request access again."
+                .to_owned()
+        }
+        DomainError::PeerAccessTimeout => {
+            "等待管理员批准超时 / Timed out waiting for administrator approval.".to_owned()
+        }
+        DomainError::PeerAccessCanceled => {
+            "已取消访问申请 / The access request was canceled.".to_owned()
         }
         DomainError::PeerRequest { .. } => {
             "请求服务器失败 / The request to the server failed.".to_owned()
@@ -444,6 +474,13 @@ fn user_message(error: &DomainError) -> String {
         DomainError::ExternalOpen { .. } => {
             "无法使用外部应用打开该文件 / Could not open the file with an external application."
                 .to_owned()
+        }
+        DomainError::ExternalReveal { .. } => {
+            "无法在文件管理器中显示该文件 / Could not reveal the file in the file manager."
+                .to_owned()
+        }
+        DomainError::UploadQueueTooLarge { limit, .. } => {
+            format!("一次最多上传 {limit} 个文件 / At most {limit} files can be uploaded at once.")
         }
         DomainError::Discovery { .. } => {
             "局域网发现失败 / LAN discovery failed.".to_owned()
@@ -499,7 +536,11 @@ fn error_context(error: &DomainError) -> Option<Value> {
         DomainError::RemoteNotFound { path }
         | DomainError::TransferConflict { path }
         | DomainError::RemotePathInvalid { detail: path }
-        | DomainError::ExternalOpen { path, .. } => Some(json!({ "path": path })),
+        | DomainError::ExternalOpen { path, .. }
+        | DomainError::ExternalReveal { path, .. } => Some(json!({ "path": path })),
+        DomainError::UploadQueueTooLarge { count, limit } => {
+            Some(json!({ "count": count, "limit": limit }))
+        }
         DomainError::TransferTooLarge { size, limit } => {
             Some(json!({ "size": size, "limit": limit }))
         }

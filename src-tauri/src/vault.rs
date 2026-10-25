@@ -23,11 +23,11 @@ use crate::db::Database;
 use crate::error::DomainError;
 use crate::keyfile;
 use crate::types::{
-    AdminLoginResult, AdminRecord, AdminSessionInfo, AuthorizationRecord, InitializeVaultResult,
-    META_KEY_FILE, META_RECOVERY_HASH, META_SCHEMA_VERSION, PEER_SECRET_PREFIX, PeerRecord,
-    PeerSecret, ResetVaultResult, SCHEMA_VERSION, SECRET_ADMIN, SECRET_VAULT_VERIFIER,
-    SharePermissions, ShareRecord, ShareRuleRecord, VAULT_KEY_LEN, VAULT_VERIFIER_PLAINTEXT,
-    VaultStatus,
+    AdminLoginResult, AdminRecord, AdminSessionInfo, AuthorizationRecord, CLIENT_ID_META,
+    InitializeVaultResult, MAX_CLIENT_ID_CHARS, META_KEY_FILE, META_RECOVERY_HASH,
+    META_SCHEMA_VERSION, MIN_CLIENT_ID_CHARS, PEER_SECRET_PREFIX, PeerRecord, PeerSecret,
+    ResetVaultResult, SCHEMA_VERSION, SECRET_ADMIN, SECRET_VAULT_VERIFIER, SharePermissions,
+    ShareRecord, ShareRuleRecord, VAULT_KEY_LEN, VAULT_VERIFIER_PLAINTEXT, VaultStatus,
 };
 
 #[derive(Default)]
@@ -78,6 +78,13 @@ impl Vault {
             key_file,
             key_error: session.key_error.map(str::to_owned),
         })
+    }
+
+    /// Whether the process currently holds the vault key.
+    pub(crate) fn is_unlocked(&self) -> bool {
+        self.session()
+            .map(|session| session.key.is_some())
+            .unwrap_or(false)
     }
 
     /// First-run initialization. Generates a key file in the chosen directory,
@@ -442,10 +449,12 @@ impl Vault {
         self.db()?.delete_share(id)
     }
 
-    /// Active (non-revoked) authorizations. The stored value is a SHA-256
-    /// digest; the plaintext code is never persisted.
-    pub(crate) fn list_authorizations(&self) -> Result<Vec<AuthorizationRecord>, DomainError> {
-        self.db()?.list_active_authorizations()
+    /// Active and revoked authorization rows. Revoked rows are tombstones used
+    /// by PeerDav clients to remove a server binding whose code no longer works.
+    pub(crate) fn list_authorization_records(
+        &self,
+    ) -> Result<Vec<AuthorizationRecord>, DomainError> {
+        self.db()?.list_all_authorizations()
     }
 
     pub(crate) fn add_authorization(
@@ -459,8 +468,18 @@ impl Vault {
             id: id.to_owned(),
             label: label.to_owned(),
             code_hash: code_hash.to_owned(),
+            client_id: None,
             created_at,
+            revoked_at: None,
         })
+    }
+
+    pub(crate) fn bind_authorization(
+        &self,
+        id: &str,
+        client_id: &str,
+    ) -> Result<bool, DomainError> {
+        self.db()?.set_authorization_client(id, client_id)
     }
 
     pub(crate) fn revoke_authorization(&self, id: &str) -> Result<(), DomainError> {
@@ -482,6 +501,32 @@ impl Vault {
 
     pub(crate) fn delete_peer_record(&self, id: &str) -> Result<(), DomainError> {
         self.db()?.delete_peer(id)
+    }
+
+    pub(crate) fn set_peer_authorization_id(
+        &self,
+        peer_id: &str,
+        authorization_id: &str,
+    ) -> Result<(), DomainError> {
+        self.db()?
+            .set_peer_authorization_id(peer_id, authorization_id)
+    }
+
+    /// Returns the stable installation id, creating it on first use. It is not
+    /// secret; it only prevents one bound client from deleting another client's
+    /// server authorization.
+    pub(crate) fn ensure_client_id(&self) -> Result<String, DomainError> {
+        let db = self.db()?;
+        if let Some(existing) = db.read_meta(CLIENT_ID_META)? {
+            let existing = existing.trim();
+            if valid_client_id(existing) {
+                return Ok(existing.to_owned());
+            }
+        }
+
+        let client_id = hex::encode(crypto::random_bytes::<16>());
+        db.write_meta(CLIENT_ID_META, &client_id)?;
+        Ok(client_id)
     }
 
     /// Stores the peer URL and authorization code as one encrypted record.
@@ -740,6 +785,13 @@ fn load_admin_record(db: &Database, key: &[u8; VAULT_KEY_LEN]) -> Result<AdminRe
         })?;
     let plaintext = decrypt_record(key, SECRET_ADMIN, &record.nonce, &record.ciphertext)?;
     admin::decode(&plaintext)
+}
+
+fn valid_client_id(value: &str) -> bool {
+    (MIN_CLIENT_ID_CHARS..=MAX_CLIENT_ID_CHARS).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn peer_secret_name(id: &str) -> Result<String, DomainError> {

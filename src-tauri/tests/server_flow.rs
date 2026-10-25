@@ -12,7 +12,8 @@ use http::{HeaderMap, Method, Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper_util::rt::TokioIo;
 use peerdav_lib::{
-    AccessRule, AppError, DomainError, MAX_PENDING_ATTEMPTS, MAX_PENDING_PATH_CHARS,
+    ACCESS_REQUEST_HEADER, ACCESS_STATUS_PATH, AccessRequestStatus, AccessRule,
+    AccessStatusResponse, AppError, DomainError, MAX_PENDING_ATTEMPTS, MAX_PENDING_PATH_CHARS,
     MAX_PENDING_REQUESTS, PendingRequestInfo, RuleKind, RuleMatcher, ServerConfig,
     ServerController, ServerEvents, SharePermissions, Vault,
 };
@@ -401,6 +402,84 @@ async fn authentication_challenge_approval_and_webdav_crud() {
         .await;
     assert_eq!(after_revoke.status, StatusCode::UNAUTHORIZED);
     assert_eq!(harness.controller.list_pending().len(), 1);
+
+    harness.shutdown().await;
+    drop(harness.directory);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approved_code_is_delivered_once_only_to_the_requesting_client() {
+    let harness = Harness::new(full_permissions(), vec![loopback_rule()]).await;
+    let request_id = "a".repeat(32);
+    let headers = [(ACCESS_REQUEST_HEADER, request_id.clone())];
+
+    let challenge = harness
+        .request_with_headers(Method::GET, "/__peerdav/catalog", None, b"", &headers)
+        .await;
+    assert_eq!(challenge.status, StatusCode::UNAUTHORIZED);
+
+    let pending = harness.controller.list_pending();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].client_request_id.as_deref(),
+        Some(request_id.as_str())
+    );
+    let admin_dto = serde_json::to_string(&pending[0]).expect("serialize pending request");
+    assert!(
+        !admin_dto.contains(&request_id),
+        "the claim key must not be exposed in the admin DTO"
+    );
+
+    let waiting = harness
+        .request_with_headers(Method::GET, ACCESS_STATUS_PATH, None, b"", &headers)
+        .await;
+    assert_eq!(waiting.status, StatusCode::ACCEPTED);
+    let status: AccessStatusResponse =
+        serde_json::from_slice(&waiting.body).expect("parse pending status");
+    assert_eq!(status.status, AccessRequestStatus::Pending);
+    assert!(status.authorization_code.is_none());
+
+    let wrong_key = harness
+        .request_with_headers(
+            Method::GET,
+            ACCESS_STATUS_PATH,
+            None,
+            b"",
+            &[(ACCESS_REQUEST_HEADER, "b".repeat(32))],
+        )
+        .await;
+    assert_eq!(wrong_key.status, StatusCode::NOT_FOUND);
+    let wrong_status: AccessStatusResponse =
+        serde_json::from_slice(&wrong_key.body).expect("parse wrong-key status");
+    assert_eq!(wrong_status.status, AccessRequestStatus::Expired);
+    assert!(wrong_status.authorization_code.is_none());
+
+    let approved = harness
+        .controller
+        .approve_pending(&pending[0].id)
+        .expect("approve");
+    assert!(approved.auto_delivery);
+
+    let delivered = harness
+        .request_with_headers(Method::GET, ACCESS_STATUS_PATH, None, b"", &headers)
+        .await;
+    assert_eq!(delivered.status, StatusCode::OK);
+    let status: AccessStatusResponse =
+        serde_json::from_slice(&delivered.body).expect("parse approved status");
+    assert_eq!(status.status, AccessRequestStatus::Approved);
+    assert_eq!(
+        status.authorization_code.as_deref(),
+        Some(approved.authorization_code.as_str())
+    );
+
+    let repeated = harness
+        .request_with_headers(Method::GET, ACCESS_STATUS_PATH, None, b"", &headers)
+        .await;
+    assert_eq!(repeated.status, StatusCode::NOT_FOUND);
+    let status: AccessStatusResponse =
+        serde_json::from_slice(&repeated.body).expect("parse consumed status");
+    assert_eq!(status.status, AccessRequestStatus::Expired);
+    assert!(status.authorization_code.is_none());
 
     harness.shutdown().await;
     drop(harness.directory);

@@ -61,9 +61,6 @@ function initials(peer) {
           {{ initials(peer) }}
         </button>
       </el-tooltip>
-      <p v-if="!peers.length" class="rail-empty">
-        {{ t("settings.noServers") }}
-      </p>
     </div>
     <el-tooltip
       :content="t('settings.open')"
@@ -173,14 +170,6 @@ function initials(peer) {
   stroke-width: 1.6;
   stroke-linecap: round;
   stroke-linejoin: round;
-}
-
-.rail-empty {
-  margin: 4px 0 0;
-  font-size: 10px;
-  line-height: 1.4;
-  color: var(--app-text-muted);
-  text-align: center;
 }
 
 @media (max-width: 560px) {

@@ -42,6 +42,9 @@ pub const SERVER_BIND_META: &str = "server.bindAddress";
 pub const SERVER_PORT_META: &str = "server.port";
 pub const SERVER_DISCOVERY_PORT_META: &str = "server.discoveryPort";
 pub const SERVER_NAME_META: &str = "server.name";
+/// Stable installation identifier used to bind a server authorization to the
+/// PeerDav client that owns it.
+pub const CLIENT_ID_META: &str = "client.id";
 
 /// Reserved secret record holding the encrypted unlock verifier.
 pub const SECRET_VAULT_VERIFIER: &str = "__vault_verifier__";
@@ -127,6 +130,32 @@ pub const SHARE_URL_PREFIX: &str = "/share/";
 /// Catalog endpoint used by the client to discover the shares a code can see.
 pub const CATALOG_PATH: &str = "/__peerdav/catalog";
 pub const CATALOG_PROTOCOL: &str = "peerdav-catalog/1";
+/// Endpoint where a waiting client claims its approved authorization code.
+pub const ACCESS_STATUS_PATH: &str = "/__peerdav/access";
+pub const ACCESS_PROTOCOL: &str = "peerdav-access/1";
+/// Client-generated key that binds one approval to the requesting client.
+pub const ACCESS_REQUEST_HEADER: &str = "x-peerdav-access-request";
+/// Authorization lifecycle endpoint. `GET` reports whether the submitted code
+/// is still active or has been revoked; `POST` binds the authorization to this
+/// installation; `DELETE` revokes it on behalf of the owning client.
+pub const AUTHORIZATION_PATH: &str = "/__peerdav/authorization";
+pub const AUTHORIZATION_PROTOCOL: &str = "peerdav-authorization/1";
+pub const CLIENT_ID_HEADER: &str = "x-peerdav-client-id";
+pub const MIN_CLIENT_ID_CHARS: usize = 16;
+pub const MAX_CLIENT_ID_CHARS: usize = 64;
+/// Backend interval for checking saved peers against their server bindings.
+pub const PEER_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+pub const MIN_ACCESS_REQUEST_ID_CHARS: usize = 16;
+pub const MAX_ACCESS_REQUEST_ID_CHARS: usize = 128;
+/// How long an approved code waits for the client to claim it.
+pub const ACCESS_GRANT_TTL: Duration = Duration::from_secs(15 * 60);
+/// Upper bound for in-memory approved grants.
+pub const MAX_ACCESS_GRANTS: usize = 64;
+/// The client stops waiting for an administrator after this duration.
+pub const PEER_ACCESS_WAIT: Duration = Duration::from_secs(10 * 60);
+/// Poll interval while waiting for approval; the UI remains responsive because
+/// the wait runs in the backend.
+pub const PEER_ACCESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Default UDP port used for LAN discovery.
 pub const DEFAULT_DISCOVERY_PORT: u16 = 4919;
 pub const DISCOVERY_PROTOCOL: &str = "peerdav-discovery/1";
@@ -144,6 +173,12 @@ pub const MAX_PENDING_ATTEMPTS: u32 = 100;
 /// Event names for the shared background error outlet.
 pub const ERROR_EVENT: &str = "app://error";
 pub const PENDING_REQUEST_EVENT: &str = "app://pending-request";
+/// Event emitted when a client withdraws its pending access request.
+pub const PENDING_CANCELED_EVENT: &str = "app://pending-canceled";
+/// Event emitted while a peer transfer is streaming.
+pub const TRANSFER_PROGRESS_EVENT: &str = "app://transfer-progress";
+/// Event emitted when a saved peer is removed because its server revoked it.
+pub const PEER_REVOKED_EVENT: &str = "app://peer-revoked";
 /// Event emitted when the user asks to quit from the tray menu.
 pub const QUIT_REQUEST_EVENT: &str = "app://quit-request";
 /// Label of the main application window.
@@ -219,6 +254,10 @@ pub struct PendingRequestInfo {
     pub first_seen: i64,
     pub last_seen: i64,
     pub attempts: u32,
+    /// Opaque key supplied by a PeerDav client. It is omitted from the admin
+    /// DTO because only the requesting client needs it to claim the code.
+    #[serde(skip_serializing)]
+    pub client_request_id: Option<String>,
 }
 
 /// The one and only time the plaintext authorization code is returned.
@@ -227,6 +266,8 @@ pub struct PendingRequestInfo {
 pub struct ApprovePendingResult {
     pub authorization_code: String,
     pub authorization: AuthorizationInfo,
+    /// True when the code was queued for automatic delivery to the client.
+    pub auto_delivery: bool,
 }
 
 /// Runtime server state exposed to the UI.
@@ -265,7 +306,9 @@ pub(crate) struct AuthorizationRecord {
     pub id: String,
     pub label: String,
     pub code_hash: String,
+    pub client_id: Option<String>,
     pub created_at: i64,
+    pub revoked_at: Option<i64>,
 }
 
 /// Prefix of the vault secret that stores a peer's authorization code.
@@ -287,7 +330,7 @@ pub const DISCOVERY_SCAN_TIMEOUT: Duration = Duration::from_millis(1200);
 pub const DISCOVERY_RECV_BUFFER: usize = 8 * 1024;
 /// Timeout applied to every peer HTTP request.
 pub const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-/// Upper bound for an authorization code supplied by the UI.
+/// Upper bound for an authorization code accepted from the backend or a peer.
 pub const MAX_AUTHORIZATION_CODE_CHARS: usize = 512;
 
 /// One server seen on the LAN through UDP discovery.
@@ -337,6 +380,64 @@ pub struct PeerInfo {
 #[serde(rename_all = "camelCase")]
 pub struct PeerAccessRequest {
     pub requested: bool,
+    /// Opaque key used to claim the approval code; `None` when no approval is
+    /// needed.
+    pub request_id: Option<String>,
+}
+
+/// State of one client access request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AccessRequestStatus {
+    Pending,
+    Approved,
+    Expired,
+}
+
+/// Response from the one-time access status endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessStatusResponse {
+    pub protocol: String,
+    pub status: AccessRequestStatus,
+    pub authorization_code: Option<String>,
+}
+
+/// State reported by the authorization lifecycle endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AuthorizationStatus {
+    Active,
+    Revoked,
+}
+
+/// Response from `/__peerdav/authorization`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthorizationStatusResponse {
+    pub protocol: String,
+    pub status: AuthorizationStatus,
+    pub authorization_id: String,
+    pub client_id: Option<String>,
+}
+
+/// Response from binding an authorization to this PeerDav installation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthorizationBindingResponse {
+    pub protocol: String,
+    pub authorization_id: String,
+    pub client_id: String,
+}
+
+/// Payload sent to the UI after a saved peer is automatically removed.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerRevocationInfo {
+    pub id: String,
+    pub label: String,
+    pub url: String,
+    pub reason: String,
 }
 
 /// Lightweight connection health, including denial reasons.
@@ -396,6 +497,28 @@ pub struct TransferResult {
     pub skipped_reason: Option<String>,
 }
 
+/// Streaming progress for a download or upload initiated by the UI.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferProgress {
+    pub transfer_id: String,
+    pub direction: String,
+    pub file_name: String,
+    pub transferred: u64,
+    /// Zero when the server did not provide a content length.
+    pub total: u64,
+}
+
+/// One local file discovered for an upload queue. `relative_path` keeps the
+/// selected directory hierarchy, using `/` separators.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadCandidate {
+    pub local_path: String,
+    pub relative_path: String,
+    pub size: u64,
+}
+
 /// Backend-read preview payload. Never served through a broad asset scope.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -429,6 +552,7 @@ pub(crate) struct PeerRecord {
     pub id: String,
     pub label: String,
     pub url: String,
+    pub authorization_id: Option<String>,
     pub created_at: i64,
     pub last_connected_at: Option<i64>,
 }

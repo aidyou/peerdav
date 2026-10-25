@@ -4,14 +4,14 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use dav_server::DavHandler;
 use dav_server::body::Body;
 use dav_server::davpath::DavPath;
 use dav_server::fakels::FakeLs;
-use http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE};
+use http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE};
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -34,9 +34,14 @@ use crate::policy::{
 };
 use crate::traits::ServerEvents;
 use crate::types::{
-    AccessRule, ApprovePendingResult, AuthorizationInfo, CATALOG_PATH, CATALOG_PROTOCOL,
-    CatalogResponse, DEFAULT_SERVER_PORT, MAX_PENDING_ATTEMPTS, MAX_PENDING_PATH_CHARS,
-    MAX_PENDING_REQUESTS, PeerShare, PendingRequestInfo, ServerStatus, ShareInfo, SharePermissions,
+    ACCESS_GRANT_TTL, ACCESS_PROTOCOL, ACCESS_REQUEST_HEADER, ACCESS_STATUS_PATH,
+    AUTHORIZATION_PATH, AUTHORIZATION_PROTOCOL, AccessRequestStatus, AccessRule,
+    AccessStatusResponse, ApprovePendingResult, AuthorizationBindingResponse, AuthorizationInfo,
+    AuthorizationStatus, AuthorizationStatusResponse, CATALOG_PATH, CATALOG_PROTOCOL,
+    CLIENT_ID_HEADER, CatalogResponse, DEFAULT_SERVER_PORT, MAX_ACCESS_GRANTS,
+    MAX_ACCESS_REQUEST_ID_CHARS, MAX_CLIENT_ID_CHARS, MAX_PENDING_ATTEMPTS, MAX_PENDING_PATH_CHARS,
+    MAX_PENDING_REQUESTS, MIN_ACCESS_REQUEST_ID_CHARS, MIN_CLIENT_ID_CHARS, PeerShare,
+    PendingRequestInfo, ServerStatus, ShareInfo, SharePermissions,
 };
 use crate::vault::Vault;
 
@@ -73,6 +78,17 @@ impl Default for ServerConfig {
 struct AuthEntry {
     info: AuthorizationInfo,
     hash: [u8; 32],
+    client_id: Option<String>,
+    revoked: bool,
+}
+
+/// An approved code waiting to be claimed by the requesting client.
+struct PendingGrant {
+    client_request_id: String,
+    peer_ip: String,
+    authorization_id: String,
+    code: String,
+    expires_at: Instant,
 }
 
 struct RunningServer {
@@ -83,9 +99,11 @@ struct RunningServer {
 }
 
 struct Gate {
+    vault: Arc<Vault>,
     shares: Arc<std::sync::RwLock<ShareMap>>,
     authorizations: Arc<std::sync::RwLock<Vec<AuthEntry>>>,
     pending: Arc<Mutex<Vec<PendingRequestInfo>>>,
+    grants: Arc<Mutex<Vec<PendingGrant>>>,
     events: Arc<dyn ServerEvents>,
     server_name: String,
 }
@@ -97,6 +115,7 @@ pub struct ServerController {
     shares: Arc<std::sync::RwLock<ShareMap>>,
     authorizations: Arc<std::sync::RwLock<Vec<AuthEntry>>>,
     pending: Arc<Mutex<Vec<PendingRequestInfo>>>,
+    grants: Arc<Mutex<Vec<PendingGrant>>>,
     lifecycle: Mutex<Option<RunningServer>>,
     server_id: String,
 }
@@ -117,7 +136,7 @@ impl ServerController {
         }
 
         let mut authorizations = Vec::new();
-        for record in vault.list_authorizations()? {
+        for record in vault.list_authorization_records()? {
             match load_authorization(&record) {
                 Ok(entry) => authorizations.push(entry),
                 Err(error) => publish_error(events.as_ref(), &error),
@@ -130,6 +149,7 @@ impl ServerController {
             shares: Arc::new(std::sync::RwLock::new(shares)),
             authorizations: Arc::new(std::sync::RwLock::new(authorizations)),
             pending: Arc::new(Mutex::new(Vec::new())),
+            grants: Arc::new(Mutex::new(Vec::new())),
             lifecycle: Mutex::new(None),
             server_id: random_hex(8),
         })
@@ -206,9 +226,11 @@ impl ServerController {
             .build_handler();
 
         let gate = Arc::new(Gate {
+            vault: Arc::clone(&self.vault),
             shares: Arc::clone(&self.shares),
             authorizations: Arc::clone(&self.authorizations),
             pending: Arc::clone(&self.pending),
+            grants: Arc::clone(&self.grants),
             events: Arc::clone(&self.events),
             server_name: config.server_name.clone(),
         });
@@ -369,6 +391,7 @@ impl ServerController {
         match self.authorizations.read() {
             Ok(authorizations) => authorizations
                 .iter()
+                .filter(|entry| !entry.revoked)
                 .map(|entry| entry.info.clone())
                 .collect(),
             Err(_) => {
@@ -559,6 +582,8 @@ impl ServerController {
                 created_at: record.created_at,
             },
             hash,
+            client_id: None,
+            revoked: false,
         });
         pending.remove(position);
 
@@ -568,22 +593,65 @@ impl ServerController {
             .ok_or_else(|| DomainError::Internal {
                 detail: "authorization was not inserted".to_owned(),
             })?;
+        drop(authorizations);
+
+        let auto_delivery = match request.client_request_id.as_deref() {
+            Some(client_request_id) => {
+                self.queue_grant(client_request_id, &request.peer_ip, &info.id, &code)
+            }
+            None => false,
+        };
         Ok(ApprovePendingResult {
             authorization_code: code,
             authorization: info,
+            auto_delivery,
         })
     }
 
     pub fn revoke_authorization(&self, authorization_id: &str) -> Result<(), DomainError> {
-        self.vault.revoke_authorization(authorization_id)?;
-        let mut authorizations =
-            self.authorizations
-                .write()
-                .map_err(|_| DomainError::Internal {
-                    detail: "authorization catalog lock poisoned".to_owned(),
-                })?;
-        authorizations.retain(|entry| entry.info.id != authorization_id);
-        Ok(())
+        revoke_authorization_state(
+            self.vault.as_ref(),
+            &self.authorizations,
+            &self.grants,
+            self.events.as_ref(),
+            authorization_id,
+        )
+    }
+
+    /// Queues the approved code for the client identified by its request key.
+    /// The code is removed as soon as the client claims it.
+    fn queue_grant(
+        &self,
+        client_request_id: &str,
+        peer_ip: &str,
+        authorization_id: &str,
+        code: &str,
+    ) -> bool {
+        let mut grants = match self.grants.lock() {
+            Ok(grants) => grants,
+            Err(_) => {
+                publish_error(
+                    self.events.as_ref(),
+                    &DomainError::Internal {
+                        detail: "access grant lock poisoned".to_owned(),
+                    },
+                );
+                return false;
+            }
+        };
+        let now = Instant::now();
+        grants.retain(|grant| grant.expires_at > now);
+        if grants.len() >= MAX_ACCESS_GRANTS {
+            grants.remove(0);
+        }
+        grants.push(PendingGrant {
+            client_request_id: client_request_id.to_owned(),
+            peer_ip: peer_ip.to_owned(),
+            authorization_id: authorization_id.to_owned(),
+            code: code.to_owned(),
+            expires_at: now + ACCESS_GRANT_TTL,
+        });
+        true
     }
 }
 
@@ -624,6 +692,71 @@ fn load_share(record: crate::types::ShareRecord) -> Result<ShareConfig, DomainEr
     })
 }
 
+fn revoke_authorization_state(
+    vault: &Vault,
+    authorizations: &Arc<std::sync::RwLock<Vec<AuthEntry>>>,
+    grants: &Arc<Mutex<Vec<PendingGrant>>>,
+    events: &dyn ServerEvents,
+    authorization_id: &str,
+) -> Result<(), DomainError> {
+    let is_active = match authorizations.read() {
+        Ok(entries) => entries
+            .iter()
+            .any(|entry| entry.info.id == authorization_id && !entry.revoked),
+        Err(_) => {
+            publish_error(
+                events,
+                &DomainError::Internal {
+                    detail: "authorization catalog lock poisoned while revoking".to_owned(),
+                },
+            );
+            return Err(DomainError::Internal {
+                detail: "authorization catalog lock poisoned while revoking".to_owned(),
+            });
+        }
+    };
+    if !is_active {
+        return Err(DomainError::AuthorizationNotFound {
+            id: authorization_id.to_owned(),
+        });
+    }
+
+    match vault.revoke_authorization(authorization_id) {
+        Ok(()) => {}
+        Err(DomainError::AuthorizationNotFound { id }) if id == authorization_id => {}
+        Err(error) => return Err(error),
+    }
+
+    match authorizations.write() {
+        Ok(mut entries) => {
+            for entry in &mut *entries {
+                if entry.info.id == authorization_id {
+                    entry.revoked = true;
+                }
+            }
+        }
+        Err(_) => publish_error(
+            events,
+            &DomainError::Internal {
+                detail: "authorization catalog lock poisoned after revoke".to_owned(),
+            },
+        ),
+    }
+
+    match grants.lock() {
+        Ok(mut grants) => {
+            grants.retain(|grant| grant.authorization_id != authorization_id);
+        }
+        Err(_) => publish_error(
+            events,
+            &DomainError::Internal {
+                detail: "access grant lock poisoned after revoke".to_owned(),
+            },
+        ),
+    }
+    Ok(())
+}
+
 fn load_authorization(
     record: &crate::types::AuthorizationRecord,
 ) -> Result<AuthEntry, DomainError> {
@@ -640,6 +773,8 @@ fn load_authorization(
             created_at: record.created_at,
         },
         hash,
+        client_id: record.client_id.clone(),
+        revoked: record.revoked_at.is_some(),
     })
 }
 
@@ -719,6 +854,12 @@ async fn handle_request(
     if request.method().as_str() == "PROPPATCH" {
         return empty_response(StatusCode::NOT_IMPLEMENTED);
     }
+    if request.uri().path() == ACCESS_STATUS_PATH {
+        return handle_access_status(request, peer, gate).await;
+    }
+    if request.uri().path() == AUTHORIZATION_PATH {
+        return handle_authorization(request, gate).await;
+    }
     if request.uri().path() == CATALOG_PATH {
         return handle_catalog(request, peer, gate).await;
     }
@@ -786,7 +927,14 @@ async fn handle_request(
         if pending_eligible_method(request.method())
             && let Some(requested_path) = pending_target(&relative)
         {
-            record_pending(&gate, &share, peer, &requested_path);
+            let client_request_id = access_request_id(request.headers());
+            record_pending(
+                &gate,
+                &share,
+                peer,
+                &requested_path,
+                client_request_id.as_deref(),
+            );
         }
         return auth_challenge();
     };
@@ -863,7 +1011,8 @@ async fn handle_catalog(
     let authorized = auth_token(request.headers())
         .and_then(|token| find_authorization(&gate, &hash_code(&token)));
     if authorized.is_none() {
-        record_pending(&gate, &allowed[0], peer, "");
+        let client_request_id = access_request_id(request.headers());
+        record_pending(&gate, &allowed[0], peer, "", client_request_id.as_deref());
         return auth_challenge();
     }
 
@@ -895,12 +1044,448 @@ async fn handle_catalog(
     }
 }
 
+/// Returns the approval state for one client request. The approved code is
+/// released exactly once and only to the peer IP that created the request.
+async fn handle_access_status(
+    request: Request<Incoming>,
+    peer: SocketAddr,
+    gate: Arc<Gate>,
+) -> Response<Body> {
+    match *request.method() {
+        Method::GET => handle_access_poll(request, peer, gate).await,
+        Method::DELETE => cancel_access_request(request, peer, gate).await,
+        _ => method_not_allowed(),
+    }
+}
+
+/// Cancels a request that has not been claimed yet. Removing a queued grant
+/// also revokes the authorization created by the approval, so a cancel cannot
+/// leave an orphaned server authorization behind.
+async fn cancel_access_request(
+    request: Request<Incoming>,
+    peer: SocketAddr,
+    gate: Arc<Gate>,
+) -> Response<Body> {
+    let Some(client_request_id) = access_request_id(request.headers()) else {
+        return empty_response(StatusCode::BAD_REQUEST);
+    };
+    let peer_ip = canonical_ip(peer.ip()).to_string();
+
+    let grant = match gate.grants.lock() {
+        Ok(mut grants) => grants
+            .iter()
+            .position(|grant| {
+                grant.client_request_id == client_request_id && grant.peer_ip == peer_ip
+            })
+            .map(|position| grants.remove(position)),
+        Err(_) => {
+            publish_error(
+                gate.events.as_ref(),
+                &DomainError::Internal {
+                    detail: "access grant lock poisoned while canceling".to_owned(),
+                },
+            );
+            return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    let canceled_pending = match gate.pending.lock() {
+        Ok(mut pending) => pending
+            .iter()
+            .position(|request| {
+                request.peer_ip == peer_ip
+                    && request.client_request_id.as_deref() == Some(client_request_id.as_str())
+            })
+            .map(|position| pending.remove(position)),
+        Err(_) => {
+            publish_error(
+                gate.events.as_ref(),
+                &DomainError::Internal {
+                    detail: "pending request lock poisoned while canceling".to_owned(),
+                },
+            );
+            return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    if let Some(request) = canceled_pending {
+        gate.events.pending_canceled(&request);
+    }
+
+    if let Some(grant) = grant {
+        match revoke_authorization_state(
+            gate.vault.as_ref(),
+            &gate.authorizations,
+            &gate.grants,
+            gate.events.as_ref(),
+            &grant.authorization_id,
+        ) {
+            Ok(()) | Err(DomainError::AuthorizationNotFound { .. }) => {}
+            Err(error) => {
+                publish_error(gate.events.as_ref(), &error);
+                return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+
+    empty_response(StatusCode::NO_CONTENT)
+}
+
+async fn handle_access_poll(
+    request: Request<Incoming>,
+    peer: SocketAddr,
+    gate: Arc<Gate>,
+) -> Response<Body> {
+    let Some(client_request_id) = access_request_id(request.headers()) else {
+        return empty_response(StatusCode::BAD_REQUEST);
+    };
+    let peer_ip = canonical_ip(peer.ip()).to_string();
+    let now = Instant::now();
+
+    let grant = match gate.grants.lock() {
+        Ok(mut grants) => {
+            grants.retain(|grant| grant.expires_at > now);
+            grants
+                .iter()
+                .position(|grant| {
+                    grant.client_request_id == client_request_id && grant.peer_ip == peer_ip
+                })
+                .map(|position| grants.remove(position))
+        }
+        Err(_) => {
+            publish_error(
+                gate.events.as_ref(),
+                &DomainError::Internal {
+                    detail: "access grant lock poisoned".to_owned(),
+                },
+            );
+            return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    if let Some(grant) = grant {
+        return access_response(
+            gate.events.as_ref(),
+            StatusCode::OK,
+            AccessRequestStatus::Approved,
+            Some(grant.code),
+        );
+    }
+
+    let pending = match gate.pending.lock() {
+        Ok(pending) => pending.iter().any(|request| {
+            request.peer_ip == peer_ip
+                && request.client_request_id.as_deref() == Some(client_request_id.as_str())
+        }),
+        Err(_) => {
+            publish_error(
+                gate.events.as_ref(),
+                &DomainError::Internal {
+                    detail: "pending request lock poisoned".to_owned(),
+                },
+            );
+            return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    if pending {
+        return access_response(
+            gate.events.as_ref(),
+            StatusCode::ACCEPTED,
+            AccessRequestStatus::Pending,
+            None,
+        );
+    }
+
+    access_response(
+        gate.events.as_ref(),
+        StatusCode::NOT_FOUND,
+        AccessRequestStatus::Expired,
+        None,
+    )
+}
+
+/// Handles the PeerDav authorization lifecycle. The code authenticates the
+/// caller with the same Basic credentials used for WebDAV. This lets a client
+/// discover that its server authorization was revoked and lets it revoke its
+/// own binding without asking an administrator to do the second step.
+async fn handle_authorization(request: Request<Incoming>, gate: Arc<Gate>) -> Response<Body> {
+    let method = request.method().clone();
+    if !matches!(method.as_str(), "GET" | "POST" | "DELETE") {
+        return method_not_allowed();
+    }
+    let Some(code) = auth_token(request.headers()) else {
+        return auth_challenge();
+    };
+    let Some((authorization_id, stored_client_id, revoked)) =
+        find_authorization_entry(&gate, &hash_code(&code))
+    else {
+        return auth_challenge();
+    };
+
+    let status_response = AuthorizationStatusResponse {
+        protocol: AUTHORIZATION_PROTOCOL.to_owned(),
+        status: if revoked {
+            AuthorizationStatus::Revoked
+        } else {
+            AuthorizationStatus::Active
+        },
+        authorization_id: authorization_id.clone(),
+        client_id: stored_client_id.clone(),
+    };
+    if revoked {
+        return json_struct_response(
+            gate.events.as_ref(),
+            StatusCode::GONE,
+            "serialize revoked authorization",
+            &status_response,
+        );
+    }
+
+    match method.as_str() {
+        "GET" => json_struct_response(
+            gate.events.as_ref(),
+            StatusCode::OK,
+            "serialize authorization status",
+            &status_response,
+        ),
+        "POST" => {
+            let Some(client_id) = client_id_value(request.headers()) else {
+                return empty_response(StatusCode::BAD_REQUEST);
+            };
+            if let Some(bound) = stored_client_id.as_deref()
+                && bound != client_id
+            {
+                return json_struct_response(
+                    gate.events.as_ref(),
+                    StatusCode::CONFLICT,
+                    "serialize authorization binding conflict",
+                    &status_response,
+                );
+            }
+
+            match bind_authorization_client(
+                Arc::clone(&gate),
+                authorization_id.clone(),
+                client_id.clone(),
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(DomainError::AuthorizationNotFound { .. }) => {
+                    return json_struct_response(
+                        gate.events.as_ref(),
+                        StatusCode::GONE,
+                        "serialize revoked authorization",
+                        &AuthorizationStatusResponse {
+                            protocol: AUTHORIZATION_PROTOCOL.to_owned(),
+                            status: AuthorizationStatus::Revoked,
+                            authorization_id,
+                            client_id: None,
+                        },
+                    );
+                }
+                Err(error) => {
+                    publish_error(gate.events.as_ref(), &error);
+                    return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+            let body = AuthorizationBindingResponse {
+                protocol: AUTHORIZATION_PROTOCOL.to_owned(),
+                authorization_id,
+                client_id,
+            };
+            json_struct_response(
+                gate.events.as_ref(),
+                StatusCode::OK,
+                "serialize authorization binding",
+                &body,
+            )
+        }
+        "DELETE" => {
+            match revoke_authorization_via_gate(Arc::clone(&gate), authorization_id.clone()).await {
+                Ok(()) => empty_response(StatusCode::NO_CONTENT),
+                Err(DomainError::AuthorizationNotFound { .. }) => json_struct_response(
+                    gate.events.as_ref(),
+                    StatusCode::GONE,
+                    "serialize revoked authorization",
+                    &AuthorizationStatusResponse {
+                        protocol: AUTHORIZATION_PROTOCOL.to_owned(),
+                        status: AuthorizationStatus::Revoked,
+                        authorization_id,
+                        client_id: None,
+                    },
+                ),
+                Err(error) => {
+                    publish_error(gate.events.as_ref(), &error);
+                    empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            }
+        }
+        _ => method_not_allowed(),
+    }
+}
+
+async fn bind_authorization_client(
+    gate: Arc<Gate>,
+    authorization_id: String,
+    client_id: String,
+) -> Result<(), DomainError> {
+    let vault = Arc::clone(&gate.vault);
+    let authorizations = Arc::clone(&gate.authorizations);
+    let events = Arc::clone(&gate.events);
+    tokio::task::spawn_blocking(move || {
+        if !vault.bind_authorization(&authorization_id, &client_id)? {
+            return Err(DomainError::AuthorizationNotFound {
+                id: authorization_id,
+            });
+        }
+        match authorizations.write() {
+            Ok(mut entries) => {
+                for entry in &mut *entries {
+                    if entry.info.id == authorization_id {
+                        entry.client_id = Some(client_id.clone());
+                    }
+                }
+            }
+            Err(_) => publish_error(
+                events.as_ref(),
+                &DomainError::Internal {
+                    detail: "authorization catalog lock poisoned after bind".to_owned(),
+                },
+            ),
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| DomainError::Internal {
+        detail: format!("authorization bind task failed: {error}"),
+    })?
+}
+
+async fn revoke_authorization_via_gate(
+    gate: Arc<Gate>,
+    authorization_id: String,
+) -> Result<(), DomainError> {
+    let vault = Arc::clone(&gate.vault);
+    let authorizations = Arc::clone(&gate.authorizations);
+    let grants = Arc::clone(&gate.grants);
+    let events = Arc::clone(&gate.events);
+    tokio::task::spawn_blocking(move || {
+        revoke_authorization_state(
+            vault.as_ref(),
+            &authorizations,
+            &grants,
+            events.as_ref(),
+            &authorization_id,
+        )
+    })
+    .await
+    .map_err(|error| DomainError::Internal {
+        detail: format!("authorization revoke task failed: {error}"),
+    })?
+}
+
+fn json_struct_response<T: serde::Serialize>(
+    events: &dyn ServerEvents,
+    status: StatusCode,
+    operation: &'static str,
+    body: &T,
+) -> Response<Body> {
+    match serde_json::to_vec(body) {
+        Ok(body) => json_response_with_status(status, &body),
+        Err(source) => {
+            publish_error(events, &DomainError::Serialization { operation, source });
+            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+fn access_response(
+    events: &dyn ServerEvents,
+    status: StatusCode,
+    request_status: AccessRequestStatus,
+    authorization_code: Option<String>,
+) -> Response<Body> {
+    let body = AccessStatusResponse {
+        protocol: ACCESS_PROTOCOL.to_owned(),
+        status: request_status,
+        authorization_code,
+    };
+    match serde_json::to_vec(&body) {
+        Ok(body) => json_response_with_status(status, &body),
+        Err(error) => {
+            publish_error(
+                events,
+                &DomainError::Serialization {
+                    operation: "serialize access status",
+                    source: error,
+                },
+            );
+            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+fn access_request_id(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(ACCESS_REQUEST_HEADER)?.to_str().ok()?.trim();
+    if !(MIN_ACCESS_REQUEST_ID_CHARS..=MAX_ACCESS_REQUEST_ID_CHARS).contains(&value.len()) {
+        return None;
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+fn client_id_value(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(CLIENT_ID_HEADER)?.to_str().ok()?.trim();
+    if !(MIN_CLIENT_ID_CHARS..=MAX_CLIENT_ID_CHARS).contains(&value.len()) {
+        return None;
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
 fn find_authorization(gate: &Gate, hash: &[u8; 32]) -> Option<String> {
     match gate.authorizations.read() {
         Ok(authorizations) => authorizations
             .iter()
+            .filter(|entry| !entry.revoked)
             .find(|entry| constant_time_eq(&entry.hash, hash))
             .map(|entry| entry.info.id.clone()),
+        Err(_) => {
+            publish_error(
+                gate.events.as_ref(),
+                &DomainError::Internal {
+                    detail: "authorization catalog lock poisoned".to_owned(),
+                },
+            );
+            None
+        }
+    }
+}
+
+fn find_authorization_entry(
+    gate: &Gate,
+    hash: &[u8; 32],
+) -> Option<(String, Option<String>, bool)> {
+    match gate.authorizations.read() {
+        Ok(authorizations) => authorizations
+            .iter()
+            .find(|entry| constant_time_eq(&entry.hash, hash))
+            .map(|entry| {
+                (
+                    entry.info.id.clone(),
+                    entry.client_id.clone(),
+                    entry.revoked,
+                )
+            }),
         Err(_) => {
             publish_error(
                 gate.events.as_ref(),
@@ -979,7 +1564,13 @@ fn next_attempt_count(attempts: u32) -> u32 {
     attempts.saturating_add(1).min(MAX_PENDING_ATTEMPTS)
 }
 
-fn record_pending(gate: &Gate, share: &ShareConfig, peer: SocketAddr, requested_path: &str) {
+fn record_pending(
+    gate: &Gate,
+    share: &ShareConfig,
+    peer: SocketAddr,
+    requested_path: &str,
+    client_request_id: Option<&str>,
+) {
     let now = now_unix();
     let peer_ip = canonical_ip(peer.ip()).to_string();
 
@@ -1002,6 +1593,9 @@ fn record_pending(gate: &Gate, share: &ShareConfig, peer: SocketAddr, requested_
         existing.last_seen = now;
         existing.attempts = next_attempt_count(existing.attempts);
         existing.requested_path = requested_path.to_owned();
+        if let Some(client_request_id) = client_request_id {
+            existing.client_request_id = Some(client_request_id.to_owned());
+        }
         return;
     }
 
@@ -1020,6 +1614,7 @@ fn record_pending(gate: &Gate, share: &ShareConfig, peer: SocketAddr, requested_
         first_seen: now,
         last_seen: now,
         attempts: 1,
+        client_request_id: client_request_id.map(str::to_owned),
     };
     pending.push(request.clone());
     drop(pending);
@@ -1070,9 +1665,14 @@ fn empty_response(status: StatusCode) -> Response<Body> {
 }
 
 fn json_response(body: &[u8]) -> Response<Body> {
+    json_response_with_status(StatusCode::OK, body)
+}
+
+fn json_response_with_status(status: StatusCode, body: &[u8]) -> Response<Body> {
     Response::builder()
-        .status(StatusCode::OK)
+        .status(status)
         .header(CONTENT_TYPE, "application/json")
+        .header(CACHE_CONTROL, "no-store")
         .header(CONTENT_LENGTH, body.len())
         .body(Body::from(bytes::Bytes::from(body.to_vec())))
         .unwrap_or_else(|_| empty_response(StatusCode::INTERNAL_SERVER_ERROR))

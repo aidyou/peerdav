@@ -93,6 +93,7 @@ impl Database {
                  id         TEXT PRIMARY KEY NOT NULL,
                  label      TEXT NOT NULL,
                  code_hash  TEXT NOT NULL UNIQUE,
+                 client_id  TEXT,
                  created_at INTEGER NOT NULL,
                  revoked_at INTEGER
              );
@@ -100,11 +101,16 @@ impl Database {
                  id                TEXT PRIMARY KEY NOT NULL,
                  label             TEXT NOT NULL,
                  url               TEXT NOT NULL,
+                 authorization_id  TEXT,
                  created_at        INTEGER NOT NULL,
                  last_connected_at INTEGER
              );",
         )
-        .map_err(database_error("initialize schema"))
+        .map_err(database_error("initialize schema"))?;
+
+        add_column_if_missing(conn, "authorizations", "client_id", "TEXT")?;
+        add_column_if_missing(conn, "peers", "authorization_id", "TEXT")?;
+        Ok(())
     }
 
     pub(crate) fn is_initialized(&self) -> Result<bool, DomainError> {
@@ -495,16 +501,18 @@ impl Database {
     pub(crate) fn upsert_peer(&self, peer: &PeerRecord) -> Result<(), DomainError> {
         self.conn
             .execute(
-                "INSERT INTO peers (id, label, url, created_at, last_connected_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO peers (id, label, url, authorization_id, created_at, last_connected_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(id) DO UPDATE SET
                      label = excluded.label,
                      url = excluded.url,
+                     authorization_id = excluded.authorization_id,
                      last_connected_at = excluded.last_connected_at",
                 params![
                     peer.id,
                     peer.label,
                     peer.url,
+                    peer.authorization_id,
                     peer.created_at,
                     peer.last_connected_at,
                 ],
@@ -516,7 +524,7 @@ impl Database {
     pub(crate) fn get_peer(&self, id: &str) -> Result<Option<PeerRecord>, DomainError> {
         self.conn
             .query_row(
-                "SELECT id, label, url, created_at, last_connected_at
+                "SELECT id, label, url, authorization_id, created_at, last_connected_at
                  FROM peers WHERE id = ?1",
                 params![id],
                 peer_from_row,
@@ -529,7 +537,7 @@ impl Database {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT id, label, url, created_at, last_connected_at
+                "SELECT id, label, url, authorization_id, created_at, last_connected_at
                  FROM peers ORDER BY label, id",
             )
             .map_err(database_error("prepare peer scan"))?;
@@ -546,6 +554,20 @@ impl Database {
             .execute("DELETE FROM peers WHERE id = ?1", params![id])
             .map(|_| ())
             .map_err(database_error("delete peer record"))
+    }
+
+    pub(crate) fn set_peer_authorization_id(
+        &self,
+        peer_id: &str,
+        authorization_id: &str,
+    ) -> Result<(), DomainError> {
+        self.conn
+            .execute(
+                "UPDATE peers SET authorization_id = ?2 WHERE id = ?1",
+                params![peer_id, authorization_id],
+            )
+            .map(|_| ())
+            .map_err(database_error("bind peer authorization"))
     }
 
     pub(crate) fn insert_authorization(
@@ -580,29 +602,59 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) fn list_active_authorizations(
+    /// Loads active and revoked authorizations. Revoked rows are kept as
+    /// tombstones so a bound client can discover that it should delete its
+    /// local server record.
+    pub(crate) fn list_all_authorizations(&self) -> Result<Vec<AuthorizationRecord>, DomainError> {
+        self.read_authorizations("authorizations", "")
+    }
+
+    pub(crate) fn set_authorization_client(
         &self,
+        id: &str,
+        client_id: &str,
+    ) -> Result<bool, DomainError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE authorizations
+                 SET client_id = ?2
+                 WHERE id = ?1 AND revoked_at IS NULL",
+                params![id, client_id],
+            )
+            .map_err(database_error("bind authorization client"))?;
+        Ok(changed > 0)
+    }
+
+    fn read_authorizations(
+        &self,
+        operation: &'static str,
+        filter: &str,
     ) -> Result<Vec<AuthorizationRecord>, DomainError> {
+        let sql = format!(
+            "SELECT id, label, code_hash, client_id, created_at, revoked_at
+             FROM authorizations{filter}
+             ORDER BY created_at, id"
+        );
         let mut statement = self
             .conn
-            .prepare(
-                "SELECT id, label, code_hash, created_at
-                 FROM authorizations WHERE revoked_at IS NULL ORDER BY created_at, id",
-            )
-            .map_err(database_error("prepare authorization scan"))?;
+            .prepare(&sql)
+            .map_err(|source| database_error(operation)(source))?;
         let rows = statement
             .query_map([], |row| {
                 Ok(AuthorizationRecord {
                     id: row.get(0)?,
                     label: row.get(1)?,
                     code_hash: row.get(2)?,
-                    created_at: row.get(3)?,
+                    client_id: row.get(3)?,
+                    created_at: row.get(4)?,
+                    revoked_at: row.get(5)?,
                 })
             })
-            .map_err(database_error("scan authorizations"))?;
+            .map_err(|source| database_error(operation)(source))?;
 
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(database_error("read authorization row"))
+            .map_err(|source| database_error(operation)(source))
     }
 }
 
@@ -611,9 +663,37 @@ fn peer_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeerRecord> {
         id: row.get(0)?,
         label: row.get(1)?,
         url: row.get(2)?,
-        created_at: row.get(3)?,
-        last_connected_at: row.get(4)?,
+        authorization_id: row.get(3)?,
+        created_at: row.get(4)?,
+        last_connected_at: row.get(5)?,
     })
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_type: &str,
+) -> Result<(), DomainError> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(database_error("inspect schema columns"))?;
+    let existing = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(database_error("scan schema columns"))?
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+    if existing {
+        return Ok(());
+    }
+
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
+        [],
+    )
+    .map_err(database_error("migrate schema column"))?;
+    Ok(())
 }
 
 fn matcher_columns(matcher: &RuleMatcher) -> (&'static str, &str) {

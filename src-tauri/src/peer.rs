@@ -13,7 +13,7 @@
 //! - Previews are read by the backend and returned over IPC; no broad asset
 //!   protocol scope is introduced.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,17 +26,24 @@ use reqwest_dav::types::list_cmd::{ListEntity, ListMultiStatus};
 use reqwest_dav::{Auth, Client, ClientBuilder, Depth};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
+use tokio::task::JoinHandle;
 use url::Url;
+use zeroize::Zeroizing;
 
 use crate::discovery;
 use crate::error::{AppError, DomainError};
+use crate::traits::PeerEvents;
 use crate::types::{
-    CATALOG_PATH, CATALOG_PROTOCOL, CatalogResponse, ConflictPolicy, DiscoveredPeer,
-    ExternalEditInfo, MAX_AUTHORIZATION_CODE_CHARS, MAX_DIR_ENTRIES, MAX_PREVIEW_BYTES,
-    MAX_REMOTE_PATH_BYTES, MAX_TEXT_PREVIEW_BYTES, MAX_TRANSFER_BYTES, PEER_REQUEST_TIMEOUT,
-    PeerAccessRequest, PeerEntry, PeerHealth, PeerInfo, PeerListing, PeerRecord, PeerShare,
-    PreviewPayload, SHARE_URL_PREFIX, TransferResult,
+    ACCESS_PROTOCOL, ACCESS_REQUEST_HEADER, ACCESS_STATUS_PATH, AUTHORIZATION_PATH,
+    AUTHORIZATION_PROTOCOL, AccessRequestStatus, AccessStatusResponse,
+    AuthorizationBindingResponse, AuthorizationStatus, AuthorizationStatusResponse, CATALOG_PATH,
+    CATALOG_PROTOCOL, CLIENT_ID_HEADER, CatalogResponse, ConflictPolicy, DiscoveredPeer,
+    ExternalEditInfo, MAX_ACCESS_REQUEST_ID_CHARS, MAX_AUTHORIZATION_CODE_CHARS, MAX_DIR_ENTRIES,
+    MAX_PREVIEW_BYTES, MAX_REMOTE_PATH_BYTES, MAX_TEXT_PREVIEW_BYTES, MAX_TRANSFER_BYTES,
+    MIN_ACCESS_REQUEST_ID_CHARS, PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT, PEER_REQUEST_TIMEOUT,
+    PEER_SYNC_INTERVAL, PeerAccessRequest, PeerEntry, PeerHealth, PeerInfo, PeerListing,
+    PeerRecord, PeerRevocationInfo, PeerShare, PreviewPayload, SHARE_URL_PREFIX, TransferResult,
 };
 use crate::vault::Vault;
 
@@ -44,11 +51,15 @@ use crate::vault::Vault;
 /// matching the server's share-token convention.
 const CLIENT_USERNAME: &str = "peerdav";
 const CATALOG_BODY_LIMIT: u64 = 1024 * 1024;
+const ACCESS_BODY_LIMIT: u64 = 16 * 1024;
+const AUTHORIZATION_BODY_LIMIT: u64 = 16 * 1024;
 const LISTING_BODY_LIMIT: u64 = 8 * 1024 * 1024;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
 const READ_CHUNK: usize = 64 * 1024;
+
+pub type TransferProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
@@ -62,6 +73,8 @@ pub struct PeerLimits {
     pub max_transfer_bytes: u64,
     pub max_preview_bytes: u64,
     pub request_timeout: Duration,
+    pub access_wait: Duration,
+    pub sync_interval: Duration,
 }
 
 impl Default for PeerLimits {
@@ -70,6 +83,8 @@ impl Default for PeerLimits {
             max_transfer_bytes: MAX_TRANSFER_BYTES,
             max_preview_bytes: MAX_PREVIEW_BYTES,
             request_timeout: PEER_REQUEST_TIMEOUT,
+            access_wait: PEER_ACCESS_WAIT,
+            sync_interval: PEER_SYNC_INTERVAL,
         }
     }
 }
@@ -83,6 +98,19 @@ struct ExternalEdit {
     baseline_etag: Option<String>,
 }
 
+struct RunningPeerBackground {
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+/// Result of asking a server about a previously accepted authorization code.
+enum AuthorizationOutcome {
+    Active(AuthorizationStatusResponse),
+    Revoked,
+    Removed,
+    Unsupported,
+}
+
 /// Process-wide peer client. Sessions are intentionally not cached: each
 /// operation re-reads the code from the vault so revocation is immediate.
 pub struct PeerManager {
@@ -91,6 +119,48 @@ pub struct PeerManager {
     temp_root: PathBuf,
     limits: PeerLimits,
     edits: Mutex<HashMap<String, ExternalEdit>>,
+    access_cancellations: Mutex<HashSet<String>>,
+    events: Arc<dyn PeerEvents>,
+    background: std::sync::Mutex<Option<RunningPeerBackground>>,
+}
+
+impl Drop for PeerManager {
+    fn drop(&mut self) {
+        if let Some(background) = self
+            .background
+            .get_mut()
+            .ok()
+            .and_then(|background| background.as_mut())
+        {
+            if let Some(sender) = background.shutdown.take() {
+                let _ = sender.send(());
+            }
+            background.task.abort();
+        }
+    }
+}
+
+/// Default event sink for tests and headless callers. Production uses AppEvents
+/// through [`PeerManager::with_events`].
+#[derive(Default)]
+struct LoggingPeerEvents;
+
+impl PeerEvents for LoggingPeerEvents {
+    fn error(&self, error: &AppError) {
+        log::error!(
+            "peerdav.peer background error [{}]: {}",
+            error.code,
+            error.detail.as_deref().unwrap_or(&error.message)
+        );
+    }
+
+    fn peer_revoked(&self, peer: &PeerRevocationInfo) {
+        log::info!(
+            "peerdav.peer removed revoked server {} ({})",
+            peer.label,
+            peer.reason
+        );
+    }
 }
 
 impl PeerManager {
@@ -98,10 +168,27 @@ impl PeerManager {
         Self::with_limits(vault, temp_root, PeerLimits::default())
     }
 
+    pub fn with_events(
+        vault: Arc<Vault>,
+        temp_root: PathBuf,
+        events: Arc<dyn PeerEvents>,
+    ) -> Result<Self, DomainError> {
+        Self::with_limits_and_events(vault, temp_root, PeerLimits::default(), events)
+    }
+
     pub fn with_limits(
         vault: Arc<Vault>,
         temp_root: PathBuf,
         limits: PeerLimits,
+    ) -> Result<Self, DomainError> {
+        Self::with_limits_and_events(vault, temp_root, limits, Arc::new(LoggingPeerEvents))
+    }
+
+    pub fn with_limits_and_events(
+        vault: Arc<Vault>,
+        temp_root: PathBuf,
+        limits: PeerLimits,
+        events: Arc<dyn PeerEvents>,
     ) -> Result<Self, DomainError> {
         // Copies left by a previous process are never valid edit sessions.
         // Each process uses its own run directory so a second instance cannot
@@ -123,7 +210,57 @@ impl PeerManager {
             temp_root: run_root,
             limits,
             edits: Mutex::new(HashMap::new()),
+            access_cancellations: Mutex::new(HashSet::new()),
+            events,
+            background: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Starts the periodic server-binding synchronizer. The task is idempotent
+    /// and is shut down when this manager is dropped.
+    pub fn start_background(self: &Arc<Self>) {
+        let mut started = match self.background.lock() {
+            Ok(started) => started,
+            Err(_) => {
+                log::error!("peerdav.peer background mutex poisoned");
+                return;
+            }
+        };
+        if started.is_some() {
+            return;
+        }
+
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let manager = Arc::clone(self);
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                log::error!("peerdav.peer background task has no async runtime: {error}");
+                return;
+            }
+        };
+        let task = runtime.spawn(async move {
+            let mut interval = tokio::time::interval(manager.limits.sync_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    _ = interval.tick() => {
+                        if !manager.vault.is_unlocked() {
+                            continue;
+                        }
+                        if let Err(error) = manager.sync_saved_peers().await {
+                            manager.events.error(&AppError::from_ref(&error));
+                        }
+                    }
+                }
+            }
+        });
+        *started = Some(RunningPeerBackground {
+            shutdown: Some(shutdown_tx),
+            task,
+        });
     }
 
     /// Scans the LAN over UDP discovery.
@@ -152,21 +289,230 @@ impl PeerManager {
 
     /// Asks a server to record this client as pending. The server's policy is
     /// still enforced: a denied peer receives `PEER_REQUEST_FAILED`, and
-    /// nothing is approved automatically.
+    /// nothing is approved automatically. The returned request id is used to
+    /// claim the code after an administrator approves the request.
     pub async fn request_access(&self, url: &str) -> Result<PeerAccessRequest, DomainError> {
         let url = normalize_peer_url(url)?;
-        let client = build_client(&self.agent, &url, Auth::Anonymous)?;
-        match tokio::time::timeout(HEALTH_TIMEOUT, catalog(&client)).await {
-            Ok(Ok(_)) => Ok(PeerAccessRequest { requested: false }),
-            Ok(Err(DomainError::PeerAuthorizationRejected)) => {
-                Ok(PeerAccessRequest { requested: true })
-            }
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(DomainError::PeerRequest {
-                operation: "request access",
+        let request_id = random_hex(16);
+        let endpoint = format!("{url}{CATALOG_PATH}");
+        let response = tokio::time::timeout(
+            HEALTH_TIMEOUT,
+            self.agent
+                .get(endpoint)
+                .header(ACCESS_REQUEST_HEADER, &request_id)
+                .send(),
+        )
+        .await
+        .map_err(|_| DomainError::PeerRequest {
+            operation: "request access",
+            status: None,
+            detail: "the request timed out".to_owned(),
+        })?
+        .map_err(|error| map_transport("request access", &error))?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(PeerAccessRequest {
+                requested: false,
+                request_id: None,
+            });
+        }
+        if status == StatusCode::UNAUTHORIZED {
+            return Ok(PeerAccessRequest {
+                requested: true,
+                request_id: Some(request_id),
+            });
+        }
+        Err(DomainError::PeerRequest {
+            operation: "request access",
+            status: Some(status.as_u16()),
+            detail: status
+                .canonical_reason()
+                .unwrap_or("server rejected the request")
+                .to_owned(),
+        })
+    }
+
+    /// Cancels a pending access request. The server removes its pending or
+    /// queued grant first, then the waiting command exits through
+    /// [`DomainError::PeerAccessCanceled`].
+    pub async fn cancel_access(&self, url: &str, request_id: &str) -> Result<(), DomainError> {
+        let url = normalize_peer_url(url)?;
+        let request_id = request_id.trim();
+        if !valid_access_request_id(request_id) {
+            return Err(DomainError::PeerRequest {
+                operation: "cancel access",
                 status: None,
-                detail: "the request timed out".to_owned(),
-            }),
+                detail: "the access request id is invalid".to_owned(),
+            });
+        }
+
+        self.access_cancellations
+            .lock()
+            .await
+            .insert(request_id.to_owned());
+        let endpoint = format!("{url}{ACCESS_STATUS_PATH}");
+        let response = tokio::time::timeout(
+            HEALTH_TIMEOUT,
+            self.agent
+                .delete(endpoint)
+                .header(ACCESS_REQUEST_HEADER, request_id)
+                .send(),
+        )
+        .await
+        .map_err(|_| DomainError::PeerRequest {
+            operation: "cancel access",
+            status: None,
+            detail: "the request timed out".to_owned(),
+        })
+        .and_then(|response| response.map_err(|error| map_transport("cancel access", &error)));
+
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.access_cancellations.lock().await.remove(request_id);
+                return Err(error);
+            }
+        };
+
+        let status = response.status();
+        if status.is_success()
+            || status == StatusCode::UNAUTHORIZED
+            || status == StatusCode::NOT_FOUND
+            || status == StatusCode::GONE
+        {
+            return Ok(());
+        }
+        self.access_cancellations.lock().await.remove(request_id);
+        Err(DomainError::PeerRequest {
+            operation: "cancel access",
+            status: Some(status.as_u16()),
+            detail: status
+                .canonical_reason()
+                .unwrap_or("server rejected the cancellation")
+                .to_owned(),
+        })
+    }
+
+    /// Waits for an administrator to approve a request and returns the
+    /// automatically delivered authorization code. Polling runs in the
+    /// backend, so the frontend can show the pending state without keeping a
+    /// long-lived HTTP connection or asking the user to copy a code.
+    pub async fn wait_for_access(
+        &self,
+        url: &str,
+        request_id: &str,
+    ) -> Result<String, DomainError> {
+        let request_id = request_id.trim();
+        let result = self.wait_for_access_inner(url, request_id).await;
+        self.access_cancellations.lock().await.remove(request_id);
+        result
+    }
+
+    async fn wait_for_access_inner(
+        &self,
+        url: &str,
+        request_id: &str,
+    ) -> Result<String, DomainError> {
+        let url = normalize_peer_url(url)?;
+        if !valid_access_request_id(request_id) {
+            return Err(DomainError::PeerRequest {
+                operation: "wait for approval",
+                status: None,
+                detail: "the access request id is invalid".to_owned(),
+            });
+        }
+
+        let endpoint = format!("{url}{ACCESS_STATUS_PATH}");
+        let deadline = Instant::now() + self.limits.access_wait;
+        loop {
+            if self.access_cancellations.lock().await.contains(request_id) {
+                return Err(DomainError::PeerAccessCanceled);
+            }
+            let response = tokio::time::timeout(
+                HEALTH_TIMEOUT,
+                self.agent
+                    .get(&endpoint)
+                    .header(ACCESS_REQUEST_HEADER, request_id)
+                    .send(),
+            )
+            .await
+            .map_err(|_| DomainError::PeerRequest {
+                operation: "wait for approval",
+                status: None,
+                detail: "the status request timed out".to_owned(),
+            })?
+            .map_err(|error| map_transport("wait for approval", &error))?;
+
+            let status = response.status();
+            if status == StatusCode::OK {
+                let bytes =
+                    read_response_limited(response, ACCESS_BODY_LIMIT, "read access status")
+                        .await?;
+                let parsed: AccessStatusResponse =
+                    serde_json::from_slice(&bytes).map_err(|source| {
+                        DomainError::Serialization {
+                            operation: "decode access status",
+                            source,
+                        }
+                    })?;
+                if parsed.protocol != ACCESS_PROTOCOL {
+                    return Err(DomainError::PeerProtocol {
+                        detail: format!("unsupported access protocol `{}`", parsed.protocol),
+                    });
+                }
+                match parsed.status {
+                    AccessRequestStatus::Approved => {
+                        let code = parsed.authorization_code.unwrap_or_default();
+                        if code.is_empty() || code.chars().count() > MAX_AUTHORIZATION_CODE_CHARS {
+                            return Err(DomainError::PeerProtocol {
+                                detail: "the server delivered an invalid authorization code"
+                                    .to_owned(),
+                            });
+                        }
+                        if self.access_cancellations.lock().await.contains(request_id) {
+                            if let Err(error) = self.revoke_authorization(&url, &code).await {
+                                log::warn!(
+                                    "failed to revoke an authorization after canceling the request: {error}"
+                                );
+                            }
+                            return Err(DomainError::PeerAccessCanceled);
+                        }
+                        return Ok(code);
+                    }
+                    AccessRequestStatus::Pending => {}
+                    AccessRequestStatus::Expired => return Err(DomainError::PeerAccessExpired),
+                }
+            } else if status == StatusCode::ACCEPTED {
+                // The administrator has not approved the request yet.
+            } else if status == StatusCode::NOT_FOUND {
+                if self.access_cancellations.lock().await.contains(request_id) {
+                    return Err(DomainError::PeerAccessCanceled);
+                }
+                return Err(DomainError::PeerAccessExpired);
+            } else {
+                if self.access_cancellations.lock().await.contains(request_id) {
+                    return Err(DomainError::PeerAccessCanceled);
+                }
+                return Err(DomainError::PeerRequest {
+                    operation: "wait for approval",
+                    status: Some(status.as_u16()),
+                    detail: status
+                        .canonical_reason()
+                        .unwrap_or("server rejected the status request")
+                        .to_owned(),
+                });
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                if self.access_cancellations.lock().await.contains(request_id) {
+                    return Err(DomainError::PeerAccessCanceled);
+                }
+                return Err(DomainError::PeerAccessTimeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            tokio::time::sleep(PEER_ACCESS_POLL_INTERVAL.min(remaining)).await;
         }
     }
 
@@ -214,10 +560,18 @@ impl PeerManager {
                 .map(|record| record.label.clone())
                 .unwrap_or_else(|| default_label(&url)),
         };
+        let authorization_id = self
+            .bind_authorization(&url, code)
+            .await
+            .unwrap_or_else(|error| {
+                log::debug!("failed to bind a new peer authorization: {error}");
+                None
+            });
         let record = PeerRecord {
             id: id.clone(),
             label: label.clone(),
             url: url.clone(),
+            authorization_id,
             created_at: existing.as_ref().map_or(now, |record| record.created_at),
             last_connected_at: Some(now),
         };
@@ -296,8 +650,28 @@ impl PeerManager {
         Ok(catalog.shares)
     }
 
-    /// Removes a saved peer, its encrypted code, and any external-edit files.
+    /// Removes a saved peer after asking its server to revoke the binding. The
+    /// local record is removed when the server confirms removal or reports that
+    /// the authorization no longer exists. A transport failure leaves the record
+    /// intact so the user can retry.
     pub async fn forget(&self, peer_id: &str) -> Result<(), DomainError> {
+        let record = self
+            .vault
+            .peer_record(peer_id)?
+            .ok_or_else(|| DomainError::PeerNotFound {
+                id: peer_id.to_owned(),
+            })?;
+        let code = Zeroizing::new(self.vault.load_peer_code(peer_id)?.code);
+        match self.revoke_authorization(&record.url, code.as_str()).await {
+            Ok(()) | Err(DomainError::PeerAuthorizationRejected) => {}
+            Err(error) => return Err(error),
+        }
+        self.forget_local(peer_id).await
+    }
+
+    /// Removes a peer only from this installation. This is used after the
+    /// server has already revoked an authorization.
+    pub async fn forget_local(&self, peer_id: &str) -> Result<(), DomainError> {
         if self.vault.peer_record(peer_id)?.is_none() {
             return Err(DomainError::PeerNotFound {
                 id: peer_id.to_owned(),
@@ -310,6 +684,97 @@ impl PeerManager {
             .await
             .retain(|_, edit| edit.info.peer_id != peer_id);
         remove_dir_best_effort(&self.temp_root.join(peer_id));
+        Ok(())
+    }
+
+    /// Reconciles every saved server with its authorization status. A revoked
+    /// or displaced binding is removed locally and reported through the shared
+    /// background event outlet.
+    pub async fn sync_saved_peers(&self) -> Result<usize, DomainError> {
+        if !self.vault.is_unlocked() {
+            return Ok(0);
+        }
+        let records = self.vault.list_peer_records()?;
+        let client_id = self.vault.ensure_client_id()?;
+        let mut removed = 0;
+
+        for record in records {
+            let Ok(secret) = self.vault.load_peer_code(&record.id) else {
+                continue;
+            };
+            let code = Zeroizing::new(secret.code);
+            match self
+                .fetch_authorization_status(&record.url, code.as_str())
+                .await
+            {
+                Ok(AuthorizationOutcome::Active(status)) => {
+                    let expected = record.authorization_id.as_deref();
+                    if expected != Some(status.authorization_id.as_str()) {
+                        self.vault
+                            .set_peer_authorization_id(&record.id, &status.authorization_id)?;
+                    }
+                    if let Some(bound) = status.client_id.as_deref()
+                        && bound != client_id
+                    {
+                        self.remove_saved_peer(record, "bound-elsewhere").await?;
+                        removed += 1;
+                        continue;
+                    }
+                    if status.client_id.is_none() {
+                        self.bind_saved_peer(&record.id, &record.url, code.as_str(), &client_id)
+                            .await;
+                    }
+                }
+                Ok(AuthorizationOutcome::Revoked)
+                | Ok(AuthorizationOutcome::Removed)
+                | Err(DomainError::PeerAuthorizationRejected) => {
+                    self.remove_saved_peer(record, "revoked").await?;
+                    removed += 1;
+                }
+                Ok(AuthorizationOutcome::Unsupported) => {}
+                Err(error) => {
+                    // An offline server is a normal transient state. Only
+                    // unexpected protocol or local failures are surfaced.
+                    if !matches!(
+                        error,
+                        DomainError::PeerRequest { .. } | DomainError::PeerProtocol { .. }
+                    ) {
+                        return Err(error);
+                    }
+                    log::debug!(
+                        "peerdav.peer synchronization skipped {}: {error}",
+                        record.url
+                    );
+                }
+            }
+        }
+
+        Ok(removed)
+    }
+
+    async fn bind_saved_peer(&self, peer_id: &str, url: &str, code: &str, client_id: &str) {
+        match self.post_authorization_binding(url, code, client_id).await {
+            Ok(Some(binding)) => {
+                if let Err(error) = self
+                    .vault
+                    .set_peer_authorization_id(peer_id, &binding.authorization_id)
+                {
+                    log::warn!("failed to save a peer authorization binding: {error}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => log::debug!("peerdav.peer authorization bind failed: {error}"),
+        }
+    }
+
+    async fn remove_saved_peer(&self, record: PeerRecord, reason: &str) -> Result<(), DomainError> {
+        self.forget_local(&record.id).await?;
+        self.events.peer_revoked(&PeerRevocationInfo {
+            id: record.id,
+            label: record.label,
+            url: record.url,
+            reason: reason.to_owned(),
+        });
         Ok(())
     }
 
@@ -330,6 +795,166 @@ impl PeerManager {
             log::warn!("peer edit map was busy during shutdown cleanup");
         }
         remove_dir_best_effort(&self.temp_root);
+    }
+
+    async fn bind_authorization(
+        &self,
+        url: &str,
+        code: &str,
+    ) -> Result<Option<String>, DomainError> {
+        let client_id = self.vault.ensure_client_id()?;
+        Ok(self
+            .post_authorization_binding(url, code, &client_id)
+            .await?
+            .map(|binding| binding.authorization_id))
+    }
+
+    async fn post_authorization_binding(
+        &self,
+        url: &str,
+        code: &str,
+        client_id: &str,
+    ) -> Result<Option<AuthorizationBindingResponse>, DomainError> {
+        let endpoint = format!("{}{AUTHORIZATION_PATH}", normalize_peer_url(url)?);
+        let response = tokio::time::timeout(
+            HEALTH_TIMEOUT,
+            self.agent
+                .post(endpoint)
+                .basic_auth(CLIENT_USERNAME, Some(code))
+                .header(CLIENT_ID_HEADER, client_id)
+                .send(),
+        )
+        .await
+        .map_err(|_| DomainError::PeerRequest {
+            operation: "bind authorization",
+            status: None,
+            detail: "the request timed out".to_owned(),
+        })?
+        .map_err(|error| map_transport("bind authorization", &error))?;
+
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            if status == StatusCode::UNAUTHORIZED || status == StatusCode::CONFLICT {
+                return Ok(None);
+            }
+            return Err(DomainError::PeerRequest {
+                operation: "bind authorization",
+                status: Some(status.as_u16()),
+                detail: status
+                    .canonical_reason()
+                    .unwrap_or("server rejected the authorization binding")
+                    .to_owned(),
+            });
+        }
+
+        let bytes =
+            read_response_limited(response, AUTHORIZATION_BODY_LIMIT, "decode binding").await?;
+        let binding: AuthorizationBindingResponse =
+            serde_json::from_slice(&bytes).map_err(|source| DomainError::Serialization {
+                operation: "decode authorization binding",
+                source,
+            })?;
+        if binding.protocol != AUTHORIZATION_PROTOCOL {
+            return Err(DomainError::PeerProtocol {
+                detail: format!("unsupported authorization protocol `{}`", binding.protocol),
+            });
+        }
+        Ok(Some(binding))
+    }
+
+    async fn revoke_authorization(&self, url: &str, code: &str) -> Result<(), DomainError> {
+        let endpoint = format!("{}{AUTHORIZATION_PATH}", normalize_peer_url(url)?);
+        let response = tokio::time::timeout(
+            HEALTH_TIMEOUT,
+            self.agent
+                .delete(endpoint)
+                .basic_auth(CLIENT_USERNAME, Some(code))
+                .send(),
+        )
+        .await
+        .map_err(|_| DomainError::PeerRequest {
+            operation: "revoke authorization",
+            status: None,
+            detail: "the request timed out".to_owned(),
+        })?
+        .map_err(|error| map_transport("revoke authorization", &error))?;
+
+        let status = response.status();
+        if status.is_success()
+            || status == StatusCode::UNAUTHORIZED
+            || status == StatusCode::NOT_FOUND
+            || status == StatusCode::GONE
+        {
+            return Ok(());
+        }
+        Err(DomainError::PeerRequest {
+            operation: "revoke authorization",
+            status: Some(status.as_u16()),
+            detail: status
+                .canonical_reason()
+                .unwrap_or("server rejected the authorization revocation")
+                .to_owned(),
+        })
+    }
+
+    async fn fetch_authorization_status(
+        &self,
+        url: &str,
+        code: &str,
+    ) -> Result<AuthorizationOutcome, DomainError> {
+        let endpoint = format!("{}{AUTHORIZATION_PATH}", normalize_peer_url(url)?);
+        let response = tokio::time::timeout(
+            HEALTH_TIMEOUT,
+            self.agent
+                .get(endpoint)
+                .basic_auth(CLIENT_USERNAME, Some(code))
+                .send(),
+        )
+        .await
+        .map_err(|_| DomainError::PeerRequest {
+            operation: "check authorization",
+            status: None,
+            detail: "the request timed out".to_owned(),
+        })?
+        .map_err(|error| map_transport("check authorization", &error))?;
+
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED {
+            return Ok(AuthorizationOutcome::Removed);
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Ok(AuthorizationOutcome::Unsupported);
+        }
+        if status != StatusCode::OK && status != StatusCode::GONE {
+            return Err(DomainError::PeerRequest {
+                operation: "check authorization",
+                status: Some(status.as_u16()),
+                detail: status
+                    .canonical_reason()
+                    .unwrap_or("server rejected the authorization status request")
+                    .to_owned(),
+            });
+        }
+
+        let bytes =
+            read_response_limited(response, AUTHORIZATION_BODY_LIMIT, "decode status").await?;
+        let parsed: AuthorizationStatusResponse =
+            serde_json::from_slice(&bytes).map_err(|source| DomainError::Serialization {
+                operation: "decode authorization status",
+                source,
+            })?;
+        if parsed.protocol != AUTHORIZATION_PROTOCOL {
+            return Err(DomainError::PeerProtocol {
+                detail: format!("unsupported authorization protocol `{}`", parsed.protocol),
+            });
+        }
+        match parsed.status {
+            AuthorizationStatus::Active => Ok(AuthorizationOutcome::Active(parsed)),
+            AuthorizationStatus::Revoked => Ok(AuthorizationOutcome::Revoked),
+        }
     }
 
     pub async fn list_dir(
@@ -400,6 +1025,58 @@ impl PeerManager {
             &destination,
             self.limits.max_transfer_bytes,
             conflict,
+            None,
+        )
+        .await?;
+
+        Ok(TransferResult {
+            transferred: true,
+            remote_path: display,
+            local_path: Some(destination.display().to_string()),
+            bytes: written,
+            skipped_reason: None,
+        })
+    }
+
+    /// Downloads one file to the exact path chosen in a native save dialog.
+    /// The save dialog owns the overwrite confirmation, so the destination is
+    /// replaced atomically after the complete download succeeds.
+    pub async fn download_to(
+        &self,
+        peer_id: &str,
+        share_id: &str,
+        remote_path: &str,
+        local_path: &str,
+    ) -> Result<TransferResult, DomainError> {
+        self.download_to_with_progress(peer_id, share_id, remote_path, local_path, None)
+            .await
+    }
+
+    pub async fn download_to_with_progress(
+        &self,
+        peer_id: &str,
+        share_id: &str,
+        remote_path: &str,
+        local_path: &str,
+        progress: Option<TransferProgressCallback>,
+    ) -> Result<TransferResult, DomainError> {
+        let (_, client) = self.peer_client(peer_id)?;
+        let (display, remote, _) = remote_file_target(share_id, remote_path)?;
+        let (directory, destination) = resolve_local_file_destination(local_path).await?;
+
+        let response = client
+            .get_raw(&remote)
+            .await
+            .map_err(|error| map_dav_error("download file", error, &display))?;
+        ensure_status(response.status(), "download file", &display)?;
+
+        let written = write_response_to_file(
+            response,
+            &directory,
+            &destination,
+            self.limits.max_transfer_bytes,
+            ConflictPolicy::Overwrite,
+            progress,
         )
         .await?;
 
@@ -443,6 +1120,7 @@ impl PeerManager {
 
         let directory = normalize_display_path(remote_dir)?;
         let directory_encoded = encode_share_path(share_id, &directory)?;
+        ensure_remote_directories(&client, share_id, &directory).await?;
         let (remote, display) = resolve_remote_destination(
             &client,
             &directory_encoded,
@@ -561,6 +1239,7 @@ impl PeerManager {
                 &local_path,
                 self.limits.max_transfer_bytes,
                 "prepare external edit",
+                None,
             )
             .await
         }
@@ -862,6 +1541,13 @@ fn default_label(url: &str) -> String {
         .unwrap_or_else(|| url.to_owned())
 }
 
+fn valid_access_request_id(request_id: &str) -> bool {
+    (MIN_ACCESS_REQUEST_ID_CHARS..=MAX_ACCESS_REQUEST_ID_CHARS).contains(&request_id.len())
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 fn validate_label(label: &str) -> Result<String, DomainError> {
     if label.is_empty() || label.chars().count() > 128 || label.chars().any(char::is_control) {
         return Err(DomainError::RemotePathInvalid {
@@ -1022,6 +1708,79 @@ async fn canonical_local_file(path: &str) -> Result<PathBuf, DomainError> {
         .map_err(|error| io_error("resolve local file", input, error))
 }
 
+/// Resolves the file name chosen in a native save dialog without requiring the
+/// target file to exist. The parent directory must already exist and the
+/// target must not be a symbolic link or directory.
+async fn resolve_local_file_destination(path: &str) -> Result<(PathBuf, PathBuf), DomainError> {
+    if path.trim().is_empty() {
+        return Err(DomainError::Io {
+            operation: "resolve download destination",
+            path: None,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the download destination is empty",
+            ),
+        });
+    }
+    let input = Path::new(path);
+    let file_name = input
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| DomainError::Io {
+            operation: "resolve download destination",
+            path: Some(input.to_path_buf()),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the download destination has no file name",
+            ),
+        })?;
+    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    let directory =
+        canonical_local_dir(
+            parent
+                .to_str()
+                .ok_or_else(|| DomainError::RemotePathInvalid {
+                    detail: "the download destination is not valid UTF-8".to_owned(),
+                })?,
+        )
+        .await?;
+    let destination = directory.join(file_name);
+
+    match tokio::fs::symlink_metadata(&destination).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(io_error(
+                "inspect download destination",
+                &destination,
+                error,
+            ));
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(DomainError::Io {
+                operation: "inspect download destination",
+                path: Some(destination),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing to overwrite a symbolic link",
+                ),
+            });
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(DomainError::Io {
+                operation: "inspect download destination",
+                path: Some(destination),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the download destination is a directory",
+                ),
+            });
+        }
+        Ok(_) => {}
+    }
+
+    Ok((directory, destination))
+}
+
 async fn resolve_local_destination(
     directory: &Path,
     file_name: &str,
@@ -1107,6 +1866,40 @@ async fn resolve_remote_destination(
 
 fn encode_segment(segment: &str) -> String {
     utf8_percent_encode(segment, PATH_SEGMENT).to_string()
+}
+
+/// Creates each missing collection on the way to `directory`. WebDAV returns
+/// 405 when the collection already exists, which is the normal case for all
+/// but the newest directory in an upload queue.
+async fn ensure_remote_directories(
+    client: &Client,
+    share_id: &str,
+    directory: &str,
+) -> Result<(), DomainError> {
+    let normalized = normalize_display_path(directory)?;
+    if normalized == "/" {
+        return Ok(());
+    }
+    let mut accumulated = String::new();
+    for segment in normalized.trim_matches('/').split('/') {
+        accumulated.push('/');
+        accumulated.push_str(segment);
+        let encoded = encode_share_path(share_id, &accumulated)?;
+        if remote_exists(client, &encoded).await? {
+            continue;
+        }
+        match client.mkcol(&encoded).await {
+            Ok(()) => {}
+            Err(reqwest_dav::Error::Decode(reqwest_dav::DecodeError::StatusMismatched(status)))
+                if status.response_code == StatusCode::METHOD_NOT_ALLOWED.as_u16() => {}
+            Err(reqwest_dav::Error::Decode(reqwest_dav::DecodeError::Server(server)))
+                if server.response_code == StatusCode::METHOD_NOT_ALLOWED.as_u16() => {}
+            Err(error) => {
+                return Err(map_dav_error("create remote folder", error, &accumulated));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn join_display(directory: &str, file_name: &str) -> String {
@@ -1370,9 +2163,11 @@ async fn write_response_to_file(
     destination: &Path,
     limit: u64,
     conflict: ConflictPolicy,
+    progress: Option<TransferProgressCallback>,
 ) -> Result<u64, DomainError> {
     let temp = directory.join(format!(".peerdav-{}.part", random_hex(8)));
-    let (written, _) = write_response_to_path(response, &temp, limit, "download file").await?;
+    let (written, _) =
+        write_response_to_path(response, &temp, limit, "download file", progress).await?;
 
     if conflict == ConflictPolicy::Fail && destination.exists() {
         remove_file_best_effort(&temp);
@@ -1401,7 +2196,9 @@ async fn write_response_to_path(
     target: &Path,
     limit: u64,
     operation: &'static str,
+    progress: Option<TransferProgressCallback>,
 ) -> Result<(u64, [u8; 32]), DomainError> {
+    let total = response.content_length().unwrap_or(0);
     if let Some(length) = response.content_length()
         && length > limit
     {
@@ -1457,6 +2254,9 @@ async fn write_response_to_path(
             drop(file);
             remove_file_best_effort(target);
             return Err(io_error(operation, target, error));
+        }
+        if let Some(progress) = progress.as_ref() {
+            progress(written, total);
         }
     }
 

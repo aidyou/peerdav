@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use peerdav_lib::{
-    AccessRule, AppError, ConflictPolicy, DomainError, PeerInfo, PeerLimits, PeerManager,
-    PendingRequestInfo, RuleKind, RuleMatcher, ServerConfig, ServerController, ServerEvents,
-    SharePermissions, Vault,
+    AccessRule, AppError, ConflictPolicy, DomainError, PeerEvents, PeerInfo, PeerLimits,
+    PeerManager, PeerRevocationInfo, PendingRequestInfo, RuleKind, RuleMatcher, ServerConfig,
+    ServerController, ServerEvents, SharePermissions, Vault,
 };
 
 mod common;
@@ -29,6 +29,7 @@ const ADMIN_PASSWORD: &str = "admin password peer 2026";
 struct Recording {
     errors: Mutex<Vec<AppError>>,
     pending: Mutex<Vec<PendingRequestInfo>>,
+    revoked: Mutex<Vec<PeerRevocationInfo>>,
 }
 
 impl ServerEvents for Recording {
@@ -41,10 +42,21 @@ impl ServerEvents for Recording {
     }
 }
 
+impl PeerEvents for Recording {
+    fn error(&self, error: &AppError) {
+        self.errors.lock().expect("errors").push(error.clone());
+    }
+
+    fn peer_revoked(&self, peer: &PeerRevocationInfo) {
+        self.revoked.lock().expect("revoked").push(peer.clone());
+    }
+}
+
 struct Harness {
     directory: DevTestDir,
     controller: Arc<ServerController>,
     peers: Arc<PeerManager>,
+    events: Arc<Recording>,
     share_id: String,
     url: String,
     discovery_port: u16,
@@ -75,8 +87,13 @@ impl Harness {
         std::fs::write(share_root.join("image.png"), b"\x89PNG\r\n\x1a\nfakepng").expect("image");
 
         let events = Arc::new(Recording::default());
-        let controller =
-            Arc::new(ServerController::new(Arc::clone(&vault), events).expect("controller"));
+        let controller = Arc::new(
+            ServerController::new(
+                Arc::clone(&vault),
+                Arc::clone(&events) as Arc<dyn ServerEvents>,
+            )
+            .expect("controller"),
+        );
         let share = controller
             .create_share(
                 "Loopback share",
@@ -108,10 +125,11 @@ impl Harness {
             .expect("bound port");
 
         let peers = Arc::new(
-            PeerManager::with_limits(
+            PeerManager::with_limits_and_events(
                 Arc::clone(&vault),
                 directory.path().join("peer-temp"),
                 limits,
+                Arc::clone(&events) as Arc<dyn PeerEvents>,
             )
             .expect("peer manager"),
         );
@@ -120,6 +138,7 @@ impl Harness {
             directory,
             controller,
             peers,
+            events,
             share_id: share.id,
             url: format!("http://127.0.0.1:{port}"),
             discovery_port,
@@ -179,6 +198,75 @@ fn free_udp_port() -> u16 {
 
 fn code_of(error: &DomainError) -> String {
     AppError::from_ref(error).code
+}
+
+#[tokio::test]
+async fn approved_code_is_delivered_and_saved_automatically() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let request = harness
+        .peers
+        .request_access(&harness.url)
+        .await
+        .expect("request access");
+    assert!(request.requested);
+    let request_id = request.request_id.expect("request id");
+
+    let pending = harness.controller.list_pending();
+    assert_eq!(pending.len(), 1);
+    let approved = harness
+        .controller
+        .approve_pending(&pending[0].id)
+        .expect("approve");
+    assert!(approved.auto_delivery);
+
+    let delivered = harness
+        .peers
+        .wait_for_access(&harness.url, &request_id)
+        .await
+        .expect("claim delivered code");
+    assert_eq!(delivered, approved.authorization_code);
+
+    let info = harness
+        .peers
+        .connect(&harness.url, &delivered, Some("automatic"))
+        .await
+        .expect("connect with delivered code");
+    assert_eq!(info.label, "automatic");
+    assert_eq!(info.shares.len(), 1);
+    let saved = harness.peers.list_peers().expect("list saved peers");
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].url, harness.url);
+}
+
+#[tokio::test]
+async fn access_wait_times_out_without_making_the_client_an_admin() {
+    let limits = PeerLimits {
+        access_wait: Duration::from_millis(150),
+        ..PeerLimits::default()
+    };
+    let harness = Harness::with_limits(vec![loopback_rule()], false, limits).await;
+    let request = harness
+        .peers
+        .request_access(&harness.url)
+        .await
+        .expect("request access");
+    let request_id = request.request_id.expect("request id");
+
+    let error = harness
+        .peers
+        .wait_for_access(&harness.url, &request_id)
+        .await
+        .expect_err("unapproved request must time out");
+    assert!(matches!(error, DomainError::PeerAccessTimeout));
+    assert_eq!(harness.controller.list_authorizations().len(), 0);
+    assert!(harness.peers.list_peers().expect("saved peers").is_empty());
+
+    let error = harness
+        .peers
+        .wait_for_access(&harness.url, &"f".repeat(32))
+        .await
+        .expect_err("unknown request id must not receive a code");
+    assert!(matches!(error, DomainError::PeerAccessExpired));
 }
 
 #[tokio::test]
@@ -279,6 +367,128 @@ async fn self_connect_needs_approval_and_admin_credentials_are_not_a_code() {
         .await
         .expect_err("forgotten peer");
     assert_eq!(code_of(&missing), "PEER_NOT_FOUND");
+
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn pending_access_request_can_be_canceled_before_approval() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let request = harness
+        .peers
+        .request_access(&harness.url)
+        .await
+        .expect("request access");
+    let request_id = request.request_id.expect("request id");
+    assert_eq!(harness.controller.list_pending().len(), 1);
+
+    let waiter = {
+        let peers = Arc::clone(&harness.peers);
+        let url = harness.url.clone();
+        let request_id = request_id.clone();
+        tokio::spawn(async move { peers.wait_for_access(&url, &request_id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    harness
+        .peers
+        .cancel_access(&harness.url, &request_id)
+        .await
+        .expect("cancel access");
+
+    let result = waiter.await.expect("waiter task");
+    assert!(matches!(result, Err(DomainError::PeerAccessCanceled)));
+    assert!(harness.controller.list_pending().is_empty());
+    assert!(harness.controller.list_authorizations().is_empty());
+
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn canceling_after_approval_discards_the_queued_code_and_authorization() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let request = harness
+        .peers
+        .request_access(&harness.url)
+        .await
+        .expect("request access");
+    let request_id = request.request_id.expect("request id");
+    let pending = harness.controller.list_pending();
+    let approved = harness
+        .controller
+        .approve_pending(&pending[0].id)
+        .expect("approve");
+    assert!(approved.auto_delivery);
+    assert_eq!(harness.controller.list_authorizations().len(), 1);
+
+    harness
+        .peers
+        .cancel_access(&harness.url, &request_id)
+        .await
+        .expect("cancel approved request");
+
+    assert!(harness.controller.list_pending().is_empty());
+    assert!(harness.controller.list_authorizations().is_empty());
+    let result = harness
+        .peers
+        .wait_for_access(&harness.url, &request_id)
+        .await;
+    assert!(matches!(result, Err(DomainError::PeerAccessCanceled)));
+    assert!(harness.peers.list_peers().expect("peers").is_empty());
+
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn client_unbind_revokes_the_server_authorization() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (info, code) = harness.connect().await;
+    assert_eq!(harness.controller.list_authorizations().len(), 1);
+
+    harness.peers.forget(&info.id).await.expect("client unbind");
+
+    assert!(harness.peers.list_peers().expect("peers").is_empty());
+    assert!(harness.controller.list_authorizations().is_empty());
+    let response = reqwest::Client::new()
+        .get(format!("{}/__peerdav/catalog", harness.url))
+        .basic_auth("peerdav", Some(&code))
+        .send()
+        .await
+        .expect("catalog after client unbind");
+    assert_eq!(response.status().as_u16(), 401);
+
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn server_revocation_removes_the_client_binding() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (info, _code) = harness.connect().await;
+    let authorization = harness
+        .controller
+        .list_authorizations()
+        .into_iter()
+        .next()
+        .expect("connected authorization");
+
+    harness
+        .controller
+        .revoke_authorization(&authorization.id)
+        .expect("server revoke");
+    let removed = harness
+        .peers
+        .sync_saved_peers()
+        .await
+        .expect("sync clients");
+
+    assert_eq!(removed, 1);
+    assert!(harness.peers.list_peers().expect("peers").is_empty());
+    {
+        let revocations = harness.events.revoked.lock().expect("revoked");
+        assert_eq!(revocations.len(), 1);
+        assert_eq!(revocations[0].id, info.id);
+        assert_eq!(revocations[0].label, info.label);
+        assert_eq!(revocations[0].reason, "revoked");
+    }
 
     harness.controller.stop().await;
 }
@@ -485,6 +695,31 @@ async fn browse_transfer_preview_and_external_edit_roundtrip() {
         .expect("renamed upload");
     assert_eq!(upload_renamed.remote_path, "/sub/upload (1).txt");
 
+    let nested_upload = harness
+        .peers
+        .upload(
+            &peer_id,
+            &share_id,
+            upload_path.to_str().expect("utf8"),
+            "/sub/new/deep",
+            ConflictPolicy::Fail,
+        )
+        .await
+        .expect("upload into a new folder tree");
+    assert_eq!(nested_upload.remote_path, "/sub/new/deep/upload.txt");
+    assert_eq!(
+        std::fs::read_to_string(
+            harness
+                .share_root
+                .join("sub")
+                .join("new")
+                .join("deep")
+                .join("upload.txt"),
+        )
+        .expect("nested uploaded file"),
+        "uploaded\n"
+    );
+
     let unicode_upload = upload_dir.path().join("上 传.txt");
     std::fs::write(&unicode_upload, b"uploaded unicode\n").expect("unicode upload");
     let unicode_uploaded = harness
@@ -640,11 +875,88 @@ async fn path_traversal_and_invalid_share_ids_are_rejected() {
 }
 
 #[tokio::test]
+async fn downloads_to_the_exact_save_dialog_path() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (info, _code) = harness.connect().await;
+    let destination = tempfile::tempdir().expect("destination");
+    let target = destination.path().join("renamed copy.txt");
+
+    let result = harness
+        .peers
+        .download_to(
+            &info.id,
+            &harness.share_id,
+            "/notes.txt",
+            target.to_str().expect("utf8 target"),
+        )
+        .await
+        .expect("download to save path");
+    assert!(result.transferred);
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("saved file"),
+        "hello peer\n"
+    );
+
+    std::fs::write(&target, b"old contents").expect("existing target");
+    harness
+        .peers
+        .download_to(
+            &info.id,
+            &harness.share_id,
+            "/notes.txt",
+            target.to_str().expect("utf8 target"),
+        )
+        .await
+        .expect("overwrite save path");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("overwritten file"),
+        "hello peer\n"
+    );
+
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn download_reports_streaming_progress() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (info, _code) = harness.connect().await;
+    let destination = tempfile::tempdir().expect("destination");
+    let target = destination.path().join("progress.txt");
+    let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let progress_updates = Arc::clone(&updates);
+    let progress = Arc::new(move |transferred, total| {
+        progress_updates
+            .lock()
+            .expect("progress updates")
+            .push((transferred, total));
+    });
+
+    harness
+        .peers
+        .download_to_with_progress(
+            &info.id,
+            &harness.share_id,
+            "/notes.txt",
+            target.to_str().expect("utf8 target"),
+            Some(progress),
+        )
+        .await
+        .expect("download with progress");
+    {
+        let updates = updates.lock().expect("progress updates");
+        assert!(!updates.is_empty());
+        assert_eq!(updates.last().copied(), Some((11, 11)));
+    }
+
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
 async fn transfer_limits_and_symlink_destinations_are_enforced() {
     let limits = PeerLimits {
         max_transfer_bytes: 16,
         max_preview_bytes: 8,
-        request_timeout: Duration::from_secs(15),
+        ..PeerLimits::default()
     };
     let harness = Harness::with_limits(vec![loopback_rule()], false, limits).await;
     std::fs::write(harness.share_root.join("large.txt"), vec![b'x'; 32]).expect("large");

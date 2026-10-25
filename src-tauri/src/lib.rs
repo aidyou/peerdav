@@ -22,13 +22,17 @@ pub use error::{AppError, DomainError};
 pub use peer::{PeerLimits, PeerManager};
 pub use policy::{PeerContext, PolicyDecision, evaluate_rules};
 pub use server::{ServerConfig, ServerController};
-pub use traits::ServerEvents;
+pub use traits::{PeerEvents, ServerEvents};
 pub use types::{
-    AccessRule, AdminLoginResult, ApprovePendingResult, AuthorizationInfo, ConflictPolicy,
-    DiscoveredPeer, ExternalEditInfo, InitializeVaultResult, MAX_PENDING_ATTEMPTS,
-    MAX_PENDING_PATH_CHARS, MAX_PENDING_REQUESTS, PeerAccessRequest, PeerEntry, PeerHealth,
-    PeerInfo, PeerListing, PeerShare, PendingRequestInfo, PreviewPayload, RuleKind, RuleMatcher,
-    ServerStatus, ShareInfo, SharePermissions, TransferResult, VaultStatus,
+    ACCESS_GRANT_TTL, ACCESS_PROTOCOL, ACCESS_REQUEST_HEADER, ACCESS_STATUS_PATH,
+    AccessRequestStatus, AccessRule, AccessStatusResponse, AdminLoginResult, ApprovePendingResult,
+    AuthorizationBindingResponse, AuthorizationInfo, AuthorizationStatus,
+    AuthorizationStatusResponse, ConflictPolicy, DiscoveredPeer, ExternalEditInfo,
+    InitializeVaultResult, MAX_ACCESS_GRANTS, MAX_ACCESS_REQUEST_ID_CHARS, MAX_PENDING_ATTEMPTS,
+    MAX_PENDING_PATH_CHARS, MAX_PENDING_REQUESTS, MIN_ACCESS_REQUEST_ID_CHARS,
+    PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT, PeerAccessRequest, PeerEntry, PeerHealth,
+    PeerInfo, PeerListing, PeerRevocationInfo, PeerShare, PendingRequestInfo, PreviewPayload,
+    RuleKind, RuleMatcher, ServerStatus, ShareInfo, SharePermissions, TransferResult, VaultStatus,
 };
 pub use vault::Vault;
 
@@ -78,11 +82,15 @@ pub fn run() {
             })?;
             let vault = Arc::new(Vault::open(&data_dir.join(DB_FILE_NAME))?);
             let events = Arc::new(AppEvents::new(app.handle().clone()));
-            let server = Arc::new(ServerController::new(Arc::clone(&vault), events)?);
-            let peers = Arc::new(PeerManager::new(
+            let server_events: Arc<dyn ServerEvents> = Arc::clone(&events) as Arc<dyn ServerEvents>;
+            let peer_events: Arc<dyn PeerEvents> = Arc::clone(&events) as Arc<dyn PeerEvents>;
+            let server = Arc::new(ServerController::new(Arc::clone(&vault), server_events)?);
+            let peers = Arc::new(PeerManager::with_events(
                 Arc::clone(&vault),
                 data_dir.join("peer-temp"),
+                peer_events,
             )?);
+            peers.start_background();
             app.manage(Arc::clone(&vault) as SharedVault);
             app.manage(server as SharedServer);
             app.manage(peers as SharedPeers);
@@ -133,12 +141,19 @@ pub fn run() {
             commands::local_networks,
             commands::list_peers,
             commands::request_peer_access,
+            commands::wait_for_peer_access,
+            commands::cancel_peer_access,
             commands::connect_peer,
             commands::check_peer_health,
             commands::forget_peer,
+            commands::sync_peers,
             commands::list_peer_shares,
             commands::list_peer_dir,
             commands::download_peer_file,
+            commands::download_peer_file_to,
+            commands::open_local_file,
+            commands::reveal_local_file,
+            commands::collect_upload_paths,
             commands::upload_peer_file,
             commands::preview_peer_file,
             commands::prepare_peer_external_edit,

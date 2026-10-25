@@ -8,12 +8,21 @@ import {
 } from "@tauri-apps/plugin-autostart";
 
 import { useAppContext } from "../lib/appContext";
+import { confirmAction } from "../lib/confirm";
 import { localizeMessage, t } from "../lib/i18n";
+import { normalizeAppError } from "../lib/invoke";
 import { validatePassword } from "../lib/password";
 import { useAction } from "../composables/useAction";
 
 const app = useAppContext();
 const { busy, run } = useAction();
+
+const settingsTabs = [
+  { name: "shares", label: "settings.tabShares" },
+  { name: "clients", label: "settings.tabClients" },
+  { name: "service", label: "settings.tabService" },
+  { name: "account", label: "settings.tabAccount" },
+];
 
 const autostartEnabled = ref(false);
 const autostartLoading = ref(true);
@@ -35,15 +44,17 @@ const shareCanRead = ref(true);
 const shareCanWrite = ref(true);
 const shareCanDelete = ref(false);
 const editingShareId = ref("");
-const approvalCode = ref("");
-const approvalLabel = ref("");
 
 const lanServers = ref([]);
 const lanScanned = ref(false);
+const manualOpen = ref(false);
 const peerUrl = ref("");
-const peerCode = ref("");
-const peerLabel = ref("");
 const peerHealth = ref({});
+const peerWaiting = ref(false);
+const peerRequestId = ref("");
+const peerRequestUrl = ref("");
+const peerCancelRequested = ref(false);
+const peerCanceling = ref(false);
 const peerNoticeState = ref(null);
 
 const adminCurrentPassword = ref("");
@@ -259,10 +270,13 @@ async function saveShare() {
 }
 
 async function deleteShare(share) {
-  if (!window.confirm(t("shares.deleteConfirm", { name: share.name }))) {
-    return;
-  }
   await run(async () => {
+    const confirmed = await confirmAction(
+      t("shares.deleteConfirm", { name: share.name }),
+      t("common.delete"),
+    );
+    if (!confirmed) return;
+
     await app.invoke("delete_share", {
       ...adminArgs(),
       shareId: share.id,
@@ -281,20 +295,21 @@ async function approveRequest(request) {
       ...adminArgs(),
       requestId: request.id,
     });
-    approvalCode.value = result.authorizationCode;
-    approvalLabel.value = `${request.peerIp} · ${request.shareName}`;
-    app.setNotice("pending.approved");
+    app.setNotice(
+      result.autoDelivery ? "pending.approvedAuto" : "pending.approved",
+    );
     await loadAdminData();
   });
 }
 
 async function revokeAuthorization(authorization) {
-  if (
-    !window.confirm(t("auth.revokeConfirm", { label: authorization.label }))
-  ) {
-    return;
-  }
   await run(async () => {
+    const confirmed = await confirmAction(
+      t("auth.revokeConfirm", { label: authorization.label }),
+      t("auth.revoke"),
+    );
+    if (!confirmed) return;
+
     await app.invoke("revoke_authorization", {
       ...adminArgs(),
       authorizationId: authorization.id,
@@ -311,41 +326,67 @@ async function scanLan() {
   });
 }
 
-function useDiscovered(server) {
-  peerUrl.value = server.url;
-  setPeerNotice("client.filled", { url: server.url });
-}
+async function requestPeerAccess(url = peerUrl.value) {
+  const target = String(url ?? "").trim();
+  if (!target || peerWaiting.value) return;
+  peerWaiting.value = true;
+  peerRequestUrl.value = target;
+  peerRequestId.value = "";
+  peerCancelRequested.value = false;
+  setPeerNotice("client.waiting");
+  try {
+    const request = await app.invoke("request_peer_access", { url: target });
+    if (!request.requested) {
+      setPeerNotice("client.alreadyAccessible");
+      return;
+    }
+    if (!request.requestId) {
+      setPeerNotice("client.requestMissing");
+      return;
+    }
 
-function peerUrlForHost(server, host) {
-  const wrapped =
-    host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-  return `http://${wrapped}:${server.port}`;
-}
-
-function useDiscoveredHost(server, host) {
-  peerUrl.value = peerUrlForHost(server, host);
-  setPeerNotice("client.filled", { url: peerUrl.value });
-}
-
-async function requestPeerAccess() {
-  await run(async () => {
-    await app.invoke("request_peer_access", { url: peerUrl.value });
-    setPeerNotice("client.requested");
-  });
-}
-
-async function connectPeer() {
-  await run(async () => {
-    const result = await app.invoke("connect_peer", {
-      url: peerUrl.value,
-      code: peerCode.value,
-      label: peerLabel.value || null,
+    peerRequestId.value = request.requestId;
+    const result = await app.invoke("wait_for_peer_access", {
+      url: target,
+      requestId: request.requestId,
+      label: null,
     });
-    peerCode.value = "";
     await app.refreshPeers();
-    app.openPeer(result);
     setPeerNotice("client.connected", { label: result.label });
-  });
+  } catch (error) {
+    if (
+      peerCancelRequested.value ||
+      normalizeAppError(error).code === "PEER_ACCESS_CANCELED"
+    ) {
+      setPeerNotice("client.canceled");
+    } else {
+      app.handleFailure(error);
+      setPeerNotice("client.failed");
+    }
+  } finally {
+    peerWaiting.value = false;
+    peerRequestId.value = "";
+    peerRequestUrl.value = "";
+    peerCancelRequested.value = false;
+    peerCanceling.value = false;
+  }
+}
+
+async function cancelPeerRequest() {
+  if (!peerRequestId.value || peerCanceling.value) return;
+  peerCanceling.value = true;
+  peerCancelRequested.value = true;
+  try {
+    await app.invoke("cancel_peer_access", {
+      url: peerRequestUrl.value,
+      requestId: peerRequestId.value,
+    });
+  } catch (error) {
+    peerCancelRequested.value = false;
+    peerCanceling.value = false;
+    app.handleFailure(error);
+    setPeerNotice("client.cancelFailed");
+  }
 }
 
 function healthText(health) {
@@ -359,6 +400,10 @@ function healthText(health) {
   return reason && reason !== label ? `${label} · ${reason}` : label;
 }
 
+function isPeerSaved(url) {
+  return app.peers.some((peer) => peer.url === url);
+}
+
 async function checkPeer(peer) {
   await run(async () => {
     const health = await app.invoke("check_peer_health", { peerId: peer.id });
@@ -367,10 +412,13 @@ async function checkPeer(peer) {
 }
 
 async function forgetPeer(peer) {
-  if (!window.confirm(t("client.forgetConfirm", { label: peer.label }))) {
-    return;
-  }
   await run(async () => {
+    const confirmed = await confirmAction(
+      t("client.forgetConfirm", { label: peer.label }),
+      t("client.forget"),
+    );
+    if (!confirmed) return;
+
     await app.invoke("forget_peer", { peerId: peer.id });
     if (app.activePeerId === peer.id) {
       app.closePeer();
@@ -472,8 +520,30 @@ async function loadInitialData() {
       </label>
     </header>
 
-    <el-tabs v-model="app.settingsTab" class="settings-tabs">
-      <el-tab-pane :label="t('settings.tabService')" name="service">
+    <nav class="settings-tabbar" role="tablist" :aria-label="t('settings.title')">
+      <button
+        v-for="tab in settingsTabs"
+        :key="tab.name"
+        type="button"
+        role="tab"
+        :id="`tab-${tab.name}`"
+        class="settings-tab"
+        :class="{ 'is-active': app.settingsTab === tab.name }"
+        :aria-selected="app.settingsTab === tab.name"
+        :aria-controls="`pane-${tab.name}`"
+        @click="app.settingsTab = tab.name"
+      >
+        {{ t(tab.label) }}
+      </button>
+    </nav>
+
+      <section
+        v-if="app.settingsTab === 'service'"
+        id="pane-service"
+        class="settings-pane"
+        role="tabpanel"
+        aria-labelledby="tab-service"
+      >
         <div class="server-panel">
           <h3>{{ t("server.title") }}</h3>
           <p class="hint">{{ t("server.verifyHint") }}</p>
@@ -549,9 +619,15 @@ async function loadInitialData() {
             />
           </div>
         </div>
-      </el-tab-pane>
+      </section>
 
-      <el-tab-pane :label="t('settings.tabShares')" name="shares">
+      <section
+        v-if="app.settingsTab === 'shares'"
+        id="pane-shares"
+        class="settings-pane"
+        role="tabpanel"
+        aria-labelledby="tab-shares"
+      >
         <div class="server-panel">
           <h3>{{ t("shares.title") }}</h3>
           <ul class="list">
@@ -669,195 +745,251 @@ async function loadInitialData() {
             </div>
           </form>
         </div>
-      </el-tab-pane>
+      </section>
 
-      <el-tab-pane :label="t('settings.tabClients')" name="clients">
-        <div class="server-panel">
-          <h3>{{ t("pending.title") }}</h3>
-          <p class="hint">{{ t("pending.hint") }}</p>
-          <ul class="list">
-            <li v-for="request in app.pendingRequests" :key="request.id">
+      <section
+        v-if="app.settingsTab === 'clients'"
+        id="pane-clients"
+        class="settings-pane"
+        role="tabpanel"
+        aria-labelledby="tab-clients"
+      >
+        <div class="client-roles">
+          <section class="client-role">
+            <header class="role-heading">
+              <span class="role-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <path d="M12 3v11" />
+                  <path d="m8 10 4 4 4-4" />
+                  <path d="M5 18h14" />
+                </svg>
+              </span>
               <div>
-                <strong class="mono">{{ request.peerIp }}</strong>
-                <div class="hint">
-                  {{ request.shareName }} · {{ request.requestedPath }} ·
-                  {{ t("pending.attempts", { count: request.attempts }) }}
-                </div>
+                <h2>{{ t("clients.inboundTitle") }}</h2>
+                <p>{{ t("clients.inboundHint") }}</p>
               </div>
-              <el-button
-                type="primary"
-                :disabled="busy"
-                @click="approveRequest(request)"
-              >
-                {{ t("pending.approve") }}
-              </el-button>
-            </li>
-            <li v-if="!app.pendingRequests.length" class="hint">
-              {{ t("pending.empty") }}
-            </li>
-          </ul>
+            </header>
 
-          <div v-if="approvalCode" class="code-box">
-            <p class="warning">
-              {{ t("code.onlyOnce") }}
-              <span class="mono">{{ approvalLabel }}</span>
-            </p>
-            <p class="mono code">{{ approvalCode }}</p>
-            <el-button plain @click="approvalCode = ''">
-              {{ t("code.saved") }}
-            </el-button>
-          </div>
-        </div>
-
-        <div class="server-panel">
-          <h3>{{ t("auth.title") }}</h3>
-          <ul class="list">
-            <li v-for="authorization in authorizations" :key="authorization.id">
-              <div>
-                <strong class="mono">{{ authorization.label }}</strong>
-                <div class="hint mono">#{{ authorization.id }}</div>
+            <div class="role-card">
+              <div class="role-block">
+                <h3>{{ t("pending.title") }}</h3>
+                <p class="hint">{{ t("pending.hint") }}</p>
+                <ul class="list">
+                  <li v-for="request in app.pendingRequests" :key="request.id">
+                    <div>
+                      <strong class="mono">{{ request.peerIp }}</strong>
+                      <div class="hint">
+                        {{ request.shareName }}
+                        <template v-if="request.attempts > 1">
+                          · {{ t("pending.attempts", { count: request.attempts }) }}
+                        </template>
+                      </div>
+                    </div>
+                    <el-button
+                      type="primary"
+                      :disabled="busy"
+                      @click="approveRequest(request)"
+                    >
+                      {{ t("pending.approve") }}
+                    </el-button>
+                  </li>
+                  <li v-if="!app.pendingRequests.length" class="hint">
+                    {{ t("pending.empty") }}
+                  </li>
+                </ul>
               </div>
-              <el-button
-                plain
-                :disabled="busy"
-                @click="revokeAuthorization(authorization)"
-              >
-                {{ t("auth.revoke") }}
-              </el-button>
-            </li>
-            <li v-if="!authorizations.length" class="hint">
-              {{ t("auth.empty") }}
-            </li>
-          </ul>
-        </div>
 
-        <div class="server-panel">
-          <h3>{{ t("client.title") }}</h3>
-          <p class="hint">{{ t("client.hint") }}</p>
-          <div class="actions">
-            <el-button type="primary" :disabled="busy" @click="scanLan">
-              {{ t("client.scan") }}
-            </el-button>
-          </div>
-          <p v-if="lanScanned" class="hint">
-            {{
-              lanServers.length
-                ? t("client.scanFound", { count: lanServers.length })
-                : t("client.scanEmpty")
-            }}
-          </p>
-          <ul v-if="lanServers.length" class="list">
-            <li v-for="server in lanServers" :key="server.serverId">
-              <div>
-                <strong>{{ server.name }}</strong>
-                <div class="hint mono">{{ server.url }}</div>
-                <div class="hint">
-                  {{
-                    t("client.discoveredMeta", {
-                      count: server.shareCount,
-                      hosts: server.hosts.join(", "),
-                    })
-                  }}
-                </div>
-                <div class="actions">
-                  <el-button
-                    v-for="host in server.hosts"
-                    :key="host"
-                    plain
-                    :disabled="busy"
-                    @click="useDiscoveredHost(server, host)"
+              <div class="role-block">
+                <h3>{{ t("auth.title") }}</h3>
+                <p class="hint">{{ t("auth.hint") }}</p>
+                <ul class="list">
+                  <li
+                    v-for="authorization in authorizations"
+                    :key="authorization.id"
                   >
-                    {{ host }}
+                    <div>
+                      <strong>{{ authorization.label }}</strong>
+                      <div class="hint">{{ t("auth.active") }}</div>
+                    </div>
+                    <el-button
+                      plain
+                      :disabled="busy"
+                      @click.stop="revokeAuthorization(authorization)"
+                    >
+                      {{ t("auth.revoke") }}
+                    </el-button>
+                  </li>
+                  <li v-if="!authorizations.length" class="hint">
+                    {{ t("auth.empty") }}
+                  </li>
+                </ul>
+              </div>
+            </div>
+          </section>
+
+          <section class="client-role">
+            <header class="role-heading">
+              <span class="role-icon role-icon--outbound" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <path d="M12 17V6" />
+                  <path d="m8 10 4-4 4 4" />
+                  <path d="M5 20h14" />
+                </svg>
+              </span>
+              <div>
+                <h2>{{ t("clients.outboundTitle") }}</h2>
+                <p>{{ t("clients.outboundHint") }}</p>
+              </div>
+            </header>
+
+            <div class="role-card">
+              <div class="role-block">
+                <div class="role-block__head">
+                  <div>
+                    <h3>{{ t("client.addTitle") }}</h3>
+                    <p class="hint">{{ t("client.addHint") }}</p>
+                  </div>
+                  <div class="actions">
+                    <el-button
+                      type="primary"
+                      plain
+                      :loading="busy"
+                      :disabled="busy || peerWaiting"
+                      @click="scanLan"
+                    >
+                      {{ t("client.scan") }}
+                    </el-button>
+                    <el-button plain @click="manualOpen = !manualOpen">
+                      {{ t("client.manual") }}
+                    </el-button>
+                  </div>
+                </div>
+
+                <p v-if="lanScanned" class="hint">
+                  {{
+                    lanServers.length
+                      ? t("client.scanFound", { count: lanServers.length })
+                      : t("client.scanEmpty")
+                  }}
+                </p>
+
+                <ul v-if="lanServers.length" class="list">
+                  <li v-for="server in lanServers" :key="server.serverId">
+                    <div>
+                      <strong>{{ server.name }}</strong>
+                      <div class="hint mono">{{ server.url }}</div>
+                      <div class="hint">
+                        {{
+                          t("client.discoveredMeta", {
+                            count: server.shareCount,
+                            hosts: server.hosts.join(", "),
+                          })
+                        }}
+                      </div>
+                    </div>
+                    <el-button
+                      v-if="isPeerSaved(server.url)"
+                      plain
+                      disabled
+                    >
+                      {{ t("home.connected") }}
+                    </el-button>
+                    <el-button
+                      v-else
+                      type="primary"
+                      plain
+                      :disabled="busy || peerWaiting"
+                      @click="requestPeerAccess(server.url)"
+                    >
+                      {{ t("client.connect") }}
+                    </el-button>
+                  </li>
+                </ul>
+
+                <form
+                  v-if="manualOpen"
+                  class="manual-connect"
+                  @submit.prevent="requestPeerAccess()"
+                >
+                  <el-input
+                    v-model="peerUrl"
+                    type="text"
+                    placeholder="http://192.168.1.10:4918"
+                    :disabled="peerWaiting"
+                  />
+                  <el-button
+                    type="primary"
+                    native-type="submit"
+                    :loading="peerWaiting"
+                    :disabled="busy || peerWaiting || !peerUrl"
+                  >
+                    {{ t("client.request") }}
+                  </el-button>
+                </form>
+
+                <div v-if="peerWaiting" class="request-progress">
+                  <span>{{ peerNotice || t("client.waiting") }}</span>
+                  <el-button
+                    plain
+                    :loading="peerCanceling"
+                    @click="cancelPeerRequest"
+                  >
+                    {{ t("client.cancel") }}
                   </el-button>
                 </div>
+                <p v-else-if="peerNotice" class="hint request-progress__notice">
+                  {{ peerNotice }}
+                </p>
               </div>
-              <el-button plain :disabled="busy" @click="useDiscovered(server)">
-                {{ t("client.use") }}
-              </el-button>
-            </li>
-          </ul>
 
-          <div class="grid">
-            <label>
-              {{ t("client.serverUrl") }}
-              <el-input
-                v-model="peerUrl"
-                type="text"
-                placeholder="http://192.168.1.10:4918"
-              />
-            </label>
-            <label>
-              {{ t("client.code") }}
-              <el-input
-                v-model="peerCode"
-                type="password"
-                show-password
-                autocomplete="off"
-              />
-            </label>
-            <label>
-              {{ t("client.label") }}
-              <el-input
-                v-model="peerLabel"
-                type="text"
-                :placeholder="t('client.labelPlaceholder')"
-              />
-            </label>
-          </div>
-          <div class="actions">
-            <el-button
-              type="primary"
-              :disabled="busy || !peerUrl"
-              @click="requestPeerAccess"
-            >
-              {{ t("client.request") }}
-            </el-button>
-            <el-button
-              :disabled="busy || !peerUrl || !peerCode"
-              @click="connectPeer"
-            >
-              {{ t("client.connect") }}
-            </el-button>
-            <el-button plain :disabled="busy" @click="app.refreshPeers">
-              {{ t("client.refreshSaved") }}
-            </el-button>
-          </div>
-          <p v-if="peerNotice" class="hint">{{ peerNotice }}</p>
-
-          <h3>{{ t("client.savedTitle") }}</h3>
-          <ul class="list">
-            <li v-for="peer in app.peers" :key="peer.id">
-              <div>
-                <strong>{{ peer.label }}</strong>
-                <div class="hint mono">{{ peer.url }}</div>
-                <div v-if="peerHealth[peer.id]" class="hint">
-                  {{ healthText(peerHealth[peer.id]) }}
-                </div>
+              <div class="role-block">
+                <h3>{{ t("client.savedTitle") }}</h3>
+                <ul class="list">
+                  <li v-for="peer in app.peers" :key="peer.id">
+                    <div>
+                      <strong>{{ peer.label }}</strong>
+                      <div class="hint mono">{{ peer.url }}</div>
+                      <div v-if="peerHealth[peer.id]" class="hint">
+                        {{ healthText(peerHealth[peer.id]) }}
+                      </div>
+                    </div>
+                    <div class="actions">
+                      <el-button
+                        type="primary"
+                        :disabled="busy"
+                        @click="app.openPeer(peer)"
+                      >
+                        {{ t("client.open") }}
+                      </el-button>
+                      <el-button plain :disabled="busy" @click="checkPeer(peer)">
+                        {{ t("client.check") }}
+                      </el-button>
+                      <el-button
+                        plain
+                        :disabled="busy"
+                        @click.stop="forgetPeer(peer)"
+                      >
+                        {{ t("client.forget") }}
+                      </el-button>
+                    </div>
+                  </li>
+                  <li v-if="!app.peers.length" class="hint">
+                    {{ t("client.empty") }}
+                  </li>
+                </ul>
               </div>
-              <div class="actions">
-                <el-button
-                  type="primary"
-                  :disabled="busy"
-                  @click="app.openPeer(peer)"
-                >
-                  {{ t("client.open") }}
-                </el-button>
-                <el-button plain :disabled="busy" @click="checkPeer(peer)">
-                  {{ t("client.check") }}
-                </el-button>
-                <el-button plain :disabled="busy" @click="forgetPeer(peer)">
-                  {{ t("client.forget") }}
-                </el-button>
-              </div>
-            </li>
-            <li v-if="!app.peers.length" class="hint">
-              {{ t("client.empty") }}
-            </li>
-          </ul>
+            </div>
+          </section>
         </div>
-      </el-tab-pane>
+      </section>
 
-      <el-tab-pane :label="t('settings.tabAccount')" name="account">
+      <section
+        v-if="app.settingsTab === 'account'"
+        id="pane-account"
+        class="settings-pane"
+        role="tabpanel"
+        aria-labelledby="tab-account"
+      >
         <div class="server-panel">
           <h3>{{ t("login.changeTitle") }}</h3>
           <p class="hint">{{ t("login.changeAccountHint") }}</p>
@@ -921,14 +1053,13 @@ async function loadInitialData() {
             </el-button>
           </div>
         </div>
-      </el-tab-pane>
-    </el-tabs>
+      </section>
   </div>
 </template>
 
 <style scoped>
 .settings-view {
-  max-width: 820px;
+  max-width: 920px;
   margin: 0 auto;
 }
 
@@ -961,8 +1092,174 @@ async function loadInitialData() {
   color: var(--app-text-secondary);
 }
 
-.settings-tabs {
-  margin-top: 4px;
+.settings-tabbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 8px 0 18px;
+  padding: 4px;
+  border: 1px solid var(--app-border);
+  border-radius: 13px;
+  background: color-mix(in oklab, var(--app-surface-2) 74%, transparent);
+}
+
+.settings-tab {
+  border: 0;
+  border-radius: 9px;
+  padding: 8px 15px;
+  background: transparent;
+  color: var(--app-text-secondary);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.settings-tab:hover {
+  color: var(--app-text);
+  background: var(--app-surface-3);
+}
+
+.settings-tab.is-active {
+  color: var(--app-text);
+  background: var(--app-surface);
+  box-shadow: 0 2px 8px rgba(22, 32, 46, 0.08);
+}
+
+.settings-pane {
+  display: flex;
+  flex-direction: column;
+}
+
+.client-roles {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  align-items: start;
+}
+
+.client-role {
+  min-width: 0;
+}
+
+.role-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  margin-bottom: 10px;
+  padding: 0 2px;
+}
+
+.role-heading h2 {
+  margin: 0 0 4px;
+  font-size: 17px;
+  line-height: 1.3;
+  color: var(--app-text);
+}
+
+.role-heading p {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--app-text-muted);
+}
+
+.role-icon {
+  width: 32px;
+  height: 32px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  color: var(--el-color-primary);
+  background: color-mix(in oklab, var(--el-color-primary) 10%, var(--app-surface-2));
+}
+
+.role-icon--outbound {
+  color: color-mix(in oklab, var(--accent-green) 72%, var(--app-text));
+  background: color-mix(in oklab, var(--accent-green) 10%, var(--app-surface-2));
+}
+
+.role-icon svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.role-card {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 16px;
+  border: 1px solid var(--app-border);
+  border-radius: 15px;
+  background: var(--app-surface);
+}
+
+.role-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.role-block + .role-block {
+  padding-top: 16px;
+  border-top: 1px solid var(--app-border);
+}
+
+.role-block h3 {
+  margin: 0;
+  font-size: 14px;
+  color: var(--app-text);
+}
+
+.role-block__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.role-block__head .actions {
+  flex: none;
+}
+
+.manual-connect {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.manual-connect :deep(.el-input) {
+  flex: 1;
+  min-width: 0;
+}
+
+.request-progress {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 11px;
+  border: 1px solid var(--app-border);
+  border-radius: 10px;
+  background: var(--app-surface-3);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--app-text-secondary);
+}
+
+.request-progress__notice {
+  margin: 0;
 }
 
 .input-with-button {
@@ -1002,6 +1299,12 @@ async function loadInitialData() {
   overflow-wrap: anywhere;
 }
 
+@media (max-width: 760px) {
+  .client-roles {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 560px) {
   .settings-header {
     flex-direction: column;
@@ -1010,6 +1313,15 @@ async function loadInitialData() {
 
   .settings-secret {
     width: 100%;
+  }
+
+  .role-block__head {
+    flex-direction: column;
+  }
+
+  .manual-connect {
+    align-items: stretch;
+    flex-direction: column;
   }
 }
 </style>

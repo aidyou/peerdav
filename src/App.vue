@@ -62,8 +62,10 @@ const serverStatus = ref({
 const pendingRequests = ref([]);
 const peers = ref([]);
 const activePeerId = ref("");
+const activePeerSnapshot = ref(null);
 const workspaceView = ref("home");
-const settingsTab = ref("service");
+const settingsTab = ref("shares");
+const transfers = ref({});
 
 let eventUnlisten = [];
 let activeNotice = null;
@@ -111,8 +113,27 @@ const view = computed(() => {
 });
 
 const activePeer = computed(
-  () => peers.value.find((peer) => peer.id === activePeerId.value) ?? null,
+  () =>
+    peers.value.find((peer) => peer.id === activePeerId.value) ??
+    (activePeerSnapshot.value?.id === activePeerId.value
+      ? activePeerSnapshot.value
+      : null),
 );
+
+function setTransferProgress(payload) {
+  if (!payload?.transferId) return;
+  transfers.value = {
+    ...transfers.value,
+    [payload.transferId]: payload,
+  };
+}
+
+function clearTransfer(transferId) {
+  if (!transferId || !(transferId in transfers.value)) return;
+  const next = { ...transfers.value };
+  delete next[transferId];
+  transfers.value = next;
+}
 
 onMounted(async () => {
   await bindServerEvents();
@@ -121,6 +142,7 @@ onMounted(async () => {
   await refreshServerStatus();
   await resumeServer();
   await refreshPeers();
+  void syncPeers();
 });
 
 onUnmounted(() => {
@@ -172,6 +194,42 @@ async function bindServerEvents() {
           pendingCount: pendingRequests.value.length,
         };
         setNotice("pending.newRequest", { ip: request.peerIp });
+      }),
+    );
+    eventUnlisten.push(
+      await listen("app://pending-canceled", (event) => {
+        const request = event.payload;
+        if (!request?.id) return;
+        pendingRequests.value = pendingRequests.value.filter(
+          (item) => item.id !== request.id,
+        );
+        serverStatus.value = {
+          ...serverStatus.value,
+          pendingCount: pendingRequests.value.length,
+        };
+        setNotice("pending.canceled", { ip: request.peerIp });
+      }),
+    );
+    eventUnlisten.push(
+      await listen("app://peer-revoked", (event) => {
+        const peer = event.payload;
+        if (!peer?.id) return;
+        if (activePeerId.value === peer.id) {
+          closePeer();
+        }
+        const noticeKey =
+          peer.reason === "revoked"
+            ? "peer.revoked"
+            : peer.reason === "bound-elsewhere"
+              ? "peer.boundElsewhere"
+              : "peer.removed";
+        setNotice(noticeKey, { label: peer.label ?? "" });
+        void refreshPeers();
+      }),
+    );
+    eventUnlisten.push(
+      await listen("app://transfer-progress", (event) => {
+        setTransferProgress(event.payload);
       }),
     );
     eventUnlisten.push(
@@ -242,17 +300,19 @@ function handleFailure(error) {
   } else if (strategy === "server-refresh") {
     void refreshServerStatus();
   } else if (strategy === "peer-refresh") {
-    activePeerId.value = "";
-    workspaceView.value = "home";
+    // A stale or transient peer lookup must not tear down an open browser.
+    // Refresh the catalog; explicit removal events or the user's own unbind
+    // action are the only paths that leave the current peer view.
     void refreshPeers();
   }
 }
 
 function landAfterLogin() {
   activePeerId.value = "";
+  activePeerSnapshot.value = null;
   if (shouldOpenSettingsOnLogin()) {
     markSettingsSeen();
-    settingsTab.value = "service";
+    settingsTab.value = "shares";
     workspaceView.value = "settings";
   } else {
     workspaceView.value = "home";
@@ -298,6 +358,7 @@ function resetAdminSession() {
   serverPassword.value = "";
   pendingRequests.value = [];
   activePeerId.value = "";
+  activePeerSnapshot.value = null;
   workspaceView.value = "home";
 }
 
@@ -332,25 +393,43 @@ async function refreshPeers() {
   }
 }
 
+/// Reconciles saved peers with their server bindings. Backend polling repeats
+/// this automatically; an immediate check keeps startup responsive to a server
+/// that was unbound while this application was closed.
+async function syncPeers() {
+  try {
+    const removed = await invoke("sync_peers");
+    if (removed > 0) {
+      await refreshPeers();
+    }
+  } catch (error) {
+    console.warn("PeerDav peer synchronization failed", error);
+  }
+}
+
 function openPeer(peer) {
   activePeerId.value = peer.id;
+  activePeerSnapshot.value = peer;
   workspaceView.value = "peer";
 }
 
 function closePeer() {
   activePeerId.value = "";
+  activePeerSnapshot.value = null;
   workspaceView.value = "home";
 }
 
 function openHome() {
   activePeerId.value = "";
+  activePeerSnapshot.value = null;
   workspaceView.value = "home";
 }
 
 function openSettings() {
   activePeerId.value = "";
+  activePeerSnapshot.value = null;
   workspaceView.value = "settings";
-  settingsTab.value = "service";
+  settingsTab.value = "shares";
 }
 
 async function logout() {
@@ -385,12 +464,15 @@ provide(
     activePeerId,
     workspaceView,
     settingsTab,
+    transfers,
     invoke,
     clearMessages,
     handleFailure,
     setError,
     setRawError,
     setNotice,
+    setTransferProgress,
+    clearTransfer,
     refreshStatus,
     refreshServerStatus,
     refreshPeers,
@@ -564,15 +646,23 @@ provide(
           @open-peer="openPeer"
           @open-settings="openSettings"
         />
-        <div class="workspace-content">
+        <div
+          class="workspace-content"
+          :class="{ 'workspace-content--browser': workspaceView === 'peer' }"
+        >
           <HomeView v-if="workspaceView === 'home'" />
           <PeerBrowser
             v-else-if="workspaceView === 'peer' && activePeer"
             :key="activePeer.id"
             :peer="activePeer"
-            @close="closePeer"
           />
           <SettingsView v-else-if="workspaceView === 'settings'" />
+          <div v-else-if="workspaceView === 'peer'" class="peer-unavailable">
+            <p>{{ t("peer.unavailable") }}</p>
+            <el-button type="primary" @click="openHome">
+              {{ t("home.title") }}
+            </el-button>
+          </div>
           <HomeView v-else />
         </div>
       </div>
@@ -779,6 +869,27 @@ provide(
   box-sizing: border-box;
 }
 
+.workspace-content--browser {
+  padding: 15px;
+}
+
+.peer-unavailable {
+  max-width: 460px;
+  margin: 80px auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  text-align: center;
+}
+
+.peer-unavailable p {
+  margin: 0;
+  color: var(--app-text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .shell--workspace > .alert {
   margin: 10px 16px 0;
 }
@@ -878,6 +989,21 @@ provide(
   --el-button-text-color: var(--accent-on);
   --el-button-hover-text-color: var(--accent-on);
   --el-button-active-text-color: var(--accent-on);
+}
+
+/* Element Plus sets a 32px button size and input wrapper height on the
+   component roots, so the shared component-size token alone leaves buttons
+   shorter than text fields. Pin both to the same control height. */
+:root .el-button {
+  --el-button-size: var(--el-component-size);
+  height: var(--el-component-size);
+}
+
+:root .el-input__wrapper,
+:root .el-select__wrapper {
+  height: var(--el-component-size);
+  min-height: var(--el-component-size);
+  box-sizing: border-box;
 }
 
 /* Dark theme overrides. [data-theme=dark] (specificity 0,2,0) beats Element
