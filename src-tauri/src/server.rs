@@ -1,0 +1,1251 @@
+//! LAN WebDAV server: request authentication/policy gate, pending approval
+//! flow, share catalog, task lifecycle, and the background error outlet.
+
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use base64::Engine as _;
+use dav_server::DavHandler;
+use dav_server::body::Body;
+use dav_server::davpath::DavPath;
+use dav_server::fakels::FakeLs;
+use http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE};
+use http::{HeaderMap, Method, Request, Response, StatusCode};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
+use rand::RngCore;
+use rand::rngs::OsRng;
+use sha2::{Digest, Sha256};
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use tokio::task::{JoinHandle, JoinSet};
+
+use crate::discovery::{self, DiscoveryServer};
+use crate::error::{AppError, DomainError};
+use crate::fs::split_share_path;
+use crate::fs::{RequestCredentials, RestrictedFs, ShareConfig, ShareMap, ShareRoot};
+use crate::policy::{
+    CompiledRule, PeerContext, PolicyDecision, canonical_ip, compile_rule, evaluate,
+    required_for_method,
+};
+use crate::traits::ServerEvents;
+use crate::types::{
+    AccessRule, ApprovePendingResult, AuthorizationInfo, CATALOG_PATH, CATALOG_PROTOCOL,
+    CatalogResponse, DEFAULT_SERVER_PORT, MAX_PENDING_ATTEMPTS, MAX_PENDING_PATH_CHARS,
+    MAX_PENDING_REQUESTS, PeerShare, PendingRequestInfo, ServerStatus, ShareInfo, SharePermissions,
+};
+use crate::vault::Vault;
+
+const AUTH_CHALLENGE: &str = "Basic realm=\"PeerDav\", charset=\"UTF-8\"";
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVER_AGENT: &str = "PeerDav";
+
+/// Publishes a structured error through the shared background outlet.
+fn publish_error(events: &dyn ServerEvents, error: &DomainError) {
+    events.error(&AppError::from_ref(error));
+}
+
+/// Configuration for one server start.
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub bind_address: String,
+    pub port: u16,
+    /// `0` disables UDP discovery (used by tests and headless setups).
+    pub discovery_port: u16,
+    pub server_name: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind_address: "0.0.0.0".to_owned(),
+            port: DEFAULT_SERVER_PORT,
+            discovery_port: 0,
+            server_name: SERVER_AGENT.to_owned(),
+        }
+    }
+}
+
+struct AuthEntry {
+    info: AuthorizationInfo,
+    hash: [u8; 32],
+}
+
+struct RunningServer {
+    address: SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+    discovery: Option<DiscoveryServer>,
+}
+
+struct Gate {
+    shares: Arc<std::sync::RwLock<ShareMap>>,
+    authorizations: Arc<std::sync::RwLock<Vec<AuthEntry>>>,
+    pending: Arc<Mutex<Vec<PendingRequestInfo>>>,
+    events: Arc<dyn ServerEvents>,
+    server_name: String,
+}
+
+/// Owns the share/authorization catalog and the running server task.
+pub struct ServerController {
+    vault: Arc<Vault>,
+    events: Arc<dyn ServerEvents>,
+    shares: Arc<std::sync::RwLock<ShareMap>>,
+    authorizations: Arc<std::sync::RwLock<Vec<AuthEntry>>>,
+    pending: Arc<Mutex<Vec<PendingRequestInfo>>>,
+    lifecycle: Mutex<Option<RunningServer>>,
+    server_id: String,
+}
+
+impl ServerController {
+    /// Loads persisted shares and active authorizations. A single broken
+    /// share is reported through the error outlet and skipped so the rest of
+    /// the service stays available.
+    pub fn new(vault: Arc<Vault>, events: Arc<dyn ServerEvents>) -> Result<Self, DomainError> {
+        let mut shares = ShareMap::new();
+        for record in vault.load_shares()? {
+            match load_share(record) {
+                Ok(share) => {
+                    shares.insert(share.id.clone(), Arc::new(share));
+                }
+                Err(error) => publish_error(events.as_ref(), &error),
+            }
+        }
+
+        let mut authorizations = Vec::new();
+        for record in vault.list_authorizations()? {
+            match load_authorization(&record) {
+                Ok(entry) => authorizations.push(entry),
+                Err(error) => publish_error(events.as_ref(), &error),
+            }
+        }
+
+        Ok(Self {
+            vault,
+            events,
+            shares: Arc::new(std::sync::RwLock::new(shares)),
+            authorizations: Arc::new(std::sync::RwLock::new(authorizations)),
+            pending: Arc::new(Mutex::new(Vec::new())),
+            lifecycle: Mutex::new(None),
+            server_id: random_hex(8),
+        })
+    }
+
+    pub fn status(&self) -> ServerStatus {
+        let (running, bind_address, discovery_running, discovery_port) = match self.lifecycle.lock()
+        {
+            Ok(guard) => match guard.as_ref() {
+                Some(server) => (
+                    true,
+                    Some(server.address.to_string()),
+                    server.discovery.is_some(),
+                    server.discovery.as_ref().map(DiscoveryServer::port),
+                ),
+                None => (false, None, false, None),
+            },
+            Err(_) => {
+                log::error!("server lifecycle mutex poisoned while reading status");
+                (false, None, false, None)
+            }
+        };
+        ServerStatus {
+            running,
+            bind_address,
+            discovery_running,
+            discovery_port,
+            share_count: self.shares.read().map(|shares| shares.len()).unwrap_or(0),
+            pending_count: self
+                .pending
+                .lock()
+                .map(|pending| pending.len())
+                .unwrap_or(0),
+        }
+    }
+
+    /// Starts the server. Requires an already unlocked vault only through the
+    /// command guard; the controller itself has no auth state.
+    pub async fn start(&self, config: ServerConfig) -> Result<ServerStatus, DomainError> {
+        {
+            let guard = self.lifecycle.lock().map_err(|_| DomainError::Internal {
+                detail: "server lifecycle mutex poisoned".to_owned(),
+            })?;
+            if guard.is_some() {
+                return Err(DomainError::ServerAlreadyRunning);
+            }
+        }
+
+        let address = format!("{}:{}", config.bind_address.trim(), config.port);
+        let parsed = address
+            .parse::<SocketAddr>()
+            .map_err(|error| DomainError::ServerBind {
+                address: address.clone(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()),
+            })?;
+        let listener =
+            TcpListener::bind(parsed)
+                .await
+                .map_err(|source| DomainError::ServerBind {
+                    address: address.clone(),
+                    source,
+                })?;
+        let bound = listener
+            .local_addr()
+            .map_err(|source| DomainError::ServerBind {
+                address: address.clone(),
+                source,
+            })?;
+
+        let handler: DavHandler<RequestCredentials> = DavHandler::builder()
+            .filesystem(Box::new(RestrictedFs::new(Arc::clone(&self.shares))))
+            .locksystem(FakeLs::new())
+            .hide_symlinks(true)
+            .build_handler();
+
+        let gate = Arc::new(Gate {
+            shares: Arc::clone(&self.shares),
+            authorizations: Arc::clone(&self.authorizations),
+            pending: Arc::clone(&self.pending),
+            events: Arc::clone(&self.events),
+            server_name: config.server_name.clone(),
+        });
+
+        let mut discovery = if config.discovery_port == 0 {
+            None
+        } else {
+            let hosts = discovery::advertised_hosts(&config.bind_address);
+            match discovery::start(
+                config.discovery_port,
+                self.server_id.clone(),
+                config.server_name.clone(),
+                bound.port(),
+                hosts,
+                Arc::clone(&self.shares),
+            )
+            .await
+            {
+                Ok(discovery) => Some(discovery),
+                Err(error) => {
+                    publish_error(self.events.as_ref(), &error);
+                    None
+                }
+            }
+        };
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(run_server(listener, handler, gate, shutdown_rx));
+
+        let mut guard = self.lifecycle.lock().map_err(|_| DomainError::Internal {
+            detail: "server lifecycle mutex poisoned".to_owned(),
+        })?;
+        if guard.is_some() {
+            if let Err(error) = shutdown_tx.send(()) {
+                log::debug!("failed to stop racing server start: {error:?}");
+            }
+            if let Some(mut discovery) = discovery.take() {
+                discovery.request_shutdown();
+            }
+            return Err(DomainError::ServerAlreadyRunning);
+        }
+        *guard = Some(RunningServer {
+            address: bound,
+            shutdown: Some(shutdown_tx),
+            task,
+            discovery,
+        });
+        drop(guard);
+
+        Ok(self.status())
+    }
+
+    pub async fn stop(&self) -> ServerStatus {
+        let running = {
+            match self.lifecycle.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(_) => {
+                    publish_error(
+                        self.events.as_ref(),
+                        &DomainError::Internal {
+                            detail: "server lifecycle mutex poisoned".to_owned(),
+                        },
+                    );
+                    None
+                }
+            }
+        };
+
+        if let Some(RunningServer {
+            shutdown,
+            mut task,
+            discovery,
+            ..
+        }) = running
+        {
+            if let Some(discovery) = discovery {
+                discovery.stop().await;
+            }
+            if let Some(sender) = shutdown
+                && let Err(error) = sender.send(())
+            {
+                log::debug!("server already stopped before shutdown signal: {error:?}");
+            }
+
+            match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, &mut task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    if !error.is_cancelled() {
+                        publish_error(
+                            self.events.as_ref(),
+                            &DomainError::ServerTask {
+                                detail: error.to_string(),
+                            },
+                        );
+                    }
+                }
+                Err(_) => {
+                    log::warn!("server did not stop within the timeout; aborting task");
+                    task.abort();
+                    if let Err(error) = task.await
+                        && !error.is_cancelled()
+                    {
+                        publish_error(
+                            self.events.as_ref(),
+                            &DomainError::ServerTask {
+                                detail: error.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        self.status()
+    }
+
+    /// Best-effort synchronous shutdown for application exit.
+    pub fn request_shutdown(&self) {
+        let running = match self.lifecycle.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => {
+                log::error!("server lifecycle mutex poisoned during shutdown");
+                None
+            }
+        };
+        if let Some(mut server) = running {
+            if let Some(mut discovery) = server.discovery.take() {
+                discovery.request_shutdown();
+            }
+            if let Some(sender) = server.shutdown.take()
+                && let Err(error) = sender.send(())
+            {
+                log::debug!("server shutdown signal was not delivered: {error:?}");
+            }
+        }
+    }
+
+    pub fn list_shares(&self) -> Vec<ShareInfo> {
+        match self.shares.read() {
+            Ok(shares) => {
+                let mut list: Vec<ShareInfo> = shares.values().map(|share| share.info()).collect();
+                list.sort_by(|left, right| left.name.cmp(&right.name));
+                list
+            }
+            Err(_) => {
+                publish_error(
+                    self.events.as_ref(),
+                    &DomainError::Internal {
+                        detail: "share catalog lock poisoned".to_owned(),
+                    },
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    pub fn list_authorizations(&self) -> Vec<AuthorizationInfo> {
+        match self.authorizations.read() {
+            Ok(authorizations) => authorizations
+                .iter()
+                .map(|entry| entry.info.clone())
+                .collect(),
+            Err(_) => {
+                publish_error(
+                    self.events.as_ref(),
+                    &DomainError::Internal {
+                        detail: "authorization catalog lock poisoned".to_owned(),
+                    },
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    pub fn list_pending(&self) -> Vec<PendingRequestInfo> {
+        match self.pending.lock() {
+            Ok(pending) => pending.clone(),
+            Err(_) => {
+                publish_error(
+                    self.events.as_ref(),
+                    &DomainError::Internal {
+                        detail: "pending request lock poisoned".to_owned(),
+                    },
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    pub fn create_share(
+        &self,
+        name: &str,
+        root_path: &str,
+        permissions: SharePermissions,
+        rules: &[AccessRule],
+    ) -> Result<ShareInfo, DomainError> {
+        validate_share_name(name)?;
+        if root_path.trim().is_empty() {
+            return Err(DomainError::InvalidShareConfig {
+                detail: "root path must not be empty".to_owned(),
+            });
+        }
+
+        let normalized = crate::policy::normalize_rules(rules)?;
+        let compiled = compile_rules(&normalized)?;
+        let root = Arc::new(ShareRoot::open(std::path::Path::new(root_path))?);
+        let id = random_hex(8);
+        let record_rules = normalized
+            .iter()
+            .map(|rule| crate::types::ShareRuleRecord {
+                kind: rule.kind,
+                matcher: rule.matcher.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        self.vault
+            .create_share(&id, name, root_path.trim(), permissions, &record_rules)?;
+
+        let share = ShareConfig {
+            id: id.clone(),
+            name: name.to_owned(),
+            root_path: root_path.trim().into(),
+            permissions,
+            rules: compiled,
+            display_rules: normalized,
+            root,
+        };
+        let info = share.info();
+        let mut shares = self.shares.write().map_err(|_| DomainError::Internal {
+            detail: "share catalog lock poisoned".to_owned(),
+        })?;
+        shares.insert(id, Arc::new(share));
+        Ok(info)
+    }
+
+    pub fn update_share_permissions(
+        &self,
+        share_id: &str,
+        permissions: SharePermissions,
+    ) -> Result<ShareInfo, DomainError> {
+        let mut shares = self.shares.write().map_err(|_| DomainError::Internal {
+            detail: "share catalog lock poisoned".to_owned(),
+        })?;
+        let share = shares
+            .get_mut(share_id)
+            .ok_or_else(|| DomainError::ShareNotFound {
+                id: share_id.to_owned(),
+            })?;
+        self.vault.update_share_permissions(share_id, permissions)?;
+        if let Some(existing) = Arc::get_mut(share) {
+            existing.permissions = permissions;
+        } else {
+            let mut updated = (**share).clone();
+            updated.permissions = permissions;
+            *share = Arc::new(updated);
+        }
+        Ok(share.info())
+    }
+
+    pub fn set_share_rules(
+        &self,
+        share_id: &str,
+        rules: &[AccessRule],
+    ) -> Result<ShareInfo, DomainError> {
+        let normalized = crate::policy::normalize_rules(rules)?;
+        let compiled = compile_rules(&normalized)?;
+        let record_rules = normalized
+            .iter()
+            .map(|rule| crate::types::ShareRuleRecord {
+                kind: rule.kind,
+                matcher: rule.matcher.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut shares = self.shares.write().map_err(|_| DomainError::Internal {
+            detail: "share catalog lock poisoned".to_owned(),
+        })?;
+        let share = shares
+            .get_mut(share_id)
+            .ok_or_else(|| DomainError::ShareNotFound {
+                id: share_id.to_owned(),
+            })?;
+        self.vault.set_share_rules(share_id, &record_rules)?;
+        let mut updated = (**share).clone();
+        updated.rules = compiled;
+        updated.display_rules = normalized;
+        *share = Arc::new(updated);
+        Ok(share.info())
+    }
+
+    pub fn delete_share(&self, share_id: &str) -> Result<(), DomainError> {
+        self.vault.delete_share(share_id)?;
+        match self.shares.write() {
+            Ok(mut shares) => {
+                shares.remove(share_id);
+            }
+            Err(_) => publish_error(
+                self.events.as_ref(),
+                &DomainError::Internal {
+                    detail: "share catalog lock poisoned after delete".to_owned(),
+                },
+            ),
+        }
+        match self.pending.lock() {
+            Ok(mut pending) => {
+                pending.retain(|request| request.share_id != share_id);
+            }
+            Err(_) => publish_error(
+                self.events.as_ref(),
+                &DomainError::Internal {
+                    detail: "pending request lock poisoned after delete".to_owned(),
+                },
+            ),
+        }
+        Ok(())
+    }
+
+    /// Approves a pending client and returns the plaintext code exactly once.
+    pub fn approve_pending(&self, request_id: &str) -> Result<ApprovePendingResult, DomainError> {
+        let mut pending = self.pending.lock().map_err(|_| DomainError::Internal {
+            detail: "pending request lock poisoned".to_owned(),
+        })?;
+        let position = pending
+            .iter()
+            .position(|request| request.id == request_id)
+            .ok_or_else(|| DomainError::PendingRequestNotFound {
+                id: request_id.to_owned(),
+            })?;
+        let request = pending[position].clone();
+
+        let code = random_hex(32);
+        let hash = hash_code(&code);
+        let label = format!("{} ({})", request.peer_ip, request.share_name);
+        let authorization_id = random_hex(8);
+        let record = self
+            .vault
+            .add_authorization(&authorization_id, &label, &hex::encode(hash))?;
+
+        let mut authorizations =
+            self.authorizations
+                .write()
+                .map_err(|_| DomainError::Internal {
+                    detail: "authorization catalog lock poisoned".to_owned(),
+                })?;
+        authorizations.push(AuthEntry {
+            info: AuthorizationInfo {
+                id: record.id,
+                label: record.label,
+                created_at: record.created_at,
+            },
+            hash,
+        });
+        pending.remove(position);
+
+        let info = authorizations
+            .last()
+            .map(|entry| entry.info.clone())
+            .ok_or_else(|| DomainError::Internal {
+                detail: "authorization was not inserted".to_owned(),
+            })?;
+        Ok(ApprovePendingResult {
+            authorization_code: code,
+            authorization: info,
+        })
+    }
+
+    pub fn revoke_authorization(&self, authorization_id: &str) -> Result<(), DomainError> {
+        self.vault.revoke_authorization(authorization_id)?;
+        let mut authorizations =
+            self.authorizations
+                .write()
+                .map_err(|_| DomainError::Internal {
+                    detail: "authorization catalog lock poisoned".to_owned(),
+                })?;
+        authorizations.retain(|entry| entry.info.id != authorization_id);
+        Ok(())
+    }
+}
+
+fn validate_share_name(name: &str) -> Result<(), DomainError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 128 || trimmed.chars().any(char::is_control)
+    {
+        return Err(DomainError::InvalidShareConfig {
+            detail: "share name must be 1-128 characters without control codes".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn compile_rules(rules: &[AccessRule]) -> Result<Vec<CompiledRule>, DomainError> {
+    rules.iter().map(compile_rule).collect()
+}
+
+fn load_share(record: crate::types::ShareRecord) -> Result<ShareConfig, DomainError> {
+    let rules = record
+        .rules
+        .iter()
+        .map(|rule| AccessRule {
+            kind: rule.kind,
+            matcher: rule.matcher.clone(),
+        })
+        .collect::<Vec<_>>();
+    let compiled = compile_rules(&rules)?;
+    let root = Arc::new(ShareRoot::open(std::path::Path::new(&record.root_path))?);
+    Ok(ShareConfig {
+        id: record.id,
+        name: record.name,
+        root_path: record.root_path.into(),
+        permissions: record.permissions,
+        rules: compiled,
+        display_rules: rules,
+        root,
+    })
+}
+
+fn load_authorization(
+    record: &crate::types::AuthorizationRecord,
+) -> Result<AuthEntry, DomainError> {
+    let bytes = hex::decode(&record.code_hash).map_err(|error| DomainError::Corrupted {
+        detail: format!("authorization hash is not valid hex: {error}"),
+    })?;
+    let hash: [u8; 32] = bytes.try_into().map_err(|_| DomainError::Corrupted {
+        detail: "authorization hash has the wrong length".to_owned(),
+    })?;
+    Ok(AuthEntry {
+        info: AuthorizationInfo {
+            id: record.id.clone(),
+            label: record.label.clone(),
+            created_at: record.created_at,
+        },
+        hash,
+    })
+}
+
+async fn run_server(
+    listener: TcpListener,
+    handler: DavHandler<RequestCredentials>,
+    gate: Arc<Gate>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    let mut connections = JoinSet::new();
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, peer)) => {
+                        let handler = handler.clone();
+                        let gate = Arc::clone(&gate);
+                        connections.spawn(async move {
+                            let io = TokioIo::new(stream);
+                            let service = service_fn(move |request: Request<Incoming>| {
+                                let handler = handler.clone();
+                                let gate = Arc::clone(&gate);
+                                async move {
+                                    Ok::<Response<Body>, Infallible>(
+                                        handle_request(request, peer, gate, handler).await,
+                                    )
+                                }
+                            });
+                            if let Err(error) = http1::Builder::new()
+                                .serve_connection(io, service)
+                                .await
+                            {
+                                log::debug!("peerdav.server connection closed: {error}");
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        publish_error(
+                            gate.events.as_ref(),
+                            &DomainError::ServerTask {
+                                detail: format!("accept failed: {error}"),
+                            },
+                        );
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+            joined = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = joined
+                    && !error.is_cancelled()
+                {
+                    publish_error(
+                        gate.events.as_ref(),
+                        &DomainError::ServerTask {
+                            detail: error.to_string(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    connections.shutdown().await;
+}
+
+async fn handle_request(
+    request: Request<Incoming>,
+    peer: SocketAddr,
+    gate: Arc<Gate>,
+    handler: DavHandler<RequestCredentials>,
+) -> Response<Body> {
+    if request.method() == Method::OPTIONS {
+        return options_response();
+    }
+    if request.method().as_str() == "PROPPATCH" {
+        return empty_response(StatusCode::NOT_IMPLEMENTED);
+    }
+    if request.uri().path() == CATALOG_PATH {
+        return handle_catalog(request, peer, gate).await;
+    }
+
+    // `DavPath` keeps malformed escapes as literal text; the gateway must not
+    // turn an invalid request target into a pending approval.
+    if !valid_percent_encoding(request.uri().path()) {
+        log::warn!("peerdav.server rejected request with invalid percent encoding");
+        return empty_response(StatusCode::BAD_REQUEST);
+    }
+
+    let path = match DavPath::new(request.uri().path()) {
+        Ok(path) => path,
+        Err(error) => {
+            log::warn!("peerdav.server invalid request path: {error:?}");
+            return empty_response(StatusCode::BAD_REQUEST);
+        }
+    };
+    let Some((share_id, relative)) = split_share_path(&path) else {
+        return empty_response(StatusCode::NOT_FOUND);
+    };
+
+    let share = match gate.shares.read() {
+        Ok(shares) => shares.get(&share_id).cloned(),
+        Err(_) => {
+            publish_error(
+                gate.events.as_ref(),
+                &DomainError::Internal {
+                    detail: "share catalog lock poisoned".to_owned(),
+                },
+            );
+            return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+    let Some(share) = share else {
+        return empty_response(StatusCode::NOT_FOUND);
+    };
+
+    // MAC lookup is intentionally not implemented yet: a missing MAC must not
+    // grant access, and MAC rules simply do not match.
+    let policy_peer = PeerContext {
+        ip: canonical_ip(peer.ip()),
+        mac: None,
+    };
+    if evaluate(&share.rules, &policy_peer) == PolicyDecision::Deny {
+        log::info!(
+            "peerdav.server denied peer {} for share {} by network policy",
+            peer.ip(),
+            share.id
+        );
+        return empty_response(StatusCode::FORBIDDEN);
+    }
+
+    let token = auth_token(request.headers());
+    let authorization = token.and_then(|token| {
+        let hash = hash_code(&token);
+        find_authorization(&gate, &hash)
+    });
+
+    let Some(authorization) = authorization else {
+        // Only read-style discovery on a structurally valid, in-share target
+        // may ask an administrator for a code. Unknown/unrelated methods,
+        // non-share paths, malformed targets, and traversal are rejected
+        // above without touching the pending queue.
+        if pending_eligible_method(request.method())
+            && let Some(requested_path) = pending_target(&relative)
+        {
+            record_pending(&gate, &share, peer, &requested_path);
+        }
+        return auth_challenge();
+    };
+
+    let Some(required) = required_for_method(request.method()) else {
+        return method_not_allowed();
+    };
+    if !required.is_met_by(share.permissions) {
+        log::info!(
+            "peerdav.server denied {} on share {}: permissions {:?}",
+            request.method(),
+            share.id,
+            share.permissions
+        );
+        return empty_response(StatusCode::FORBIDDEN);
+    }
+
+    let credentials = RequestCredentials {
+        share_id: share.id.clone(),
+        permissions: share.permissions,
+    };
+    handler
+        .handle_guarded(request, format!("auth:{authorization}"), credentials)
+        .await
+}
+
+/// Authenticated catalog used by the PeerDav client. It only lists shares the
+/// peer is allowed to reach by network policy, and never exposes local paths.
+/// An unauthenticated request records a pending approval against the first
+/// allowed share, which is how a self-connecting client asks an administrator
+/// for a code.
+async fn handle_catalog(
+    request: Request<Incoming>,
+    peer: SocketAddr,
+    gate: Arc<Gate>,
+) -> Response<Body> {
+    if request.method() != Method::GET {
+        return method_not_allowed();
+    }
+
+    let peer_context = PeerContext {
+        ip: canonical_ip(peer.ip()),
+        mac: None,
+    };
+    let allowed: Vec<Arc<ShareConfig>> = match gate.shares.read() {
+        Ok(shares) => {
+            let mut allowed: Vec<Arc<ShareConfig>> = shares
+                .values()
+                .filter(|share| evaluate(&share.rules, &peer_context) == PolicyDecision::Allow)
+                .cloned()
+                .collect();
+            allowed.sort_by(|left, right| left.name.cmp(&right.name));
+            allowed
+        }
+        Err(_) => {
+            publish_error(
+                gate.events.as_ref(),
+                &DomainError::Internal {
+                    detail: "share catalog lock poisoned".to_owned(),
+                },
+            );
+            return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    if allowed.is_empty() {
+        log::info!(
+            "peerdav.server catalog denied peer {}: no share allows it",
+            peer.ip()
+        );
+        return empty_response(StatusCode::FORBIDDEN);
+    }
+
+    let authorized = auth_token(request.headers())
+        .and_then(|token| find_authorization(&gate, &hash_code(&token)));
+    if authorized.is_none() {
+        record_pending(&gate, &allowed[0], peer, "");
+        return auth_challenge();
+    }
+
+    let shares = allowed
+        .iter()
+        .map(|share| PeerShare {
+            id: share.id.clone(),
+            name: share.name.clone(),
+            permissions: share.permissions,
+        })
+        .collect();
+    let catalog = CatalogResponse {
+        protocol: CATALOG_PROTOCOL.to_owned(),
+        server_name: gate.server_name.clone(),
+        shares,
+    };
+    match serde_json::to_vec(&catalog) {
+        Ok(body) => json_response(&body),
+        Err(error) => {
+            publish_error(
+                gate.events.as_ref(),
+                &DomainError::Serialization {
+                    operation: "serialize catalog",
+                    source: error,
+                },
+            );
+            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+fn find_authorization(gate: &Gate, hash: &[u8; 32]) -> Option<String> {
+    match gate.authorizations.read() {
+        Ok(authorizations) => authorizations
+            .iter()
+            .find(|entry| constant_time_eq(&entry.hash, hash))
+            .map(|entry| entry.info.id.clone()),
+        Err(_) => {
+            publish_error(
+                gate.events.as_ref(),
+                &DomainError::Internal {
+                    detail: "authorization catalog lock poisoned".to_owned(),
+                },
+            );
+            None
+        }
+    }
+}
+
+/// Methods that may ask an administrator for a code. Only discovery-style
+/// reads qualify; mutations must first obtain a code through one of these
+/// paths (or the catalog).
+fn pending_eligible_method(method: &Method) -> bool {
+    matches!(method.as_str(), "GET" | "PROPFIND")
+}
+
+/// Checks percent escapes in the raw request target. `DavPath` deliberately
+/// treats malformed escapes as literal bytes, so this gate performs the
+/// rejection before anything can be recorded as a pending request.
+fn valid_percent_encoding(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let (Some(high), Some(low)) = (bytes.get(index + 1), bytes.get(index + 2)) else {
+                return false;
+            };
+            if !high.is_ascii_hexdigit() || !low.is_ascii_hexdigit() {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
+}
+
+/// Renders the normalized share-relative target for a pending request, or
+/// `None` when it is not a safe in-share path.
+///
+/// Existence is deliberately not checked: WebDAV clients routinely PROPFIND
+/// a missing path before creating it, and the gate must keep the same virtual
+/// directory semantics as `DavHandler`.
+fn pending_target(relative: &std::path::Path) -> Option<String> {
+    use std::path::Component;
+
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    if relative
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .any(|byte| *byte < 0x20 || *byte == 0x7f)
+    {
+        return None;
+    }
+
+    let mut rendered = relative.to_string_lossy().into_owned();
+    if rendered.chars().count() > MAX_PENDING_PATH_CHARS {
+        rendered = rendered.chars().take(MAX_PENDING_PATH_CHARS).collect();
+    }
+    Some(rendered)
+}
+
+fn next_attempt_count(attempts: u32) -> u32 {
+    attempts.saturating_add(1).min(MAX_PENDING_ATTEMPTS)
+}
+
+fn record_pending(gate: &Gate, share: &ShareConfig, peer: SocketAddr, requested_path: &str) {
+    let now = now_unix();
+    let peer_ip = canonical_ip(peer.ip()).to_string();
+
+    let mut pending = match gate.pending.lock() {
+        Ok(pending) => pending,
+        Err(_) => {
+            publish_error(
+                gate.events.as_ref(),
+                &DomainError::Internal {
+                    detail: "pending request lock poisoned".to_owned(),
+                },
+            );
+            return;
+        }
+    };
+
+    if let Some(existing) = pending.iter_mut().find(|request| {
+        request.share_id == share.id && request.peer_ip == peer_ip && request.peer_mac.is_none()
+    }) {
+        existing.last_seen = now;
+        existing.attempts = next_attempt_count(existing.attempts);
+        existing.requested_path = requested_path.to_owned();
+        return;
+    }
+
+    if pending.len() >= MAX_PENDING_REQUESTS {
+        log::warn!("peerdav.server pending request list is full; ignoring new peer");
+        return;
+    }
+
+    let request = PendingRequestInfo {
+        id: random_hex(8),
+        share_id: share.id.clone(),
+        share_name: share.name.clone(),
+        peer_ip,
+        peer_mac: None,
+        requested_path: requested_path.to_owned(),
+        first_seen: now,
+        last_seen: now,
+        attempts: 1,
+    };
+    pending.push(request.clone());
+    drop(pending);
+    gate.events.pending_request(&request);
+}
+
+fn options_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("DAV", "1, 2")
+        .header(
+            "Allow",
+            "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL, COPY, MOVE, LOCK, UNLOCK",
+        )
+        .header("Server", SERVER_AGENT)
+        .header(CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn auth_challenge() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(WWW_AUTHENTICATE, AUTH_CHALLENGE)
+        .header(CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn method_not_allowed() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header(
+            "Allow",
+            "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL, COPY, MOVE, LOCK, UNLOCK",
+        )
+        .header(CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn empty_response(status: StatusCode) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn json_response(body: &[u8]) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, body.len())
+        .body(Body::from(bytes::Bytes::from(body.to_vec())))
+        .unwrap_or_else(|_| empty_response(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+/// Extracts a share authorization code from `Authorization`. Basic auth uses
+/// the password as the code; when it is empty the username is used, matching
+/// the share-token convention. Bearer tokens are accepted as well.
+fn auth_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?.trim();
+    let (scheme, credentials) = value.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("basic") {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(credentials.trim())
+            .ok()?;
+        let decoded = String::from_utf8(decoded).ok()?;
+        let (username, password) = decoded.split_once(':')?;
+        let token = if password.is_empty() {
+            username
+        } else {
+            password
+        };
+        if token.is_empty() {
+            return None;
+        }
+        return Some(token.to_owned());
+    }
+    if scheme.eq_ignore_ascii_case("bearer") {
+        let token = credentials.trim();
+        if token.is_empty() {
+            return None;
+        }
+        return Some(token.to_owned());
+    }
+    None
+}
+
+fn hash_code(code: &str) -> [u8; 32] {
+    Sha256::digest(code.as_bytes()).into()
+}
+
+fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut difference = 0_u8;
+    for (left, right) in left.iter().zip(right.iter()) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
+fn random_hex(bytes: usize) -> String {
+    let mut buffer = vec![0_u8; bytes];
+    OsRng.fill_bytes(&mut buffer);
+    hex::encode(buffer)
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct RecordingEvents {
+        errors: StdMutex<Vec<AppError>>,
+        pending: StdMutex<Vec<PendingRequestInfo>>,
+    }
+
+    impl ServerEvents for RecordingEvents {
+        fn error(&self, error: &AppError) {
+            self.errors.lock().expect("errors lock").push(error.clone());
+        }
+
+        fn pending_request(&self, request: &PendingRequestInfo) {
+            self.pending
+                .lock()
+                .expect("pending lock")
+                .push(request.clone());
+        }
+    }
+
+    #[test]
+    fn publish_error_uses_the_shared_structured_payload() {
+        let events = RecordingEvents::default();
+        publish_error(&events, &DomainError::ServerAlreadyRunning);
+
+        let errors = events.errors.lock().expect("errors");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, "SERVER_ALREADY_RUNNING");
+        assert!(errors[0].message.contains("服务已在运行"));
+        assert!(errors[0].message.contains("already running"));
+        assert!(errors[0].detail.is_some());
+    }
+
+    #[test]
+    fn token_extraction_supports_basic_bearer_and_share_tokens() {
+        let basic = basic_header("peerdav", "code123");
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, basic);
+        assert_eq!(auth_token(&headers).as_deref(), Some("code123"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer plain-code"),
+        );
+        assert_eq!(auth_token(&headers).as_deref(), Some("plain-code"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, basic_header("username-only", ""));
+        assert_eq!(auth_token(&headers).as_deref(), Some("username-only"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, http::HeaderValue::from_static("Digest x"));
+        assert!(auth_token(&headers).is_none());
+    }
+
+    fn basic_header(username: &str, password: &str) -> http::HeaderValue {
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+        http::HeaderValue::from_str(&format!("Basic {encoded}")).expect("header")
+    }
+
+    #[test]
+    fn authorization_hashes_compare_in_constant_time_shape() {
+        let hash = hash_code("abc");
+        assert!(constant_time_eq(&hash, &hash_code("abc")));
+        assert!(!constant_time_eq(&hash, &hash_code("abd")));
+    }
+
+    #[test]
+    fn malformed_percent_escapes_are_rejected() {
+        assert!(valid_percent_encoding("/share/id/a%20b.txt"));
+        assert!(valid_percent_encoding("/share/id/100%25"));
+        assert!(!valid_percent_encoding("/share/id/%zz"));
+        assert!(!valid_percent_encoding("/share/id/%2"));
+        assert!(!valid_percent_encoding("/share/id/%"));
+    }
+
+    #[test]
+    fn pending_targets_stay_inside_the_share_and_are_bounded() {
+        assert_eq!(
+            pending_target(std::path::Path::new("")).as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            pending_target(std::path::Path::new("a/b.txt")).as_deref(),
+            Some("a/b.txt")
+        );
+        assert!(pending_target(std::path::Path::new("../escape")).is_none());
+        assert!(pending_target(std::path::Path::new("bad\nname")).is_none());
+
+        let long = "a".repeat(MAX_PENDING_PATH_CHARS + 64);
+        let rendered = pending_target(std::path::Path::new(&long)).expect("long target");
+        assert_eq!(rendered.chars().count(), MAX_PENDING_PATH_CHARS);
+    }
+
+    #[test]
+    fn pending_attempts_are_capped() {
+        assert_eq!(next_attempt_count(0), 1);
+        assert_eq!(
+            next_attempt_count(MAX_PENDING_ATTEMPTS - 1),
+            MAX_PENDING_ATTEMPTS
+        );
+        assert_eq!(
+            next_attempt_count(MAX_PENDING_ATTEMPTS),
+            MAX_PENDING_ATTEMPTS
+        );
+        assert_eq!(next_attempt_count(u32::MAX), MAX_PENDING_ATTEMPTS);
+    }
+}

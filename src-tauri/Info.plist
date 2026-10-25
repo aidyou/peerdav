@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+		PeerDav provides and consumes WebDAV over the local network and uses
+		directed UDP broadcast for discovery (see src-tauri/src/discovery.rs:
+		custom JSON datagrams on UDP 4919). It does not use Bonjour/mDNS, so no
+		NSBonjourServices entries are declared. Declaring a service type that is
+		never advertised would be fabricated and would not enable anything.
+	-->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>PeerDav 需要访问本地网络，以便在局域网内提供并连接 WebDAV 文件共享服务。</string>
+</dict>
+</plist>
