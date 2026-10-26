@@ -1,14 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 
-const { windowMock, eventHandlers } = vi.hoisted(() => ({
-  windowMock: {
+const { windowMock, eventHandlers, resizeHandlers } = vi.hoisted(() => {
+  const eventHandlers = new Map();
+  const resizeHandlers = new Set();
+  const windowMock = {
     close: vi.fn(),
     minimize: vi.fn(),
     toggleMaximize: vi.fn(),
-  },
-  eventHandlers: new Map(),
-}));
+    isMaximized: vi.fn(async () => false),
+    onResized: vi.fn(async (handler) => {
+      resizeHandlers.add(handler);
+      return () => resizeHandlers.delete(handler);
+    }),
+  };
+  return { windowMock, eventHandlers, resizeHandlers };
+});
 
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async (event, handler) => {
@@ -550,11 +557,8 @@ describe("share management", () => {
       update_share_permissions: async () => SHARE,
       set_share_rules: async () => SHARE,
     });
-    await signIn(wrapper);
+    await signIn(wrapper, "admin-secret");
 
-    await wrapper
-      .find('input[type="password"][autocomplete="current-password"]')
-      .setValue("admin-secret");
     expect(wrapper.text()).toContain("Docs");
 
     await clickButton(wrapper, "编辑");
@@ -601,13 +605,18 @@ describe("share management", () => {
     wrapper.unmount();
   });
 
-  it("places the directory first, derives its name, and defaults allow rules to the local subnet", async () => {
+  it("opens the create form from the header and derives the name from the directory", async () => {
     const createShare = vi.fn(async (args) => args);
     const wrapper = await mountReady({
       local_networks: async () => ["10.0.5.0/24"],
       create_share: createShare,
     });
     await signIn(wrapper);
+    await flushPromises();
+
+    // The create form stays hidden until the header add button is used.
+    expect(wrapper.find("#pane-shares form").exists()).toBe(false);
+    await wrapper.find('[aria-label="创建共享"]').trigger("click");
     await flushPromises();
 
     const form = wrapper.find("#pane-shares form");
@@ -624,16 +633,13 @@ describe("share management", () => {
     await form.trigger("submit");
     await flushPromises();
 
+    // Detected networks are offered as choices but never preselected, so a new
+    // share starts with no access rules until the user picks them.
     expect(createShare).toHaveBeenCalledWith(
       expect.objectContaining({
         name: "peerdav-keys",
         rootPath: "/tmp/peerdav-keys",
-        rules: [
-          {
-            kind: "allow",
-            matcher: { type: "network", value: "10.0.5.0/24" },
-          },
-        ],
+        rules: [],
       }),
     );
 
@@ -662,11 +668,54 @@ describe("home workspace", () => {
     expect(wrapper.text()).toContain("Office");
     expect(wrapper.text()).toContain("http://192.168.1.10:4918");
 
-    await wrapper.find("button.server-card").trigger("click");
+    await wrapper.find("button.server-row__main").trigger("click");
     await flushPromises();
 
     expect(wrapper.find(".peer-browser").exists()).toBe(true);
     expect(wrapper.text()).toContain("这个文件夹是空的。");
+
+    wrapper.unmount();
+  });
+
+  it("reads each connected server's live share count for the home cards", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    const wrapper = await mountReady({
+      admin_session: async () => ({
+        username: "admin",
+        mustChangePassword: false,
+      }),
+      list_peers: async () => [PEER],
+      list_peer_shares: async () => [{ id: "a" }, { id: "b" }, { id: "c" }],
+    });
+    await flushPromises();
+
+    expect(wrapper.find(".server-row__count strong").text()).toBe("3");
+
+    wrapper.unmount();
+  });
+
+  it("shows a dash instead of a misleading zero when a peer is offline", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const wrapper = await mountReady({
+      admin_session: async () => ({
+        username: "admin",
+        mustChangePassword: false,
+      }),
+      list_peers: async () => [PEER],
+      list_peer_shares: async () => {
+        throw {
+          code: "PEER_REQUEST_FAILED",
+          message: "offline",
+          detail: null,
+          context: null,
+        };
+      },
+    });
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("—");
+    warnSpy.mockRestore();
 
     wrapper.unmount();
   });
@@ -779,7 +828,7 @@ describe("home workspace", () => {
 
     expect(wrapper.text()).toContain("局域网中的服务器");
     expect(wrapper.text()).toContain("Lab");
-    expect(wrapper.text()).toContain("2 个共享");
+    expect(wrapper.find(".server-row__count strong").text()).toBe("2");
 
     savedPeers = [PEER];
     await clickButton(wrapper, "申请访问");
@@ -1014,7 +1063,7 @@ describe("Finder-style peer browser", () => {
       ...overrides,
     });
     await flushPromises();
-    await wrapper.find("button.server-card").trigger("click");
+    await wrapper.find("button.server-row__main").trigger("click");
     await flushPromises();
     return { wrapper, downloadTo };
   }
@@ -1917,6 +1966,13 @@ describe("admin session restore", () => {
     invoke.mockReset();
   });
 
+  it("squares the window corners when the window is maximized", async () => {
+    windowMock.isMaximized.mockResolvedValueOnce(true);
+    const wrapper = await mountReady();
+    expect(wrapper.find(".window-frame").classes()).toContain("is-maximized");
+    wrapper.unmount();
+  });
+
   it("restores the signed-in admin after a reload", async () => {
     const wrapper = await mountReady({
       admin_session: async () => ({
@@ -1926,10 +1982,7 @@ describe("admin session restore", () => {
     });
 
     expect(wrapper.text()).not.toContain("管理员登录");
-    expect(wrapper.text()).toContain("首页");
-    expect(wrapper.text()).toContain(
-      "浏览已连接的服务器，或在局域网中申请新的访问。",
-    );
+    expect(wrapper.text()).toContain("局域网中的服务器");
 
     wrapper.unmount();
   });
@@ -1940,7 +1993,7 @@ describe("admin session restore", () => {
     const wrapper = await mountReady();
     await signIn(wrapper);
 
-    expect(wrapper.text()).toContain("首页");
+    expect(wrapper.text()).toContain("局域网中的服务器");
     expect(wrapper.text()).not.toContain("当前管理员");
     expect(document.body.textContent).toContain("管理员登录成功。");
 
@@ -1951,7 +2004,7 @@ describe("admin session restore", () => {
     const wrapper = await mountReady();
     await signIn(wrapper);
 
-    expect(wrapper.text()).toContain("当前管理员");
+    expect(wrapper.find("#pane-shares").exists()).toBe(true);
     expect(localStorage.getItem(SETTINGS_SEEN_STORAGE_KEY)).toBe("1");
 
     wrapper.unmount();

@@ -29,6 +29,7 @@ const status = ref({
 });
 const showQuitDialog = ref(false);
 const isMacOS = /Macintosh|Mac OS X/.test(navigator.userAgent);
+const isMaximized = ref(false);
 
 const languageItems = computed(() => [
   { value: "zh-CN", label: t("language.zh"), lang: "zh-CN" },
@@ -132,11 +133,12 @@ function clearTransfer(transferId) {
 
 onMounted(async () => {
   await bindServerEvents();
+  await bindWindowState();
   await refreshStatus();
+  await refreshPeers();
   await restoreAdminSession();
   await refreshServerStatus();
   await resumeServer();
-  await refreshPeers();
   void syncPeers();
 });
 
@@ -148,6 +150,37 @@ onUnmounted(() => {
   activeToast?.close();
   activeToast = null;
 });
+
+/// Tracks the OS window's maximized state so the rounded transparent frame can
+/// drop its corner radius when the window fills the screen. A maximized window
+/// keeps its square bounds, so the rounded corners would otherwise expose the
+/// transparent gap at each screen edge. The resize listener and its initial read
+/// are wrapped in try/catch: outside a Tauri runtime (e.g. tests) these window
+/// APIs are unavailable and the frame simply keeps its normal rounded state.
+async function bindWindowState() {
+  const win = getCurrentWindow();
+  try {
+    isMaximized.value = await win.isMaximized();
+  } catch (error) {
+    console.warn("PeerDav window maximize state is unavailable", error);
+    return;
+  }
+  try {
+    const unlisten = await win.onResized(() => {
+      void win
+        .isMaximized()
+        .then((value) => {
+          isMaximized.value = value;
+        })
+        .catch((error) =>
+          console.warn("PeerDav maximize state refresh failed", error),
+        );
+    });
+    eventUnlisten.push(unlisten);
+  } catch (error) {
+    console.warn("PeerDav window resize listener is unavailable", error);
+  }
+}
 
 function runWindowAction(action) {
   return Promise.resolve()
@@ -488,7 +521,7 @@ provide(
 </script>
 
 <template>
-  <div class="window-frame">
+  <div class="window-frame" :class="{ 'is-maximized': isMaximized }">
     <header
       class="titlebar"
       :class="{ 'titlebar--win': !isMacOS }"
@@ -634,7 +667,10 @@ provide(
         />
         <div
           class="workspace-content"
-          :class="{ 'workspace-content--browser': workspaceView === 'peer' }"
+          :class="{
+            'workspace-content--browser': workspaceView === 'peer',
+            'workspace-content--fluid': workspaceView === 'home',
+          }"
         >
           <HomeView v-if="workspaceView === 'home'" />
           <PeerBrowser
@@ -699,6 +735,18 @@ provide(
     ),
     var(--app-bg-solid);
   box-shadow: 0 18px 48px rgba(22, 32, 46, 0.18);
+}
+
+/* A maximized window fills the screen, so the rounded frame and its drop
+   shadow no longer apply: keep the corners square and flush to the edges. */
+.window-frame.is-maximized {
+  border-radius: 0;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.window-frame.is-maximized .titlebar {
+  border-radius: 0;
 }
 
 .titlebar {
@@ -852,8 +900,15 @@ provide(
   flex: 1;
   min-width: 0;
   overflow-y: auto;
-  padding: 24px max(20px, calc((100% - 820px) / 2)) 24px;
+  padding: 24px max(20px, calc((100% - 1040px) / 2)) 24px;
   box-sizing: border-box;
+}
+
+/* Home is a browse surface, so it follows Apple's fluid desktop layout: content
+   fills the available width and the server grid adds columns as the window
+   grows. Settings keeps the centered reading width above. */
+.workspace-content.workspace-content--fluid {
+  padding: 24px clamp(20px, 4vw, 56px);
 }
 
 /* The browser owns its internal scrolling; this pane must not add a second

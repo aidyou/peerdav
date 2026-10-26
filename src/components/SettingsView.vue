@@ -44,6 +44,7 @@ const shareCanRead = ref(true);
 const shareCanWrite = ref(true);
 const shareCanDelete = ref(false);
 const editingShareId = ref("");
+const showShareForm = ref(false);
 
 const lanServers = ref([]);
 const lanScanned = ref(false);
@@ -122,7 +123,7 @@ function resetShareForm() {
   editingShareId.value = "";
   shareName.value = "";
   shareRoot.value = "";
-  shareAllow.value = [...defaultAllowRules.value];
+  shareAllow.value = [];
   shareDeny.value = [];
   shareCanRead.value = true;
   shareCanWrite.value = true;
@@ -142,10 +143,17 @@ function editShare(share) {
   shareCanRead.value = share.permissions.canRead;
   shareCanWrite.value = share.permissions.canWrite;
   shareCanDelete.value = share.permissions.canDelete;
+  showShareForm.value = true;
 }
 
 function cancelShareEdit() {
   resetShareForm();
+  showShareForm.value = false;
+}
+
+function openNewShareForm() {
+  resetShareForm();
+  showShareForm.value = true;
 }
 
 function effectiveShareName() {
@@ -178,20 +186,9 @@ async function loadLocalNetworks() {
   try {
     const networks = await app.invoke("local_networks");
     defaultAllowRules.value = networks;
-    if (!editingShareId.value && !shareAllow.value.length) {
-      shareAllow.value = [...networks];
-    }
   } catch (error) {
     app.handleFailure(error);
   }
-}
-
-function describePermissions(permissions) {
-  const labels = [];
-  if (permissions.canRead) labels.push(t("permissions.read"));
-  if (permissions.canWrite) labels.push(t("permissions.write"));
-  if (permissions.canDelete) labels.push(t("permissions.delete"));
-  return labels.length ? labels.join(" · ") : t("permissions.none");
 }
 
 function describeRule(rule) {
@@ -204,6 +201,8 @@ function describeRule(rule) {
   }
   return `${kind} · ${type} · ${rule.matcher.value}`;
 }
+
+const activeShareIds = ref([]);
 
 async function refreshAdminData() {
   await run(loadAdminData);
@@ -265,6 +264,7 @@ async function saveShare() {
       app.setNotice("shares.created");
     }
     resetShareForm();
+    showShareForm.value = false;
     await loadAdminData();
   });
 }
@@ -500,26 +500,6 @@ async function loadInitialData() {
 
 <template>
   <div class="settings-view">
-    <header class="settings-header">
-      <div>
-        <h1>{{ t("settings.title") }}</h1>
-        <p class="hint">
-          {{ t("signedIn.current") }}:
-          <strong class="mono">{{ app.adminUsername }}</strong>
-        </p>
-      </div>
-      <label class="settings-secret">
-        <span>{{ t("settings.adminPassword") }}</span>
-        <el-input
-          v-model="app.serverPassword"
-          type="password"
-          show-password
-          autocomplete="current-password"
-          :placeholder="t('server.needPassword')"
-        />
-      </label>
-    </header>
-
     <nav class="settings-tabbar" role="tablist" :aria-label="t('settings.title')">
       <button
         v-for="tab in settingsTabs"
@@ -629,71 +609,121 @@ async function loadInitialData() {
         aria-labelledby="tab-shares"
       >
         <div class="server-panel">
-          <h3>{{ t("shares.title") }}</h3>
-          <ul class="list">
-            <li v-for="share in shares" :key="share.id">
-              <div>
-                <strong>{{ share.name }}</strong>
-                <div class="hint mono">{{ share.rootPath }}</div>
-                <div class="hint">
-                  {{ describePermissions(share.permissions) }}
+          <div class="pane-heading">
+            <div class="pane-heading__title">
+              <h3>{{ t("shares.title") }}</h3>
+              <span class="pane-heading__badge">{{ shares.length }}</span>
+            </div>
+            <el-button
+              type="primary"
+              plain
+              size="small"
+              :aria-label="t('shares.create')"
+              @click="openNewShareForm"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true" class="pane-heading__add-icon">
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+            </el-button>
+          </div>
+          <el-collapse v-if="shares.length" v-model="activeShareIds" class="share-collapse">
+            <el-collapse-item
+              v-for="share in shares"
+              :key="share.id"
+              :name="share.id"
+            >
+              <template #title>
+                <div class="share-item__main">
+                  <span class="share-item__icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24">
+                      <path
+                        d="M3.5 7.5A2 2 0 0 1 5.5 5.5h3.6l2 2h7.4a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"
+                      />
+                    </svg>
+                  </span>
+                  <div class="share-item__title">
+                    <strong>{{ share.name }}</strong>
+                    <span class="hint mono">{{ share.rootPath }}</span>
+                  </div>
                 </div>
-                <div
+                <div class="share-item__perms">
+                  <el-checkbox :model-value="share.permissions.canRead" disabled>
+                    {{ t("permissions.read") }}
+                  </el-checkbox>
+                  <el-checkbox :model-value="share.permissions.canWrite" disabled>
+                    {{ t("permissions.write") }}
+                  </el-checkbox>
+                  <el-checkbox :model-value="share.permissions.canDelete" disabled>
+                    {{ t("permissions.delete") }}
+                  </el-checkbox>
+                </div>
+                <div class="share-item__actions" @click.stop>
+                  <el-button
+                    type="primary"
+                    plain
+                    size="small"
+                    round
+                    :disabled="busy"
+                    @click="editShare(share)"
+                  >
+                    {{ t("shares.edit") }}
+                  </el-button>
+                  <el-button
+                    type="primary"
+                    plain
+                    size="small"
+                    round
+                    :disabled="busy"
+                    @click="deleteShare(share)"
+                  >
+                    {{ t("common.delete") }}
+                  </el-button>
+                </div>
+              </template>
+              <ul v-if="share.rules.length" class="share-item__rules">
+                <li
                   v-for="(rule, index) in share.rules"
                   :key="`${share.id}-${index}`"
                   class="hint"
                 >
                   {{ describeRule(rule) }}
-                </div>
-                <div v-if="!share.rules.length" class="hint">
-                  {{ t("shares.noRules") }}
-                </div>
-              </div>
-              <div class="actions">
-                <el-button plain :disabled="busy" @click="editShare(share)">
-                  {{ t("shares.edit") }}
-                </el-button>
-                <el-button plain :disabled="busy" @click="deleteShare(share)">
-                  {{ t("common.delete") }}
-                </el-button>
-              </div>
-            </li>
-            <li v-if="!shares.length" class="hint">{{ t("shares.empty") }}</li>
-          </ul>
+                </li>
+              </ul>
+            </el-collapse-item>
+          </el-collapse>
+          <p v-else class="hint">{{ t("shares.empty") }}</p>
 
           <p v-if="editingShareId" class="hint">
             {{ t("shares.editing", { name: shareName }) }}
           </p>
-          <form class="stack" @submit.prevent="saveShare">
-            <div class="grid">
-              <label>
-                {{ t("shares.localDir") }}
-                <div class="input-with-button">
-                  <el-input
-                    v-model="shareRoot"
-                    type="text"
-                    :disabled="Boolean(editingShareId)"
-                    required
-                  />
-                  <el-button
-                    plain
-                    :disabled="busy || Boolean(editingShareId)"
-                    @click="chooseShareRoot"
-                  >
-                    {{ t("shares.chooseDir") }}
-                  </el-button>
-                </div>
-              </label>
-              <label>
-                {{ t("shares.name") }}
+          <form v-if="showShareForm" class="stack" @submit.prevent="saveShare">
+            <label>
+              {{ t("shares.localDir") }}
+              <div class="input-with-button">
                 <el-input
-                  v-model="shareName"
+                  v-model="shareRoot"
                   type="text"
                   :disabled="Boolean(editingShareId)"
-                  :placeholder="t('shares.nameOptional')"
+                  required
                 />
-              </label>
-            </div>
+                <el-button
+                  plain
+                  :disabled="busy || Boolean(editingShareId)"
+                  @click="chooseShareRoot"
+                >
+                  {{ t("shares.chooseDir") }}
+                </el-button>
+              </div>
+            </label>
+            <label>
+              {{ t("shares.name") }}
+              <el-input
+                v-model="shareName"
+                type="text"
+                :disabled="Boolean(editingShareId)"
+                :placeholder="t('shares.nameOptional')"
+              />
+            </label>
             <label>
               {{ t("shares.allowRules") }}
               <el-select
@@ -703,8 +733,17 @@ async function loadInitialData() {
                 filterable
                 allow-create
                 default-first-option
+                collapse-tags
+                collapse-tags-tooltip
                 :placeholder="t('shares.rulesPlaceholder')"
-              />
+              >
+                <el-option
+                  v-for="net in defaultAllowRules"
+                  :key="net"
+                  :label="net"
+                  :value="net"
+                />
+              </el-select>
             </label>
             <label>
               {{ t("shares.denyRules") }}
@@ -715,8 +754,17 @@ async function loadInitialData() {
                 filterable
                 allow-create
                 default-first-option
+                collapse-tags
+                collapse-tags-tooltip
                 :placeholder="t('shares.denyPlaceholder')"
-              />
+              >
+                <el-option
+                  v-for="net in defaultAllowRules"
+                  :key="net"
+                  :label="net"
+                  :value="net"
+                />
+              </el-select>
             </label>
             <p class="hint">{{ t("shares.rulesHint") }}</p>
             <div class="checks">
@@ -731,7 +779,11 @@ async function loadInitialData() {
               </el-checkbox>
             </div>
             <div class="actions">
-              <el-button type="primary" native-type="submit" :disabled="busy">
+              <el-button
+                type="primary"
+                native-type="submit"
+                :disabled="busy || !shareRoot.trim()"
+              >
                 {{ editingShareId ? t("shares.save") : t("shares.create") }}
               </el-button>
               <el-button
@@ -1063,40 +1115,10 @@ async function loadInitialData() {
   margin: 0 auto;
 }
 
-.settings-header {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 20px;
-  margin-bottom: 10px;
-}
-
-.settings-header h1 {
-  margin: 0 0 6px;
-  font-size: 22px;
-  line-height: 1.2;
-}
-
-.settings-header .hint {
-  margin: 0;
-}
-
-.settings-secret {
-  flex: none;
-  width: 240px;
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--app-text-secondary);
-}
-
 .settings-tabbar {
   display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  margin: 8px 0 18px;
+  width: fit-content;
+  margin: 8px auto 18px;
   padding: 4px;
   border: 1px solid var(--app-border);
   border-radius: 13px;
@@ -1106,7 +1128,7 @@ async function loadInitialData() {
 .settings-tab {
   border: 0;
   border-radius: 9px;
-  padding: 8px 15px;
+  padding: 8px 50px;
   background: transparent;
   color: var(--app-text-secondary);
   font: inherit;
@@ -1125,14 +1147,156 @@ async function loadInitialData() {
 }
 
 .settings-tab.is-active {
-  color: var(--app-text);
-  background: var(--app-surface);
-  box-shadow: 0 2px 8px rgba(22, 32, 46, 0.08);
+  color: #fff;
+  background: var(--el-color-primary);
+  box-shadow: 0 2px 8px color-mix(in oklab, var(--el-color-primary) 38%, transparent);
 }
 
 .settings-pane {
   display: flex;
   flex-direction: column;
+}
+
+.pane-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.pane-heading h3 {
+  margin: 0;
+}
+
+.pane-heading__title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.pane-heading__add-icon {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+}
+
+.pane-heading__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--el-color-primary);
+  background: color-mix(in oklab, var(--el-color-primary) 12%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+
+.share-collapse {
+  border-top: 0;
+}
+
+.share-collapse :deep(.el-collapse-item__header) {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr auto;
+  align-items: center;
+  gap: 16px;
+  height: auto;
+  padding: 12px 0;
+  line-height: 1.4;
+  font-size: 14px;
+  color: var(--app-text);
+}
+
+.share-collapse :deep(.el-collapse-item__arrow) {
+  margin: 0;
+}
+
+.share-collapse :deep(.el-collapse-item__content) {
+  padding-bottom: 4px;
+}
+
+.share-item__main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.share-item__icon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--el-color-primary);
+}
+
+.share-item__icon svg {
+  width: 32px;
+  height: 32px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.share-item__title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.share-item__title strong {
+  font-size: 14px;
+  color: var(--app-text);
+}
+
+.share-item__title .hint {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.share-item__perms {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.share-item__perms :deep(.el-checkbox) {
+  height: auto;
+  margin: 0;
+}
+
+.share-item__perms :deep(.el-checkbox__label) {
+  font-size: 13px;
+  color: var(--app-text-secondary);
+}
+
+.share-item__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-self: end;
+}
+
+.share-item__rules {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0 8px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .client-roles {
@@ -1306,15 +1470,6 @@ async function loadInitialData() {
 }
 
 @media (max-width: 560px) {
-  .settings-header {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .settings-secret {
-    width: 100%;
-  }
-
   .role-block__head {
     flex-direction: column;
   }

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 
 import { confirmAction } from "../lib/confirm";
 import { normalizeAppError } from "../lib/invoke";
@@ -15,6 +15,7 @@ const activeRequest = ref(null);
 const canceling = ref(false);
 const cancelRequested = ref(false);
 const removingPeerId = ref("");
+const shareCounts = ref({});
 
 const hasPeers = computed(() => app.peers.length > 0);
 const requestBusy = computed(() =>
@@ -29,6 +30,39 @@ onMounted(() => {
     void scanLan();
   }
 });
+
+/// The saved-peer list can arrive after this view mounts, so the live share
+/// counts are driven by a watcher rather than a one-shot mount check.
+watch(
+  () => app.peers.map((peer) => peer.id).join("|"),
+  (key) => {
+    if (key) void refreshShareCounts();
+  },
+  { immediate: true },
+);
+
+/// Saved peers carry no share list in the local record, so the home cards read
+/// each peer's live catalog to show a real count. An offline or unauthorized
+/// peer falls back to a dash rather than a misleading zero.
+async function refreshShareCounts() {
+  const results = await Promise.all(
+    app.peers.map(async (peer) => {
+      try {
+        const shares = await app.invoke("list_peer_shares", { peerId: peer.id });
+        return [peer.id, shares.length];
+      } catch (error) {
+        console.warn(`PeerDav share count unavailable for ${peer.id}`, error);
+        return [peer.id, null];
+      }
+    }),
+  );
+  shareCounts.value = Object.fromEntries(results);
+}
+
+function peerCount(peer) {
+  const count = shareCounts.value[peer.id];
+  return typeof count === "number" ? count : null;
+}
 
 async function scanLan() {
   if (scanState.value === "scanning") return;
@@ -191,135 +225,156 @@ async function forgetPeer(peer) {
 
 <template>
   <div class="home-view">
-    <section class="home-hero">
-      <div class="home-hero__copy">
-        <p class="home-eyebrow">{{ t("home.eyebrow") }}</p>
-        <h1>{{ t("home.title") }}</h1>
-        <p class="home-subtitle">{{ t("home.subtitle") }}</p>
-      </div>
-      <div class="home-hero__aside">
-        <span class="home-status" :class="{ 'is-empty': !hasPeers }">
-          <span class="home-status__dot" aria-hidden="true"></span>
-          {{
-            hasPeers
-              ? t("home.connectedCount", { count: app.peers.length })
-              : t("home.notConnected")
-          }}
+    <section class="home-section">
+      <header class="section-heading">
+        <h2>{{ t("home.authorizedServers") }}</h2>
+        <span v-if="hasPeers" class="section-summary">
+          {{ t("home.totalServers", { count: app.peers.length }) }}
         </span>
+      </header>
+
+      <ul v-if="hasPeers" class="server-list">
+        <li v-for="peer in app.peers" :key="peer.id" class="server-row">
+          <div
+            class="server-row__line is-clickable"
+            @click="app.openPeer(peer)"
+          >
+            <button
+              type="button"
+              class="server-row__main"
+              :aria-label="t('home.openServer', { label: peer.label })"
+              @click.stop="app.openPeer(peer)"
+            >
+              <span class="server-row__icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <rect x="3.5" y="4.5" width="17" height="11" rx="2" />
+                  <path d="M9 19h6M12 15.5V19" />
+                </svg>
+              </span>
+              <span class="server-row__title">
+                <strong>{{ peer.label }}</strong>
+                <span class="server-row__url">{{ peer.url }}</span>
+              </span>
+            </button>
+            <span class="server-row__count">
+              <strong>{{ peerCount(peer) ?? "—" }}</strong>
+              <em v-if="peerCount(peer) !== null">
+                {{ t("home.sharesUnit") }}
+              </em>
+            </span>
+            <button
+              type="button"
+              class="server-row__badge"
+              :disabled="removingPeerId === peer.id"
+              @click.stop="forgetPeer(peer)"
+            >
+              {{ t("home.forget") }}
+            </button>
+            <span class="server-row__chevron" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M9 6l6 6-6 6" />
+              </svg>
+            </span>
+          </div>
+        </li>
+      </ul>
+      <div v-else class="home-empty">
+        <span class="home-empty__icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <rect x="3.5" y="4.5" width="17" height="11" rx="2" />
+            <path d="M9 19h6M12 15.5V19" />
+          </svg>
+        </span>
+        <div>
+          <strong>{{ t("home.noPeersTitle") }}</strong>
+          <p>{{ t("home.noPeersHint") }}</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="home-section">
+      <header class="section-heading">
+        <h2>{{ t("home.discoveredServers") }}</h2>
         <el-button
           plain
+          size="small"
+          class="section-scan"
           :loading="scanState === 'scanning'"
           @click="scanLan"
         >
           {{ scanState === "scanning" ? t("home.scanning") : t("home.scan") }}
         </el-button>
-      </div>
-    </section>
-
-    <section v-if="hasPeers" class="home-section">
-      <header class="section-heading">
-        <div>
-          <h2>{{ t("home.authorizedServers") }}</h2>
-          <p class="section-hint">{{ t("home.connectedHint") }}</p>
-        </div>
-        <span class="section-count">{{ app.peers.length }}</span>
-      </header>
-
-      <ul class="server-list">
-        <li v-for="peer in app.peers" :key="peer.id" class="server-item">
-          <button
-            type="button"
-            class="server-card server-item__main"
-            :aria-label="t('home.openServer', { label: peer.label })"
-            @click="app.openPeer(peer)"
-          >
-            <span class="server-item__icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24">
-                <rect x="3.5" y="4.5" width="17" height="11" rx="2" />
-                <path d="M9 19h6M12 15.5V19" />
-              </svg>
-            </span>
-            <span class="server-item__body">
-              <strong>{{ peer.label }}</strong>
-              <span class="server-item__url">{{ peer.url }}</span>
-            </span>
-            <span class="server-item__meta">
-              {{ t("home.shareCount", { count: peer.shares.length }) }}
-            </span>
-            <svg class="server-item__arrow" viewBox="0 0 24 24" aria-hidden="true">
-              <path d="m9 6 6 6-6 6" />
-            </svg>
-          </button>
-          <div class="server-item__actions">
-            <el-button
-              text
-              size="small"
-              :disabled="removingPeerId === peer.id"
-              @click.stop="forgetPeer(peer)"
-            >
-              {{ t("home.forget") }}
-            </el-button>
-          </div>
-        </li>
-      </ul>
-    </section>
-
-    <section class="home-section home-section--discovery">
-      <header class="section-heading">
-        <div>
-          <h2>{{ t("home.discoveredServers") }}</h2>
-          <p class="section-hint">{{ t("home.discoveryHint") }}</p>
-        </div>
       </header>
 
       <p v-if="scanError" class="home-error">{{ scanError }}</p>
 
       <ul v-if="discovered.length" class="server-list">
-        <li v-for="server in discovered" :key="server.serverId" class="server-item">
-          <div class="server-item__main server-item__main--static">
-            <span class="server-item__icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24">
-                <rect x="4" y="4" width="16" height="6" rx="1.5" />
-                <rect x="4" y="14" width="16" height="6" rx="1.5" />
-                <path d="M8 7h.01M8 17h.01" />
-              </svg>
-            </span>
-            <span class="server-item__body">
-              <strong>{{ server.name }}</strong>
-              <span class="server-item__url">{{ server.url }}</span>
-              <span class="server-item__detail">
-                {{ t("home.discoveredMeta", {
-                  count: server.shareCount,
-                  hosts: server.hosts.join(", "),
-                }) }}
+        <li
+          v-for="server in discovered"
+          :key="server.serverId"
+          class="server-row"
+        >
+          <div class="server-row__line">
+            <button
+              type="button"
+              class="server-row__main"
+              :disabled="!isSaved(server) && !canRequest(server)"
+              :aria-label="
+                isSaved(server)
+                  ? t('home.openServer', { label: server.name })
+                  : t('home.add')
+              "
+              @click="beginAdd(server)"
+            >
+              <span class="server-row__icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <rect x="4" y="4" width="16" height="6" rx="1.5" />
+                  <rect x="4" y="14" width="16" height="6" rx="1.5" />
+                  <path d="M8 7h.01M8 17h.01" />
+                </svg>
               </span>
+              <span class="server-row__title">
+                <strong>{{ server.name }}</strong>
+                <span class="server-row__url">{{ server.url }}</span>
+              </span>
+            </button>
+            <span class="server-row__count">
+              <strong>{{ server.shareCount }}</strong>
+              <em>{{ t("home.sharesUnit") }}</em>
             </span>
-            <span v-if="isSaved(server)" class="server-state is-connected">
+            <span
+              v-if="isSaved(server)"
+              class="server-row__badge is-connected"
+            >
               {{ t("home.connected") }}
             </span>
-            <div v-else class="server-request">
-              <el-button
-                v-if="canRequest(server)"
-                type="primary"
-                plain
-                :disabled="requestBusy"
-                @click="beginAdd(server)"
-              >
-                {{ t("home.add") }}
-              </el-button>
-              <el-button
-                v-if="canCancel(server)"
-                plain
-                :loading="canceling"
-                @click="cancelRequest(server)"
-              >
-                {{ canceling ? t("home.canceling") : t("home.requestCancel") }}
-              </el-button>
-            </div>
+            <button
+              v-else-if="canRequest(server)"
+              type="button"
+              class="server-row__badge is-primary"
+              :disabled="requestBusy"
+              @click="beginAdd(server)"
+            >
+              {{ t("home.add") }}
+            </button>
+            <button
+              v-else-if="canCancel(server)"
+              type="button"
+              class="server-row__badge"
+              :disabled="canceling"
+              @click="cancelRequest(server)"
+            >
+              {{ canceling ? t("home.canceling") : t("home.requestCancel") }}
+            </button>
+            <span class="server-row__chevron" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M9 6l6 6-6 6" />
+              </svg>
+            </span>
           </div>
           <p
             v-if="requestMessage(server) || requestError(server)"
-            class="request-status"
+            class="server-row__status"
             :class="{ 'is-error': requestError(server) }"
           >
             {{ requestError(server) || requestMessage(server) }}
@@ -327,10 +382,7 @@ async function forgetPeer(peer) {
         </li>
       </ul>
 
-      <div
-        v-else-if="scanState === 'done' && !scanError"
-        class="home-empty"
-      >
+      <div v-else-if="scanState === 'done' && !scanError" class="home-empty">
         <span class="home-empty__icon" aria-hidden="true">
           <svg viewBox="0 0 24 24">
             <circle cx="12" cy="12" r="8" />
@@ -343,185 +395,104 @@ async function forgetPeer(peer) {
         </div>
       </div>
 
-      <p v-else-if="scanState === 'scanning'" class="hint">
-        {{ t("home.discoveryHint") }}
-      </p>
+      <div v-else-if="!scanError" class="home-empty">
+        <span class="home-empty__icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <circle cx="11" cy="11" r="6" />
+            <path d="M11 11l3.5-3.5M15.5 15.5L19 19" />
+          </svg>
+        </span>
+        <div>
+          <strong>{{ t("home.scanIdleTitle") }}</strong>
+          <p>{{ t("home.scanIdleHint") }}</p>
+        </div>
+      </div>
     </section>
   </div>
 </template>
 
 <style scoped>
 .home-view {
-  max-width: 860px;
-  margin: 0 auto;
+  width: 100%;
   display: flex;
   flex-direction: column;
-  gap: 28px;
-}
-
-.home-hero {
-  position: relative;
-  overflow: hidden;
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 28px;
-  padding: 30px 30px 28px;
-  border: 1px solid var(--app-border);
-  border-radius: 22px;
-  background:
-    radial-gradient(
-      circle at 92% 12%,
-      color-mix(in oklab, var(--accent) 18%, transparent),
-      transparent 42%
-    ),
-    linear-gradient(145deg, var(--app-surface), var(--app-surface-2));
-  box-shadow: 0 18px 44px -32px rgba(22, 32, 46, 0.4);
-}
-
-.home-eyebrow {
-  margin: 0 0 10px;
-  font-size: 12px;
-  font-weight: 650;
-  letter-spacing: 0.02em;
-  color: var(--el-color-primary);
-}
-
-.home-hero h1 {
-  margin: 0;
-  font-size: clamp(28px, 4vw, 36px);
-  line-height: 1.05;
-  letter-spacing: -0.035em;
-  color: var(--app-text);
-}
-
-.home-subtitle {
-  max-width: 46ch;
-  margin: 12px 0 0;
-  font-size: 14px;
-  line-height: 1.65;
-  color: var(--app-text-secondary);
-}
-
-.home-hero__aside {
-  flex: none;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 12px;
-}
-
-.home-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  padding: 7px 11px;
-  border: 1px solid color-mix(in oklab, var(--accent-green) 35%, var(--app-border));
-  border-radius: 999px;
-  background: color-mix(in oklab, var(--accent-green) 8%, var(--app-surface));
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--app-text-secondary);
-}
-
-.home-status.is-empty {
-  border-color: var(--app-border);
-  background: var(--app-surface-3);
-}
-
-.home-status__dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--accent-green);
-  box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent-green) 16%, transparent);
-}
-
-.home-status.is-empty .home-status__dot {
-  background: var(--app-text-muted);
-  box-shadow: none;
+  gap: 30px;
 }
 
 .home-section {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-}
-
-.home-section--discovery {
-  padding-top: 4px;
+  gap: 14px;
 }
 
 .section-heading {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: space-between;
-  gap: 20px;
+  gap: 16px;
 }
 
 .section-heading h2 {
   margin: 0;
-  font-size: 17px;
+  font-size: 16px;
+  font-weight: 600;
   letter-spacing: -0.01em;
   color: var(--app-text);
 }
 
-.section-hint {
-  margin: 4px 0 0;
+.section-summary {
   font-size: 13px;
-  line-height: 1.5;
+  font-weight: 500;
   color: var(--app-text-muted);
 }
 
-.section-count {
-  display: inline-flex;
-  min-width: 26px;
-  height: 26px;
-  align-items: center;
-  justify-content: center;
-  border-radius: 999px;
-  background: var(--app-surface-3);
-  border: 1px solid var(--app-border);
+.section-scan {
   font-size: 12px;
-  font-weight: 650;
-  color: var(--app-text-muted);
 }
 
 .server-list {
   list-style: none;
   margin: 0;
   padding: 0;
-  overflow: hidden;
   border: 1px solid var(--app-border);
-  border-radius: 16px;
+  border-radius: 14px;
   background: var(--app-surface);
+  overflow: hidden;
 }
 
-.server-item {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 12px 6px 8px;
-}
-
-.server-item + .server-item {
+.server-row + .server-row {
   border-top: 1px solid var(--app-border);
 }
 
-.server-item:hover {
+.server-row__line {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 14px 12px 18px;
+  transition: background 0.15s ease;
+}
+
+.server-row__line:hover {
   background: var(--app-surface-2);
 }
 
-.server-item__main {
+.server-row__line.is-clickable {
+  cursor: pointer;
+}
+
+.server-row__line.is-clickable:hover .server-row__chevron {
+  opacity: 1;
+  transform: translateX(2px);
+}
+
+.server-row__main {
   flex: 1;
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 10px 8px;
+  gap: 12px;
+  padding: 0;
   border: 0;
-  border-radius: 10px;
   background: transparent;
   color: var(--app-text);
   text-align: left;
@@ -529,26 +500,32 @@ async function forgetPeer(peer) {
   cursor: pointer;
 }
 
-.server-item__main--static {
+.server-row__main:disabled {
   cursor: default;
 }
 
-.server-item__icon {
-  width: 46px;
-  height: 46px;
+.server-row__main:focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: 6px;
+  border-radius: 8px;
+}
+
+.server-row__icon {
+  width: 36px;
+  height: 36px;
   flex: none;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 13px;
+  border-radius: 10px;
   color: var(--el-color-primary);
   background: color-mix(in oklab, var(--el-color-primary) 9%, var(--app-surface-2));
   border: 1px solid color-mix(in oklab, var(--el-color-primary) 14%, var(--app-border));
 }
 
-.server-item__icon svg {
-  width: 24px;
-  height: 24px;
+.server-row__icon svg {
+  width: 19px;
+  height: 19px;
   fill: none;
   stroke: currentColor;
   stroke-width: 1.5;
@@ -556,25 +533,24 @@ async function forgetPeer(peer) {
   stroke-linejoin: round;
 }
 
-.server-item__body {
+.server-row__title {
   flex: 1;
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
 }
 
-.server-item__body strong {
+.server-row__title strong {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 14px;
-  font-weight: 650;
+  font-weight: 600;
   color: var(--app-text);
 }
 
-.server-item__url,
-.server-item__detail {
+.server-row__url {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -583,58 +559,101 @@ async function forgetPeer(peer) {
   color: var(--app-text-muted);
 }
 
-.server-item__detail {
-  font-family: inherit;
-  font-size: 12px;
-}
-
-.server-item__meta {
+.server-row__count {
   flex: none;
-  font-size: 12px;
-  color: var(--app-text-secondary);
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
 }
 
-.server-item__arrow {
+.server-row__count strong {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--app-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.server-row__count em {
+  font-style: normal;
+  font-size: 12px;
+  color: var(--app-text-muted);
+}
+
+.server-row__badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 12px;
+  border: 1px solid var(--app-border);
+  border-radius: 999px;
+  background: var(--app-surface);
+  color: var(--app-text-secondary);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease,
+    background 0.15s ease;
+}
+
+.server-row__badge:hover:not(:disabled) {
+  border-color: color-mix(in oklab, var(--el-color-primary) 40%, var(--app-border));
+  color: var(--el-color-primary);
+}
+
+.server-row__badge:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.server-row__badge.is-primary {
+  border-color: color-mix(in oklab, var(--el-color-primary) 45%, var(--app-border));
+  color: var(--el-color-primary);
+}
+
+.server-row__badge.is-connected {
+  cursor: default;
+  border-color: color-mix(in oklab, var(--accent-green) 40%, var(--app-border));
+  background: color-mix(in oklab, var(--accent-green) 10%, var(--app-surface));
+  color: color-mix(in oklab, var(--accent-green) 72%, var(--app-text));
+}
+
+.server-row__chevron {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  color: var(--app-text-muted);
+  opacity: 0.45;
+  transition:
+    opacity 0.15s ease,
+    transform 0.15s ease;
+}
+
+.server-row__main:not(:disabled):hover ~ .server-row__chevron {
+  opacity: 1;
+  transform: translateX(2px);
+}
+
+.server-row__chevron svg {
   width: 18px;
   height: 18px;
-  flex: none;
   fill: none;
-  stroke: var(--app-text-muted);
-  stroke-width: 1.7;
+  stroke: currentColor;
+  stroke-width: 1.8;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
 
-.server-item__actions {
-  flex: none;
-}
-
-.server-request {
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.server-state {
-  flex: none;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--app-text-muted);
-}
-
-.server-state.is-connected {
-  color: color-mix(in oklab, var(--accent-green) 72%, var(--app-text));
-}
-
-.request-status {
-  margin: -2px 12px 10px 68px;
+.server-row__status {
+  margin: -2px 14px 12px 66px;
   font-size: 12.5px;
   line-height: 1.5;
   color: var(--app-text-secondary);
 }
 
-.request-status.is-error {
+.server-row__status.is-error {
   color: var(--el-color-danger);
 }
 
@@ -642,10 +661,12 @@ async function forgetPeer(peer) {
   display: flex;
   align-items: center;
   gap: 16px;
-  padding: 22px;
-  border: 1px dashed var(--app-border);
-  border-radius: 16px;
-  background: color-mix(in oklab, var(--app-surface-2) 70%, transparent);
+  box-sizing: border-box;
+  width: 100%;
+  padding: 12px 14px 12px 18px;
+  border: 1px solid var(--app-border);
+  border-radius: 14px;
+  background: var(--app-surface);
 }
 
 .home-empty__icon {
@@ -690,30 +711,18 @@ async function forgetPeer(peer) {
   font-size: 13px;
 }
 
-@media (max-width: 640px) {
-  .home-hero {
-    align-items: flex-start;
-    flex-direction: column;
-    padding: 24px;
+@media (max-width: 560px) {
+  .home-view {
+    gap: 24px;
   }
 
-  .home-hero__aside {
-    width: 100%;
-    align-items: stretch;
-    flex-direction: row;
-    justify-content: space-between;
+  .server-row__line {
+    gap: 12px;
+    padding-right: 12px;
   }
 
-  .server-item {
-    padding-right: 8px;
-  }
-
-  .server-item__meta {
+  .server-row__count em {
     display: none;
-  }
-
-  .request-status {
-    margin-left: 12px;
   }
 }
 </style>

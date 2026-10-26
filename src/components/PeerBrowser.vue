@@ -1829,7 +1829,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 .sidebar-label {
   margin: 0 8px 6px;
   font-size: 11px;
-  font-weight: 650;
+  font-weight: 600;
   color: var(--app-text-muted);
 }
 
@@ -1931,7 +1931,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
 .breadcrumb.is-current {
   color: var(--app-text);
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .breadcrumb-sep {
@@ -2000,7 +2000,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12.5px;
-  font-weight: 550;
+  font-weight: 500;
 }
 
 .file-tile__meta {
@@ -2574,7 +2574,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   background: var(--app-surface-2);
   color: var(--app-text);
   font-size: 11.5px;
-  font-weight: 650;
+  font-weight: 600;
   border-bottom-color: var(--app-border);
 }
 
