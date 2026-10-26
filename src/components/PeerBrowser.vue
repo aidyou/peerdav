@@ -1,13 +1,20 @@
 <script setup>
-import { computed, ref, watch } from "vue";
+import { computed, nextTick, ref, shallowRef, watch } from "vue";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 
 import FileGlyph from "./FileGlyph.vue";
 import { useAppContext } from "../lib/appContext";
 import { confirmAction } from "../lib/confirm";
-import { fileKind, fileKindKey } from "../lib/fileKinds";
+import { canPreview, fileKind, fileKindKey, isReadableText } from "../lib/fileKinds";
 import { t } from "../lib/i18n";
 import { normalizeAppError } from "../lib/invoke";
+import {
+  MAX_PREVIEW_BYTES,
+  MAX_PREVIEW_LINES,
+  parseDelimited,
+  previewFormat as detectPreviewFormat,
+  tableDelimiter,
+} from "../lib/textPreview";
 import { useAction } from "../composables/useAction";
 
 const props = defineProps({
@@ -26,14 +33,26 @@ const peerPath = ref("/");
 const peerListing = ref(null);
 const peerPreview = ref(null);
 const peerPreviewPath = ref("");
+const previewOpen = ref(false);
+const previewLimit = ref(null);
+const previewDialogEl = ref(null);
+const previewRenderTools = shallowRef(null);
+let previewRenderToolsPromise = null;
 const peerEdit = ref(null);
 const peerNoticeState = ref(null);
 const viewMode = ref(readViewMode());
 const columnStack = ref([]);
+const columnViewEl = ref(null);
 const selectedEntry = ref(null);
 const downloadOpen = ref(false);
 const downloadName = ref("");
 const downloadTransferId = ref("");
+const downloadDialogOpen = ref(false);
+const downloadDirectoryName = ref("");
+const downloadRoot = ref("");
+const downloadQueue = ref([]);
+const downloadRunning = ref(false);
+const downloadCanceled = ref(false);
 const savedOpen = ref(false);
 const savedPath = ref("");
 const uploadDialogOpen = ref(false);
@@ -43,6 +62,10 @@ const uploadCanceled = ref(false);
 
 const activeShare = computed(
   () => peerShares.value.find((share) => share.id === activeShareId.value) ?? null,
+);
+
+const canDeleteEntries = computed(() =>
+  Boolean(activeShare.value?.permissions?.canDelete),
 );
 
 const peerHost = computed(() => {
@@ -67,6 +90,59 @@ const downloadPercent = computed(() => {
   if (!transfer?.total) return 0;
   return Math.min(100, Math.round((transfer.transferred / transfer.total) * 100));
 });
+
+const downloadFinished = computed(
+  () =>
+    downloadQueue.value.filter(
+      (item) => !["pending", "downloading"].includes(item.status),
+    ).length,
+);
+
+const downloadTotalBytes = computed(() =>
+  downloadQueue.value.reduce(
+    (total, item) => total + (Number(item.size) || 0),
+    0,
+  ),
+);
+
+const downloadTransferredBytes = computed(() => {
+  let transferred = downloadQueue.value
+    .filter((item) => item.status === "done")
+    .reduce(
+      (total, item) => total + (Number(item.bytes ?? item.size) || 0),
+      0,
+    );
+  const current = downloadQueue.value.find(
+    (item) => item.status === "downloading",
+  );
+  if (current && activeTransfer.value) {
+    transferred += Number(activeTransfer.value.transferred) || 0;
+  }
+  return transferred;
+});
+
+const downloadQueuePercent = computed(() => {
+  if (!downloadQueue.value.length) return 0;
+  if (downloadQueue.value.every((item) => item.status === "done")) return 100;
+  if (downloadTotalBytes.value > 0) {
+    return Math.min(
+      100,
+      Math.round(
+        (downloadTransferredBytes.value / downloadTotalBytes.value) * 100,
+      ),
+    );
+  }
+  return Math.round(
+    (downloadFinished.value / downloadQueue.value.length) * 100,
+  );
+});
+
+const downloadSummary = computed(() =>
+  t("peer.downloadSummary", {
+    finished: downloadFinished.value,
+    total: downloadQueue.value.length,
+  }),
+);
 
 const uploadFinished = computed(
   () =>
@@ -102,6 +178,34 @@ const breadcrumbs = computed(() => {
   return crumbs;
 });
 
+const breadcrumbsEl = ref(null);
+
+watch(
+  breadcrumbs,
+  () => {
+    const element = breadcrumbsEl.value;
+    if (element) element.scrollLeft = element.scrollWidth;
+  },
+  { flush: "post" },
+);
+
+function scrollBreadcrumbs(event) {
+  const element = event.currentTarget;
+  if (!element || element.scrollWidth <= element.clientWidth) return;
+  if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+  event.preventDefault();
+  element.scrollLeft += event.deltaY;
+}
+
+watch(
+  columnStack,
+  () => {
+    const element = columnViewEl.value;
+    if (element) element.scrollLeft = element.scrollWidth;
+  },
+  { flush: "post" },
+);
+
 const activePreview = computed(() =>
   peerPreview.value && peerPreviewPath.value === selectedEntry.value?.path
     ? peerPreview.value
@@ -118,6 +222,91 @@ const peerPreviewSource = computed(() => {
 const isImagePreview = computed(() =>
   Boolean(activePreview.value?.mime?.startsWith("image/")),
 );
+
+const isAudioPreview = computed(() =>
+  Boolean(activePreview.value?.mime?.startsWith("audio/")),
+);
+
+const isVideoPreview = computed(() =>
+  Boolean(activePreview.value?.mime?.startsWith("video/")),
+);
+
+const previewTarget = computed(() => selectedEntry.value);
+const previewFormatKind = computed(() =>
+  detectPreviewFormat(previewTarget.value ?? {}),
+);
+
+const previewKind = computed(() => {
+  if (!activePreview.value) {
+    return previewLimit.value ? "unavailable" : "empty";
+  }
+  if (isImagePreview.value) return "image";
+  if (isAudioPreview.value) return "audio";
+  if (isVideoPreview.value) return "video";
+  if (activePreview.value.encoding !== "utf8") return "binary";
+  return previewFormatKind.value;
+});
+
+const codePreview = computed(() =>
+  previewKind.value === "code" && previewRenderTools.value
+    ? previewRenderTools.value.highlightCode(
+        activePreview.value?.data,
+        previewTarget.value,
+      )
+    : null,
+);
+
+const codeLineCount = computed(() =>
+  previewKind.value === "code"
+    ? Math.max(1, String(activePreview.value?.data ?? "").split("\n").length)
+    : 0,
+);
+
+const markdownPreviewHtml = computed(() =>
+  previewKind.value === "markdown" && previewRenderTools.value
+    ? previewRenderTools.value.renderMarkdown(activePreview.value?.data)
+    : "",
+);
+
+const tablePreview = computed(() =>
+  previewKind.value === "table"
+    ? parseDelimited(
+        activePreview.value?.data,
+        tableDelimiter(previewTarget.value),
+      )
+    : null,
+);
+
+const previewMeta = computed(() => {
+  if (activePreview.value) {
+    return `${activePreview.value.mime} · ${formatBytes(activePreview.value.size)}`;
+  }
+  if (previewTarget.value) return formatBytes(previewTarget.value.size);
+  return "";
+});
+
+const previewLimitText = computed(() => {
+  if (!previewLimit.value) return "";
+  if (previewLimit.value.code === "PEER_PREVIEW_TOO_MANY_LINES") {
+    return t("peer.previewTooManyLines", {
+      lines: previewLimit.value.lines ?? "—",
+      limit: previewLimit.value.limit ?? MAX_PREVIEW_LINES,
+    });
+  }
+  if (previewLimit.value.code === "PEER_PREVIEW_TOO_LARGE") {
+    return t("peer.previewTooLarge", {
+      size: formatBytes(previewLimit.value.size ?? 0),
+      limit: formatBytes(previewLimit.value.limit ?? MAX_PREVIEW_BYTES),
+    });
+  }
+  return t("peer.previewUnavailable");
+});
+
+watch(previewOpen, async (open) => {
+  if (!open) return;
+  await nextTick();
+  previewDialogEl.value?.focus();
+});
 
 const galleryFile = computed(() =>
   selectedEntry.value && !selectedEntry.value.isDir ? selectedEntry.value : null,
@@ -142,9 +331,12 @@ function setViewMode(mode) {
   }
   if (mode === "columns" && peerListing.value) {
     columnStack.value = [peerListing.value];
+    void rebuildColumnStack();
   }
   if (mode === "gallery" && galleryFile.value && !activePreview.value) {
-    void previewEntry(galleryFile.value);
+    if (canPreview(galleryFile.value)) {
+      void previewEntry(galleryFile.value);
+    }
   }
 }
 
@@ -152,19 +344,31 @@ function setPeerNotice(key, params) {
   peerNoticeState.value = { key, params };
 }
 
+function clearPreview() {
+  peerPreview.value = null;
+  peerPreviewPath.value = "";
+  previewOpen.value = false;
+  previewLimit.value = null;
+}
+
 function reset() {
   peerShares.value = [];
   activeShareId.value = "";
   peerPath.value = "/";
   peerListing.value = null;
-  peerPreview.value = null;
-  peerPreviewPath.value = "";
+  clearPreview();
   peerEdit.value = null;
   peerNoticeState.value = null;
   columnStack.value = [];
   selectedEntry.value = null;
   downloadOpen.value = false;
   downloadTransferId.value = "";
+  downloadDialogOpen.value = false;
+  downloadDirectoryName.value = "";
+  downloadRoot.value = "";
+  downloadQueue.value = [];
+  downloadRunning.value = false;
+  downloadCanceled.value = false;
   savedOpen.value = false;
   savedPath.value = "";
   uploadDialogOpen.value = false;
@@ -177,8 +381,7 @@ function applyListing(listing) {
   peerListing.value = listing;
   peerPath.value = listing.path;
   selectedEntry.value = null;
-  peerPreview.value = null;
-  peerPreviewPath.value = "";
+  clearPreview();
   if (viewMode.value === "columns") {
     columnStack.value = [listing];
   }
@@ -192,9 +395,35 @@ async function fetchListing(path) {
   });
 }
 
+async function rebuildColumnStack() {
+  const current = peerListing.value;
+  if (!current) return;
+  const targetPath = peerPath.value;
+  const listings = [];
+
+  try {
+    for (const crumb of breadcrumbs.value) {
+      listings.push(
+        crumb.path === targetPath ? current : await fetchListing(crumb.path),
+      );
+    }
+  } catch (error) {
+    if (viewMode.value !== "columns" || peerPath.value !== targetPath) return;
+    app.handleFailure(error);
+    columnStack.value = [current];
+    return;
+  }
+
+  if (viewMode.value !== "columns" || peerPath.value !== targetPath) return;
+  columnStack.value = listings;
+}
+
 async function loadPath(path) {
   const listing = await fetchListing(path);
   applyListing(listing);
+  if (viewMode.value === "columns") {
+    await rebuildColumnStack();
+  }
 }
 
 async function loadPeer() {
@@ -229,7 +458,7 @@ async function refreshListing() {
 
 function selectEntry(entry) {
   selectedEntry.value = entry;
-  if (viewMode.value === "gallery" && !entry.isDir) {
+  if (viewMode.value === "gallery" && !entry.isDir && canPreview(entry)) {
     void previewEntry(entry);
   }
 }
@@ -237,7 +466,7 @@ function selectEntry(entry) {
 function openEntry(entry) {
   if (entry.isDir) {
     void browse(entry.path);
-  } else {
+  } else if (canPreview(entry)) {
     void previewEntry(entry);
   }
 }
@@ -252,9 +481,8 @@ async function loadColumn(entry, index) {
     const listing = await fetchListing(entry.path);
     peerListing.value = listing;
     peerPath.value = listing.path;
+    clearPreview();
     selectedEntry.value = entry;
-    peerPreview.value = null;
-    peerPreviewPath.value = "";
     columnStack.value = [...columnStack.value.slice(0, index + 1), listing];
   });
 }
@@ -306,6 +534,134 @@ async function downloadEntry(entry) {
       downloadTransferId.value = "";
       downloadOpen.value = false;
     }
+  });
+}
+
+function markRemainingDownloadCanceled() {
+  for (const item of downloadQueue.value) {
+    if (item.status === "pending") {
+      item.status = "canceled";
+    }
+  }
+}
+
+function downloadStatusText(item) {
+  const key = {
+    pending: "peer.downloadStatusPending",
+    downloading: "peer.downloadStatusDownloading",
+    done: "peer.downloadStatusDone",
+    canceled: "peer.downloadStatusCanceled",
+    error: "peer.downloadStatusError",
+  }[item.status];
+  return key ? t(key) : "";
+}
+
+async function processDownloadQueue() {
+  let completed = 0;
+  for (const item of downloadQueue.value) {
+    if (downloadCanceled.value) {
+      if (item.status === "pending") item.status = "canceled";
+      continue;
+    }
+    if (item.status !== "pending") continue;
+
+    item.status = "downloading";
+    const transferId = newTransferId();
+    downloadTransferId.value = transferId;
+    app.clearTransfer(transferId);
+    try {
+      const result = await app.invoke("download_peer_file_to", {
+        peerId: props.peer.id,
+        shareId: activeShareId.value,
+        remotePath: item.remotePath,
+        localPath: item.localPath,
+        transferId,
+      });
+      item.status = "done";
+      item.bytes = result.bytes;
+      completed += 1;
+    } catch (error) {
+      item.status = "error";
+      item.error = normalizeAppError(error).message;
+      markRemainingDownloadCanceled();
+      app.handleFailure(error);
+      break;
+    } finally {
+      app.clearTransfer(transferId);
+      if (downloadTransferId.value === transferId) {
+        downloadTransferId.value = "";
+      }
+    }
+  }
+  downloadRunning.value = false;
+  if (!downloadCanceled.value && completed > 0) {
+    app.setNotice("peer.downloadFinished", { count: completed });
+  }
+}
+
+function cancelDownloadQueue() {
+  if (!downloadRunning.value || downloadCanceled.value) return;
+  downloadCanceled.value = true;
+  markRemainingDownloadCanceled();
+}
+
+async function downloadDirectory(entry) {
+  if (!entry?.isDir || busy.value) return;
+  await run(async () => {
+    const selected = await openDialog({
+      title: t("peer.pickDownloadFolder"),
+      multiple: false,
+      directory: true,
+    });
+    const localParent = typeof selected === "string" ? selected : "";
+    if (!localParent) return;
+
+    const request = (conflict) =>
+      app.invoke("prepare_peer_directory_download", {
+        peerId: props.peer.id,
+        shareId: activeShareId.value,
+        remotePath: entry.path,
+        localParent,
+        conflict,
+      });
+
+    let plan;
+    try {
+      plan = await request("fail");
+    } catch (error) {
+      if (normalizeAppError(error).code !== "TRANSFER_CONFLICT") throw error;
+      const overwrite = await confirmAction(
+        t("peer.overwriteDirectoryConfirm", { name: entry.name }),
+        t("peer.download"),
+        {
+          confirmText: t("peer.overwrite"),
+          cancelText: t("confirm.cancel"),
+        },
+      );
+      if (!overwrite) return;
+      plan = await request("overwrite");
+    }
+
+    if (!plan.files.length) {
+      app.setNotice("peer.downloadEmptyDirectory", {
+        count: plan.directoryCount,
+        path: plan.localRoot,
+      });
+      return;
+    }
+
+    downloadDirectoryName.value = entry.name;
+    downloadRoot.value = plan.localRoot;
+    downloadQueue.value = plan.files.map((file) => ({
+      ...file,
+      status: "pending",
+      error: "",
+      bytes: null,
+    }));
+    downloadCanceled.value = false;
+    downloadRunning.value = true;
+    downloadDialogOpen.value = true;
+    await processDownloadQueue();
   });
 }
 
@@ -469,17 +825,81 @@ function uploadStatusText(item) {
   return key ? t(key) : "";
 }
 
+function previewUsesDialog(entry, preview) {
+  if (viewMode.value !== "gallery") return true;
+  const mime = String(preview?.mime ?? "");
+  if (
+    mime.startsWith("image/") ||
+    mime.startsWith("audio/") ||
+    mime.startsWith("video/")
+  ) {
+    return false;
+  }
+  return ["markdown", "table", "code", "text"].includes(
+    detectPreviewFormat(entry),
+  );
+}
+
+async function loadPreviewRenderTools() {
+  if (previewRenderTools.value) return previewRenderTools.value;
+  previewRenderToolsPromise ??= import("../lib/textPreviewRender");
+  try {
+    previewRenderTools.value = await previewRenderToolsPromise;
+  } catch (error) {
+    previewRenderToolsPromise = null;
+    throw error;
+  }
+  return previewRenderTools.value;
+}
+
+function closePreview() {
+  clearPreview();
+}
+
 async function previewEntry(entry) {
-  if (!entry || entry.isDir || busy.value) return;
-  await run(async () => {
-    const preview = await app.invoke("preview_peer_file", {
-      peerId: props.peer.id,
-      shareId: activeShareId.value,
-      remotePath: entry.path,
-    });
-    selectedEntry.value = entry;
-    peerPreview.value = preview;
+  if (!entry || entry.isDir || busy.value || !canPreview(entry)) return;
+  clearPreview();
+  selectedEntry.value = entry;
+
+  if (Number(entry.size) > MAX_PREVIEW_BYTES) {
     peerPreviewPath.value = entry.path;
+    previewLimit.value = {
+      code: "PEER_PREVIEW_TOO_LARGE",
+      size: Number(entry.size),
+      limit: MAX_PREVIEW_BYTES,
+    };
+    previewOpen.value = true;
+    return;
+  }
+
+  await run(async () => {
+    try {
+      const preview = await app.invoke("preview_peer_file", {
+        peerId: props.peer.id,
+        shareId: activeShareId.value,
+        remotePath: entry.path,
+      });
+      if (
+        preview.encoding === "utf8" &&
+        ["code", "markdown"].includes(detectPreviewFormat(entry))
+      ) {
+        await loadPreviewRenderTools();
+      }
+      peerPreview.value = preview;
+      peerPreviewPath.value = entry.path;
+      previewOpen.value = previewUsesDialog(entry, preview);
+    } catch (error) {
+      if (
+        error?.code === "PEER_PREVIEW_TOO_LARGE" ||
+        error?.code === "PEER_PREVIEW_TOO_MANY_LINES"
+      ) {
+        peerPreviewPath.value = entry.path;
+        previewLimit.value = { code: error.code, ...(error.context ?? {}) };
+        previewOpen.value = true;
+        return;
+      }
+      throw error;
+    }
   });
 }
 
@@ -492,6 +912,33 @@ async function editEntry(entry) {
       remotePath: entry.path,
     });
     setPeerNotice("peer.editOpened");
+  });
+}
+
+async function deleteEntry(entry) {
+  if (!entry || busy.value || !canDeleteEntries.value) return;
+  await run(async () => {
+    const confirmed = await confirmAction(
+      t(entry.isDir ? "peer.deleteFolderConfirm" : "peer.deleteFileConfirm", {
+        name: entry.name,
+      }),
+      t("common.delete"),
+    );
+    if (!confirmed) return;
+
+    if (peerEdit.value?.remotePath === entry.path) {
+      await app.invoke("discard_peer_external_edit", {
+        editId: peerEdit.value.editId,
+      });
+      peerEdit.value = null;
+    }
+    await app.invoke("delete_peer_entry", {
+      peerId: props.peer.id,
+      shareId: activeShareId.value,
+      remotePath: entry.path,
+    });
+    await loadPath(peerPath.value);
+    app.setNotice("peer.deleted", { name: entry.name });
   });
 }
 
@@ -608,7 +1055,12 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
       <main class="browser-main">
         <div class="pathbar">
-          <div class="breadcrumbs" aria-label="Breadcrumb">
+          <div
+            ref="breadcrumbsEl"
+            class="breadcrumbs"
+            aria-label="Breadcrumb"
+            @wheel="scrollBreadcrumbs"
+          >
             <template v-for="(crumb, index) in breadcrumbs" :key="crumb.path">
               <span v-if="index" class="breadcrumb-sep">›</span>
               <button
@@ -784,7 +1236,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
             </tbody>
           </table>
 
-          <div v-else-if="viewMode === 'columns'" class="column-view">
+          <div v-else-if="viewMode === 'columns'" class="column-view" ref="columnViewEl">
             <div
               v-for="(column, index) in columnStack"
               :key="column.path"
@@ -797,6 +1249,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 class="column-row"
                 :class="{ 'is-selected': selectedEntry?.path === entry.path }"
                 @click="loadColumn(entry, index)"
+                @dblclick="previewEntry(entry)"
               >
                 <FileGlyph :entry="entry" />
                 <span class="column-name">{{ entry.name }}</span>
@@ -817,6 +1270,21 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                   :alt="t('peer.previewAlt')"
                   class="gallery-image"
                 />
+                <audio
+                  v-else-if="isAudioPreview && peerPreviewSource"
+                  :src="peerPreviewSource"
+                  class="gallery-audio"
+                  controls
+                  preload="metadata"
+                ></audio>
+                <video
+                  v-else-if="isVideoPreview && peerPreviewSource"
+                  :src="peerPreviewSource"
+                  class="gallery-video"
+                  controls
+                  playsinline
+                  preload="metadata"
+                ></video>
                 <pre
                   v-else-if="activePreview && activePreview.encoding === 'utf8'"
                   class="gallery-text"
@@ -825,7 +1293,13 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                   <FileGlyph :entry="galleryFile" size="xl" />
                   <strong>{{ galleryFile.name }}</strong>
                   <span>{{ entryKind(galleryFile) }} · {{ formatSize(galleryFile) }}</span>
-                  <el-button type="primary" plain :disabled="busy" @click="previewEntry(galleryFile)">
+                  <el-button
+                    v-if="canPreview(galleryFile)"
+                    type="primary"
+                    plain
+                    :disabled="busy"
+                    @click="previewEntry(galleryFile)"
+                  >
                     {{ t("peer.preview") }}
                   </el-button>
                 </div>
@@ -882,8 +1356,17 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
             >
               {{ t("peer.open") }}
             </el-button>
+            <el-button
+              v-if="selectedEntry.isDir"
+              plain
+              :disabled="busy"
+              @click="downloadDirectory(selectedEntry)"
+            >
+              {{ t("peer.download") }}
+            </el-button>
             <template v-else>
               <el-button
+                v-if="canPreview(selectedEntry)"
                 type="primary"
                 plain
                 :disabled="busy"
@@ -894,41 +1377,26 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
               <el-button plain :disabled="busy" @click="downloadEntry(selectedEntry)">
                 {{ t("peer.download") }}
               </el-button>
-              <el-button plain :disabled="busy" @click="editEntry(selectedEntry)">
+              <el-button
+                v-if="isReadableText(selectedEntry)"
+                plain
+                :disabled="busy"
+                @click="editEntry(selectedEntry)"
+              >
                 {{ t("peer.edit") }}
               </el-button>
             </template>
+            <el-button
+              v-if="canDeleteEntries"
+              type="danger"
+              plain
+              :disabled="busy"
+              @click="deleteEntry(selectedEntry)"
+            >
+              {{ t("common.delete") }}
+            </el-button>
           </div>
         </div>
-
-        <section
-          v-if="viewMode !== 'gallery' && activePreview"
-          class="preview-panel"
-        >
-          <header class="preview-panel__head">
-            <div>
-              <strong>{{ activePreview.fileName }}</strong>
-              <span>{{ activePreview.mime }} · {{ activePreview.size }} B</span>
-            </div>
-            <el-button text @click="peerPreview = null">
-              {{ t("common.close") }}
-            </el-button>
-          </header>
-          <img
-            v-if="isImagePreview && peerPreviewSource"
-            :src="peerPreviewSource"
-            :alt="t('peer.previewAlt')"
-            class="preview-image"
-          />
-          <pre
-            v-else-if="activePreview.encoding === 'utf8'"
-            class="preview-text"
-          >{{ activePreview.data }}</pre>
-          <p v-else class="hint">{{ t("peer.binaryPreview") }}</p>
-          <p v-if="activePreview.truncated" class="hint">
-            {{ t("peer.previewTruncated") }}
-          </p>
-        </section>
 
         <section v-if="peerEdit" class="edit-panel">
           <div>
@@ -979,6 +1447,66 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
     </el-dialog>
 
     <el-dialog
+      v-model="downloadDialogOpen"
+      :title="t('peer.downloadQueue')"
+      width="560"
+      :show-close="!downloadRunning"
+      :close-on-click-modal="false"
+      :close-on-press-escape="false"
+    >
+      <div class="transfer-dialog">
+        <p class="transfer-dialog__name">{{ downloadDirectoryName }}</p>
+        <p class="saved-path">{{ downloadRoot }}</p>
+        <p class="hint">{{ downloadSummary }}</p>
+        <el-progress :percentage="downloadQueuePercent" :stroke-width="8" />
+        <p v-if="downloadTotalBytes" class="hint">
+          {{ formatBytes(downloadTransferredBytes) }} /
+          {{ formatBytes(downloadTotalBytes) }}
+        </p>
+        <ul class="transfer-queue">
+          <li
+            v-for="item in downloadQueue"
+            :key="item.remotePath"
+          >
+            <div class="transfer-queue__name">
+              <FileGlyph
+                :entry="{
+                  isDir: false,
+                  name: item.relativePath,
+                  contentType: null,
+                }"
+              />
+              <div>
+                <strong>{{ baseName(item.relativePath) }}</strong>
+                <span>{{ item.relativePath }} · {{ formatBytes(item.size) }}</span>
+              </div>
+            </div>
+            <span
+              class="transfer-queue__status"
+              :class="`is-${item.status}`"
+              :title="item.error || undefined"
+            >
+              {{ downloadStatusText(item) }}
+            </span>
+          </li>
+        </ul>
+      </div>
+      <template #footer>
+        <el-button
+          v-if="downloadRunning"
+          plain
+          :disabled="downloadCanceled"
+          @click="cancelDownloadQueue"
+        >
+          {{ downloadCanceled ? t("peer.cancelingDownload") : t("peer.cancelDownload") }}
+        </el-button>
+        <el-button v-else type="primary" @click="downloadDialogOpen = false">
+          {{ t("common.close") }}
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
       v-model="savedOpen"
       :title="t('peer.downloadComplete')"
       width="480"
@@ -1006,12 +1534,12 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
       <div class="transfer-dialog">
         <p class="hint">{{ uploadSummary }}</p>
         <el-progress :percentage="uploadPercent" :stroke-width="8" />
-        <ul class="upload-queue">
+        <ul class="transfer-queue">
           <li
             v-for="(item, index) in uploadQueue"
             :key="`${item.localPath}-${index}`"
           >
-            <div class="upload-queue__name">
+            <div class="transfer-queue__name">
               <FileGlyph
                 :entry="{
                   isDir: false,
@@ -1025,7 +1553,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
               </div>
             </div>
             <span
-              class="upload-queue__status"
+              class="transfer-queue__status"
               :class="`is-${item.status}`"
               :title="item.error || undefined"
             >
@@ -1048,16 +1576,163 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
         </el-button>
       </template>
     </el-dialog>
+
+    <section
+      v-if="previewOpen"
+      ref="previewDialogEl"
+      class="preview-dialog"
+      role="dialog"
+      aria-modal="true"
+      :aria-label="previewTarget?.name ?? t('peer.preview')"
+      tabindex="-1"
+      @keydown.esc="closePreview"
+    >
+      <header class="preview-dialog__head">
+        <div class="preview-dialog__identity">
+          <FileGlyph
+            v-if="previewTarget"
+            :entry="previewTarget"
+          />
+          <div>
+            <strong>{{ previewTarget?.name ?? activePreview?.fileName }}</strong>
+            <span>{{ previewMeta }}</span>
+          </div>
+        </div>
+        <div class="preview-dialog__actions">
+          <span v-if="codePreview" class="preview-language">
+            {{ codePreview.language }}
+          </span>
+          <el-button text @click="closePreview">
+            {{ t("common.close") }}
+          </el-button>
+        </div>
+      </header>
+
+      <div class="preview-dialog__body">
+        <div
+          v-if="previewKind === 'unavailable'"
+          class="preview-unavailable"
+        >
+          <FileGlyph v-if="previewTarget" :entry="previewTarget" size="xl" />
+          <strong>{{ t("peer.previewUnavailable") }}</strong>
+          <p>{{ previewLimitText }}</p>
+          <el-button
+            type="primary"
+            :disabled="busy"
+            @click="downloadEntry(previewTarget)"
+          >
+            {{ t("peer.download") }}
+          </el-button>
+        </div>
+
+        <div v-else-if="previewKind === 'image'" class="preview-image-wrap">
+          <img
+            :src="peerPreviewSource"
+            :alt="t('peer.previewAlt')"
+            class="preview-image-full"
+          />
+        </div>
+
+        <div v-else-if="previewKind === 'audio'" class="preview-media-wrap">
+          <audio
+            :src="peerPreviewSource"
+            class="preview-audio"
+            controls
+            preload="metadata"
+          ></audio>
+        </div>
+
+        <div v-else-if="previewKind === 'video'" class="preview-media-wrap">
+          <video
+            :src="peerPreviewSource"
+            class="preview-video"
+            controls
+            playsinline
+            preload="metadata"
+          ></video>
+        </div>
+
+        <div
+          v-else-if="previewKind === 'markdown'"
+          class="markdown-body"
+          v-html="markdownPreviewHtml"
+        ></div>
+
+        <div v-else-if="previewKind === 'table'" class="preview-table-wrap">
+          <p
+            v-if="!tablePreview?.header.length && !tablePreview?.rows.length"
+            class="preview-empty"
+          >
+            {{ t("peer.previewEmpty") }}
+          </p>
+          <table v-else class="preview-table">
+            <thead>
+              <tr>
+                <th class="preview-row-number" scope="col">#</th>
+                <th
+                  v-for="column in tablePreview.columnCount"
+                  :key="column"
+                  scope="col"
+                >
+                  {{
+                    tablePreview.header[column - 1] ||
+                    t("peer.columnName", { number: column })
+                  }}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="(row, rowIndex) in tablePreview.rows"
+                :key="rowIndex"
+              >
+                <th class="preview-row-number" scope="row">
+                  {{ rowIndex + 1 }}
+                </th>
+                <td
+                  v-for="column in tablePreview.columnCount"
+                  :key="column"
+                >
+                  {{ row[column - 1] ?? "" }}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div v-else-if="previewKind === 'code'" class="preview-code-wrap">
+          <pre class="preview-code-gutter" aria-hidden="true"><span
+            v-for="line in codeLineCount"
+            :key="line"
+          >{{ line }}</span></pre>
+          <pre class="preview-code"><code class="hljs" v-html="codePreview?.html"></code></pre>
+        </div>
+
+        <pre
+          v-else-if="previewKind === 'text'"
+          class="preview-text-full"
+        >{{ activePreview?.data }}</pre>
+
+        <div
+          v-else-if="previewKind === 'binary'"
+          class="preview-empty-state"
+        >
+          <p>{{ t("peer.binaryPreview") }}</p>
+        </div>
+      </div>
+    </section>
   </div>
 </template>
 
 <style scoped>
 .peer-browser {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   gap: 12px;
-  height: 100%;
-  min-height: 540px;
 }
 
 .sidebar-identity {
@@ -1137,8 +1812,6 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   display: grid;
   grid-template-columns: 180px minmax(0, 1fr);
   overflow: hidden;
-  border: 1px solid var(--app-border);
-  border-radius: 16px;
   background: var(--app-surface);
 }
 
@@ -1207,7 +1880,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 .browser-main {
   min-width: 0;
   min-height: 0;
-  overflow-y: auto;
+  overflow: hidden;
   padding: 14px 16px 18px;
   display: flex;
   flex-direction: column;
@@ -1218,6 +1891,8 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   display: flex;
   align-items: center;
   gap: 12px;
+  border-bottom: 1px solid var(--app-border);
+  padding-bottom: 12px;
 }
 
 .breadcrumbs {
@@ -1227,7 +1902,14 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   align-items: center;
   gap: 2px;
   overflow-x: auto;
+  overflow-y: hidden;
   white-space: nowrap;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.breadcrumbs::-webkit-scrollbar {
+  display: none;
 }
 
 .breadcrumb {
@@ -1274,10 +1956,11 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   font-size: 12.5px;
 }
 
+/* Keep the pathbar and selection bar fixed; only the file area scrolls. */
 .file-view {
   flex: 1;
-  min-height: 280px;
-  overflow-x: auto;
+  min-height: 0;
+  overflow: auto;
 }
 
 .icon-grid {
@@ -1371,8 +2054,6 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   align-items: stretch;
   min-height: 320px;
   overflow-x: auto;
-  border: 1px solid var(--app-border);
-  border-radius: 10px;
 }
 
 .column {
@@ -1465,6 +2146,18 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   max-height: 380px;
   object-fit: contain;
   border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(22, 32, 46, 0.16);
+}
+
+.gallery-audio {
+  width: min(440px, 100%);
+}
+
+.gallery-video {
+  max-width: 100%;
+  max-height: 380px;
+  border-radius: 8px;
+  background: #000;
   box-shadow: 0 8px 28px rgba(22, 32, 46, 0.16);
 }
 
@@ -1596,10 +2289,11 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   gap: 6px;
 }
 
-.preview-panel,
 .edit-panel {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
   gap: 10px;
   padding: 12px;
   border: 1px solid var(--app-border);
@@ -1607,33 +2301,448 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   background: var(--app-surface-2);
 }
 
-.preview-panel__head {
+.preview-dialog {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  min-height: 0;
   display: flex;
-  align-items: flex-start;
+  flex-direction: column;
+  background: var(--app-surface);
+  color: var(--app-text);
+  outline: none;
+}
+
+.preview-dialog__head {
+  flex: none;
+  min-height: 54px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
   justify-content: space-between;
+  gap: 16px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--app-border);
+  background: var(--app-surface-2);
+}
+
+.preview-dialog__identity {
+  min-width: 0;
+  display: flex;
+  align-items: center;
   gap: 10px;
 }
 
-.preview-panel__head div {
+.preview-dialog__identity > div {
   min-width: 0;
   display: flex;
   flex-direction: column;
+  gap: 2px;
 }
 
-.preview-panel__head strong {
+.preview-dialog__identity strong,
+.preview-dialog__identity span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preview-dialog__identity strong {
   font-size: 13px;
   color: var(--app-text);
 }
 
-.preview-panel__head span {
+.preview-dialog__identity span {
   font-size: 11.5px;
   color: var(--app-text-muted);
 }
 
-.edit-panel {
-  flex-direction: row;
+.preview-dialog__actions {
+  flex: none;
+  display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 10px;
+}
+
+.preview-language {
+  padding: 3px 7px;
+  border-radius: 6px;
+  background: var(--pill-bg);
+  color: var(--pill-fg);
+  font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.preview-dialog__body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: var(--app-surface);
+}
+
+.preview-image-wrap {
+  min-height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.preview-image-full {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 8px;
+  border: 1px solid var(--app-border);
+  background: var(--app-surface-2);
+}
+
+.preview-media-wrap {
+  min-height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.preview-audio {
+  width: min(560px, 100%);
+}
+
+.preview-video {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 10px;
+  background: #000;
+  box-shadow: 0 12px 36px rgba(22, 32, 46, 0.2);
+}
+
+.markdown-body {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 32px 40px 64px;
+  color: var(--app-text-secondary);
+  font-size: 14px;
+  line-height: 1.75;
+  overflow-wrap: anywhere;
+}
+
+.markdown-body :deep(h1),
+.markdown-body :deep(h2),
+.markdown-body :deep(h3),
+.markdown-body :deep(h4) {
+  margin: 1.5em 0 0.6em;
+  color: var(--app-text);
+  line-height: 1.3;
+}
+
+.markdown-body :deep(h1) {
+  font-size: 1.8em;
+  padding-bottom: 0.35em;
+  border-bottom: 1px solid var(--app-border);
+}
+
+.markdown-body :deep(h2) {
+  font-size: 1.4em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid color-mix(in oklab, var(--app-border) 65%, transparent);
+}
+
+.markdown-body :deep(h3) {
+  font-size: 1.18em;
+}
+
+.markdown-body :deep(p),
+.markdown-body :deep(ul),
+.markdown-body :deep(ol),
+.markdown-body :deep(blockquote),
+.markdown-body :deep(pre),
+.markdown-body :deep(table) {
+  margin: 0 0 1em;
+}
+
+.markdown-body :deep(ul),
+.markdown-body :deep(ol) {
+  padding-left: 1.6em;
+}
+
+.markdown-body :deep(li + li) {
+  margin-top: 0.25em;
+}
+
+.markdown-body :deep(a) {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.markdown-body :deep(a:hover) {
+  text-decoration: underline;
+}
+
+.markdown-body :deep(code) {
+  padding: 0.18em 0.36em;
+  border-radius: 5px;
+  background: var(--app-surface-2);
+  border: 1px solid var(--app-border);
+  font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 0.88em;
+  color: var(--app-text);
+}
+
+.markdown-body :deep(pre) {
+  padding: 14px 16px;
+  overflow: auto;
+  border-radius: 8px;
+  background: var(--app-surface-2);
+  border: 1px solid var(--app-border);
+}
+
+.markdown-body :deep(pre code) {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: 0.86em;
+}
+
+.markdown-body :deep(blockquote) {
+  padding: 0.2em 0 0.2em 1em;
+  border-left: 3px solid var(--app-border);
+  color: var(--app-text-muted);
+}
+
+.markdown-body :deep(hr) {
+  height: 1px;
+  margin: 1.5em 0;
+  border: 0;
+  background: var(--app-border);
+}
+
+.markdown-body :deep(img) {
+  max-width: 100%;
+  border-radius: 8px;
+}
+
+.markdown-body :deep(table) {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92em;
+}
+
+.markdown-body :deep(th),
+.markdown-body :deep(td) {
+  padding: 7px 10px;
+  border: 1px solid var(--app-border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown-body :deep(th) {
+  background: var(--app-surface-2);
+  color: var(--app-text);
+}
+
+.preview-table-wrap {
+  min-width: 100%;
+  padding-bottom: 24px;
+}
+
+.preview-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.preview-table th,
+.preview-table td {
+  max-width: 420px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--app-border);
+  text-align: left;
+  vertical-align: top;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.preview-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--app-surface-2);
+  color: var(--app-text);
+  font-size: 11.5px;
+  font-weight: 650;
+  border-bottom-color: var(--app-border);
+}
+
+.preview-table tbody tr:nth-child(even) {
+  background: color-mix(in oklab, var(--app-surface-2) 55%, transparent);
+}
+
+.preview-table .preview-row-number {
+  width: 1%;
+  padding-right: 10px;
+  color: var(--app-text-muted);
+  font-weight: 500;
+  text-align: right;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.preview-code-wrap {
+  min-height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  align-items: stretch;
+  overflow: auto;
+}
+
+.preview-code-gutter {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  flex: none;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 20px 12px 48px 16px;
+  border-right: 1px solid var(--app-border);
+  background: var(--app-surface);
+  color: var(--app-text-muted);
+  font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.65;
+  text-align: right;
+  user-select: none;
+}
+
+.preview-code-gutter span {
+  display: block;
+}
+
+.preview-code {
+  flex: 1 0 auto;
+  min-width: max-content;
+  min-height: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 20px 22px 48px;
+  color: var(--app-text);
+  font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.65;
+  tab-size: 2;
+  white-space: pre;
+}
+
+.preview-code code {
+  font-family: inherit;
+}
+
+.preview-text-full {
+  min-height: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 24px 28px 48px;
+  color: var(--app-text-secondary);
+  font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.preview-unavailable,
+.preview-empty-state {
+  min-height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 32px;
+  text-align: center;
+}
+
+.preview-unavailable strong {
+  font-size: 16px;
+  color: var(--app-text);
+}
+
+.preview-unavailable p,
+.preview-empty-state p,
+.preview-empty {
+  max-width: 480px;
+  margin: 0;
+  color: var(--app-text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.preview-empty {
+  padding: 32px;
+  text-align: center;
+}
+
+.preview-code :deep(.hljs-comment),
+.preview-code :deep(.hljs-quote),
+.preview-code :deep(.hljs-meta) {
+  color: var(--syntax-comment);
+}
+
+.preview-code :deep(.hljs-keyword),
+.preview-code :deep(.hljs-literal),
+.preview-code :deep(.hljs-selector-tag),
+.preview-code :deep(.hljs-doctag) {
+  color: var(--syntax-keyword);
+}
+
+.preview-code :deep(.hljs-string),
+.preview-code :deep(.hljs-attr),
+.preview-code :deep(.hljs-attribute),
+.preview-code :deep(.hljs-addition),
+.preview-code :deep(.hljs-template-tag) {
+  color: var(--syntax-string);
+}
+
+.preview-code :deep(.hljs-number),
+.preview-code :deep(.hljs-symbol),
+.preview-code :deep(.hljs-regexp) {
+  color: var(--syntax-number);
+}
+
+.preview-code :deep(.hljs-title),
+.preview-code :deep(.hljs-section),
+.preview-code :deep(.hljs-name),
+.preview-code :deep(.hljs-selector-id),
+.preview-code :deep(.hljs-selector-class) {
+  color: var(--syntax-title);
+}
+
+.preview-code :deep(.hljs-built_in),
+.preview-code :deep(.hljs-type) {
+  color: var(--syntax-built-in);
+}
+
+.preview-code :deep(.hljs-variable),
+.preview-code :deep(.hljs-template-variable),
+.preview-code :deep(.hljs-params) {
+  color: var(--syntax-variable);
+}
+
+.preview-code :deep(.hljs-deletion) {
+  color: var(--syntax-deletion);
+}
+
+.preview-code :deep(.hljs-emphasis) {
+  font-style: italic;
+}
+
+.preview-code :deep(.hljs-strong) {
+  font-weight: 700;
 }
 
 .edit-panel p {
@@ -1662,7 +2771,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   overflow-wrap: anywhere;
 }
 
-.upload-queue {
+.transfer-queue {
   list-style: none;
   max-height: 320px;
   overflow-y: auto;
@@ -1672,7 +2781,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   border-radius: 10px;
 }
 
-.upload-queue li {
+.transfer-queue li {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1680,62 +2789,63 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   padding: 9px 11px;
 }
 
-.upload-queue li + li {
+.transfer-queue li + li {
   border-top: 1px solid var(--app-border);
 }
 
-.upload-queue__name {
+.transfer-queue__name {
   min-width: 0;
   display: flex;
   align-items: center;
   gap: 9px;
 }
 
-.upload-queue__name > div {
+.transfer-queue__name > div {
   min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 
-.upload-queue__name strong,
-.upload-queue__name span {
+.transfer-queue__name strong,
+.transfer-queue__name span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.upload-queue__name strong {
+.transfer-queue__name strong {
   font-size: 12.5px;
   color: var(--app-text);
 }
 
-.upload-queue__name span {
+.transfer-queue__name span {
   font-size: 11px;
   color: var(--app-text-muted);
 }
 
-.upload-queue__status {
+.transfer-queue__status {
   flex: none;
   font-size: 11.5px;
   font-weight: 600;
   color: var(--app-text-muted);
 }
 
-.upload-queue__status.is-done {
+.transfer-queue__status.is-done {
   color: color-mix(in oklab, var(--accent-green) 72%, var(--app-text));
 }
 
-.upload-queue__status.is-error {
+.transfer-queue__status.is-error {
   color: var(--el-color-danger);
 }
 
-.upload-queue__status.is-skipped,
-.upload-queue__status.is-canceled {
+.transfer-queue__status.is-skipped,
+.transfer-queue__status.is-canceled {
   color: var(--app-text-muted);
 }
 
-.upload-queue__status.is-uploading {
+.transfer-queue__status.is-uploading,
+.transfer-queue__status.is-downloading {
   color: var(--el-color-primary);
 }
 

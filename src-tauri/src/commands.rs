@@ -5,23 +5,25 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ignore::WalkBuilder;
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_opener::OpenerExt;
 use zeroize::Zeroizing;
 
 use crate::error::{AppError, DomainError};
+use crate::ignore_rules::is_builtin_ignored;
 use crate::peer::{PeerManager, TransferProgressCallback};
 use crate::server::{ServerConfig, ServerController};
 use crate::traits::{PeerEvents, ServerEvents};
 use crate::types::{
     AccessRule, AdminLoginResult, AdminSessionInfo, ApprovePendingResult, AuthorizationInfo,
-    ConflictPolicy, DEFAULT_DISCOVERY_PORT, DEFAULT_SERVER_PORT, DiscoveredPeer, ERROR_EVENT,
-    ExternalEditInfo, InitializeVaultResult, PEER_REVOKED_EVENT, PENDING_CANCELED_EVENT,
-    PENDING_REQUEST_EVENT, PeerAccessRequest, PeerHealth, PeerInfo, PeerListing,
-    PeerRevocationInfo, PeerShare, PendingRequestInfo, PreviewPayload, ResetVaultResult,
-    SERVER_BIND_META, SERVER_DISCOVERY_PORT_META, SERVER_ENABLED_META, SERVER_NAME_META,
-    SERVER_PORT_META, ServerStatus, ShareInfo, SharePermissions, TRANSFER_PROGRESS_EVENT,
-    TransferProgress, TransferResult, UploadCandidate, VaultStatus,
+    ConflictPolicy, DEFAULT_DISCOVERY_PORT, DEFAULT_SERVER_PORT, DirectoryDownloadPlan,
+    DiscoveredPeer, ERROR_EVENT, ExternalEditInfo, InitializeVaultResult, PEER_REVOKED_EVENT,
+    PENDING_CANCELED_EVENT, PENDING_REQUEST_EVENT, PeerAccessRequest, PeerHealth, PeerInfo,
+    PeerListing, PeerRevocationInfo, PeerShare, PendingRequestInfo, PreviewPayload,
+    ResetVaultResult, SERVER_BIND_META, SERVER_DISCOVERY_PORT_META, SERVER_ENABLED_META,
+    SERVER_NAME_META, SERVER_PORT_META, ServerStatus, ShareInfo, SharePermissions,
+    TRANSFER_PROGRESS_EVENT, TransferProgress, TransferResult, UploadCandidate, VaultStatus,
 };
 use crate::vault::Vault;
 
@@ -615,6 +617,20 @@ pub async fn list_peer_dir(
 }
 
 #[tauri::command]
+pub async fn delete_peer_entry(
+    peers: State<'_, SharedPeers>,
+    peer_id: String,
+    share_id: String,
+    remote_path: String,
+) -> Result<(), AppError> {
+    let peers = Arc::clone(peers.inner());
+    peers
+        .delete_entry(&peer_id, &share_id, &remote_path)
+        .await
+        .map_err(AppError::from)
+}
+
+#[tauri::command]
 pub async fn download_peer_file(
     peers: State<'_, SharedPeers>,
     peer_id: String,
@@ -630,6 +646,28 @@ pub async fn download_peer_file(
             &share_id,
             &remote_path,
             &local_dir,
+            conflict.unwrap_or_default(),
+        )
+        .await
+        .map_err(AppError::from)
+}
+
+#[tauri::command]
+pub async fn prepare_peer_directory_download(
+    peers: State<'_, SharedPeers>,
+    peer_id: String,
+    share_id: String,
+    remote_path: String,
+    local_parent: String,
+    conflict: Option<ConflictPolicy>,
+) -> Result<DirectoryDownloadPlan, AppError> {
+    let peers = Arc::clone(peers.inner());
+    peers
+        .prepare_directory_download(
+            &peer_id,
+            &share_id,
+            &remote_path,
+            &local_parent,
             conflict.unwrap_or_default(),
         )
         .await
@@ -746,31 +784,56 @@ fn walk_upload_dir(
     relative: &Path,
     candidates: &mut Vec<UploadCandidate>,
 ) -> Result<(), DomainError> {
-    if candidates.len() > MAX_UPLOAD_FILES {
-        return Err(DomainError::UploadQueueTooLarge {
-            count: candidates.len(),
-            limit: MAX_UPLOAD_FILES,
+    let mut builder = WalkBuilder::new(directory);
+    builder
+        .hidden(false)
+        .parents(false)
+        .git_global(false)
+        .git_exclude(false)
+        .git_ignore(true)
+        .ignore(false)
+        .require_git(false)
+        .follow_links(false)
+        .filter_entry(|entry| {
+            let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
+            !is_builtin_ignored(&entry.file_name().to_string_lossy(), is_dir)
         });
-    }
-    let mut entries = std::fs::read_dir(directory)
-        .map_err(|error| local_upload_io("read upload folder", directory, error))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| local_upload_io("read upload folder", directory, error))?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
+
+    for result in builder.build() {
+        let entry = result.map_err(|error| {
+            local_upload_io(
+                "walk upload folder",
+                directory,
+                std::io::Error::other(error),
+            )
+        })?;
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| local_upload_io("inspect upload entry", &path, error))?;
-        if file_type.is_symlink() {
+        if path == directory {
             continue;
         }
-        let relative_path = relative.join(entry.file_name());
-        if file_type.is_dir() {
-            walk_upload_dir(&path, &relative_path, candidates)?;
-        } else if file_type.is_file() {
-            candidates.push(candidate_for(&path, &relative_path)?);
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
         }
+        if candidates.len() >= MAX_UPLOAD_FILES {
+            return Err(DomainError::UploadQueueTooLarge {
+                count: candidates.len() + 1,
+                limit: MAX_UPLOAD_FILES,
+            });
+        }
+        let relative_path = path
+            .strip_prefix(directory)
+            .map(|path| relative.join(path))
+            .map_err(|error| {
+                local_upload_io(
+                    "resolve upload path",
+                    path,
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()),
+                )
+            })?;
+        candidates.push(candidate_for(path, &relative_path)?);
     }
     Ok(())
 }
@@ -971,6 +1034,53 @@ mod tests {
         assert_eq!(candidates[1].relative_path, "docs/sub/b.txt");
         assert_eq!(candidates[0].size, 1);
         assert_eq!(candidates[1].size, 2);
+    }
+
+    #[test]
+    fn upload_walk_honors_gitignore_and_builtin_temporary_rules() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let docs = temp.path().join("docs");
+        std::fs::create_dir_all(docs.join("sub")).expect("nested dir");
+        std::fs::create_dir_all(docs.join("build")).expect("ignored dir");
+        std::fs::create_dir_all(docs.join("__pycache__")).expect("cache dir");
+        std::fs::write(docs.join(".gitignore"), b"*.log\nbuild/\n!keep.log\n").expect("gitignore");
+        std::fs::write(docs.join("a.txt"), b"a").expect("root file");
+        std::fs::write(docs.join("drop.log"), b"drop").expect("ignored log");
+        std::fs::write(docs.join("keep.log"), b"keep").expect("kept log");
+        std::fs::write(docs.join("module.pyc"), b"cache").expect("pyc file");
+        std::fs::write(docs.join("build").join("generated.txt"), b"generated")
+            .expect("ignored file");
+        std::fs::write(docs.join("__pycache__").join("x.pyc"), b"cache").expect("cache file");
+        std::fs::write(docs.join("sub").join("b.txt"), b"bb").expect("nested file");
+
+        let candidates =
+            collect_upload_candidates(&[docs.display().to_string()]).expect("collect uploads");
+        let relative: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.relative_path.as_str())
+            .collect();
+        for expected in [
+            "docs/.gitignore",
+            "docs/a.txt",
+            "docs/keep.log",
+            "docs/sub/b.txt",
+        ] {
+            assert!(
+                relative.contains(&expected),
+                "{expected} should be queued: {relative:?}"
+            );
+        }
+        for ignored in [
+            "docs/drop.log",
+            "docs/module.pyc",
+            "docs/build/generated.txt",
+            "docs/__pycache__/x.pyc",
+        ] {
+            assert!(
+                !relative.contains(&ignored),
+                "{ignored} should be ignored: {relative:?}"
+            );
+        }
     }
 
     #[tokio::test]

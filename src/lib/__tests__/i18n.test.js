@@ -190,6 +190,9 @@ describe("error mapping", () => {
     expect(errorStrategy(error("AUTH_INVALID_CREDENTIALS"))).toBe("retry");
     expect(errorStrategy(error("PEER_NOT_FOUND"))).toBe("peer-refresh");
     expect(errorStrategy(error("SERVER_BIND_FAILED"))).toBe("edit");
+    expect(errorStrategy(error("TRANSFER_TOO_LARGE"))).toBe("show");
+    expect(errorStrategy(error("PEER_PREVIEW_TOO_LARGE"))).toBe("show");
+    expect(errorStrategy(error("PEER_PREVIEW_TOO_MANY_LINES"))).toBe("show");
     expect(errorStrategy(error("SOMETHING_NEW"))).toBe("show");
   });
 

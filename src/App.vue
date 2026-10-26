@@ -27,7 +27,6 @@ const status = ref({
   keyFile: null,
   keyError: null,
 });
-const errorState = ref(null);
 const showQuitDialog = ref(false);
 const isMacOS = /Macintosh|Mac OS X/.test(navigator.userAgent);
 
@@ -68,39 +67,35 @@ const settingsTab = ref("shares");
 const transfers = ref({});
 
 let eventUnlisten = [];
-let activeNotice = null;
+let activeToast = null;
 let statusRequestInFlight = false;
 
-const errorMessage = computed(() => messageFromState(errorState.value));
-
-function messageFromState(state) {
-  if (!state) return "";
-  if (state.key) return t(state.key, state.params);
-  return localizeMessage(state.raw ?? "");
-}
-
-function setError(key, params) {
-  errorState.value = { key, params };
-}
-
-function setRawError(error) {
-  errorState.value = { raw: normalizeAppError(error).message };
-}
-
-function setNotice(key, params) {
-  activeNotice?.close();
-  activeNotice = ElMessage({
-    message: t(key, params),
-    type: "success",
-    duration: 3000,
+function showToast(message, type, duration) {
+  activeToast?.close();
+  activeToast = ElMessage({
+    message,
+    type,
+    duration,
     showClose: true,
+    offset: 54,
   });
 }
 
+function setError(key, params) {
+  showToast(t(key, params), "error", 5000);
+}
+
+function setRawError(error) {
+  showToast(localizeMessage(normalizeAppError(error).message), "error", 5000);
+}
+
+function setNotice(key, params) {
+  showToast(t(key, params), "success", 3000);
+}
+
 function clearMessages() {
-  errorState.value = null;
-  activeNotice?.close();
-  activeNotice = null;
+  activeToast?.close();
+  activeToast = null;
 }
 
 const view = computed(() => {
@@ -150,8 +145,8 @@ onUnmounted(() => {
     unlisten();
   }
   eventUnlisten = [];
-  activeNotice?.close();
-  activeNotice = null;
+  activeToast?.close();
+  activeToast = null;
 });
 
 function runWindowAction(action) {
@@ -234,7 +229,7 @@ async function bindServerEvents() {
     );
     eventUnlisten.push(
       await listen("app://error", (event) => {
-        errorState.value = { raw: normalizeAppError(event.payload).message };
+        setRawError(event.payload);
       }),
     );
     eventUnlisten.push(
@@ -558,7 +553,7 @@ provide(
           </button>
         </el-tooltip>
       </div>
-      <span class="titlebar-title">PeerDav</span>
+      <span class="titlebar-title">{{ t("titlebar.name") }}</span>
       <div class="titlebar-actions">
         <TitleBarMenu
           name="language"
@@ -626,15 +621,6 @@ provide(
     </header>
 
     <main class="shell" :class="{ 'shell--workspace': view === 'ready' }">
-      <el-alert
-        v-if="errorMessage"
-        class="alert alert-error"
-        type="error"
-        :title="errorMessage"
-        :closable="false"
-        show-icon
-      />
-
       <AuthView v-if="view !== 'ready'" :view="view" />
 
       <div v-else class="workspace">
@@ -869,13 +855,22 @@ provide(
   box-sizing: border-box;
 }
 
-.workspace-content--browser {
-  padding: 15px;
+/* The browser owns its internal scrolling; this pane must not add a second
+   scroll container around the fixed browser frame. */
+.workspace-content.workspace-content--browser {
+  position: relative;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .peer-unavailable {
   max-width: 460px;
   margin: 80px auto;
+  padding: 0 24px;
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -888,10 +883,6 @@ provide(
   color: var(--app-text-secondary);
   font-size: 13px;
   line-height: 1.6;
-}
-
-.shell--workspace > .alert {
-  margin: 10px 16px 0;
 }
 
 @media (max-width: 560px) {
@@ -939,6 +930,14 @@ provide(
   --code-bg: #fffaf0;
   --code-border: #f0c774;
   --code-text: #3a2a10;
+  --syntax-comment: #7a8699;
+  --syntax-keyword: #a626a4;
+  --syntax-string: #2f7d32;
+  --syntax-number: #9a6700;
+  --syntax-title: #3b6fd4;
+  --syntax-built-in: #9a6700;
+  --syntax-variable: #b54708;
+  --syntax-deletion: #c0392b;
 
   --el-border-radius-base: 10px;
   --el-component-size: 38px;
@@ -983,9 +982,10 @@ provide(
   --accent-on: #241a00;
 }
 
-/* Solid primary buttons use the accent's on-colour. Scoped under :root so it
-   outranks Element Plus's own primary-button defaults regardless of load order. */
-:root .el-button--primary {
+/* Solid primary buttons use the accent's on-colour. Plain, text and link
+   variants keep Element Plus's accent-coloured foreground so they stay
+   readable on their near-white surfaces. */
+:root .el-button--primary:not(.is-plain):not(.is-text):not(.is-link) {
   --el-button-text-color: var(--accent-on);
   --el-button-hover-text-color: var(--accent-on);
   --el-button-active-text-color: var(--accent-on);
@@ -1026,6 +1026,14 @@ provide(
   --code-bg: #2a2410;
   --code-border: #6b5a2a;
   --code-text: #f0dca0;
+  --syntax-comment: #8b98a9;
+  --syntax-keyword: #ff7b72;
+  --syntax-string: #a5d6ff;
+  --syntax-number: #79c0ff;
+  --syntax-title: #d2a8ff;
+  --syntax-built-in: #ffa657;
+  --syntax-variable: #ffa657;
+  --syntax-deletion: #ff7b72;
 
   /* In dark mode the lighter steps darken toward the surface. */
   --el-color-primary-light-3: color-mix(in oklab, var(--accent) 80%, black);
@@ -1090,29 +1098,6 @@ body,
   font-size: 13px;
   font-weight: 600;
   color: var(--app-text-strong);
-}
-
-.preview-image {
-  max-width: 100%;
-  max-height: 360px;
-  border-radius: 8px;
-  border: 1px solid var(--app-border);
-  background: var(--app-surface);
-  object-fit: contain;
-}
-
-.preview-text {
-  margin: 0;
-  max-height: 320px;
-  overflow: auto;
-  padding: 12px;
-  border-radius: 8px;
-  background: var(--app-surface-2);
-  border: 1px solid var(--app-border);
-  font-size: 12px;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-word;
 }
 
 .actions {

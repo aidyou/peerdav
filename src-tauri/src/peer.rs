@@ -33,17 +33,19 @@ use zeroize::Zeroizing;
 
 use crate::discovery;
 use crate::error::{AppError, DomainError};
+use crate::ignore_rules::{IgnoreLayer, build_gitignore, is_path_ignored};
 use crate::traits::PeerEvents;
 use crate::types::{
     ACCESS_PROTOCOL, ACCESS_REQUEST_HEADER, ACCESS_STATUS_PATH, AUTHORIZATION_PATH,
     AUTHORIZATION_PROTOCOL, AccessRequestStatus, AccessStatusResponse,
     AuthorizationBindingResponse, AuthorizationStatus, AuthorizationStatusResponse, CATALOG_PATH,
-    CATALOG_PROTOCOL, CLIENT_ID_HEADER, CatalogResponse, ConflictPolicy, DiscoveredPeer,
-    ExternalEditInfo, MAX_ACCESS_REQUEST_ID_CHARS, MAX_AUTHORIZATION_CODE_CHARS, MAX_DIR_ENTRIES,
-    MAX_PREVIEW_BYTES, MAX_REMOTE_PATH_BYTES, MAX_TEXT_PREVIEW_BYTES, MAX_TRANSFER_BYTES,
-    MIN_ACCESS_REQUEST_ID_CHARS, PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT, PEER_REQUEST_TIMEOUT,
-    PEER_SYNC_INTERVAL, PeerAccessRequest, PeerEntry, PeerHealth, PeerInfo, PeerListing,
-    PeerRecord, PeerRevocationInfo, PeerShare, PreviewPayload, SHARE_URL_PREFIX, TransferResult,
+    CATALOG_PROTOCOL, CLIENT_ID_HEADER, CatalogResponse, ConflictPolicy, DirectoryDownloadPlan,
+    DiscoveredPeer, DownloadCandidate, ExternalEditInfo, MAX_ACCESS_REQUEST_ID_CHARS,
+    MAX_AUTHORIZATION_CODE_CHARS, MAX_DIR_ENTRIES, MAX_DIRECTORY_DOWNLOAD_FILES, MAX_PREVIEW_BYTES,
+    MAX_PREVIEW_LINES, MAX_REMOTE_PATH_BYTES, MAX_TRANSFER_BYTES, MIN_ACCESS_REQUEST_ID_CHARS,
+    PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT, PEER_REQUEST_TIMEOUT, PEER_SYNC_INTERVAL,
+    PeerAccessRequest, PeerEntry, PeerHealth, PeerInfo, PeerListing, PeerRecord,
+    PeerRevocationInfo, PeerShare, PreviewPayload, SHARE_URL_PREFIX, TransferResult,
 };
 use crate::vault::Vault;
 
@@ -58,6 +60,206 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
 const READ_CHUNK: usize = 64 * 1024;
+const MAX_IGNORE_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Suffixes treated as text previews. This is deliberately suffix-driven:
+/// server-reported MIME types are often `application/octet-stream` for source
+/// files. Keep this list aligned with `CODE_EXTENSIONS`/`TEXT_EXTENSIONS` in
+/// `src/lib/fileKinds.js`.
+const TEXT_EXTENSIONS: &[&str] = &[
+    "1st",
+    "adoc",
+    "asciidoc",
+    "asm",
+    "astro",
+    "avsc",
+    "awk",
+    "bash",
+    "bat",
+    "babelrc",
+    "bashrc",
+    "browserslistrc",
+    "c",
+    "c++",
+    "cc",
+    "cfg",
+    "clj",
+    "cljc",
+    "cljs",
+    "cmake",
+    "cmd",
+    "cnf",
+    "conf",
+    "copying",
+    "cpp",
+    "cs",
+    "csx",
+    "css",
+    "csv",
+    "cxx",
+    "dart",
+    "desktop",
+    "dockerignore",
+    "edn",
+    "editorconfig",
+    "elm",
+    "env",
+    "erl",
+    "eslintrc",
+    "ex",
+    "exs",
+    "f90",
+    "f95",
+    "fish",
+    "fs",
+    "fsx",
+    "gitattributes",
+    "gitconfig",
+    "gitignore",
+    "go",
+    "gql",
+    "gradle",
+    "graphql",
+    "groovy",
+    "h",
+    "hh",
+    "hpp",
+    "hrl",
+    "hs",
+    "htaccess",
+    "htpasswd",
+    "htm",
+    "html",
+    "hxx",
+    "ini",
+    "ipynb",
+    "java",
+    "jl",
+    "js",
+    "inputrc",
+    "json",
+    "json5",
+    "jsonc",
+    "jsx",
+    "kt",
+    "kts",
+    "less",
+    "lhs",
+    "lock",
+    "log",
+    "lua",
+    "m",
+    "make",
+    "map",
+    "markdown",
+    "md",
+    "mdown",
+    "mdx",
+    "mjs",
+    "mk",
+    "mkd",
+    "mli",
+    "ml",
+    "mm",
+    "mount",
+    "netrc",
+    "nim",
+    "nfo",
+    "npmrc",
+    "nvmrc",
+    "org",
+    "pas",
+    "php",
+    "php3",
+    "php4",
+    "php5",
+    "php7",
+    "phtml",
+    "phps",
+    "pid",
+    "pl",
+    "plist",
+    "pm",
+    "prettierrc",
+    "profile",
+    "properties",
+    "proto",
+    "ps1",
+    "psm1",
+    "purs",
+    "py",
+    "pyw",
+    "r",
+    "rb",
+    "rc",
+    "re",
+    "rei",
+    "rst",
+    "rs",
+    "rules",
+    "s",
+    "sass",
+    "scala",
+    "scss",
+    "sed",
+    "service",
+    "sh",
+    "socket",
+    "sol",
+    "sql",
+    "srt",
+    "stylelintrc",
+    "sv",
+    "svelte",
+    "swift",
+    "tcl",
+    "target",
+    "tex",
+    "text",
+    "thrift",
+    "timer",
+    "toml",
+    "ts",
+    "tsv",
+    "tsx",
+    "txt",
+    "tx",
+    "vb",
+    "vhd",
+    "vhdl",
+    "v",
+    "vimrc",
+    "vtt",
+    "vue",
+    "wgetrc",
+    "xml",
+    "xsd",
+    "xsl",
+    "xslt",
+    "yaml",
+    "yarnrc",
+    "yml",
+    "zig",
+    "zsh",
+    "zshrc",
+];
+const TEXT_FILENAMES: &[&str] = &[
+    "authors",
+    "changelog",
+    "copying",
+    "dockerfile",
+    "gemfile",
+    "jenkinsfile",
+    "license",
+    "licence",
+    "makefile",
+    "notice",
+    "procfile",
+    "rakefile",
+    "readme",
+    "todo",
+    "vagrantfile",
+];
 
 pub type TransferProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
@@ -1000,6 +1202,181 @@ impl PeerManager {
         })
     }
 
+    /// Recursively scans a remote directory and creates the matching local
+    /// directory tree. The returned files are ordered by relative path so the
+    /// UI can download them sequentially with visible queue progress.
+    pub async fn prepare_directory_download(
+        &self,
+        peer_id: &str,
+        share_id: &str,
+        remote_path: &str,
+        local_parent: &str,
+        conflict: ConflictPolicy,
+    ) -> Result<DirectoryDownloadPlan, DomainError> {
+        let (display, _, folder_name) = remote_file_target(share_id, remote_path)?;
+        let parent = canonical_local_dir(local_parent).await?;
+        let target_root = parent.join(&folder_name);
+
+        let root_exists = match tokio::fs::symlink_metadata(&target_root).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io_error(
+                    "inspect download directory",
+                    &target_root,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "refusing to use a symbolic link as the download directory",
+                    ),
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(DomainError::TransferConflict {
+                    path: target_root.display().to_string(),
+                });
+            }
+            Ok(_) if conflict != ConflictPolicy::Overwrite => {
+                return Err(DomainError::TransferConflict {
+                    path: target_root.display().to_string(),
+                });
+            }
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(io_error("inspect download directory", &target_root, error));
+            }
+        };
+
+        let mut directories = Vec::new();
+        let mut remote_files = Vec::new();
+        let mut pending = vec![(display, String::new(), Vec::<IgnoreLayer>::new())];
+        while let Some((directory, relative_parent, mut layers)) = pending.pop() {
+            let listing = self.list_dir(peer_id, share_id, &directory).await?;
+            if listing.truncated {
+                return Err(DomainError::DownloadQueueTooLarge {
+                    count: MAX_DIRECTORY_DOWNLOAD_FILES + 1,
+                    limit: MAX_DIRECTORY_DOWNLOAD_FILES,
+                });
+            }
+            if let Some(ignore_entry) = listing
+                .entries
+                .iter()
+                .find(|entry| !entry.is_dir && entry.name == ".gitignore")
+                && let Some(content) = self
+                    .read_remote_ignore_file(peer_id, share_id, &ignore_entry.path)
+                    .await?
+                && let Some(matcher) = build_gitignore(&content)
+            {
+                layers.push(IgnoreLayer {
+                    base: directory.clone(),
+                    matcher,
+                });
+            }
+            for entry in listing.entries {
+                let name = sanitize_file_name(&entry.name)?;
+                if is_path_ignored(&entry.path, &name, entry.is_dir, &layers) {
+                    continue;
+                }
+                let relative = if relative_parent.is_empty() {
+                    name
+                } else {
+                    format!("{relative_parent}/{name}")
+                };
+                if directories.len() + remote_files.len() >= MAX_DIRECTORY_DOWNLOAD_FILES {
+                    return Err(DomainError::DownloadQueueTooLarge {
+                        count: directories.len() + remote_files.len() + 1,
+                        limit: MAX_DIRECTORY_DOWNLOAD_FILES,
+                    });
+                }
+                if entry.is_dir {
+                    directories.push(relative.clone());
+                    pending.push((entry.path, relative, layers.clone()));
+                } else {
+                    remote_files.push((entry.path, relative, entry.size));
+                }
+            }
+        }
+
+        if !root_exists {
+            tokio::fs::create_dir(&target_root)
+                .await
+                .map_err(|error| io_error("create download directory", &target_root, error))?;
+        }
+        let target_root = canonical_local_dir(target_root.to_str().ok_or_else(|| {
+            DomainError::RemotePathInvalid {
+                detail: "the download directory is not valid UTF-8".to_owned(),
+            }
+        })?)
+        .await?;
+
+        directories.sort();
+        remote_files.sort_by(|left, right| left.1.cmp(&right.1));
+        for relative in &directories {
+            ensure_local_download_dir(&target_root, relative).await?;
+        }
+
+        let mut files = Vec::with_capacity(remote_files.len());
+        for (remote_path, relative_path, size) in remote_files {
+            files.push(DownloadCandidate {
+                remote_path,
+                local_path: local_download_path(&target_root, &relative_path)?
+                    .display()
+                    .to_string(),
+                relative_path,
+                size,
+            });
+        }
+
+        Ok(DirectoryDownloadPlan {
+            local_root: target_root.display().to_string(),
+            directory_count: directories.len(),
+            files,
+        })
+    }
+
+    async fn read_remote_ignore_file(
+        &self,
+        peer_id: &str,
+        share_id: &str,
+        remote_path: &str,
+    ) -> Result<Option<String>, DomainError> {
+        let (_, client) = self.peer_client(peer_id)?;
+        let (display, remote, _) = remote_file_target(share_id, remote_path)?;
+        let response = client
+            .get_raw(&remote)
+            .await
+            .map_err(|error| map_dav_error("read .gitignore", error, &display))?;
+        ensure_status(response.status(), "read .gitignore", &display)?;
+        let bytes =
+            read_response_limited(response, MAX_IGNORE_FILE_BYTES, "read .gitignore").await?;
+        match String::from_utf8(bytes) {
+            Ok(content) => Ok(Some(content)),
+            Err(error) => {
+                log::warn!("ignoring a non-UTF-8 .gitignore at {display}: {error}");
+                Ok(None)
+            }
+        }
+    }
+
+    pub async fn delete_entry(
+        &self,
+        peer_id: &str,
+        share_id: &str,
+        remote_path: &str,
+    ) -> Result<(), DomainError> {
+        let (_, client) = self.peer_client(peer_id)?;
+        let display = normalize_display_path(remote_path)?;
+        if display == "/" {
+            return Err(DomainError::RemotePathInvalid {
+                detail: "the shared root cannot be deleted".to_owned(),
+            });
+        }
+        let remote = encode_share_path(share_id, &display)?;
+        client
+            .delete(&remote)
+            .await
+            .map_err(|error| map_dav_error("delete entry", error, &display))?;
+        Ok(())
+    }
+
     pub async fn download(
         &self,
         peer_id: &str,
@@ -1155,7 +1532,8 @@ impl PeerManager {
     }
 
     /// Reads a file through the backend and returns it over IPC. Images and
-    /// PDFs are base64-encoded; text-like files are UTF-8 (truncated).
+    /// PDFs are base64-encoded; text-like files are UTF-8 and must stay within
+    /// the configured line limit.
     pub async fn preview(
         &self,
         peer_id: &str,
@@ -1171,21 +1549,34 @@ impl PeerManager {
             .map_err(|error| map_dav_error("preview file", error, &display))?;
         ensure_status(response.status(), "preview file", &display)?;
         let mut bytes =
-            read_response_limited(response, self.limits.max_preview_bytes, "preview file").await?;
+            read_response_limited(response, self.limits.max_preview_bytes, "preview file")
+                .await
+                .map_err(|error| match error {
+                    DomainError::TransferTooLarge { size, limit } => {
+                        DomainError::PreviewTooLarge { size, limit }
+                    }
+                    other => other,
+                })?;
         let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         let mime = mime_for(&file_name).to_owned();
+        let text_preview = is_text_file(&file_name);
 
-        if is_text_mime(&mime) {
+        if text_preview {
             match String::from_utf8(bytes) {
                 Ok(text) => {
-                    let (data, truncated) = truncate_utf8(text, MAX_TEXT_PREVIEW_BYTES);
+                    let lines = text.lines().count();
+                    if lines > MAX_PREVIEW_LINES {
+                        return Err(DomainError::PreviewTooManyLines {
+                            lines,
+                            limit: MAX_PREVIEW_LINES,
+                        });
+                    }
                     return Ok(PreviewPayload {
                         file_name,
                         mime,
                         encoding: "utf8".to_owned(),
-                        data,
+                        data: text,
                         size,
-                        truncated,
                     });
                 }
                 Err(error) => bytes = error.into_bytes(),
@@ -1194,7 +1585,7 @@ impl PeerManager {
 
         Ok(PreviewPayload {
             file_name,
-            mime: if is_text_mime(&mime) {
+            mime: if text_preview {
                 "application/octet-stream".to_owned()
             } else {
                 mime
@@ -1202,7 +1593,6 @@ impl PeerManager {
             encoding: "base64".to_owned(),
             data: base64::engine::general_purpose::STANDARD.encode(bytes),
             size,
-            truncated: false,
         })
     }
 
@@ -1658,6 +2048,58 @@ fn sanitize_file_name(name: &str) -> Result<String, DomainError> {
     Ok(name.to_owned())
 }
 
+fn local_download_path(root: &Path, relative: &str) -> Result<PathBuf, DomainError> {
+    let mut path = root.to_path_buf();
+    for segment in relative.split('/') {
+        path.push(sanitize_file_name(segment)?);
+    }
+    if path == root {
+        return Err(DomainError::RemotePathInvalid {
+            detail: "the downloaded file has no relative path".to_owned(),
+        });
+    }
+    Ok(path)
+}
+
+async fn ensure_local_download_dir(root: &Path, relative: &str) -> Result<(), DomainError> {
+    let mut path = root.to_path_buf();
+    for segment in relative.split('/') {
+        path.push(sanitize_file_name(segment)?);
+        match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io_error(
+                    "inspect download directory",
+                    &path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "refusing to traverse a symbolic link",
+                    ),
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(io_error(
+                    "inspect download directory",
+                    &path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "the path is not a directory",
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tokio::fs::create_dir(&path)
+                    .await
+                    .map_err(|error| io_error("create download directory", &path, error))?;
+            }
+            Err(error) => {
+                return Err(io_error("inspect download directory", &path, error));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn canonical_local_dir(path: &str) -> Result<PathBuf, DomainError> {
     if path.trim().is_empty() {
         return Err(DomainError::Io {
@@ -2107,6 +2549,19 @@ fn map_dav_error(operation: &'static str, error: reqwest_dav::Error, path: &str)
                 },
             }
         }
+        reqwest_dav::Error::Decode(reqwest_dav::DecodeError::Server(server)) => {
+            match server.response_code {
+                401 => DomainError::PeerAuthorizationRejected,
+                404 => DomainError::RemoteNotFound {
+                    path: path.to_owned(),
+                },
+                code => DomainError::PeerRequest {
+                    operation,
+                    status: Some(code),
+                    detail: format!("server returned HTTP {code}: {}", server.message.trim()),
+                },
+            }
+        }
         reqwest_dav::Error::Reqwest(source) => map_transport(operation, &source),
         other => DomainError::PeerRequest {
             operation,
@@ -2289,54 +2744,67 @@ async fn hash_file(path: &Path) -> Result<[u8; 32], DomainError> {
 }
 
 fn mime_for(file_name: &str) -> &'static str {
-    let extension = file_name
-        .rsplit_once('.')
-        .map(|(_, extension)| extension.to_lowercase())
-        .unwrap_or_default();
+    let extension = file_extension(file_name);
     match extension.as_str() {
-        "txt" | "log" | "md" | "markdown" | "rst" => "text/plain",
+        "md" | "markdown" | "mdown" | "mkd" | "mdx" => "text/markdown",
         "csv" | "tsv" => "text/csv",
-        "json" => "application/json",
-        "xml" => "application/xml",
+        "json" | "jsonc" | "json5" | "ipynb" | "avsc" | "map" => "application/json",
+        "xml" | "xsd" | "xsl" | "xslt" | "plist" => "application/xml",
         "yaml" | "yml" => "text/yaml",
-        "toml" | "ini" | "conf" | "cfg" => "text/plain",
-        "html" | "htm" => "text/html",
-        "css" => "text/css",
-        "js" | "mjs" | "cjs" => "text/javascript",
-        "ts" | "tsx" | "jsx" | "rs" | "go" | "py" | "java" | "c" | "h" | "cpp" | "hpp" | "sh"
-        | "bat" | "ps1" | "sql" => "text/plain",
+        "html" | "htm" | "vue" | "svelte" | "astro" => "text/html",
+        "css" | "scss" | "sass" | "less" => "text/css",
+        "js" | "mjs" | "cjs" | "jsx" => "text/javascript",
         "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
+        "jpg" | "jpeg" | "jfif" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
         "bmp" => "image/bmp",
         "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "avif" => "image/avif",
+        "heic" => "image/heic",
+        "tif" | "tiff" => "image/tiff",
         "pdf" => "application/pdf",
         "mp3" => "audio/mpeg",
-        "mp4" => "video/mp4",
+        "wav" => "audio/wav",
+        "ogg" | "oga" | "opus" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        "weba" => "audio/webm",
+        "aif" | "aiff" => "audio/aiff",
+        "wma" => "audio/x-ms-wma",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "ogv" => "video/ogg",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        "wmv" => "video/x-ms-wmv",
+        "flv" => "video/x-flv",
+        "3gp" => "video/3gpp",
         "zip" => "application/zip",
+        _ if is_text_file(file_name) => "text/plain",
         _ => "application/octet-stream",
     }
 }
 
-fn is_text_mime(mime: &str) -> bool {
-    mime.starts_with("text/")
-        || matches!(
-            mime,
-            "application/json" | "application/xml" | "application/javascript"
-        )
+fn file_extension(file_name: &str) -> String {
+    file_name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
-fn truncate_utf8(mut text: String, limit: usize) -> (String, bool) {
-    if text.len() <= limit {
-        return (text, false);
+/// Text previews are selected by suffix (or a known extensionless filename),
+/// never by a server-reported MIME type.
+fn is_text_file(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    if lower == ".env" || lower.starts_with(".env.") {
+        return true;
     }
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    (text, true)
+    let extension = file_extension(&lower);
+    TEXT_EXTENSIONS.contains(&extension.as_str()) || TEXT_FILENAMES.contains(&lower.as_str())
 }
 
 /// Removes run directories left behind by crashed processes. A seven-day age

@@ -832,6 +832,35 @@ async fn browse_transfer_preview_and_external_edit_roundtrip() {
         .expect("discard");
     assert!(!Path::new(&discarded.local_path).exists());
 
+    // Deleting files and non-empty directories requires delete permission.
+    harness
+        .peers
+        .delete_entry(&peer_id, &share_id, "/notes.txt")
+        .await
+        .expect("delete file");
+    assert!(!harness.share_root.join("notes.txt").exists());
+
+    let missing = harness
+        .peers
+        .delete_entry(&peer_id, &share_id, "/notes.txt")
+        .await
+        .expect_err("already deleted");
+    assert_eq!(code_of(&missing), "PEER_REMOTE_NOT_FOUND");
+
+    let root = harness
+        .peers
+        .delete_entry(&peer_id, &share_id, "/")
+        .await
+        .expect_err("shared root");
+    assert_eq!(code_of(&root), "PEER_INVALID_PATH");
+
+    harness
+        .peers
+        .delete_entry(&peer_id, &share_id, "/sub")
+        .await
+        .expect("delete directory");
+    assert!(!harness.share_root.join("sub").exists());
+
     harness.controller.stop().await;
 }
 
@@ -872,6 +901,112 @@ async fn path_traversal_and_invalid_share_ids_are_rejected() {
     assert_eq!(code_of(&error), "PEER_INVALID_PATH");
 
     harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn prepares_directory_downloads_with_gitignore_and_nested_paths() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (info, _code) = harness.connect().await;
+    let peer_id = info.id;
+    let share_id = harness.share_id.clone();
+
+    let sub = harness.share_root.join("sub");
+    std::fs::create_dir(sub.join("nested")).expect("nested dir");
+    std::fs::create_dir(sub.join("__pycache__")).expect("cache dir");
+    std::fs::write(sub.join(".gitignore"), "ignored.txt\n*.log\n!keep.log\n").expect("gitignore");
+    std::fs::write(sub.join("ignored.txt"), b"ignored").expect("ignored file");
+    std::fs::write(sub.join("drop.log"), b"drop").expect("dropped log");
+    std::fs::write(sub.join("keep.log"), b"keep").expect("kept log");
+    std::fs::write(sub.join("module.pyc"), b"cache").expect("pyc file");
+    std::fs::write(sub.join("__pycache__").join("x.pyc"), b"cache").expect("cache file");
+    std::fs::write(sub.join("nested").join(".gitignore"), "drop.log\n").expect("nested gitignore");
+    std::fs::write(sub.join("nested").join("drop.log"), b"drop").expect("nested dropped log");
+    std::fs::write(sub.join("nested").join("keep.txt"), b"keep").expect("nested keep");
+
+    let downloads = tempfile::tempdir().expect("downloads");
+    let plan = harness
+        .peers
+        .prepare_directory_download(
+            &peer_id,
+            &share_id,
+            "/sub",
+            downloads.path().to_str().expect("utf8"),
+            ConflictPolicy::Fail,
+        )
+        .await
+        .expect("prepare directory download");
+
+    assert_eq!(
+        Path::new(&plan.local_root)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("sub")
+    );
+    assert!(Path::new(&plan.local_root).join("nested").is_dir());
+    assert!(!Path::new(&plan.local_root).join("__pycache__").exists());
+    let relative: Vec<&str> = plan
+        .files
+        .iter()
+        .map(|file| file.relative_path.as_str())
+        .collect();
+    for expected in [".gitignore", "inner.txt", "keep.log", "nested/keep.txt"] {
+        assert!(
+            relative.contains(&expected),
+            "{expected} should be queued: {relative:?}"
+        );
+    }
+    for ignored in [
+        "ignored.txt",
+        "drop.log",
+        "module.pyc",
+        "nested/drop.log",
+        "__pycache__/x.pyc",
+    ] {
+        assert!(
+            !relative.contains(&ignored),
+            "{ignored} should be ignored: {relative:?}"
+        );
+    }
+
+    let inner = plan
+        .files
+        .iter()
+        .find(|file| file.relative_path == "inner.txt")
+        .expect("inner candidate");
+    harness
+        .peers
+        .download_to(&peer_id, &share_id, &inner.remote_path, &inner.local_path)
+        .await
+        .expect("download planned file");
+    assert_eq!(
+        std::fs::read_to_string(&inner.local_path).expect("downloaded inner"),
+        "inner\n"
+    );
+
+    let conflict = harness
+        .peers
+        .prepare_directory_download(
+            &peer_id,
+            &share_id,
+            "/sub",
+            downloads.path().to_str().expect("utf8"),
+            ConflictPolicy::Fail,
+        )
+        .await
+        .expect_err("existing directory");
+    assert_eq!(code_of(&conflict), "TRANSFER_CONFLICT");
+
+    harness
+        .peers
+        .prepare_directory_download(
+            &peer_id,
+            &share_id,
+            "/sub",
+            downloads.path().to_str().expect("utf8"),
+            ConflictPolicy::Overwrite,
+        )
+        .await
+        .expect("overwrite directory");
 }
 
 #[tokio::test]
@@ -1004,7 +1139,7 @@ async fn transfer_limits_and_symlink_destinations_are_enforced() {
         .preview(&peer_id, &harness.share_id, "/large.txt")
         .await
         .expect_err("preview too large");
-    assert_eq!(code_of(&error), "TRANSFER_TOO_LARGE");
+    assert_eq!(code_of(&error), "PEER_PREVIEW_TOO_LARGE");
 
     // A symlink destination is never replaced.
     #[cfg(unix)]
@@ -1027,6 +1162,94 @@ async fn transfer_limits_and_symlink_destinations_are_enforced() {
         assert_eq!(code_of(&error), "IO_FAILED");
         assert_eq!(std::fs::read_to_string(&target).expect("target"), "target");
     }
+
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn preview_rejects_text_over_the_line_limit() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (info, _code) = harness.connect().await;
+    let peer_id = info.id;
+
+    let over_limit = (0..=5000).map(|_| "line\n").collect::<String>();
+    std::fs::write(harness.share_root.join("long.txt"), over_limit).expect("long text");
+    let error = harness
+        .peers
+        .preview(&peer_id, &harness.share_id, "/long.txt")
+        .await
+        .expect_err("too many lines");
+    assert_eq!(code_of(&error), "PEER_PREVIEW_TOO_MANY_LINES");
+
+    let at_limit = (0..5000).map(|_| "line\n").collect::<String>();
+    std::fs::write(harness.share_root.join("limit.txt"), at_limit).expect("limit text");
+    let preview = harness
+        .peers
+        .preview(&peer_id, &harness.share_id, "/limit.txt")
+        .await
+        .expect("line limit boundary");
+    assert_eq!(preview.encoding, "utf8");
+    assert_eq!(preview.data.lines().count(), 5000);
+
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn preview_uses_suffixes_for_text_and_media() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (info, _code) = harness.connect().await;
+    let peer_id = info.id;
+
+    for name in [
+        "app.php",
+        "App.vue",
+        "config.yml",
+        "config.toml",
+        "app.conf",
+        ".env",
+        ".htaccess",
+        "README",
+    ] {
+        std::fs::write(harness.share_root.join(name), "key = value\n").expect("text file");
+        let preview = harness
+            .peers
+            .preview(&peer_id, &harness.share_id, &format!("/{name}"))
+            .await
+            .unwrap_or_else(|error| panic!("{name} should be text: {error:?}"));
+        assert_eq!(preview.encoding, "utf8", "{name}");
+        assert_eq!(preview.data, "key = value\n", "{name}");
+    }
+
+    std::fs::write(harness.share_root.join("track.mp3"), b"ID3fake-audio").expect("audio");
+    let audio = harness
+        .peers
+        .preview(&peer_id, &harness.share_id, "/track.mp3")
+        .await
+        .expect("audio preview");
+    assert_eq!(audio.encoding, "base64");
+    assert_eq!(audio.mime, "audio/mpeg");
+
+    std::fs::write(harness.share_root.join("clip.mp4"), b"fake-video").expect("video");
+    let video = harness
+        .peers
+        .preview(&peer_id, &harness.share_id, "/clip.mp4")
+        .await
+        .expect("video preview");
+    assert_eq!(video.encoding, "base64");
+    assert_eq!(video.mime, "video/mp4");
+
+    std::fs::write(
+        harness.share_root.join("payload.bin"),
+        [0_u8, 159, 146, 150],
+    )
+    .expect("binary");
+    let binary = harness
+        .peers
+        .preview(&peer_id, &harness.share_id, "/payload.bin")
+        .await
+        .expect("binary preview");
+    assert_eq!(binary.encoding, "base64");
+    assert_eq!(binary.mime, "application/octet-stream");
 
     harness.controller.stop().await;
 }

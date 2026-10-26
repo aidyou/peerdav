@@ -8,6 +8,7 @@ mod db;
 mod discovery;
 mod error;
 mod fs;
+mod ignore_rules;
 mod keyfile;
 mod logging;
 pub mod paths;
@@ -149,8 +150,10 @@ pub fn run() {
             commands::sync_peers,
             commands::list_peer_shares,
             commands::list_peer_dir,
+            commands::delete_peer_entry,
             commands::download_peer_file,
             commands::download_peer_file_to,
+            commands::prepare_peer_directory_download,
             commands::open_local_file,
             commands::reveal_local_file,
             commands::collect_upload_paths,

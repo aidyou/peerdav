@@ -183,6 +183,12 @@ pub enum DomainError {
     #[error("file size {size} exceeds the {limit} byte limit")]
     TransferTooLarge { size: u64, limit: u64 },
 
+    #[error("preview size {size} exceeds the {limit} byte limit")]
+    PreviewTooLarge { size: u64, limit: u64 },
+
+    #[error("preview has {lines} lines, exceeding the limit of {limit}")]
+    PreviewTooManyLines { lines: usize, limit: usize },
+
     #[error("destination already exists: {path}")]
     TransferConflict { path: String },
 
@@ -197,6 +203,9 @@ pub enum DomainError {
 
     #[error("the upload queue contains {count} files, exceeding the limit of {limit}")]
     UploadQueueTooLarge { count: usize, limit: usize },
+
+    #[error("the download queue contains {count} entries, exceeding the limit of {limit}")]
+    DownloadQueueTooLarge { count: usize, limit: usize },
 
     #[error("discovery operation `{operation}` failed: {detail}")]
     Discovery {
@@ -310,11 +319,14 @@ fn error_code(error: &DomainError) -> &'static str {
         DomainError::PeerProtocol { .. } => "PEER_PROTOCOL_ERROR",
         DomainError::RemotePathInvalid { .. } => "PEER_INVALID_PATH",
         DomainError::TransferTooLarge { .. } => "TRANSFER_TOO_LARGE",
+        DomainError::PreviewTooLarge { .. } => "PEER_PREVIEW_TOO_LARGE",
+        DomainError::PreviewTooManyLines { .. } => "PEER_PREVIEW_TOO_MANY_LINES",
         DomainError::TransferConflict { .. } => "TRANSFER_CONFLICT",
         DomainError::ExternalEditNotFound { .. } => "PEER_EDIT_NOT_FOUND",
         DomainError::ExternalOpen { .. } => "PEER_OPEN_FAILED",
         DomainError::ExternalReveal { .. } => "PEER_REVEAL_FAILED",
         DomainError::UploadQueueTooLarge { .. } => "UPLOAD_QUEUE_TOO_LARGE",
+        DomainError::DownloadQueueTooLarge { .. } => "DOWNLOAD_QUEUE_TOO_LARGE",
         DomainError::Discovery { .. } => "DISCOVERY_FAILED",
         DomainError::Internal { .. } => "INTERNAL_ERROR",
     }
@@ -465,6 +477,14 @@ fn user_message(error: &DomainError) -> String {
         DomainError::TransferTooLarge { .. } => {
             "文件超过大小限制 / The file exceeds the size limit.".to_owned()
         }
+        DomainError::PreviewTooLarge { .. } => {
+            "文件超过在线预览大小限制 / The file exceeds the online preview size limit."
+                .to_owned()
+        }
+        DomainError::PreviewTooManyLines { .. } => {
+            "文件超过在线预览行数限制 / The file exceeds the online preview line limit."
+                .to_owned()
+        }
         DomainError::TransferConflict { .. } => {
             "目标文件已存在 / The destination file already exists.".to_owned()
         }
@@ -481,6 +501,11 @@ fn user_message(error: &DomainError) -> String {
         }
         DomainError::UploadQueueTooLarge { limit, .. } => {
             format!("一次最多上传 {limit} 个文件 / At most {limit} files can be uploaded at once.")
+        }
+        DomainError::DownloadQueueTooLarge { limit, .. } => {
+            format!(
+                "一次最多下载 {limit} 个文件或目录 / At most {limit} files or directories can be downloaded at once."
+            )
         }
         DomainError::Discovery { .. } => {
             "局域网发现失败 / LAN discovery failed.".to_owned()
@@ -541,8 +566,17 @@ fn error_context(error: &DomainError) -> Option<Value> {
         DomainError::UploadQueueTooLarge { count, limit } => {
             Some(json!({ "count": count, "limit": limit }))
         }
+        DomainError::DownloadQueueTooLarge { count, limit } => {
+            Some(json!({ "count": count, "limit": limit }))
+        }
         DomainError::TransferTooLarge { size, limit } => {
             Some(json!({ "size": size, "limit": limit }))
+        }
+        DomainError::PreviewTooLarge { size, limit } => {
+            Some(json!({ "size": size, "limit": limit }))
+        }
+        DomainError::PreviewTooManyLines { lines, limit } => {
+            Some(json!({ "lines": lines, "limit": limit }))
         }
         DomainError::PeerRequest {
             operation, status, ..

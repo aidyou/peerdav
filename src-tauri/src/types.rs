@@ -316,13 +316,15 @@ pub(crate) const PEER_SECRET_PREFIX: &str = "peer.";
 /// Maximum size of a single download or upload.
 pub const MAX_TRANSFER_BYTES: u64 = 256 * 1024 * 1024;
 /// Maximum size of a backend preview payload.
-pub const MAX_PREVIEW_BYTES: u64 = 8 * 1024 * 1024;
-/// Text previews are further truncated to keep IPC payloads small.
-pub const MAX_TEXT_PREVIEW_BYTES: usize = 256 * 1024;
+pub const MAX_PREVIEW_BYTES: u64 = 10 * 1024 * 1024;
+/// Maximum physical line count accepted for an online text preview.
+pub const MAX_PREVIEW_LINES: usize = 5000;
 /// Upper bound for a share-relative remote path.
 pub const MAX_REMOTE_PATH_BYTES: usize = 4096;
 /// Upper bound for one directory listing.
 pub const MAX_DIR_ENTRIES: usize = 10_000;
+/// Upper bound for the files discovered by one recursive directory download.
+pub const MAX_DIRECTORY_DOWNLOAD_FILES: usize = 10_000;
 /// Upper bound for advertised discovery hosts.
 pub const MAX_DISCOVERY_HOSTS: usize = 16;
 pub const DISCOVERY_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(3);
@@ -519,6 +521,27 @@ pub struct UploadCandidate {
     pub size: u64,
 }
 
+/// One remote file discovered for a directory-download queue.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadCandidate {
+    pub remote_path: String,
+    pub relative_path: String,
+    pub local_path: String,
+    pub size: u64,
+}
+
+/// A prepared directory download. The backend has already scanned the remote
+/// tree and created the local directory hierarchy, so every candidate's parent
+/// directory exists.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryDownloadPlan {
+    pub local_root: String,
+    pub directory_count: usize,
+    pub files: Vec<DownloadCandidate>,
+}
+
 /// Backend-read preview payload. Never served through a broad asset scope.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -529,7 +552,6 @@ pub struct PreviewPayload {
     pub encoding: String,
     pub data: String,
     pub size: u64,
-    pub truncated: bool,
 }
 
 /// A controlled temporary copy opened in an external application.
