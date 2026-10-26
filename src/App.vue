@@ -684,7 +684,7 @@ provide(
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  border-radius: 15px;
+  border-radius: var(--window-radius);
   border: 1px solid var(--app-frame-border);
   background:
     radial-gradient(
@@ -710,6 +710,7 @@ provide(
   display: flex;
   align-items: center;
   padding: 0 14px;
+  border-radius: var(--window-inner-radius) var(--window-inner-radius) 0 0;
   background: var(--titlebar-bg);
   border-bottom: 1px solid var(--titlebar-border);
   backdrop-filter: blur(14px);
@@ -902,6 +903,14 @@ provide(
 
 <style>
 :root {
+  /* Window chrome geometry: the single source of truth for the rounded
+     transparent frame. The titlebar carries the inner radius so its
+     backdrop-filter layer is clipped by its own corners instead of relying
+     on the parent's overflow, which WebKit does not apply to composited
+     backdrop-filter layers. */
+  --window-radius: 15px;
+  --window-inner-radius: calc(var(--window-radius) - 1px);
+
   /* Reference accents: one perceptual base per hue; variants derive from it. */
   --accent-blue: oklch(58% 0.19 262);
   --accent-red: oklch(56% 0.2 25);
