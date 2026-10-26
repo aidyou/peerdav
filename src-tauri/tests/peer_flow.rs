@@ -536,6 +536,9 @@ async fn discovery_deduplicates_replies_from_the_same_server() {
         .await
         .expect("connect through discovery");
     assert_eq!(connected.shares.len(), 1);
+    // Without a caller-supplied label the server's own configured name wins over
+    // the URL host, so the saved peer does not read like a bare address.
+    assert_eq!(connected.label, "Self host");
 
     harness.controller.stop().await;
 }

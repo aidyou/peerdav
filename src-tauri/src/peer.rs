@@ -929,12 +929,20 @@ impl PeerManager {
             .as_ref()
             .map(|record| record.id.clone())
             .unwrap_or_else(|| random_hex(8));
+        // 标签优先反映「对方设备的名称」：调用方给的名字（发现时的广播名）> 已保存的
+        // 非默认标签 > 服务器在目录里自报的 server_name > URL 主机。地址只是兜底，
+        // 否则手动输入 IP 连接成功后会显示成 `10.1.1.10:4918` 这类地址串。
         let label = match label.map(str::trim).filter(|label| !label.is_empty()) {
             Some(label) => validate_label(label)?,
-            None => existing
-                .as_ref()
-                .map(|record| record.label.clone())
-                .unwrap_or_else(|| default_label(&url)),
+            None => {
+                let auto_label = default_label(&url);
+                existing
+                    .as_ref()
+                    .map(|record| record.label.clone())
+                    .filter(|label| *label != auto_label)
+                    .or_else(|| validate_label(catalog.server_name.trim()).ok())
+                    .unwrap_or(auto_label)
+            }
         };
         let authorization_id = self
             .bind_authorization(&url, code)

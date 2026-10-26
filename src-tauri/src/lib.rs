@@ -150,6 +150,7 @@ pub fn run() {
             commands::scan_lan,
             commands::discovered_peers,
             commands::local_networks,
+            commands::local_addresses,
             commands::list_peers,
             commands::request_peer_access,
             commands::wait_for_peer_access,

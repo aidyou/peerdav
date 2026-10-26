@@ -543,6 +543,13 @@ pub async fn local_networks() -> Result<Vec<String>, AppError> {
     Ok(crate::discovery::local_ipv4_networks())
 }
 
+/// Returns the machine's private IPv4 interface addresses, offered in the
+/// service pane as the LAN bind scope.
+#[tauri::command]
+pub async fn local_addresses() -> Result<Vec<String>, AppError> {
+    Ok(crate::discovery::local_ipv4_addresses())
+}
+
 #[tauri::command]
 pub async fn list_peers(peers: State<'_, SharedPeers>) -> Result<Vec<PeerInfo>, AppError> {
     let peers = Arc::clone(peers.inner());

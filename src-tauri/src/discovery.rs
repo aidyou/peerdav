@@ -607,19 +607,81 @@ pub fn local_ipv4_networks() -> Vec<String> {
             let IfAddr::V4(address) = interface.addr else {
                 continue;
             };
-            if address.ip.is_loopback()
-                || address.ip.is_unspecified()
-                || address.is_link_local()
-                || !address.ip.is_private()
-            {
+            if !is_bindable_lan_address(address.ip) {
                 continue;
             }
             if let Some(network) = ipv4_network(address.ip, address.netmask) {
-                push_network(&mut networks, network);
+                push_unique(&mut networks, network);
             }
         }
     }
     networks
+}
+
+/// Private IPv4 addresses of the local interfaces, with the address the system
+/// would actually use to leave this host first.
+///
+/// The service pane lists the head as the LAN bind scope. Virtual bridges
+/// (Docker, libvirt) also own private addresses, so interface order alone would
+/// put a bridge in front of the real LAN card; the primary probe keeps the
+/// option meaningful instead of asking the user to guess among a dozen IPs.
+pub fn local_ipv4_addresses() -> Vec<String> {
+    let mut addresses = Vec::new();
+    if let Ok(interfaces) = get_if_addrs() {
+        for interface in interfaces {
+            let IfAddr::V4(address) = interface.addr else {
+                continue;
+            };
+            if is_bindable_lan_address(address.ip) {
+                push_unique(&mut addresses, address.ip.to_string());
+            }
+        }
+    }
+    prioritize_primary(addresses, primary_lan_address())
+}
+
+/// The source address the kernel would pick for outbound traffic. Connecting an
+/// unconnected UDP socket only performs a route lookup; no packet is sent.
+fn primary_lan_address() -> Option<Ipv4Addr> {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(8, 8, 8, 8), 53)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(address) if is_bindable_lan_address(address) => Some(address),
+        _ => None,
+    }
+}
+
+/// Move `primary` to the head of `addresses`, leaving the rest in order. A
+/// missing or unknown primary keeps the interface order untouched.
+fn prioritize_primary(mut addresses: Vec<String>, primary: Option<Ipv4Addr>) -> Vec<String> {
+    let Some(value) = primary.map(|address| address.to_string()) else {
+        return addresses;
+    };
+    if let Some(index) = addresses.iter().position(|address| *address == value) {
+        if index > 0 {
+            let address = addresses.remove(index);
+            addresses.insert(0, address);
+        }
+    }
+    addresses
+}
+
+/// Whether an interface address is a sensible LAN bind target: not the loopback,
+/// not the wildcard, not an auto-assigned link-local address, and in a private
+/// or shared-address range. Public addresses belong to the WAN scope, which
+/// binds the wildcard.
+fn is_bindable_lan_address(ip: Ipv4Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
+        return false;
+    }
+    // 100.64.0.0/10（RFC 6598）不属于 std 的 is_private，但 tun/VPN 网卡
+    // （Tailscale、部分 WireGuard 配置）就在这段，漏掉它等于绑不了 VPN。
+    ip.is_private() || is_shared_address_space(ip)
+}
+
+fn is_shared_address_space(ip: Ipv4Addr) -> bool {
+    let [first, second, ..] = ip.octets();
+    first == 100 && (64..=127).contains(&second)
 }
 
 fn ipv4_network(ip: Ipv4Addr, netmask: Ipv4Addr) -> Option<String> {
@@ -631,9 +693,9 @@ fn ipv4_network(ip: Ipv4Addr, netmask: Ipv4Addr) -> Option<String> {
     Some(format!("{network}/{}", mask.count_ones()))
 }
 
-fn push_network(networks: &mut Vec<String>, network: String) {
-    if !networks.contains(&network) {
-        networks.push(network);
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.contains(&value) {
+        values.push(value);
     }
 }
 
@@ -865,6 +927,92 @@ mod tests {
 
     use crate::error::AppError;
     use crate::types::PeerRevocationInfo;
+
+    #[test]
+    fn lan_bind_filter_accepts_only_private_routable_addresses() {
+        let accepted = [
+            "10.0.0.7",
+            "172.16.5.9",
+            "192.168.1.23",
+            // tun/VPN 网卡常用的 100.64.0.0/10 也算本机可达的网络内地址。
+            "100.64.0.1",
+            "100.127.255.10",
+        ];
+        for address in accepted {
+            let ip = address
+                .parse::<Ipv4Addr>()
+                .unwrap_or_else(|_| panic!("{address} must parse"));
+            assert!(is_bindable_lan_address(ip), "{address} should bind");
+        }
+
+        // 边界：回环、通配、链路本地、公网以及 /10 之外的地址都不能作为局域网绑定项。
+        let rejected = [
+            "127.0.0.1",
+            "0.0.0.0",
+            "169.254.9.9",
+            "8.8.8.8",
+            "100.63.255.1",
+            "100.128.0.1",
+        ];
+        for address in rejected {
+            let ip = address
+                .parse::<Ipv4Addr>()
+                .unwrap_or_else(|_| panic!("{address} must parse"));
+            assert!(!is_bindable_lan_address(ip), "{address} must not bind");
+        }
+    }
+
+    #[test]
+    fn lan_bind_candidates_are_unique_private_addresses() {
+        let addresses = local_ipv4_addresses();
+        let mut deduped = addresses.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            addresses.len(),
+            "candidates must stay unique"
+        );
+
+        for address in addresses {
+            let ip = address
+                .parse::<Ipv4Addr>()
+                .unwrap_or_else(|_| panic!("{address} must be IPv4"));
+            assert!(
+                is_bindable_lan_address(ip),
+                "{address} leaked a non-LAN address"
+            );
+        }
+    }
+
+    #[test]
+    fn primary_address_moves_to_the_head() {
+        let candidates: Vec<String> = ["172.17.0.1", "192.168.1.23", "10.0.0.7"]
+            .iter()
+            .map(|address| (*address).to_owned())
+            .collect();
+
+        let ordered = prioritize_primary(candidates.clone(), "192.168.1.23".parse().ok());
+        assert_eq!(
+            ordered,
+            vec![
+                "192.168.1.23".to_owned(),
+                "172.17.0.1".to_owned(),
+                "10.0.0.7".to_owned()
+            ]
+        );
+
+        // 边界：没有默认路由或默认地址不在候选里时，保持网卡顺序，不能丢项。
+        assert_eq!(prioritize_primary(candidates.clone(), None), candidates);
+        assert_eq!(
+            prioritize_primary(candidates.clone(), "198.51.100.9".parse().ok()),
+            candidates
+        );
+        assert_eq!(
+            prioritize_primary(candidates.clone(), "172.17.0.1".parse().ok()),
+            candidates
+        );
+    }
 
     #[derive(Default)]
     struct RecordingEvents {
