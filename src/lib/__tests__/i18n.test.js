@@ -136,9 +136,13 @@ describe("catalogues", () => {
   });
 
   it("interpolates parameters", () => {
-    expect(t("pending.attempts", { count: 3 })).toBe("3 次尝试");
+    expect(t("pending.newRequest", { ip: "10.1.1.10" })).toBe(
+      "新的访问请求：10.1.1.10",
+    );
     setLocale("en");
-    expect(t("pending.attempts", { count: 3 })).toBe("3 attempts");
+    expect(t("pending.newRequest", { ip: "10.1.1.10" })).toBe(
+      "New access request: 10.1.1.10",
+    );
   });
 
   it("returns the key itself for unknown keys", () => {

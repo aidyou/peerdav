@@ -8,11 +8,14 @@ import {
 } from "@tauri-apps/plugin-autostart";
 
 import { useAppContext } from "../lib/appContext";
+import { buildBindOptions } from "../lib/bindScope";
 import { confirmAction } from "../lib/confirm";
 import { localizeMessage, t } from "../lib/i18n";
 import { normalizeAppError } from "../lib/invoke";
+import { statusTagTone } from "../lib/tagTone";
 import { validatePassword } from "../lib/password";
 import { useAction } from "../composables/useAction";
+import ListSkeleton from "./ListSkeleton.vue";
 
 const app = useAppContext();
 const { busy, run } = useAction();
@@ -32,8 +35,29 @@ const serverPort = ref(4918);
 const serverDiscoveryPort = ref(4919);
 const serverName = ref("PeerDav");
 
+/* 绑定范围首选广域网/局域网/本机三项，其余本机网卡地址（VPN tun、多网卡）
+   跟在后面；下拉框同时允许输入，公网地址或 IPv6 也能直接填。
+   局域网地址由后端按默认路由排序给出，避免用户手输一个绑不上的地址。 */
+const lanAddresses = ref([]);
+
+const bindOptions = computed(() =>
+  buildBindOptions({
+    lanAddresses: lanAddresses.value,
+    current: serverBind.value,
+    labels: {
+      wan: t("server.bindWan"),
+      lan: t("server.bindLan"),
+      local: t("server.bindLocal"),
+      other: t("server.bindOther"),
+      custom: t("server.bindCustom"),
+    },
+  }),
+);
+
 const shares = ref([]);
 const authorizations = ref([]);
+// 管理数据（共享、授权、待审批）由一次 loadAdminData 拉取；加载中的列表显示骨架屏。
+const adminLoading = ref(true);
 
 const shareName = ref("");
 const shareRoot = ref("");
@@ -47,9 +71,134 @@ const editingShareId = ref("");
 const showShareForm = ref(false);
 
 const lanServers = computed(() => app.discovered);
+const activeInboundIds = ref([]);
+const activeOutboundIds = ref([]);
+
+/* 入站与出站共用同一套审批状态：待申请 / 待审批 / 已审批。
+   排序把需要用户处理的放在前面，已完成配对放在最后。 */
+const CLIENT_STATUS_RANK = { pending: 0, unrequested: 1, approved: 2 };
+const CLIENT_STATUS_LABEL = {
+  pending: "clients.statusPending",
+  unrequested: "clients.statusUnrequested",
+  approved: "clients.statusApproved",
+};
+
+function permissionText(permissions) {
+  const parts = [];
+  if (permissions.canRead) parts.push(t("permissions.read"));
+  if (permissions.canWrite) parts.push(t("permissions.write"));
+  if (permissions.canDelete) parts.push(t("permissions.delete"));
+  return parts.join(" · ");
+}
+
+// 共享行里的读/写/删用自绘勾选框表达，不用 el-checkbox：复选框的 disabled 态
+// 会把指针换成 🚫，鼠标扫过一行就像在提示「这里不许操作」，而这三项本来就只是状态。
+function permissionFlags(share) {
+  return [
+    { key: "permissions.read", granted: share.permissions.canRead },
+    { key: "permissions.write", granted: share.permissions.canWrite },
+    { key: "permissions.delete", granted: share.permissions.canDelete },
+  ];
+}
+
+const inboundEntries = computed(() => {
+  const pending = app.pendingRequests.map((request) => ({
+    key: `pending-${request.id}`,
+    status: "pending",
+    badgeKey: CLIENT_STATUS_LABEL.pending,
+    action: "approve",
+    title: request.peerIp,
+    subtitle: request.shareName,
+    request,
+    details: [
+      { label: t("pending.requestedPath"), value: request.requestedPath, mono: true },
+      { label: t("pending.firstSeen"), value: formatStamp(request.firstSeen) },
+      { label: t("pending.lastSeen"), value: formatStamp(request.lastSeen) },
+      { label: t("pending.attemptCount"), value: String(request.attempts) },
+    ],
+  }));
+  const authorized = [...authorizations.value]
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .map((authorization) => ({
+      key: `auth-${authorization.id}`,
+      status: "approved",
+      badgeKey: CLIENT_STATUS_LABEL.approved,
+      action: "revoke",
+      title: authorization.label,
+      subtitle: t("auth.authorizedAt", {
+        time: formatStamp(authorization.createdAt),
+      }),
+      authorization,
+      details: [
+        { label: t("auth.idLabel"), value: authorization.id, mono: true },
+      ],
+    }));
+  return [...pending, ...authorized];
+});
+
+function buildOutboundEntry(server, peer, awaiting) {
+  const status = peer ? "approved" : awaiting ? "pending" : "unrequested";
+  const details = [];
+  if (peer) {
+    details.push({
+      label: t("client.connectionState"),
+      value: peer.online ? t("client.online") : t("client.offline"),
+    });
+    details.push({
+      label: t("client.shareCount"),
+      value: String(peer.shares.length),
+    });
+  } else {
+    details.push({
+      label: t("client.shareCount"),
+      value: String(server.shareCount),
+    });
+  }
+  return {
+    key: peer ? `peer-${peer.id}` : `server-${server.serverId}`,
+    status,
+    badgeKey: CLIENT_STATUS_LABEL[status],
+    action: peer ? "open" : awaiting ? "cancel" : "request",
+    title: peer ? peer.label : server.name,
+    url: peer ? peer.url : server.url,
+    hosts: server ? server.hosts : [],
+    peer: peer ?? null,
+    details,
+  };
+}
+
+const outboundEntries = computed(() => {
+  const rows = [];
+  for (const server of lanServers.value) {
+    const peer = app.peers.find((item) => item.url === server.url) ?? null;
+    const awaiting = !peer && peerWaiting.value && peerRequestUrl.value === server.url;
+    rows.push(buildOutboundEntry(server, peer, awaiting));
+  }
+  for (const peer of app.peers) {
+    if (lanServers.value.some((server) => server.url === peer.url)) continue;
+    rows.push(buildOutboundEntry(null, peer, false));
+  }
+  return rows.sort(
+    (a, b) => CLIENT_STATUS_RANK[a.status] - CLIENT_STATUS_RANK[b.status],
+  );
+});
+// 骨架屏仅用于「还没有任何数据」的首屏；已有数据时的刷新继续渲染旧行，避免整块闪烁。
+const sharesLoading = computed(
+  () => adminLoading.value && shares.value.length === 0,
+);
+const inboundLoading = computed(
+  () => adminLoading.value && inboundEntries.value.length === 0,
+);
+const outboundLoading = computed(
+  () =>
+    (app.peersLoading || app.discoveredLoading) &&
+    outboundEntries.value.length === 0,
+);
+
 const manualOpen = ref(false);
 const peerUrl = ref("");
 const peerHealth = ref({});
+const peerSending = ref(false);
 const peerWaiting = ref(false);
 const peerRequestId = ref("");
 const peerRequestUrl = ref("");
@@ -65,18 +214,6 @@ const peerNotice = computed(() => {
   if (!peerNoticeState.value) return "";
   return t(peerNoticeState.value.key, peerNoticeState.value.params);
 });
-
-const serverStatusText = computed(() =>
-  app.serverStatus.running
-    ? t("server.running", { address: app.serverStatus.bindAddress ?? "" })
-    : t("server.stopped"),
-);
-
-const serverDiscoveryText = computed(() =>
-  app.serverStatus.discoveryRunning
-    ? `:${app.serverStatus.discoveryPort}`
-    : t("server.discoveryOff"),
-);
 
 function adminArgs() {
   return { username: app.adminUsername, password: app.serverPassword };
@@ -145,7 +282,11 @@ function editShare(share) {
   showShareForm.value = true;
 }
 
-function cancelShareEdit() {
+const shareDialogTitle = computed(() =>
+  editingShareId.value ? t("shares.editTitle") : t("shares.createTitle"),
+);
+
+function cancelShareForm() {
   resetShareForm();
   showShareForm.value = false;
 }
@@ -153,6 +294,14 @@ function cancelShareEdit() {
 function openNewShareForm() {
   resetShareForm();
   showShareForm.value = true;
+}
+
+// The dialog close button bypasses the footer actions, so the form is cleared
+// when the close transition ends. Opening another share before that must not
+// wipe the freshly loaded values.
+function onShareFormClosed() {
+  if (showShareForm.value) return;
+  resetShareForm();
 }
 
 function effectiveShareName() {
@@ -190,6 +339,17 @@ async function loadLocalNetworks() {
   }
 }
 
+// 后端已把默认路由网卡排在最前，虚拟网桥不会顶掉真实局域网地址；
+// 其余网卡（含 tun/VPN）全部保留，交给下拉框尾部和输入过滤。
+async function loadLanAddress() {
+  try {
+    const addresses = await app.invoke("local_addresses");
+    lanAddresses.value = Array.isArray(addresses) ? addresses : [];
+  } catch (error) {
+    app.handleFailure(error);
+  }
+}
+
 function describeRule(rule) {
   const kind = rule.kind === "deny" ? t("rule.deny") : t("rule.allow");
   let type = t("rule.ip");
@@ -203,23 +363,24 @@ function describeRule(rule) {
 
 const activeShareIds = ref([]);
 
-async function refreshAdminData() {
-  await run(loadAdminData);
-}
-
 async function loadAdminData() {
-  const args = adminArgs();
-  shares.value = await app.invoke("list_shares", args);
-  app.pendingRequests = await app.invoke("list_pending_requests", args);
-  authorizations.value = await app.invoke("list_authorizations", args);
-  await app.refreshServerStatus();
+  adminLoading.value = true;
+  try {
+    const args = adminArgs();
+    shares.value = await app.invoke("list_shares", args);
+    app.pendingRequests = await app.invoke("list_pending_requests", args);
+    authorizations.value = await app.invoke("list_authorizations", args);
+    await app.refreshServerStatus();
+  } finally {
+    adminLoading.value = false;
+  }
 }
 
 async function startServer() {
   await run(async () => {
     app.serverStatus = await app.invoke("start_server", {
       ...adminArgs(),
-      bindAddress: serverBind.value,
+      bindAddress: serverBind.value.trim(),
       port: Number(serverPort.value),
       discoveryPort: Number(serverDiscoveryPort.value),
       serverName: serverName.value || null,
@@ -320,14 +481,18 @@ async function revokeAuthorization(authorization) {
 
 async function requestPeerAccess(url = peerUrl.value) {
   const target = String(url ?? "").trim();
-  if (!target || peerWaiting.value) return;
-  peerWaiting.value = true;
+  if (!target || peerSending.value || peerWaiting.value) return;
+  // 「正在发送」与「已发送，等待批准」必须分开：request_peer_access 返回前只知道
+  // 本机在发请求，对方是否收到、是否登记了申请都未知，此时不能声称「已发送」。
+  peerSending.value = true;
+  peerWaiting.value = false;
   peerRequestUrl.value = target;
   peerRequestId.value = "";
   peerCancelRequested.value = false;
-  setPeerNotice("client.waiting");
+  peerNoticeState.value = null;
   try {
     const request = await app.invoke("request_peer_access", { url: target });
+    peerSending.value = false;
     if (!request.requested) {
       setPeerNotice("client.alreadyAccessible");
       return;
@@ -338,6 +503,8 @@ async function requestPeerAccess(url = peerUrl.value) {
     }
 
     peerRequestId.value = request.requestId;
+    peerWaiting.value = true;
+    setPeerNotice("client.waiting");
     const result = await app.invoke("wait_for_peer_access", {
       url: target,
       requestId: request.requestId,
@@ -356,6 +523,7 @@ async function requestPeerAccess(url = peerUrl.value) {
       setPeerNotice("client.failed");
     }
   } finally {
+    peerSending.value = false;
     peerWaiting.value = false;
     peerRequestId.value = "";
     peerRequestUrl.value = "";
@@ -381,6 +549,18 @@ async function cancelPeerRequest() {
   }
 }
 
+function formatStamp(seconds) {
+  if (!seconds) return "—";
+  try {
+    return new Intl.DateTimeFormat(document.documentElement.lang || undefined, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    }).format(new Date(Number(seconds) * 1000));
+  } catch {
+    return "—";
+  }
+}
+
 function healthText(health) {
   if (!health) return "";
   const label = !health.online
@@ -390,10 +570,6 @@ function healthText(health) {
       : t("client.onlineUnauthorized");
   const reason = health.message ? localizeMessage(health.message) : "";
   return reason && reason !== label ? `${label} · ${reason}` : label;
-}
-
-function isPeerSaved(url) {
-  return app.peers.some((peer) => peer.url === url);
 }
 
 async function checkPeer(peer) {
@@ -447,8 +623,32 @@ async function changeAdminPassword() {
   });
 }
 
+// 换密钥依赖后端先验再落：vault.reload_key 会先读取并校验候选密钥，只有
+// 校验通过才写入密钥路径与内存密钥，失败则原样返回错误。因此选错文件时
+// 当前密钥和路径都不变，用户不会被自己误选的密钥挡在登录之外。
+async function chooseVaultKey() {
+  const selected = await openDialog({
+    multiple: false,
+    directory: false,
+    filters: [
+      {
+        name: t("vault.keyFileFilter"),
+        extensions: ["key", "json"],
+      },
+    ],
+  });
+  if (typeof selected !== "string") return;
+
+  await run(async () => {
+    const next = await app.invoke("reload_vault_key", { path: selected });
+    app.applyVaultStatus(next);
+    app.setNotice("vault.keyLoaded");
+  });
+}
+
 onMounted(() => {
   void loadLocalNetworks();
+  void loadLanAddress();
   void loadAutostart();
   void loadInitialData();
 });
@@ -479,8 +679,8 @@ async function changeAutostart(value) {
   }
 }
 
-/// Initial load after sign-in keeps the login notice visible; user-triggered
-/// refreshes go through `run` and clear stale messages first.
+/// Initial load after sign-in keeps the login notice visible; later reloads
+/// happen right after a user action, inside that action's `run`.
 async function loadInitialData() {
   try {
     await loadAdminData();
@@ -519,14 +719,37 @@ async function loadInitialData() {
         <div class="server-panel">
           <h3>{{ t("server.title") }}</h3>
           <p class="hint">{{ t("server.verifyHint") }}</p>
-          <div class="grid">
+          <!-- 两列固定配对：名称+绑定地址一行，HTTP 服务端口与 UDP 广播端口一行。 -->
+          <div class="grid pane-form-grid">
+            <label>
+              {{ t("server.name") }}
+              <el-input
+                v-model="serverName"
+                type="text"
+                placeholder="PeerDav"
+              />
+            </label>
             <label>
               {{ t("server.bindAddress") }}
-              <el-input
+              <el-select
                 v-model="serverBind"
-                type="text"
-                placeholder="0.0.0.0"
-              />
+                class="bind-select"
+                filterable
+                allow-create
+                default-first-option
+              >
+                <el-option
+                  v-for="option in bindOptions"
+                  :key="option.value"
+                  :value="option.value"
+                  :label="option.text"
+                >
+                  <span class="bind-option">
+                    <span>{{ option.scope }}</span>
+                    <span class="bind-option__addr">{{ option.address }}</span>
+                  </span>
+                </el-option>
+              </el-select>
             </label>
             <label>
               {{ t("server.port") }}
@@ -538,14 +761,6 @@ async function loadInitialData() {
                 v-model="serverDiscoveryPort"
                 :min="1"
                 :max="65535"
-              />
-            </label>
-            <label>
-              {{ t("server.name") }}
-              <el-input
-                v-model="serverName"
-                type="text"
-                placeholder="PeerDav"
               />
             </label>
           </div>
@@ -564,20 +779,7 @@ async function loadInitialData() {
             >
               {{ t("server.stopService") }}
             </el-button>
-            <el-button plain :disabled="busy" @click="refreshAdminData">
-              {{ t("server.refresh") }}
-            </el-button>
           </div>
-          <p class="hint">
-            {{ t("server.status") }}: {{ serverStatusText }} ·
-            {{
-              t("server.summary", {
-                shares: app.serverStatus.shareCount,
-                pending: app.serverStatus.pendingCount,
-                discovery: serverDiscoveryText,
-              })
-            }}
-          </p>
           <div class="settings-toggle">
             <div>
               <strong>{{ t("settings.autostart") }}</strong>
@@ -604,11 +806,12 @@ async function loadInitialData() {
           <div class="pane-heading">
             <div class="pane-heading__title">
               <h3>{{ t("shares.title") }}</h3>
-              <span class="pane-heading__badge">{{ shares.length }}</span>
+              <span class="count-badge">{{ shares.length }}</span>
             </div>
             <el-button
+              class="list-pill pane-cta"
               type="primary"
-              plain
+              round
               size="small"
               :aria-label="t('shares.create')"
               @click="openNewShareForm"
@@ -618,7 +821,12 @@ async function loadInitialData() {
               </svg>
             </el-button>
           </div>
-          <el-collapse v-if="shares.length" v-model="activeShareIds" class="share-collapse">
+          <list-skeleton v-if="sharesLoading" :rows="3" />
+          <el-collapse
+            v-else-if="shares.length"
+            v-model="activeShareIds"
+            class="share-collapse"
+          >
             <el-collapse-item
               v-for="share in shares"
               :key="share.id"
@@ -639,36 +847,66 @@ async function loadInitialData() {
                   </div>
                 </div>
                 <div class="share-item__perms">
-                  <el-checkbox :model-value="share.permissions.canRead" disabled>
-                    {{ t("permissions.read") }}
-                  </el-checkbox>
-                  <el-checkbox :model-value="share.permissions.canWrite" disabled>
-                    {{ t("permissions.write") }}
-                  </el-checkbox>
-                  <el-checkbox :model-value="share.permissions.canDelete" disabled>
-                    {{ t("permissions.delete") }}
-                  </el-checkbox>
+                  <span
+                    v-for="flag in permissionFlags(share)"
+                    :key="flag.key"
+                    class="perm-flag"
+                    :class="{ 'is-granted': flag.granted }"
+                    role="img"
+                    :aria-label="
+                      t(
+                        flag.granted
+                          ? 'permissions.granted'
+                          : 'permissions.denied',
+                        { name: t(flag.key) },
+                      )
+                    "
+                  >
+                    <svg viewBox="0 0 16 16" aria-hidden="true" class="perm-flag__box">
+                      <rect x="1.5" y="1.5" width="13" height="13" rx="3.5" />
+                      <path v-if="flag.granted" d="M4.4 8.1l2.2 2.2 5-5.2" />
+                    </svg>
+                    {{ t(flag.key) }}
+                  </span>
                 </div>
                 <div class="share-item__actions" @click.stop>
                   <el-button
+                    class="list-pill"
                     type="primary"
-                    plain
                     size="small"
                     round
                     :disabled="busy"
+                    :aria-label="t('shares.edit')"
                     @click="editShare(share)"
                   >
-                    {{ t("shares.edit") }}
+                    <svg
+                      viewBox="0 0 24 24"
+                      aria-hidden="true"
+                      class="share-item__action-icon"
+                    >
+                      <path d="M4 20h4L19.5 8.5a2.12 2.12 0 0 0-3-3L5 17z" />
+                      <path d="m14.5 6.5 3 3" />
+                    </svg>
                   </el-button>
                   <el-button
+                    class="list-pill"
                     type="primary"
-                    plain
                     size="small"
                     round
                     :disabled="busy"
+                    :aria-label="t('common.delete')"
                     @click="deleteShare(share)"
                   >
-                    {{ t("common.delete") }}
+                    <svg
+                      viewBox="0 0 24 24"
+                      aria-hidden="true"
+                      class="share-item__action-icon"
+                    >
+                      <path d="M4 7h16" />
+                      <path d="M9 7V4.5h6V7" />
+                      <path d="m6.5 7 .8 13h9.4l.8-13" />
+                      <path d="M10 11v5.5M14 11v5.5" />
+                    </svg>
                   </el-button>
                 </div>
               </template>
@@ -685,109 +923,114 @@ async function loadInitialData() {
           </el-collapse>
           <p v-else class="hint">{{ t("shares.empty") }}</p>
 
-          <p v-if="editingShareId" class="hint">
-            {{ t("shares.editing", { name: shareName }) }}
-          </p>
-          <form v-if="showShareForm" class="stack" @submit.prevent="saveShare">
-            <label>
-              {{ t("shares.localDir") }}
-              <div class="input-with-button">
+          <el-dialog
+            v-model="showShareForm"
+            :title="shareDialogTitle"
+            width="520px"
+            align-center
+            :close-on-click-modal="false"
+            :close-on-press-escape="false"
+            @closed="onShareFormClosed"
+          >
+            <p v-if="editingShareId" class="hint">
+              {{ t("shares.editing", { name: shareName }) }}
+            </p>
+            <form class="stack" @submit.prevent="saveShare">
+              <label>
+                {{ t("shares.localDir") }}
+                <div class="input-with-button">
+                  <el-input
+                    v-model="shareRoot"
+                    type="text"
+                    :disabled="Boolean(editingShareId)"
+                    required
+                  />
+                  <el-button
+                    plain
+                    :disabled="busy || Boolean(editingShareId)"
+                    @click="chooseShareRoot"
+                  >
+                    {{ t("shares.chooseDir") }}
+                  </el-button>
+                </div>
+              </label>
+              <label>
+                {{ t("shares.name") }}
                 <el-input
-                  v-model="shareRoot"
+                  v-model="shareName"
                   type="text"
                   :disabled="Boolean(editingShareId)"
-                  required
+                  :placeholder="t('shares.nameOptional')"
                 />
-                <el-button
-                  plain
-                  :disabled="busy || Boolean(editingShareId)"
-                  @click="chooseShareRoot"
+              </label>
+              <label>
+                {{ t("shares.allowRules") }}
+                <el-select
+                  v-model="shareAllow"
+                  class="rule-select"
+                  multiple
+                  filterable
+                  allow-create
+                  default-first-option
+                  collapse-tags
+                  collapse-tags-tooltip
+                  :placeholder="t('shares.rulesPlaceholder')"
                 >
-                  {{ t("shares.chooseDir") }}
-                </el-button>
+                  <el-option
+                    v-for="net in defaultAllowRules"
+                    :key="net"
+                    :label="net"
+                    :value="net"
+                  />
+                </el-select>
+              </label>
+              <label>
+                {{ t("shares.denyRules") }}
+                <el-select
+                  v-model="shareDeny"
+                  class="rule-select"
+                  multiple
+                  filterable
+                  allow-create
+                  default-first-option
+                  collapse-tags
+                  collapse-tags-tooltip
+                  :placeholder="t('shares.denyPlaceholder')"
+                >
+                  <el-option
+                    v-for="net in defaultAllowRules"
+                    :key="net"
+                    :label="net"
+                    :value="net"
+                  />
+                </el-select>
+              </label>
+              <p class="hint">{{ t("shares.rulesHint") }}</p>
+              <div class="checks">
+                <el-checkbox v-model="shareCanRead">
+                  {{ t("permissions.read") }}
+                </el-checkbox>
+                <el-checkbox v-model="shareCanWrite">
+                  {{ t("permissions.write") }}
+                </el-checkbox>
+                <el-checkbox v-model="shareCanDelete">
+                  {{ t("permissions.delete") }}
+                </el-checkbox>
               </div>
-            </label>
-            <label>
-              {{ t("shares.name") }}
-              <el-input
-                v-model="shareName"
-                type="text"
-                :disabled="Boolean(editingShareId)"
-                :placeholder="t('shares.nameOptional')"
-              />
-            </label>
-            <label>
-              {{ t("shares.allowRules") }}
-              <el-select
-                v-model="shareAllow"
-                class="rule-select"
-                multiple
-                filterable
-                allow-create
-                default-first-option
-                collapse-tags
-                collapse-tags-tooltip
-                :placeholder="t('shares.rulesPlaceholder')"
-              >
-                <el-option
-                  v-for="net in defaultAllowRules"
-                  :key="net"
-                  :label="net"
-                  :value="net"
-                />
-              </el-select>
-            </label>
-            <label>
-              {{ t("shares.denyRules") }}
-              <el-select
-                v-model="shareDeny"
-                class="rule-select"
-                multiple
-                filterable
-                allow-create
-                default-first-option
-                collapse-tags
-                collapse-tags-tooltip
-                :placeholder="t('shares.denyPlaceholder')"
-              >
-                <el-option
-                  v-for="net in defaultAllowRules"
-                  :key="net"
-                  :label="net"
-                  :value="net"
-                />
-              </el-select>
-            </label>
-            <p class="hint">{{ t("shares.rulesHint") }}</p>
-            <div class="checks">
-              <el-checkbox v-model="shareCanRead">
-                {{ t("permissions.read") }}
-              </el-checkbox>
-              <el-checkbox v-model="shareCanWrite">
-                {{ t("permissions.write") }}
-              </el-checkbox>
-              <el-checkbox v-model="shareCanDelete">
-                {{ t("permissions.delete") }}
-              </el-checkbox>
-            </div>
-            <div class="actions">
+            </form>
+            <template #footer>
+              <el-button plain :disabled="busy" @click="cancelShareForm">
+                {{ t("common.cancel") }}
+              </el-button>
               <el-button
                 type="primary"
-                native-type="submit"
                 :disabled="busy || !shareRoot.trim()"
+                @click="saveShare"
               >
                 {{ editingShareId ? t("shares.save") : t("shares.create") }}
               </el-button>
-              <el-button
-                v-if="editingShareId"
-                plain
-                :disabled="busy"
-                @click="cancelShareEdit"
-              >
-                {{ t("shares.cancelEdit") }}
-              </el-button>
-            </div>
-          </form>
+            </template>
+          </el-dialog>
         </div>
       </section>
 
@@ -808,65 +1051,105 @@ async function loadInitialData() {
                   <path d="M5 18h14" />
                 </svg>
               </span>
-              <div>
-                <h2>{{ t("clients.inboundTitle") }}</h2>
+              <div class="role-heading__text">
+                <h2>
+                  {{ t("clients.inboundTitle") }}
+                  <span v-if="inboundEntries.length" class="count-badge">{{
+                    inboundEntries.length
+                  }}</span>
+                </h2>
                 <p>{{ t("clients.inboundHint") }}</p>
               </div>
             </header>
 
-            <div class="role-card">
-              <div class="role-block">
-                <h3>{{ t("pending.title") }}</h3>
-                <p class="hint">{{ t("pending.hint") }}</p>
-                <ul class="list">
-                  <li v-for="request in app.pendingRequests" :key="request.id">
-                    <div>
-                      <strong class="mono">{{ request.peerIp }}</strong>
-                      <div class="hint">
-                        {{ request.shareName }}
-                        <template v-if="request.attempts > 1">
-                          · {{ t("pending.attempts", { count: request.attempts }) }}
-                        </template>
-                      </div>
+            <list-skeleton v-if="inboundLoading" :rows="3" />
+            <el-collapse
+              v-else-if="inboundEntries.length"
+              v-model="activeInboundIds"
+              class="client-collapse"
+            >
+              <el-collapse-item
+                v-for="entry in inboundEntries"
+                :key="entry.key"
+                :name="entry.key"
+              >
+                <template #title>
+                  <div class="client-item__main">
+                    <span
+                      class="client-item__icon"
+                      :class="`is-${entry.status}`"
+                      aria-hidden="true"
+                    >
+                      <svg v-if="entry.status === 'pending'" viewBox="0 0 24 24">
+                        <circle cx="12" cy="12" r="8.5" />
+                        <path d="M12 7.5V12l3.2 2" />
+                      </svg>
+                      <svg v-else viewBox="0 0 24 24">
+                        <circle cx="8.5" cy="15.5" r="3.5" />
+                        <path d="m11 13 8-8" />
+                        <path d="m15.5 5 3 3" />
+                      </svg>
+                    </span>
+                    <div class="client-item__title">
+                      <strong>{{ entry.title }}</strong>
+                      <span class="hint">{{ entry.subtitle }}</span>
                     </div>
+                  </div>
+                  <div class="client-item__status">
+                    <el-tag
+                      class="row-tag"
+                      :type="statusTagTone(entry.status)"
+                      effect="plain"
+                      round
+                      size="small"
+                    >
+                      {{ t(entry.badgeKey) }}
+                    </el-tag>
+                  </div>
+                  <div class="client-item__actions" @click.stop>
                     <el-button
+                      v-if="entry.action === 'approve'"
+                      class="list-pill"
                       type="primary"
+                      round
+                      size="small"
                       :disabled="busy"
-                      @click="approveRequest(request)"
+                      @click="approveRequest(entry.request)"
                     >
                       {{ t("pending.approve") }}
                     </el-button>
-                  </li>
-                  <li v-if="!app.pendingRequests.length" class="hint">
-                    {{ t("pending.empty") }}
-                  </li>
-                </ul>
-              </div>
-
-              <div class="role-block">
-                <h3>{{ t("auth.title") }}</h3>
-                <p class="hint">{{ t("auth.hint") }}</p>
-                <ul class="list">
-                  <li
-                    v-for="authorization in authorizations"
-                    :key="authorization.id"
-                  >
-                    <div>
-                      <strong>{{ authorization.label }}</strong>
-                      <div class="hint">{{ t("auth.active") }}</div>
-                    </div>
                     <el-button
-                      plain
+                      v-else
+                      class="list-pill"
+                      type="primary"
+                      round
+                      size="small"
                       :disabled="busy"
-                      @click.stop="revokeAuthorization(authorization)"
+                      @click="revokeAuthorization(entry.authorization)"
                     >
                       {{ t("auth.revoke") }}
                     </el-button>
-                  </li>
-                  <li v-if="!authorizations.length" class="hint">
-                    {{ t("auth.empty") }}
+                  </div>
+                </template>
+                <ul class="client-item__detail">
+                  <li v-for="line in entry.details" :key="line.label">
+                    <span>{{ line.label }}</span>
+                    <strong :class="{ mono: line.mono }">{{ line.value }}</strong>
                   </li>
                 </ul>
+              </el-collapse-item>
+            </el-collapse>
+            <div v-else class="client-empty">
+              <span class="client-empty__icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <circle cx="8.5" cy="15.5" r="3.5" />
+                  <path d="m11 13 8-8" />
+                  <path d="m15.5 5 3 3" />
+                </svg>
+              </span>
+              <div>
+                <strong>{{ t("clients.inboundEmptyTitle") }}</strong>
+                <p class="hint">{{ t("clients.inboundEmptyHint") }}</p>
               </div>
             </div>
           </section>
@@ -880,139 +1163,214 @@ async function loadInitialData() {
                   <path d="M5 20h14" />
                 </svg>
               </span>
-              <div>
-                <h2>{{ t("clients.outboundTitle") }}</h2>
+              <div class="role-heading__text">
+                <h2>
+                  {{ t("clients.outboundTitle") }}
+                  <span v-if="outboundEntries.length" class="count-badge">{{
+                    outboundEntries.length
+                  }}</span>
+                </h2>
                 <p>{{ t("clients.outboundHint") }}</p>
               </div>
+              <el-button
+                class="list-pill"
+                type="primary"
+                round
+                size="small"
+                :aria-expanded="manualOpen"
+                @click="manualOpen = !manualOpen"
+              >
+                {{ t("client.manual") }}
+              </el-button>
             </header>
 
-            <div class="role-card">
-              <div class="role-block">
-                <div class="role-block__head">
-                  <div>
-                    <h3>{{ t("client.addTitle") }}</h3>
-                    <p class="hint">{{ t("client.addHint") }}</p>
-                  </div>
-                  <div class="actions">
-                    <el-button plain @click="manualOpen = !manualOpen">
-                      {{ t("client.manual") }}
-                    </el-button>
-                  </div>
-                </div>
+            <form
+              v-if="manualOpen"
+              class="manual-connect"
+              @submit.prevent="requestPeerAccess()"
+            >
+              <el-input
+                v-model="peerUrl"
+                type="text"
+                placeholder="http://192.168.1.10:4918"
+                :disabled="peerSending || peerWaiting"
+              />
+              <el-button
+                type="primary"
+                native-type="submit"
+                :loading="peerSending || peerWaiting"
+                :disabled="busy || peerSending || peerWaiting || !peerUrl"
+              >
+                {{ t("client.request") }}
+              </el-button>
+            </form>
 
-                <p v-if="lanServers.length" class="hint">
-                  {{
-                    t("client.discoveredCount", {
-                      count: lanServers.length,
-                    })
-                  }}
-                </p>
-                <p v-else class="hint">{{ t("client.discoveredEmpty") }}</p>
+            <div v-if="peerSending || peerWaiting" class="request-progress">
+              <span>
+                {{ peerSending ? t("client.sending") : peerNotice || t("client.waiting") }}
+              </span>
+              <el-button
+                v-if="peerWaiting"
+                plain
+                :loading="peerCanceling"
+                @click="cancelPeerRequest"
+              >
+                {{ t("client.cancel") }}
+              </el-button>
+            </div>
+            <p v-else-if="peerNotice" class="hint request-progress__notice">
+              {{ peerNotice }}
+            </p>
 
-                <ul v-if="lanServers.length" class="list">
-                  <li v-for="server in lanServers" :key="server.serverId">
-                    <div>
-                      <strong>{{ server.name }}</strong>
-                      <div class="hint mono">{{ server.url }}</div>
-                      <div class="hint">
-                        {{
-                          t("client.discoveredMeta", {
-                            count: server.shareCount,
-                            hosts: server.hosts.join(", "),
-                          })
-                        }}
-                      </div>
-                    </div>
-                    <el-button
-                      v-if="isPeerSaved(server.url)"
-                      plain
-                      disabled
+            <list-skeleton v-if="outboundLoading" :rows="3" />
+            <el-collapse
+              v-else-if="outboundEntries.length"
+              v-model="activeOutboundIds"
+              class="client-collapse"
+            >
+              <el-collapse-item
+                v-for="entry in outboundEntries"
+                :key="entry.key"
+                :name="entry.key"
+              >
+                <template #title>
+                  <div class="client-item__main">
+                    <span
+                      class="client-item__icon"
+                      :class="`is-${entry.status}`"
+                      aria-hidden="true"
                     >
-                      {{ t("home.connected") }}
-                    </el-button>
+                      <svg viewBox="0 0 24 24">
+                        <rect x="4" y="4" width="16" height="6" rx="1.5" />
+                        <rect x="4" y="14" width="16" height="6" rx="1.5" />
+                        <path d="M8 7h.01M8 17h.01" />
+                      </svg>
+                    </span>
+                    <div class="client-item__title">
+                      <strong>{{ entry.title }}</strong>
+                      <span class="hint mono">{{ entry.url }}</span>
+                    </div>
+                  </div>
+                  <div class="client-item__status">
+                    <el-tag
+                      class="row-tag"
+                      :type="statusTagTone(entry.status)"
+                      effect="plain"
+                      round
+                      size="small"
+                    >
+                      {{ t(entry.badgeKey) }}
+                    </el-tag>
+                  </div>
+                  <div class="client-item__actions" @click.stop>
                     <el-button
-                      v-else
+                      v-if="entry.action === 'request'"
+                      class="list-pill"
                       type="primary"
-                      plain
-                      :disabled="busy || peerWaiting"
-                      @click="requestPeerAccess(server.url)"
+                      round
+                      size="small"
+                      :disabled="busy || peerSending || peerWaiting"
+                      @click="requestPeerAccess(entry.url)"
                     >
                       {{ t("client.connect") }}
                     </el-button>
-                  </li>
-                </ul>
-
-                <form
-                  v-if="manualOpen"
-                  class="manual-connect"
-                  @submit.prevent="requestPeerAccess()"
-                >
-                  <el-input
-                    v-model="peerUrl"
-                    type="text"
-                    placeholder="http://192.168.1.10:4918"
-                    :disabled="peerWaiting"
-                  />
-                  <el-button
-                    type="primary"
-                    native-type="submit"
-                    :loading="peerWaiting"
-                    :disabled="busy || peerWaiting || !peerUrl"
-                  >
-                    {{ t("client.request") }}
-                  </el-button>
-                </form>
-
-                <div v-if="peerWaiting" class="request-progress">
-                  <span>{{ peerNotice || t("client.waiting") }}</span>
-                  <el-button
-                    plain
-                    :loading="peerCanceling"
-                    @click="cancelPeerRequest"
-                  >
-                    {{ t("client.cancel") }}
-                  </el-button>
-                </div>
-                <p v-else-if="peerNotice" class="hint request-progress__notice">
-                  {{ peerNotice }}
-                </p>
-              </div>
-
-              <div class="role-block">
-                <h3>{{ t("client.savedTitle") }}</h3>
-                <ul class="list">
-                  <li v-for="peer in app.peers" :key="peer.id">
-                    <div>
-                      <strong>{{ peer.label }}</strong>
-                      <div class="hint mono">{{ peer.url }}</div>
-                      <div v-if="peerHealth[peer.id]" class="hint">
-                        {{ healthText(peerHealth[peer.id]) }}
-                      </div>
-                    </div>
-                    <div class="actions">
+                    <el-button
+                      v-else-if="entry.action === 'cancel'"
+                      class="list-pill"
+                      type="primary"
+                      round
+                      size="small"
+                      :loading="peerCanceling"
+                      @click="cancelPeerRequest"
+                    >
+                      {{ t("client.cancel") }}
+                    </el-button>
+                    <template v-else>
                       <el-button
+                        class="list-pill"
                         type="primary"
-                        :disabled="busy || !peer.online"
-                        @click="app.openPeer(peer)"
+                        round
+                        size="small"
+                        :disabled="busy || !entry.peer.online"
+                        @click="app.openPeer(entry.peer)"
                       >
                         {{ t("client.open") }}
                       </el-button>
-                      <el-button plain :disabled="busy" @click="checkPeer(peer)">
-                        {{ t("client.check") }}
-                      </el-button>
                       <el-button
-                        plain
+                        class="list-pill"
+                        type="primary"
+                        round
+                        size="small"
                         :disabled="busy"
-                        @click.stop="forgetPeer(peer)"
+                        @click="forgetPeer(entry.peer)"
                       >
                         {{ t("client.forget") }}
                       </el-button>
-                    </div>
-                  </li>
-                  <li v-if="!app.peers.length" class="hint">
-                    {{ t("client.empty") }}
+                    </template>
+                  </div>
+                </template>
+                <ul class="client-item__detail">
+                  <li v-for="line in entry.details" :key="line.label">
+                    <span>{{ line.label }}</span>
+                    <strong :class="{ mono: line.mono }">{{ line.value }}</strong>
                   </li>
                 </ul>
+                <div v-if="entry.hosts.length" class="client-item__block">
+                  <p class="hint client-item__block-title">
+                    {{ t("client.hostsTitle") }}
+                  </p>
+                  <ul class="client-hosts">
+                    <li v-for="host in entry.hosts" :key="host">{{ host }}</li>
+                  </ul>
+                </div>
+                <div
+                  v-if="entry.peer && entry.peer.shares.length"
+                  class="client-item__block"
+                >
+                  <p class="hint client-item__block-title">
+                    {{ t("client.grantedTitle") }}
+                  </p>
+                  <ul class="client-shares">
+                    <li v-for="share in entry.peer.shares" :key="share.id">
+                      <strong>{{ share.name }}</strong>
+                      <span class="hint">
+                        {{ permissionText(share.permissions) }}
+                      </span>
+                    </li>
+                  </ul>
+                </div>
+                <div v-if="entry.peer" class="client-item__health">
+                  <span class="hint">
+                    {{
+                      peerHealth[entry.peer.id]
+                        ? healthText(peerHealth[entry.peer.id])
+                        : t("client.healthUnknown")
+                    }}
+                  </span>
+                  <el-button
+                    class="list-pill"
+                    type="primary"
+                    round
+                    size="small"
+                    :disabled="busy"
+                    @click="checkPeer(entry.peer)"
+                  >
+                    {{ t("client.check") }}
+                  </el-button>
+                </div>
+              </el-collapse-item>
+            </el-collapse>
+            <div v-else class="client-empty">
+              <span class="client-empty__icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24">
+                  <rect x="4" y="4" width="16" height="6" rx="1.5" />
+                  <rect x="4" y="14" width="16" height="6" rx="1.5" />
+                  <path d="M8 7h.01M8 17h.01" />
+                </svg>
+              </span>
+              <div>
+                <strong>{{ t("clients.outboundEmptyTitle") }}</strong>
+                <p class="hint">{{ t("clients.outboundEmptyHint") }}</p>
               </div>
             </div>
           </section>
@@ -1030,42 +1388,49 @@ async function loadInitialData() {
           <h3>{{ t("login.changeTitle") }}</h3>
           <p class="hint">{{ t("login.changeAccountHint") }}</p>
           <form class="stack" @submit.prevent="changeAdminPassword">
-            <label>
-              {{ t("login.username") }}
-              <el-input :model-value="app.adminUsername" type="text" disabled />
-            </label>
-            <label>
-              {{ t("login.currentPassword") }}
-              <el-input
-                v-model="adminCurrentPassword"
-                type="password"
-                show-password
-                autocomplete="current-password"
-                required
-              />
-            </label>
-            <label>
-              {{ t("login.newPassword") }}
-              <el-input
-                v-model="adminNewPassword"
-                type="password"
-                show-password
-                minlength="6"
-                autocomplete="new-password"
-                required
-              />
-            </label>
-            <label>
-              {{ t("login.confirmNewPassword") }}
-              <el-input
-                v-model="adminNewPasswordConfirm"
-                type="password"
-                show-password
-                minlength="6"
-                autocomplete="new-password"
-                required
-              />
-            </label>
+            <!-- 两列配对：账号+当前密码一行，新密码+确认一行，避免单列拉成整屏长条。 -->
+            <div class="grid pane-form-grid">
+              <label>
+                {{ t("login.username") }}
+                <el-input
+                  :model-value="app.adminUsername"
+                  type="text"
+                  disabled
+                />
+              </label>
+              <label>
+                {{ t("login.currentPassword") }}
+                <el-input
+                  v-model="adminCurrentPassword"
+                  type="password"
+                  show-password
+                  autocomplete="current-password"
+                  required
+                />
+              </label>
+              <label>
+                {{ t("login.newPassword") }}
+                <el-input
+                  v-model="adminNewPassword"
+                  type="password"
+                  show-password
+                  minlength="6"
+                  autocomplete="new-password"
+                  required
+                />
+              </label>
+              <label>
+                {{ t("login.confirmNewPassword") }}
+                <el-input
+                  v-model="adminNewPasswordConfirm"
+                  type="password"
+                  show-password
+                  minlength="6"
+                  autocomplete="new-password"
+                  required
+                />
+              </label>
+            </div>
             <div class="actions">
               <el-button type="primary" native-type="submit" :disabled="busy">
                 {{ t("login.update") }}
@@ -1080,13 +1445,23 @@ async function loadInitialData() {
         <div class="server-panel">
           <h3>{{ t("vault.keyFileTitle") }}</h3>
           <p class="hint">{{ t("vault.keyFileHint") }}</p>
-          <p v-if="app.status.keyFile" class="mono key-path">
-            {{ app.status.keyFile }}
-          </p>
-          <div class="actions">
-            <el-button plain :disabled="busy" @click="app.lockVault">
-              {{ t("vault.lock") }}
-            </el-button>
+          <!-- 用 .stack 包一层，label 才能拿到与其它面板一致的字段标题样式
+               （13px/600 + 6px 间距），裸 label 会继承 16px 正文且贴住输入框。 -->
+          <div class="stack">
+            <label>
+              {{ t("vault.keyFilePath") }}
+              <!-- 路径只读：换密钥只能通过选择文件完成，避免手输一个不存在的地址。 -->
+              <div class="input-with-button">
+                <el-input
+                  :model-value="app.status.keyFile ?? ''"
+                  type="text"
+                  readonly
+                />
+                <el-button plain :disabled="busy" @click="chooseVaultKey">
+                  {{ t("vault.chooseKeyFile") }}
+                </el-button>
+              </div>
+            </label>
           </div>
         </div>
       </section>
@@ -1167,50 +1542,84 @@ async function loadInitialData() {
   stroke-linecap: round;
 }
 
-.pane-heading__badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 22px;
-  height: 20px;
-  padding: 0 8px;
-  border-radius: 10px;
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 1;
-  color: var(--el-color-primary);
-  background: color-mix(in oklab, var(--el-color-primary) 12%, transparent);
+/* 面板内表单固定两列，保证字段按语义成对换行；
+   全局 .grid 用 auto-fit，宽窗口下会排出三列把配对打散。 */
+.grid.pane-form-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+/* EP 的 select 默认 240px 固定宽，与同排输入框对不齐。 */
+.bind-select {
+  width: 100%;
+}
+
+.bind-option {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.bind-option__addr {
+  color: var(--app-text-secondary);
   font-variant-numeric: tabular-nums;
 }
 
+/* 列表/标题区按钮统一用全局 .list-pill（24px 胶囊）：App.vue 的 `:root .el-button`
+   把控件钉在 38px，size="small" 单独不生效；对话框内的表单按钮不加该类，仍与输入框同高。 */
+
+/* 最外框统一描边并裁 5px 圆角；行分隔线自己画，避免与外框叠成双线 */
 .share-collapse {
-  border-top: 0;
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  overflow: hidden;
 }
 
+.share-collapse :deep(.el-collapse-item),
+.share-collapse :deep(.el-collapse-item__header) {
+  border-bottom: 0;
+}
+
+.share-collapse :deep(.el-collapse-item:not(:last-child)) {
+  border-bottom: 1px solid var(--app-border);
+}
+
+/* header 只有两个子元素：Element Plus 的 title 包裹层 + 箭头 */
 .share-collapse :deep(.el-collapse-item__header) {
   display: grid;
-  grid-template-columns: 1fr auto 1fr auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 16px;
+  gap: 12px;
   height: auto;
-  padding: 12px 0;
+  padding: 12px 15px;
   line-height: 1.4;
   font-size: 14px;
   color: var(--app-text);
 }
 
+/* #title 插槽内容被包进 .el-collapse-item__title，三栏必须打在它身上。
+   中栏/右栏用固定下限宽度，保证所有行的「读写删」和按钮垂直对齐。 */
+.share-collapse :deep(.el-collapse-item__title) {
+  display: grid;
+  grid-template-columns:
+    minmax(0, 1fr) minmax(132px, max-content) minmax(58px, max-content);
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+
 .share-collapse :deep(.el-collapse-item__arrow) {
   margin: 0;
+  justify-self: end;
 }
 
 .share-collapse :deep(.el-collapse-item__content) {
-  padding-bottom: 4px;
+  padding: 0 15px 4px;
 }
 
 .share-item__main {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 5px;
   min-width: 0;
 }
 
@@ -1254,30 +1663,53 @@ async function loadInitialData() {
 .share-item__perms {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
 }
 
-.share-item__perms :deep(.el-checkbox) {
-  height: auto;
-  margin: 0;
+.perm-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--app-text-muted);
 }
 
-.share-item__perms :deep(.el-checkbox__label) {
-  font-size: 13px;
-  color: var(--app-text-secondary);
+.perm-flag.is-granted {
+  color: var(--tone-success);
+}
+
+.perm-flag__box {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .share-item__actions {
   display: flex;
   align-items: center;
-  gap: 8px;
-  justify-self: end;
+  gap: 6px;
+}
+
+.share-item__action-icon {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .share-item__rules {
   list-style: none;
   margin: 0;
-  padding: 4px 0 8px 32px;
+  /* 与名称列起点对齐：图标 32px + 间距 5px */
+  padding: 4px 0 8px 37px;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -1285,8 +1717,8 @@ async function loadInitialData() {
 
 .client-roles {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 18px;
+  grid-template-columns: 1fr;
+  gap: 40px;
   align-items: start;
 }
 
@@ -1295,24 +1727,29 @@ async function loadInitialData() {
 }
 
 .role-heading {
-  display: flex;
-  align-items: flex-start;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
   gap: 11px;
-  margin-bottom: 10px;
+  margin-bottom: 12px;
   padding: 0 2px;
+}
+
+.role-heading__text {
+  min-width: 0;
 }
 
 .role-heading h2 {
   margin: 0 0 4px;
-  font-size: 17px;
+  font-size: 16px;
   line-height: 1.3;
   color: var(--app-text);
 }
 
 .role-heading p {
   margin: 0;
-  font-size: 12.5px;
-  line-height: 1.55;
+  font-size: 12px;
+  line-height: 1.6;
   color: var(--app-text-muted);
 }
 
@@ -1343,48 +1780,261 @@ async function loadInitialData() {
   stroke-linejoin: round;
 }
 
-.role-card {
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-  padding: 16px;
+/* 客户端折叠面板沿用共享策略面板的语言：外框描边裁圆、行分隔自绘、
+   折叠头三栏对齐。折叠头只放标识两行，状态与动作各占一栏，
+   网段/规则/共享等长内容一律进展开体，避免一行里堆太多东西。 */
+.client-collapse {
   border: 1px solid var(--app-border);
-  border-radius: 15px;
-  background: var(--app-surface);
+  border-radius: 8px;
+  overflow: hidden;
 }
 
-.role-block {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
+.client-collapse :deep(.el-collapse-item),
+.client-collapse :deep(.el-collapse-item__header) {
+  border-bottom: 0;
 }
 
-.role-block + .role-block {
-  padding-top: 16px;
-  border-top: 1px solid var(--app-border);
+.client-collapse :deep(.el-collapse-item:not(:last-child)) {
+  border-bottom: 1px solid var(--app-border);
 }
 
-.role-block h3 {
-  margin: 0;
+.client-collapse :deep(.el-collapse-item__header) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  height: auto;
+  padding: 10px 15px;
+  line-height: 1.4;
   font-size: 14px;
   color: var(--app-text);
 }
 
-.role-block__head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px;
+.client-collapse :deep(.el-collapse-item__title) {
+  display: grid;
+  grid-template-columns:
+    minmax(0, 1fr) minmax(72px, max-content) minmax(58px, max-content);
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
 }
 
-.role-block__head .actions {
+.client-collapse :deep(.el-collapse-item__arrow) {
+  margin: 0;
+  justify-self: end;
+}
+
+.client-collapse :deep(.el-collapse-item__wrap) {
+  background: var(--app-surface-2);
+}
+
+.client-collapse :deep(.el-collapse-item__content) {
+  padding: 12px 15px 14px;
+}
+
+/* 空态与折叠面板同款外框，保证同一套设计语言 */
+.client-empty {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 14px 15px;
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  background: var(--app-surface);
+}
+
+.client-empty__icon {
   flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--app-border);
+  border-radius: 8px;
+  color: var(--app-text-muted);
+  background: var(--app-surface-2);
+}
+
+.client-empty__icon svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.client-empty strong {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--app-text);
+}
+
+.client-empty .hint {
+  margin: 2px 0 0;
+  font-size: 12px;
+}
+
+.client-item__main {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.client-item__icon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--app-text-muted);
+}
+
+.client-item__icon.is-pending {
+  color: var(--el-color-warning);
+}
+
+.client-item__icon.is-approved {
+  color: var(--accent-green);
+}
+
+.client-item__icon svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.client-item__title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.client-item__title strong {
+  font-size: 14px;
+  color: var(--app-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.client-item__title .hint {
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.client-item__status {
+  justify-self: start;
+}
+
+.client-item__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.client-item__detail {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.client-item__detail li {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 10px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.client-item__detail li > span {
+  color: var(--app-text-muted);
+}
+
+.client-item__detail li > strong {
+  color: var(--app-text-secondary);
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.client-item__block {
+  margin-top: 10px;
+}
+
+.client-item__block-title {
+  margin: 0 0 6px;
+  font-size: 11.5px;
+}
+
+.client-hosts,
+.client-shares {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.client-hosts li {
+  padding: 2px 8px;
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+  background: var(--app-surface);
+  font-size: 11px;
+  color: var(--app-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.client-shares li {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 9px;
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+  background: var(--app-surface);
+  font-size: 12px;
+}
+
+.client-shares strong {
+  color: var(--app-text);
+  font-weight: 500;
+}
+
+.client-item__health {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--app-border);
+}
+
+.client-item__health .hint {
+  font-size: 12px;
 }
 
 .manual-connect {
   display: flex;
   align-items: center;
   gap: 8px;
+  margin-bottom: 16px;
 }
 
 .manual-connect :deep(.el-input) {
@@ -1397,6 +2047,7 @@ async function loadInitialData() {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  margin-bottom: 16px;
   padding: 10px 11px;
   border: 1px solid var(--app-border);
   border-radius: 10px;
@@ -1407,7 +2058,7 @@ async function loadInitialData() {
 }
 
 .request-progress__notice {
-  margin: 0;
+  margin: 0 0 16px;
 }
 
 .input-with-button {
@@ -1434,6 +2085,9 @@ async function loadInitialData() {
   border: 1px solid var(--app-border);
   border-radius: 10px;
   background: var(--app-surface-3);
+  /* 与上面的表单拉开一档：面板 gap 14px + 这里 26px = 40px，
+     开机启动是独立开关，不该看起来像表单里的一个字段。 */
+  margin-top: 26px;
 }
 
 .settings-toggle strong {
@@ -1443,21 +2097,7 @@ async function loadInitialData() {
   color: var(--app-text-strong);
 }
 
-.key-path {
-  overflow-wrap: anywhere;
-}
-
-@media (max-width: 760px) {
-  .client-roles {
-    grid-template-columns: 1fr;
-  }
-}
-
 @media (max-width: 560px) {
-  .role-block__head {
-    flex-direction: column;
-  }
-
   .manual-connect {
     align-items: stretch;
     flex-direction: column;

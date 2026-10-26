@@ -62,8 +62,12 @@ const serverStatus = ref({
 });
 const pendingRequests = ref([]);
 const peers = ref([]);
+// 首屏数据到达前列表要显示骨架屏；标记放在共享上下文里，首页与设置页读同一份，
+// 避免两个视图各自维护一份可能不同步的加载状态。
+const peersLoading = ref(true);
 const onlinePeers = computed(() => peers.value.filter((peer) => peer.online));
 const discovered = ref([]);
+const discoveredLoading = ref(true);
 const activePeerId = ref("");
 const activePeerSnapshot = ref(null);
 const workspaceView = ref("home");
@@ -142,8 +146,10 @@ onMounted(async () => {
   await bindServerEvents();
   await bindWindowState();
   await refreshStatus();
-  await refreshPeers();
-  await refreshDiscovered();
+  // 服务器列表与发现快照互相独立，也不该挡在管理员会话恢复前面：一次慢刷新只会
+  // 让首屏多显示一会儿骨架屏，而不是把登录界面拖出来。两者内部都已捕获错误。
+  void refreshPeers();
+  void refreshDiscovered();
   await restoreAdminSession();
   await refreshServerStatus();
   await resumeServer();
@@ -478,6 +484,7 @@ async function resumeServer() {
 }
 
 async function refreshPeers() {
+  peersLoading.value = true;
   try {
     peers.value = await invoke("list_peers");
   } catch (error) {
@@ -486,6 +493,8 @@ async function refreshPeers() {
       detail: normalized.detail,
       context: normalized.context,
     });
+  } finally {
+    peersLoading.value = false;
   }
 }
 
@@ -493,6 +502,7 @@ async function refreshPeers() {
 /// the `app://discovered-peers` event, so views never trigger a LAN scan or a
 /// page reload themselves.
 async function refreshDiscovered() {
+  discoveredLoading.value = true;
   try {
     const peersOnLan = await invoke("discovered_peers");
     discovered.value = Array.isArray(peersOnLan) ? peersOnLan : [];
@@ -505,6 +515,8 @@ async function refreshDiscovered() {
         context: normalized.context,
       },
     );
+  } finally {
+    discoveredLoading.value = false;
   }
 }
 
@@ -565,16 +577,6 @@ async function logout() {
   }
 }
 
-async function lockVault() {
-  try {
-    const next = await invoke("lock_vault");
-    applyVaultStatus(next);
-    setNotice("vault.locked");
-  } catch (error) {
-    handleFailure(error);
-  }
-}
-
 provide(
   APP_CONTEXT,
   reactive({
@@ -584,7 +586,9 @@ provide(
     serverStatus,
     pendingRequests,
     peers,
+    peersLoading,
     discovered,
+    discoveredLoading,
     activePeerId,
     workspaceView,
     settingsTab,
@@ -613,7 +617,6 @@ provide(
     openSettings,
     selectSettingsTab,
     logout,
-    lockVault,
   }),
 );
 </script>
@@ -1074,11 +1077,22 @@ provide(
   --accent: var(--accent-blue);
   --accent-on: #ffffff;
 
+  /* 语义色：一个颜色只表示一个含义。强调色只用于可操作元素（主按钮、当前选中、
+     链接），状态另用一组低饱和色相：绿=已就绪，红=失败/离线，琥珀=等你处理，
+     灰蓝=中性事实（数量、未申请、已取消）。色阶由下面两个混合基色推导，
+     明暗外观各换一套基色，因此状态色在两种外观下都不会跑偏。 */
+  --tone-success: oklch(45% 0.12 152);
+  --tone-danger: oklch(46% 0.17 27);
+  --tone-warning: oklch(45% 0.11 70);
+  --tone-info: var(--app-text-secondary);
+  --tone-mix-base: white;
+  --tone-mix-shade: black;
+
   /* Semantic tokens (light theme). */
   --app-text: #16202e;
   --app-text-strong: #334155;
   --app-text-secondary: #5a6879;
-  --app-text-muted: #6b7a90;
+  --app-text-muted: #5f6e83;
   --app-surface: #ffffff;
   --app-surface-2: #f7f9fc;
   --app-surface-3: #fbfcfe;
@@ -1126,6 +1140,41 @@ provide(
   --el-color-primary-light-8: color-mix(in oklab, var(--accent) 20%, white);
   --el-color-primary-light-9: color-mix(in oklab, var(--accent) 10%, white);
   --el-color-primary-dark-2: color-mix(in oklab, var(--accent) 80%, black);
+
+  /* Element Plus 的语义色阶同样从 toned 基色推导：plain 标签的底色取 light-9、
+     描边取 light-8，文字取基色，因此状态标签只有一层真正着色（文字），
+     底色淡到几乎与面板同色，不会和强调色按钮抢视线。 */
+  --el-color-success: var(--tone-success);
+  --el-color-success-light-3: color-mix(in oklab, var(--tone-success) 80%, var(--tone-mix-base));
+  --el-color-success-light-5: color-mix(in oklab, var(--tone-success) 65%, var(--tone-mix-base));
+  --el-color-success-light-7: color-mix(in oklab, var(--tone-success) 45%, var(--tone-mix-base));
+  --el-color-success-light-8: color-mix(in oklab, var(--tone-success) 22%, var(--tone-mix-base));
+  --el-color-success-light-9: color-mix(in oklab, var(--tone-success) 10%, var(--tone-mix-base));
+  --el-color-success-dark-2: color-mix(in oklab, var(--tone-success) 85%, var(--tone-mix-shade));
+
+  --el-color-danger: var(--tone-danger);
+  --el-color-danger-light-3: color-mix(in oklab, var(--tone-danger) 80%, var(--tone-mix-base));
+  --el-color-danger-light-5: color-mix(in oklab, var(--tone-danger) 65%, var(--tone-mix-base));
+  --el-color-danger-light-7: color-mix(in oklab, var(--tone-danger) 45%, var(--tone-mix-base));
+  --el-color-danger-light-8: color-mix(in oklab, var(--tone-danger) 22%, var(--tone-mix-base));
+  --el-color-danger-light-9: color-mix(in oklab, var(--tone-danger) 10%, var(--tone-mix-base));
+  --el-color-danger-dark-2: color-mix(in oklab, var(--tone-danger) 85%, var(--tone-mix-shade));
+
+  --el-color-warning: var(--tone-warning);
+  --el-color-warning-light-3: color-mix(in oklab, var(--tone-warning) 80%, var(--tone-mix-base));
+  --el-color-warning-light-5: color-mix(in oklab, var(--tone-warning) 65%, var(--tone-mix-base));
+  --el-color-warning-light-7: color-mix(in oklab, var(--tone-warning) 45%, var(--tone-mix-base));
+  --el-color-warning-light-8: color-mix(in oklab, var(--tone-warning) 22%, var(--tone-mix-base));
+  --el-color-warning-light-9: color-mix(in oklab, var(--tone-warning) 10%, var(--tone-mix-base));
+  --el-color-warning-dark-2: color-mix(in oklab, var(--tone-warning) 85%, var(--tone-mix-shade));
+
+  --el-color-info: var(--tone-info);
+  --el-color-info-light-3: color-mix(in oklab, var(--tone-info) 80%, var(--tone-mix-base));
+  --el-color-info-light-5: color-mix(in oklab, var(--tone-info) 65%, var(--tone-mix-base));
+  --el-color-info-light-7: color-mix(in oklab, var(--tone-info) 45%, var(--tone-mix-base));
+  --el-color-info-light-8: color-mix(in oklab, var(--tone-info) 22%, var(--tone-mix-base));
+  --el-color-info-light-9: color-mix(in oklab, var(--tone-info) 10%, var(--tone-mix-base));
+  --el-color-info-dark-2: color-mix(in oklab, var(--tone-info) 85%, var(--tone-mix-shade));
 }
 
 /* Accent switching: only the base changes; all tints follow. */
@@ -1204,6 +1253,14 @@ provide(
   --el-color-primary-light-8: color-mix(in oklab, var(--accent) 40%, black);
   --el-color-primary-light-9: color-mix(in oklab, var(--accent) 25%, black);
   --el-color-primary-dark-2: color-mix(in oklab, var(--accent) 80%, white);
+
+  /* 暗色外观下的状态色：底往面板色压深、字提亮，不做简单反相。
+     与浅色共用同一套推导规则，只换基色，所以两种外观的层次一致。 */
+  --tone-success: oklch(80% 0.14 152);
+  --tone-danger: oklch(80% 0.13 25);
+  --tone-warning: oklch(84% 0.13 85);
+  --tone-mix-base: var(--app-surface-2);
+  --tone-mix-shade: white;
 }
 
 html,
@@ -1244,6 +1301,77 @@ body,
 
 .mono {
   font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+}
+
+/* 列表设计语言的全局件：标题数量角标、行内标签、行内动作按钮在首页/设置/文件页共用
+   一套几何，写在组件里会各写一份然后慢慢跑偏。 */
+.count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  margin-left: 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  vertical-align: 2px;
+  /* 数量是中性事实，用灰色层而不是强调色：强调色只代表「可操作」。 */
+  color: var(--pill-fg);
+  background: var(--pill-bg);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 行内标签不参与伸缩，保证多栏列表的列对齐。 */
+.row-tag {
+  flex: none;
+}
+
+/* 状态标签只靠底色与文字表达，描边去掉：底、边、字三层同时着色是「颜色杂」
+   的主要来源。12px 小字改用中等字重，避免细体在浅底上发虚。 */
+.el-tag.row-tag {
+  border-color: transparent;
+  font-weight: 500;
+}
+
+/* 列表行里的动作按钮比表单控件矮一档。上面的 :root .el-button 把高度钉在控件高度，
+   这里用 :root 前缀抬高权重覆盖，只影响显式带 list-pill 的按钮，不动表单按钮。 */
+:root .el-button.list-pill {
+  --el-button-size: 24px;
+  height: 24px;
+  padding: 0 10px;
+  margin: 0;
+  /* 行内动作一律降级为中性描边：一屏里只允许面板级主按钮用强调色底，
+     否则每行两颗实心按钮会把状态标签挤成噪音，也让人分不清先点哪个。 */
+  --el-button-bg-color: var(--app-surface);
+  --el-button-border-color: var(--app-border);
+  --el-button-text-color: var(--app-text-strong);
+  --el-button-hover-bg-color: var(--app-surface-2);
+  --el-button-hover-border-color: color-mix(in oklab, var(--accent) 45%, var(--app-border));
+  --el-button-hover-text-color: var(--accent);
+  --el-button-active-bg-color: var(--pill-bg);
+  --el-button-active-border-color: color-mix(in oklab, var(--accent) 60%, var(--app-border));
+  --el-button-active-text-color: var(--accent);
+  /* 禁用态也必须保持中性面：EP 默认给主类型算出的是淡强调色底，
+     请求中会闪出一块品牌色，正好破坏「强调色只表示可点」。 */
+  --el-button-disabled-bg-color: var(--app-surface);
+  --el-button-disabled-border-color: var(--app-border);
+  --el-button-disabled-text-color: var(--app-text-muted);
+}
+
+/* 面板级主操作（如「添加共享」）保留强调色底，作为该视图唯一的突出按钮。 */
+:root .el-button.list-pill.pane-cta {
+  --el-button-bg-color: var(--accent);
+  --el-button-border-color: var(--accent);
+  --el-button-text-color: var(--accent-on);
+  --el-button-hover-bg-color: var(--el-color-primary-light-3);
+  --el-button-hover-border-color: var(--el-color-primary-light-3);
+  --el-button-hover-text-color: var(--accent-on);
+  --el-button-active-bg-color: var(--el-color-primary-dark-2);
+  --el-button-active-border-color: var(--el-color-primary-dark-2);
+  --el-button-active-text-color: var(--accent-on);
 }
 
 .stack {

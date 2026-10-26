@@ -121,6 +121,7 @@ function mockCommands(overrides = {}) {
     list_peers: async () => [],
     sync_peers: async () => 0,
     local_networks: async () => ["192.168.1.0/24"],
+    local_addresses: async () => ["192.168.1.23"],
     request_peer_access: async () => ({
       requested: true,
       requestId: "request-1",
@@ -454,7 +455,15 @@ describe("peer health and LAN state", () => {
     });
     await signIn(wrapper);
     await clickButton(wrapper, "服务");
-    expect(wrapper.text()).toContain("共享 0 · 待审批 0 · 发现 关闭");
+    // 设置页的服务面板只留配置与动作，不再堆状态标签，也没有多余的刷新按钮。
+    expect(wrapper.findAll("#pane-service .el-tag")).toHaveLength(0);
+    expect(wrapper.text()).not.toContain("刷新列表");
+    // 绑定地址改为三选一下拉，默认落在广域网（0.0.0.0），不再让用户手输地址。
+    expect(wrapper.find("#pane-service .bind-select").exists()).toBe(true);
+    expect(wrapper.find('#pane-service input[placeholder="0.0.0.0"]').exists()).toBe(
+      false,
+    );
+    expect(wrapper.find("#pane-service").text()).toContain("广域网 0.0.0.0");
     await clickButton(wrapper, "客户端");
 
     await clickButton(wrapper, "检测");
@@ -482,13 +491,15 @@ describe("peer health and LAN state", () => {
     await signIn(wrapper);
     await clickButton(wrapper, "客户端");
 
-    expect(wrapper.text()).toContain(
-      "暂未发现服务器，对方上线后会自动出现在这里。",
-    );
+    // 空态使用与折叠面板同款外框，保证设计语言一致。
+    const emptyBoxes = wrapper.findAll("#pane-clients .client-empty");
+    expect(emptyBoxes).toHaveLength(2);
+    expect(emptyBoxes[0].text()).toContain("暂无客户端");
+    expect(emptyBoxes[1].text()).toContain("还没有可浏览的服务器");
 
     await switchLanguage(wrapper, "en");
-    expect(wrapper.text()).toContain(
-      "No server yet. One will appear here when it comes online.",
+    expect(wrapper.findAll("#pane-clients .client-empty")[1].text()).toContain(
+      "No servers to browse yet",
     );
 
     wrapper.unmount();
@@ -561,7 +572,8 @@ describe("share management", () => {
 
     expect(wrapper.text()).toContain("Docs");
 
-    await clickButton(wrapper, "编辑");
+    await wrapper.find('[aria-label="编辑"]').trigger("click");
+    await flushPromises();
     expect(wrapper.text()).toContain(
       "正在编辑“Docs”；名称和目录不可修改。",
     );
@@ -575,8 +587,7 @@ describe("share management", () => {
     expect(lockedTextInputs[1].element.value).toBe("Docs");
 
     const saveButton = findButton(wrapper, "保存修改");
-    expect(saveButton.attributes("type")).toBe("submit");
-    await wrapper.find("form").trigger("submit");
+    await saveButton.trigger("click");
     await flushPromises();
 
     expect(invoke).toHaveBeenCalledWith(
@@ -601,6 +612,138 @@ describe("share management", () => {
         ],
       }),
     );
+
+    wrapper.unmount();
+  });
+
+  it("lays each share row out as three columns with the arrow pinned right", async () => {
+    const wrapper = await mountReady({ list_shares: async () => [SHARE] });
+    await signIn(wrapper, "admin-secret");
+
+    // Left = icon + name/address, middle = read/write/delete, right = actions.
+    const columns = wrapper
+      .find(".el-collapse-item__title")
+      .findAll(":scope > *")
+      .map((el) => el.classes().join(" "));
+    expect(columns).toEqual([
+      "share-item__main",
+      "share-item__perms",
+      "share-item__actions",
+    ]);
+
+    const headerChildren = wrapper
+      .find(".el-collapse-item__header")
+      .findAll(":scope > *")
+      .map((el) => el.classes());
+    expect(headerChildren.at(-1)).toContain("el-collapse-item__arrow");
+
+    const [edit, remove] = wrapper
+      .find(".share-item__actions")
+      .findAll("button");
+    for (const button of [edit, remove]) {
+      expect(button.classes()).toEqual(
+        expect.arrayContaining([
+          "list-pill",
+          "is-round",
+          "el-button--small",
+          "el-button--primary",
+        ]),
+      );
+      expect(button.classes()).not.toContain("is-plain");
+    }
+    expect(edit.attributes("aria-label")).toBe("编辑");
+    expect(remove.attributes("aria-label")).toBe("删除");
+
+    // 权限列是自绘勾选框：授予=带勾的绿色框，未授予=灰色空框。
+    // 用普通 span 而不是禁用的 el-checkbox，避免鼠标划过时出现 🚫 指针。
+    const perms = wrapper.find(".share-item__perms").findAll(".perm-flag");
+    expect(perms.map((flag) => flag.text())).toEqual(["读", "写", "删"]);
+    expect(perms[0].classes()).toContain("is-granted");
+    expect(perms[1].classes()).not.toContain("is-granted");
+    expect(perms[0].attributes("role")).toBe("img");
+    expect(perms[0].attributes("aria-label")).toBe("读：已授予");
+    expect(perms[1].attributes("aria-label")).toBe("写：未授予");
+    expect(
+      wrapper.find(".share-item__perms").find(".el-checkbox").exists(),
+    ).toBe(false);
+
+    // 标题区的加号是面板级主操作：只有它保留强调色底，行内动作一律中性描边。
+    const addButton = wrapper.find('[aria-label="创建共享"]');
+    expect(addButton.classes()).toEqual(
+      expect.arrayContaining([
+        "list-pill",
+        "pane-cta",
+        "is-round",
+        "el-button--primary",
+      ]),
+    );
+
+    // The dialog form keeps the app's default button treatment: ordinary
+    // rounded corners, not the list's pill size.
+    await addButton.trigger("click");
+    await flushPromises();
+    const formButtons = [
+      ...wrapper.findAll("#pane-shares form button"),
+      ...wrapper.findAll("#pane-shares .el-dialog__footer button"),
+    ];
+    expect(formButtons).toHaveLength(3);
+    for (const button of formButtons) {
+      expect(button.classes()).not.toContain("is-round");
+      expect(button.classes()).not.toContain("el-button--small");
+    }
+
+    wrapper.unmount();
+  });
+
+  it("keeps the share dialog open on overlay clicks and Escape", async () => {
+    const wrapper = await mountReady({ list_shares: async () => [SHARE] });
+    await signIn(wrapper, "admin-secret");
+
+    // Element Plus hides the overlay with v-show instead of unmounting it.
+    const overlay = () => wrapper.find("#pane-shares .el-overlay");
+    const isClosed = () =>
+      /display:\s*none/.test(overlay().attributes("style") ?? "");
+    const dialogTitle = () =>
+      wrapper.find("#pane-shares .el-dialog__title").text();
+    // The leave transition resolves on the next frames, which jsdom only
+    // advances when rAF is pumped manually.
+    const settle = async () => {
+      await flushPromises();
+      await new Promise((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      });
+      await flushPromises();
+    };
+
+    await wrapper.find('[aria-label="创建共享"]').trigger("click");
+    await settle();
+
+    expect(dialogTitle()).toBe("新建共享");
+    expect(isClosed()).toBe(false);
+
+    // align-center drops Element Plus's default `margin-top: 15vh`, which
+    // pushed the form past the bottom edge of the 800x600 default window.
+    const dialogEl = wrapper.find("#pane-shares .el-dialog");
+    expect(dialogEl.classes()).toContain("is-align-center");
+    expect(dialogEl.attributes("style") ?? "").not.toContain("15vh");
+
+    // Neither the mask nor the keyboard shortcut may dismiss the form.
+    await overlay().trigger("click");
+    await wrapper
+      .find("#pane-shares .el-dialog")
+      .trigger("keydown.esc", { key: "Escape" });
+    await settle();
+    expect(isClosed()).toBe(false);
+
+    // The footer cancel is the explicit close path.
+    await findButton(wrapper, "取消").trigger("click");
+    await settle();
+    expect(isClosed()).toBe(true);
+
+    // Editing reuses the same dialog with the edit title.
+    await wrapper.find('[aria-label="编辑"]').trigger("click");
+    await settle();
+    expect(dialogTitle()).toBe("编辑共享");
 
     wrapper.unmount();
   });
@@ -689,7 +832,9 @@ describe("home workspace", () => {
     });
     await flushPromises();
 
-    expect(wrapper.find(".server-row__count strong").text()).toBe("3");
+    expect(
+      wrapper.find(".server-row .el-tag.row-tag").text(),
+    ).toBe("共享 3 目录");
 
     wrapper.unmount();
   });
@@ -708,7 +853,11 @@ describe("home workspace", () => {
     await flushPromises();
 
     expect(wrapper.text()).toContain("离线");
-    expect(wrapper.find(".server-row__count strong").text()).toBe("—");
+    // 离线的服务器读不到目录数，不再渲染「—」占位标签，只留失败状态标签。
+    const offlineTags = wrapper.findAll(".server-row .el-tag");
+    expect(offlineTags).toHaveLength(1);
+    expect(offlineTags[0].text()).toBe("离线");
+    expect(offlineTags[0].classes()).toContain("el-tag--danger");
     expect(wrapper.find("button.server-row__main").attributes("disabled")).toBeDefined();
     expect(wrapper.findAll(".rail-avatar")).toHaveLength(0);
     expect(listShares).not.toHaveBeenCalled();
@@ -858,7 +1007,9 @@ describe("home workspace", () => {
 
     expect(wrapper.text()).toContain("局域网中的服务器");
     expect(wrapper.text()).toContain("Lab");
-    expect(wrapper.find(".server-row__count strong").text()).toBe("2");
+    expect(
+      wrapper.find(".server-row .el-tag.row-tag").text(),
+    ).toBe("共享 2 目录");
 
     savedPeers = [PEER];
     await clickButton(wrapper, "申请访问");
@@ -909,6 +1060,60 @@ describe("home workspace", () => {
     await flushPromises();
 
     expect(wrapper.find(".peer-browser").exists()).toBe(false);
+
+    wrapper.unmount();
+  });
+
+  it("reports sending only until the peer accepts the access request", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    let resolveRequest;
+    const requestAccess = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          resolveRequest = resolve;
+        }),
+    );
+    const waitForAccess = vi.fn(() => new Promise(() => {}));
+    const wrapper = await mountReady({
+      admin_session: async () => ({
+        username: "admin",
+        mustChangePassword: false,
+      }),
+      discovered_peers: async () => [],
+      list_peers: async () => [],
+      request_peer_access: requestAccess,
+      wait_for_peer_access: waitForAccess,
+    });
+    await flushPromises();
+    await wrapper.find('button[aria-label="打开设置"]').trigger("click");
+    await flushPromises();
+    await clickButton(wrapper, "客户端");
+
+    await clickButton(wrapper, "手动输入");
+    await wrapper
+      .find(".manual-connect input")
+      .setValue("http://192.168.1.99:4918");
+    await wrapper.find(".manual-connect").trigger("submit");
+    await flushPromises();
+
+    // The POST is still in flight: only the local attempt is known.
+    const progress = wrapper.find(".request-progress");
+    expect(requestAccess).toHaveBeenCalledWith({
+      url: "http://192.168.1.99:4918",
+    });
+    expect(progress.text()).toContain("正在发送访问请求…");
+    expect(progress.text()).not.toContain("已发送访问申请");
+    expect(waitForAccess).not.toHaveBeenCalled();
+
+    resolveRequest({ requested: true, requestId: "request-9" });
+    await flushPromises();
+
+    expect(waitForAccess).toHaveBeenCalledWith({
+      url: "http://192.168.1.99:4918",
+      requestId: "request-9",
+      label: null,
+    });
+    expect(progress.text()).toContain("已发送访问申请，等待对方管理员批准…");
 
     wrapper.unmount();
   });
@@ -1034,13 +1239,150 @@ describe("settings information architecture", () => {
     expect(wrapper.text()).toContain("此设备访问其他设备");
     expect(wrapper.text()).toContain("10.1.1.10");
 
-    await clickButton(wrapper, "批准");
+    // 折叠头只保留标识与状态，请求路径等细节必须展开后才出现。
+    const inboundHeader = wrapper.find(
+      "#pane-clients .client-collapse .el-collapse-item__header",
+    );
+    expect(inboundHeader.text()).toContain("10.1.1.10");
+    expect(inboundHeader.text()).toContain("待审批");
+    expect(inboundHeader.text()).not.toContain("请求路径");
+
+    await inboundHeader.trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("请求路径");
+
+    await clickButton(wrapper, "审批");
     await flushPromises();
 
     expect(wrapper.find(".code-box").exists()).toBe(false);
     expect(document.body.textContent).toContain(
-      "已批准，客户端正在自动完成绑定。",
+      "已审批，客户端正在自动完成绑定。",
     );
+
+    wrapper.unmount();
+  });
+
+  it("holds list skeletons until the first data arrives", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    const pending = { list_shares: [], list_peers: [], discovered_peers: [] };
+    const defer = (key) => () =>
+      new Promise((resolve) => {
+        pending[key].push(resolve);
+      });
+    const wrapper = await mountReady({
+      admin_session: async () => ({
+        username: "admin",
+        mustChangePassword: false,
+      }),
+      list_shares: defer("list_shares"),
+      list_peers: defer("list_peers"),
+      discovered_peers: defer("discovered_peers"),
+    });
+    await flushPromises();
+
+    // 首页两张列表：已授权服务器、局域网中的服务器。数据没到之前不能显示空态。
+    const homeSkeletons = wrapper.findAll(".list-skeleton");
+    expect(homeSkeletons).toHaveLength(2);
+    expect(homeSkeletons[0].findAll(".list-skeleton__row")).toHaveLength(2);
+    expect(homeSkeletons[1].findAll(".list-skeleton__row")).toHaveLength(3);
+    expect(homeSkeletons[0].find(".el-skeleton__item").exists()).toBe(true);
+    expect(homeSkeletons[0].attributes("role")).toBe("status");
+    expect(wrapper.findAll(".server-list")).toHaveLength(0);
+
+    // 设置页共享策略列表同样等待首屏数据。
+    await wrapper.find('button[aria-label="打开设置"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".list-skeleton")).toHaveLength(1);
+
+    // 客户端两个折叠面板：入站列表等管理员数据，出站列表等发现快照与已保存对等端。
+    await clickButton(wrapper, "客户端");
+    expect(wrapper.findAll(".list-skeleton")).toHaveLength(2);
+
+    for (const resolvers of Object.values(pending)) {
+      for (const resolve of resolvers) resolve([]);
+    }
+    await flushPromises();
+
+    expect(wrapper.findAll(".list-skeleton")).toHaveLength(0);
+    expect(wrapper.findAll(".client-empty")).toHaveLength(2);
+
+    await clickButton(wrapper, "共享");
+    await flushPromises();
+    expect(wrapper.findAll(".list-skeleton")).toHaveLength(0);
+    expect(wrapper.text()).toContain("暂无共享目录。");
+
+    wrapper.unmount();
+  });
+
+  it("renders list counts as heading badges and statuses as semantic tags", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    const wrapper = await mountReady({
+      admin_session: async () => ({
+        username: "admin",
+        mustChangePassword: false,
+      }),
+      list_peers: async () => [PEER],
+      list_pending_requests: async () => [
+        {
+          id: "request-1",
+          shareId: "share-1",
+          shareName: "Docs",
+          peerIp: "10.1.1.10",
+          requestedPath: "/",
+          attempts: 1,
+        },
+      ],
+      list_authorizations: async () => [
+        { id: "auth-1", label: "10.1.1.11", createdAt: Date.now() },
+      ],
+    });
+    await flushPromises();
+
+    // 标题右侧是数量角标，不再是「共 N 台」的说明文字。
+    expect(
+      wrapper.findAll(".section-heading .count-badge").map((badge) => badge.text()),
+    ).toEqual(["1"]);
+    // 发现关闭属于中性未开启状态，用灰色而不是红色。
+    const discoveryChip = wrapper.find(".section-heading .el-tag");
+    expect(discoveryChip.text()).toBe("发现已关闭");
+    expect(discoveryChip.classes()).toContain("el-tag--info");
+    // 数量是中性事实，用 info 灰而不是品牌色。
+    const countChip = wrapper.find(".server-row .el-tag");
+    expect(countChip.text()).toBe("共享 0 目录");
+    expect(countChip.classes()).toContain("el-tag--info");
+
+    await wrapper.find('button[aria-label="打开设置"]').trigger("click");
+    await flushPromises();
+    await clickButton(wrapper, "客户端");
+
+    expect(
+      wrapper
+        .findAll(".role-heading .count-badge")
+        .map((badge) => badge.text()),
+    ).toEqual(["2", "1"]);
+
+    const chips = wrapper.findAll(".client-item__status .el-tag");
+    expect(chips.map((chip) => chip.text())).toEqual([
+      "待审批",
+      "已审批",
+      "已审批",
+    ]);
+    // 待审批要用户动手，用琥珀色提醒；已审批是成功态，用绿色。
+    expect(chips[0].classes()).toContain("el-tag--warning");
+    expect(chips[1].classes()).toContain("el-tag--success");
+    expect(chips[2].classes()).toContain("el-tag--success");
+
+    // 行内动作保留主类型按钮的语义，但配色降为中性描边（由 list-pill 覆盖），
+    // 只有面板级主按钮用 pane-cta 拿回强调色底。
+    const rowButtons = wrapper.findAll(".client-item__actions button");
+    expect(rowButtons.length).toBeGreaterThan(0);
+    for (const button of rowButtons) {
+      expect(button.classes()).toEqual(
+        expect.arrayContaining(["list-pill", "is-round", "el-button--primary"]),
+      );
+      expect(button.classes()).not.toContain("is-plain");
+      expect(button.classes()).not.toContain("pane-cta");
+    }
 
     wrapper.unmount();
   });

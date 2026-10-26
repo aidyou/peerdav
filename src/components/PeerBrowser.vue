@@ -8,6 +8,7 @@ import { confirmAction } from "../lib/confirm";
 import { canPreview, fileKind, fileKindKey, isReadableText } from "../lib/fileKinds";
 import { t } from "../lib/i18n";
 import { normalizeAppError } from "../lib/invoke";
+import { statusTagTone } from "../lib/tagTone";
 import {
   MAX_PREVIEW_BYTES,
   MAX_PREVIEW_LINES,
@@ -1481,13 +1482,16 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 <span>{{ item.relativePath }} · {{ formatBytes(item.size) }}</span>
               </div>
             </div>
-            <span
-              class="transfer-queue__status"
-              :class="`is-${item.status}`"
+            <el-tag
+              class="row-tag"
+              :type="statusTagTone(item.status)"
+              effect="plain"
+              round
+              size="small"
               :title="item.error || undefined"
             >
               {{ downloadStatusText(item) }}
-            </span>
+            </el-tag>
           </li>
         </ul>
       </div>
@@ -1552,13 +1556,16 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 <span>{{ item.relativePath }} · {{ formatBytes(item.size) }}</span>
               </div>
             </div>
-            <span
-              class="transfer-queue__status"
-              :class="`is-${item.status}`"
+            <el-tag
+              class="row-tag"
+              :type="statusTagTone(item.status)"
+              effect="plain"
+              round
+              size="small"
               :title="item.error || undefined"
             >
               {{ uploadStatusText(item) }}
-            </span>
+            </el-tag>
           </li>
         </ul>
       </div>
@@ -2822,31 +2829,6 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 .transfer-queue__name span {
   font-size: 11px;
   color: var(--app-text-muted);
-}
-
-.transfer-queue__status {
-  flex: none;
-  font-size: 11.5px;
-  font-weight: 600;
-  color: var(--app-text-muted);
-}
-
-.transfer-queue__status.is-done {
-  color: color-mix(in oklab, var(--accent-green) 72%, var(--app-text));
-}
-
-.transfer-queue__status.is-error {
-  color: var(--el-color-danger);
-}
-
-.transfer-queue__status.is-skipped,
-.transfer-queue__status.is-canceled {
-  color: var(--app-text-muted);
-}
-
-.transfer-queue__status.is-uploading,
-.transfer-queue__status.is-downloading {
-  color: var(--el-color-primary);
 }
 
 @media (max-width: 760px) {

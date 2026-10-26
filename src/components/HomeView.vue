@@ -5,10 +5,18 @@ import { confirmAction } from "../lib/confirm";
 import { normalizeAppError } from "../lib/invoke";
 import { useAppContext } from "../lib/appContext";
 import { t } from "../lib/i18n";
+import { statusTagTone } from "../lib/tagTone";
+import ListSkeleton from "./ListSkeleton.vue";
 
 const app = useAppContext();
 
 const discovered = computed(() => app.discovered);
+const discoveryRunning = computed(() => app.serverStatus.discoveryRunning);
+// 骨架屏只在「还没有任何数据」时出现：已有列表时后台刷新继续显示旧数据，避免闪烁。
+const peersLoading = computed(() => app.peersLoading && app.peers.length === 0);
+const discoveredLoading = computed(
+  () => app.discoveredLoading && discovered.value.length === 0,
+);
 const activeRequest = ref(null);
 const canceling = ref(false);
 const cancelRequested = ref(false);
@@ -210,13 +218,19 @@ async function forgetPeer(peer) {
   <div class="home-view">
     <section class="home-section">
       <header class="section-heading">
-        <h2>{{ t("home.authorizedServers") }}</h2>
-        <span v-if="hasPeers" class="section-summary">
-          {{ t("home.totalServers", { count: app.peers.length }) }}
-        </span>
+        <h2>
+          {{ t("home.authorizedServers") }}
+          <span
+            v-if="hasPeers"
+            class="count-badge"
+            :title="t('home.totalServers', { count: app.peers.length })"
+            >{{ app.peers.length }}</span
+          >
+        </h2>
       </header>
 
-      <ul v-if="hasPeers" class="server-list">
+      <list-skeleton v-if="peersLoading" variant="card" :rows="2" />
+      <ul v-else-if="hasPeers" class="server-list">
         <li v-for="peer in app.peers" :key="peer.id" class="server-row">
           <div
             class="server-row__line"
@@ -244,23 +258,36 @@ async function forgetPeer(peer) {
                 <span class="server-row__url">{{ peer.url }}</span>
               </span>
             </button>
-            <span class="server-row__count">
-              <strong>{{ peerCount(peer) ?? "—" }}</strong>
-              <em v-if="peerCount(peer) !== null">
-                {{ t("home.sharesUnit") }}
-              </em>
-            </span>
-            <span v-if="!peer.online" class="server-row__badge is-offline">
+            <el-tag
+              v-if="peerCount(peer) !== null"
+              class="row-tag"
+              type="info"
+              effect="plain"
+              round
+              size="small"
+            >
+              {{ t("home.sharesCount", { count: peerCount(peer) }) }}
+            </el-tag>
+            <el-tag
+              v-if="!peer.online"
+              class="row-tag"
+              :type="statusTagTone('offline')"
+              effect="plain"
+              round
+              size="small"
+            >
               {{ t("home.offline") }}
-            </span>
-            <button
-              type="button"
-              class="server-row__badge"
+            </el-tag>
+            <el-button
+              class="list-pill"
+              type="primary"
+              round
+              size="small"
               :disabled="removingPeerId === peer.id"
               @click.stop="forgetPeer(peer)"
             >
               {{ t("home.forget") }}
-            </button>
+            </el-button>
             <span class="server-row__chevron" aria-hidden="true">
               <svg viewBox="0 0 24 24">
                 <path d="M9 6l6 6-6 6" />
@@ -285,13 +312,32 @@ async function forgetPeer(peer) {
 
     <section class="home-section">
       <header class="section-heading">
-        <h2>{{ t("home.discoveredServers") }}</h2>
-        <span class="section-summary">
-          {{ t("home.discoveryListening") }}
-        </span>
+        <h2>
+          {{ t("home.discoveredServers") }}
+          <span
+            v-if="discovered.length"
+            class="count-badge"
+            :title="t('home.totalServers', { count: discovered.length })"
+            >{{ discovered.length }}</span
+          >
+        </h2>
+        <el-tag
+          class="row-tag"
+          :type="discoveryRunning ? statusTagTone('online') : statusTagTone('unknown')"
+          effect="plain"
+          round
+          size="small"
+        >
+          {{
+            discoveryRunning
+              ? t("home.discoveryListening")
+              : t("home.discoveryStopped")
+          }}
+        </el-tag>
       </header>
 
-      <ul v-if="discovered.length" class="server-list">
+      <list-skeleton v-if="discoveredLoading" variant="card" :rows="3" />
+      <ul v-else-if="discovered.length" class="server-list">
         <li
           v-for="server in discovered"
           :key="server.serverId"
@@ -321,34 +367,47 @@ async function forgetPeer(peer) {
                 <span class="server-row__url">{{ server.url }}</span>
               </span>
             </button>
-            <span class="server-row__count">
-              <strong>{{ server.shareCount }}</strong>
-              <em>{{ t("home.sharesUnit") }}</em>
-            </span>
-            <span
+            <el-tag
+              class="row-tag"
+              type="info"
+              effect="plain"
+              round
+              size="small"
+            >
+              {{ t("home.sharesCount", { count: server.shareCount }) }}
+            </el-tag>
+            <el-tag
               v-if="isSaved(server)"
-              class="server-row__badge is-connected"
+              class="row-tag"
+              :type="statusTagTone('connected')"
+              effect="plain"
+              round
+              size="small"
             >
               {{ t("home.connected") }}
-            </span>
-            <button
+            </el-tag>
+            <el-button
               v-else-if="canRequest(server)"
-              type="button"
-              class="server-row__badge is-primary"
+              class="list-pill"
+              type="primary"
+              round
+              size="small"
               :disabled="requestBusy"
               @click="beginAdd(server)"
             >
               {{ t("home.add") }}
-            </button>
-            <button
+            </el-button>
+            <el-button
               v-else-if="canCancel(server)"
-              type="button"
-              class="server-row__badge"
+              class="list-pill"
+              type="primary"
+              round
+              size="small"
               :disabled="canceling"
               @click="cancelRequest(server)"
             >
               {{ canceling ? t("home.canceling") : t("home.requestCancel") }}
-            </button>
+            </el-button>
             <span class="server-row__chevron" aria-hidden="true">
               <svg viewBox="0 0 24 24">
                 <path d="M9 6l6 6-6 6" />
@@ -408,12 +467,6 @@ async function forgetPeer(peer) {
   font-weight: 600;
   letter-spacing: -0.01em;
   color: var(--app-text);
-}
-
-.section-summary {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--app-text-muted);
 }
 
 .server-list {
@@ -533,73 +586,6 @@ async function forgetPeer(peer) {
   color: var(--app-text-muted);
 }
 
-.server-row__count {
-  flex: none;
-  display: inline-flex;
-  align-items: baseline;
-  gap: 4px;
-}
-
-.server-row__count strong {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--app-text);
-  font-variant-numeric: tabular-nums;
-}
-
-.server-row__count em {
-  font-style: normal;
-  font-size: 12px;
-  color: var(--app-text-muted);
-}
-
-.server-row__badge {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  height: 26px;
-  padding: 0 12px;
-  border: 1px solid var(--app-border);
-  border-radius: 999px;
-  background: var(--app-surface);
-  color: var(--app-text-secondary);
-  font-size: 12.5px;
-  font-weight: 500;
-  cursor: pointer;
-  transition:
-    border-color 0.15s ease,
-    color 0.15s ease,
-    background 0.15s ease;
-}
-
-.server-row__badge:hover:not(:disabled) {
-  border-color: color-mix(in oklab, var(--el-color-primary) 40%, var(--app-border));
-  color: var(--el-color-primary);
-}
-
-.server-row__badge:disabled {
-  cursor: default;
-  opacity: 0.6;
-}
-
-.server-row__badge.is-primary {
-  border-color: color-mix(in oklab, var(--el-color-primary) 45%, var(--app-border));
-  color: var(--el-color-primary);
-}
-
-.server-row__badge.is-connected {
-  cursor: default;
-  border-color: color-mix(in oklab, var(--accent-green) 40%, var(--app-border));
-  background: color-mix(in oklab, var(--accent-green) 10%, var(--app-surface));
-  color: color-mix(in oklab, var(--accent-green) 72%, var(--app-text));
-}
-
-.server-row__badge.is-offline {
-  cursor: default;
-  color: var(--app-text-muted);
-  background: var(--app-surface-2);
-}
-
 .server-row__chevron {
   flex: none;
   display: inline-flex;
@@ -693,10 +679,6 @@ async function forgetPeer(peer) {
   .server-row__line {
     gap: 12px;
     padding-right: 12px;
-  }
-
-  .server-row__count em {
-    display: none;
   }
 }
 </style>
