@@ -12,6 +12,7 @@ import {
   markSettingsSeen,
   shouldOpenSettingsOnLogin,
 } from "./lib/workspace";
+import { readRoute, writeRoute } from "./lib/navigation";
 import { APP_CONTEXT } from "./lib/appContext";
 import AppRail from "./components/AppRail.vue";
 import AuthView from "./components/AuthView.vue";
@@ -61,6 +62,8 @@ const serverStatus = ref({
 });
 const pendingRequests = ref([]);
 const peers = ref([]);
+const onlinePeers = computed(() => peers.value.filter((peer) => peer.online));
+const discovered = ref([]);
 const activePeerId = ref("");
 const activePeerSnapshot = ref(null);
 const workspaceView = ref("home");
@@ -132,10 +135,15 @@ function clearTransfer(transferId) {
 }
 
 onMounted(async () => {
+  window.addEventListener("hashchange", handleHashChange);
+  eventUnlisten.push(() =>
+    window.removeEventListener("hashchange", handleHashChange),
+  );
   await bindServerEvents();
   await bindWindowState();
   await refreshStatus();
   await refreshPeers();
+  await refreshDiscovered();
   await restoreAdminSession();
   await refreshServerStatus();
   await resumeServer();
@@ -266,6 +274,22 @@ async function bindServerEvents() {
       }),
     );
     eventUnlisten.push(
+      await listen("app://discovered-peers", (event) => {
+        discovered.value = Array.isArray(event.payload) ? event.payload : [];
+      }),
+    );
+    eventUnlisten.push(
+      await listen("app://peer-status", (event) => {
+        const status = event.payload;
+        if (!status?.id) return;
+        peers.value = peers.value.map((peer) =>
+          peer.id === status.id
+            ? { ...peer, online: Boolean(status.online) }
+            : peer,
+        );
+      }),
+    );
+    eventUnlisten.push(
       await listen("app://quit-request", () => {
         showQuitDialog.value = true;
       }),
@@ -291,6 +315,45 @@ async function refreshStatus() {
   }
 }
 
+/// Applies a route parsed from the URL hash. A peer that is not in the saved
+/// catalog still opens the page shell so the unavailable state is explicit
+/// instead of silently redirecting to Home.
+function applyRoute(route) {
+  activePeerSnapshot.value = null;
+  if (route.view === "peer" && route.peerId) {
+    activePeerId.value = route.peerId;
+    activePeerSnapshot.value =
+      peers.value.find((peer) => peer.id === route.peerId) ?? null;
+    workspaceView.value = "peer";
+    return;
+  }
+  if (route.view === "settings") {
+    activePeerId.value = "";
+    settingsTab.value = route.settingsTab;
+    workspaceView.value = "settings";
+    return;
+  }
+  activePeerId.value = "";
+  settingsTab.value = "shares";
+  workspaceView.value = "home";
+}
+
+function syncRoute() {
+  writeRoute({
+    view: workspaceView.value,
+    peerId: activePeerId.value,
+    settingsTab: settingsTab.value,
+  });
+}
+
+/// Back/forward navigation changes only the hash. Re-applying the route keeps
+/// the visible page in sync without reloading the webview or resetting state.
+function handleHashChange() {
+  if (!loggedIn.value) return;
+  applyRoute(readRoute());
+  syncRoute();
+}
+
 /// Restores the in-memory admin session after a webview reload. The backend
 /// keeps the session until the vault is locked or the admin logs out.
 async function restoreAdminSession() {
@@ -302,7 +365,8 @@ async function restoreAdminSession() {
       mustChangeAdminPassword.value = Boolean(session.mustChangePassword);
       loggedIn.value = !session.mustChangePassword;
       if (loggedIn.value) {
-        workspaceView.value = "home";
+        applyRoute(readRoute());
+        syncRoute();
       }
     }
   } catch (error) {
@@ -342,8 +406,10 @@ function landAfterLogin() {
     markSettingsSeen();
     settingsTab.value = "shares";
     workspaceView.value = "settings";
+    syncRoute();
   } else {
-    workspaceView.value = "home";
+    applyRoute(readRoute());
+    syncRoute();
   }
 }
 
@@ -387,7 +453,9 @@ function resetAdminSession() {
   pendingRequests.value = [];
   activePeerId.value = "";
   activePeerSnapshot.value = null;
+  settingsTab.value = "shares";
   workspaceView.value = "home";
+  syncRoute();
 }
 
 async function refreshServerStatus() {
@@ -421,6 +489,25 @@ async function refreshPeers() {
   }
 }
 
+/// Reads the current passive discovery snapshot. Live changes arrive through
+/// the `app://discovered-peers` event, so views never trigger a LAN scan or a
+/// page reload themselves.
+async function refreshDiscovered() {
+  try {
+    const peersOnLan = await invoke("discovered_peers");
+    discovered.value = Array.isArray(peersOnLan) ? peersOnLan : [];
+  } catch (error) {
+    const normalized = normalizeAppError(error);
+    console.error(
+      `[peerdav:${normalized.code}] discovery snapshot failed`,
+      {
+        detail: normalized.detail,
+        context: normalized.context,
+      },
+    );
+  }
+}
+
 /// Reconciles saved peers with their server bindings. Backend polling repeats
 /// this automatically; an immediate check keeps startup responsive to a server
 /// that was unbound while this application was closed.
@@ -439,18 +526,19 @@ function openPeer(peer) {
   activePeerId.value = peer.id;
   activePeerSnapshot.value = peer;
   workspaceView.value = "peer";
+  syncRoute();
 }
 
 function closePeer() {
-  activePeerId.value = "";
-  activePeerSnapshot.value = null;
-  workspaceView.value = "home";
+  openHome();
 }
 
 function openHome() {
   activePeerId.value = "";
   activePeerSnapshot.value = null;
+  settingsTab.value = "shares";
   workspaceView.value = "home";
+  syncRoute();
 }
 
 function openSettings() {
@@ -458,6 +546,13 @@ function openSettings() {
   activePeerSnapshot.value = null;
   workspaceView.value = "settings";
   settingsTab.value = "shares";
+  syncRoute();
+}
+
+/// Settings tabs are part of the URL so a reload preserves the visible pane.
+function selectSettingsTab(tab) {
+  settingsTab.value = tab;
+  if (workspaceView.value === "settings") syncRoute();
 }
 
 async function logout() {
@@ -489,6 +584,7 @@ provide(
     serverStatus,
     pendingRequests,
     peers,
+    discovered,
     activePeerId,
     workspaceView,
     settingsTab,
@@ -504,6 +600,7 @@ provide(
     refreshStatus,
     refreshServerStatus,
     refreshPeers,
+    refreshDiscovered,
     completeLogin,
     completeAdminPassword,
     applyVaultStatus,
@@ -514,6 +611,7 @@ provide(
     closePeer,
     openHome,
     openSettings,
+    selectSettingsTab,
     logout,
     lockVault,
   }),
@@ -658,7 +756,7 @@ provide(
 
       <div v-else class="workspace">
         <AppRail
-          :peers="peers"
+          :peers="onlinePeers"
           :active-peer-id="activePeerId"
           :active-view="workspaceView"
           @open-home="openHome"

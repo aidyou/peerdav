@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::discovery;
+use crate::discovery::{self, DiscoveryListener};
 use crate::error::{AppError, DomainError};
 use crate::ignore_rules::{IgnoreLayer, build_gitignore, is_path_ignored};
 use crate::traits::PeerEvents;
@@ -39,13 +39,14 @@ use crate::types::{
     ACCESS_PROTOCOL, ACCESS_REQUEST_HEADER, ACCESS_STATUS_PATH, AUTHORIZATION_PATH,
     AUTHORIZATION_PROTOCOL, AccessRequestStatus, AccessStatusResponse,
     AuthorizationBindingResponse, AuthorizationStatus, AuthorizationStatusResponse, CATALOG_PATH,
-    CATALOG_PROTOCOL, CLIENT_ID_HEADER, CatalogResponse, ConflictPolicy, DirectoryDownloadPlan,
-    DiscoveredPeer, DownloadCandidate, ExternalEditInfo, MAX_ACCESS_REQUEST_ID_CHARS,
-    MAX_AUTHORIZATION_CODE_CHARS, MAX_DIR_ENTRIES, MAX_DIRECTORY_DOWNLOAD_FILES, MAX_PREVIEW_BYTES,
-    MAX_PREVIEW_LINES, MAX_REMOTE_PATH_BYTES, MAX_TRANSFER_BYTES, MIN_ACCESS_REQUEST_ID_CHARS,
-    PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT, PEER_REQUEST_TIMEOUT, PEER_SYNC_INTERVAL,
-    PeerAccessRequest, PeerEntry, PeerHealth, PeerInfo, PeerListing, PeerRecord,
-    PeerRevocationInfo, PeerShare, PreviewPayload, SHARE_URL_PREFIX, TransferResult,
+    CATALOG_PROTOCOL, CLIENT_ID_HEADER, CatalogResponse, ConflictPolicy, DEFAULT_DISCOVERY_PORT,
+    DirectoryDownloadPlan, DiscoveredPeer, DownloadCandidate, ExternalEditInfo,
+    MAX_ACCESS_REQUEST_ID_CHARS, MAX_AUTHORIZATION_CODE_CHARS, MAX_DIR_ENTRIES,
+    MAX_DIRECTORY_DOWNLOAD_FILES, MAX_PREVIEW_BYTES, MAX_PREVIEW_LINES, MAX_REMOTE_PATH_BYTES,
+    MAX_TRANSFER_BYTES, MIN_ACCESS_REQUEST_ID_CHARS, PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT,
+    PEER_PRESENCE_INTERVAL, PEER_REQUEST_TIMEOUT, PEER_SYNC_INTERVAL, PeerAccessRequest, PeerEntry,
+    PeerHealth, PeerInfo, PeerListing, PeerRecord, PeerRevocationInfo, PeerShare, PeerStatus,
+    PreviewPayload, SERVER_DISCOVERY_PORT_META, SHARE_URL_PREFIX, TransferResult,
 };
 use crate::vault::Vault;
 
@@ -305,6 +306,14 @@ struct RunningPeerBackground {
     task: JoinHandle<()>,
 }
 
+// Last known reachability for one saved server. A server that goes offline is
+/// not probed again: PeerDav servers announce themselves over UDP when they
+/// come back, which keeps idle clients free of polling traffic.
+#[derive(Debug, Clone, Copy)]
+struct PeerAvailability {
+    online: bool,
+}
+
 /// Result of asking a server about a previously accepted authorization code.
 enum AuthorizationOutcome {
     Active(AuthorizationStatusResponse),
@@ -324,10 +333,15 @@ pub struct PeerManager {
     access_cancellations: Mutex<HashSet<String>>,
     events: Arc<dyn PeerEvents>,
     background: std::sync::Mutex<Option<RunningPeerBackground>>,
+    discovery: std::sync::Mutex<Option<Arc<DiscoveryListener>>>,
+    availability: std::sync::Mutex<HashMap<String, PeerAvailability>>,
 }
 
 impl Drop for PeerManager {
     fn drop(&mut self) {
+        if let Some(listener) = self.discovery.get_mut().ok().and_then(|slot| slot.take()) {
+            listener.request_shutdown();
+        }
         if let Some(background) = self
             .background
             .get_mut()
@@ -415,12 +429,21 @@ impl PeerManager {
             access_cancellations: Mutex::new(HashSet::new()),
             events,
             background: std::sync::Mutex::new(None),
+            discovery: std::sync::Mutex::new(None),
+            availability: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
-    /// Starts the periodic server-binding synchronizer. The task is idempotent
-    /// and is shut down when this manager is dropped.
+    /// Starts the periodic server-binding synchronizer and the passive LAN
+    /// discovery listener. Both are idempotent and stop when this manager is
+    /// dropped.
     pub fn start_background(self: &Arc<Self>) {
+        // The Tauri setup hook is synchronous and has no entered Tokio
+        // runtime. Discovery then starts on the first async command
+        // (list_peers/resume_server/start_server), where a reactor exists.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            self.start_discovery_listener();
+        }
         let mut started = match self.background.lock() {
             Ok(started) => started,
             Err(_) => {
@@ -444,10 +467,17 @@ impl PeerManager {
         let task = runtime.spawn(async move {
             let mut interval = tokio::time::interval(manager.limits.sync_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            interval.tick().await;
+            let mut presence = tokio::time::interval(PEER_PRESENCE_INTERVAL);
+            presence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Both intervals complete immediately on their first tick: saved
+            // servers get a reachability result after launch, and a returning
+            // server is promoted as soon as its announcement is visible.
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
+                    _ = presence.tick() => {
+                        manager.reconcile_announced_peers();
+                    }
                     _ = interval.tick() => {
                         if !manager.vault.is_unlocked() {
                             continue;
@@ -465,25 +495,169 @@ impl PeerManager {
         });
     }
 
+    /// Starts the passive listener on the persisted discovery port. The listener
+    /// is independent of the local WebDAV server: other servers' announcements are
+    /// received even when this device only acts as a client.
+    fn start_discovery_listener(&self) {
+        let port = self
+            .vault
+            .get_setting(SERVER_DISCOVERY_PORT_META)
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|port| *port != 0)
+            .unwrap_or(DEFAULT_DISCOVERY_PORT);
+        if let Err(error) = self.ensure_discovery_listener(port) {
+            log::warn!("peerdav.discovery listener is unavailable: {error}");
+        }
+    }
+
+    /// Rebinds the passive listener when the server's discovery port changes.
+    /// A bind failure is reported through the shared background error outlet
+    /// but does not prevent the WebDAV server from starting.
+    pub fn ensure_discovery_listener(&self, port: u16) -> Result<(), DomainError> {
+        if port == 0 {
+            return Ok(());
+        }
+
+        let previous = {
+            let mut slot = self.discovery.lock().map_err(|_| DomainError::Internal {
+                detail: "peer discovery mutex poisoned".to_owned(),
+            })?;
+            if slot
+                .as_ref()
+                .is_some_and(|listener| listener.port() == port)
+            {
+                return Ok(());
+            }
+            slot.take()
+        };
+        if let Some(previous) = previous {
+            previous.request_shutdown();
+        }
+
+        let listener = match DiscoveryListener::start(port, Arc::clone(&self.events)) {
+            Ok(listener) => Arc::new(listener),
+            Err(error) => {
+                self.events.error(&AppError::from_ref(&error));
+                return Err(error);
+            }
+        };
+        let mut slot = self.discovery.lock().map_err(|_| DomainError::Internal {
+            detail: "peer discovery mutex poisoned".to_owned(),
+        })?;
+        *slot = Some(listener);
+        Ok(())
+    }
+
+    pub fn discovered_peers(&self) -> Vec<DiscoveredPeer> {
+        match self.discovery.lock() {
+            Ok(slot) => slot
+                .as_ref()
+                .map(|listener| listener.peers())
+                .unwrap_or_default(),
+            Err(_) => {
+                log::warn!("peer discovery mutex poisoned");
+                Vec::new()
+            }
+        }
+    }
+
+    pub(crate) fn discovery_listener(&self) -> Option<Arc<DiscoveryListener>> {
+        match self.discovery.lock() {
+            Ok(slot) => slot.clone(),
+            Err(_) => {
+                log::warn!("peer discovery mutex poisoned");
+                None
+            }
+        }
+    }
+
+    fn availability_snapshot(&self) -> HashMap<String, bool> {
+        match self.availability.lock() {
+            Ok(map) => map
+                .iter()
+                .map(|(id, state)| (id.clone(), state.online))
+                .collect(),
+            Err(_) => {
+                log::warn!("peer availability mutex poisoned");
+                HashMap::new()
+            }
+        }
+    }
+
+    /// Records a reachability result and notifies the UI only on a transition.
+    fn set_peer_online(&self, peer_id: &str, online: bool) {
+        let changed = match self.availability.lock() {
+            Ok(mut map) => {
+                let previous = map.insert(peer_id.to_owned(), PeerAvailability { online });
+                previous.is_none_or(|state| state.online != online)
+            }
+            Err(_) => {
+                log::warn!("peer availability mutex poisoned");
+                false
+            }
+        };
+        if changed {
+            self.events.peer_status(&PeerStatus {
+                id: peer_id.to_owned(),
+                online,
+            });
+        }
+    }
+
+    /// Marks saved peers that are currently announcing as online. This is the
+    /// broadcast-driven path and performs no network request of its own.
+    fn reconcile_announced_peers(&self) {
+        if !self.vault.is_unlocked() {
+            return;
+        }
+        let announced = self.discovered_peers();
+        if announced.is_empty() {
+            return;
+        }
+        let Ok(records) = self.vault.list_peer_records() else {
+            return;
+        };
+        for record in records {
+            if url_is_announced(&record.url, &announced) {
+                self.set_peer_online(&record.id, true);
+            }
+        }
+    }
+
+    /// Online servers keep the normal synchronization cadence so authorization
+    /// changes are noticed quickly. Once a server is offline it is no longer
+    /// probed: the next UDP announcement is the signal that it is back.
+    fn should_probe(&self, peer_id: &str) -> bool {
+        match self.availability.lock() {
+            Ok(map) => map.get(peer_id).is_none_or(|state| state.online),
+            Err(_) => true,
+        }
+    }
+
     /// Scans the LAN over UDP discovery.
     pub async fn scan_lan(
         &self,
         port: Option<u16>,
         timeout_ms: Option<u64>,
     ) -> Result<Vec<DiscoveredPeer>, DomainError> {
-        let port = port.unwrap_or(crate::types::DEFAULT_DISCOVERY_PORT);
+        let port = port.unwrap_or(DEFAULT_DISCOVERY_PORT);
         discovery::scan(port, timeout_ms).await
     }
 
     pub fn list_peers(&self) -> Result<Vec<PeerInfo>, DomainError> {
         let records = self.vault.list_peer_records()?;
+        let announced = self.discovered_peers();
+        let availability = self.availability_snapshot();
         Ok(records
             .into_iter()
             .map(|record| PeerInfo {
+                online: availability.get(&record.id).copied().unwrap_or(false)
+                    || url_is_announced(&record.url, &announced),
                 id: record.id,
                 label: record.label,
                 url: record.url,
-                online: false,
                 shares: Vec::new(),
             })
             .collect())
@@ -785,6 +959,7 @@ impl PeerManager {
             }
             return Err(error);
         }
+        self.set_peer_online(&id, true);
 
         Ok(PeerInfo {
             id,
@@ -802,28 +977,28 @@ impl PeerManager {
         let result = tokio::time::timeout(HEALTH_TIMEOUT, catalog(&client)).await;
         let latency_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
 
-        match result {
-            Ok(Ok(_)) => Ok(PeerHealth {
+        let health = match result {
+            Ok(Ok(_)) => PeerHealth {
                 online: true,
                 authorized: true,
                 latency_ms,
                 code: None,
                 message: None,
                 detail: None,
-            }),
+            },
             Ok(Err(error)) => {
                 let app_error = AppError::from_ref(&error);
                 let online = error_is_reachable(&error);
-                Ok(PeerHealth {
+                PeerHealth {
                     online,
                     authorized: false,
                     latency_ms,
                     code: Some(app_error.code),
                     message: Some(app_error.message),
                     detail: app_error.detail,
-                })
+                }
             }
-            Err(_) => Ok(PeerHealth {
+            Err(_) => PeerHealth {
                 online: false,
                 authorized: false,
                 latency_ms,
@@ -834,8 +1009,10 @@ impl PeerManager {
                     record.url,
                     HEALTH_TIMEOUT.as_secs()
                 )),
-            }),
-        }
+            },
+        };
+        self.set_peer_online(peer_id, health.online);
+        Ok(health)
     }
 
     /// Reloads the catalog for a saved peer, so the UI can browse after a restart
@@ -881,6 +1058,9 @@ impl PeerManager {
         }
         self.vault.delete_peer_code(peer_id)?;
         self.vault.delete_peer_record(peer_id)?;
+        if let Ok(mut map) = self.availability.lock() {
+            map.remove(peer_id);
+        }
         self.edits
             .lock()
             .await
@@ -898,10 +1078,19 @@ impl PeerManager {
         }
         let records = self.vault.list_peer_records()?;
         let client_id = self.vault.ensure_client_id()?;
+        let announced = self.discovered_peers();
         let mut removed = 0;
 
         for record in records {
+            let recently_announced = url_is_announced(&record.url, &announced);
+            // Broadcasts are the primary heartbeat. A known-offline server is
+            // skipped entirely and waits for its next announcement; unknown or
+            // online servers use this sync as the lightweight HTTP probe.
+            if !recently_announced && !self.should_probe(&record.id) {
+                continue;
+            }
             let Ok(secret) = self.vault.load_peer_code(&record.id) else {
+                self.set_peer_online(&record.id, false);
                 continue;
             };
             let code = Zeroizing::new(secret.code);
@@ -910,6 +1099,7 @@ impl PeerManager {
                 .await
             {
                 Ok(AuthorizationOutcome::Active(status)) => {
+                    self.set_peer_online(&record.id, true);
                     let expected = record.authorization_id.as_deref();
                     if expected != Some(status.authorization_id.as_str()) {
                         self.vault
@@ -933,8 +1123,16 @@ impl PeerManager {
                     self.remove_saved_peer(record, "revoked").await?;
                     removed += 1;
                 }
-                Ok(AuthorizationOutcome::Unsupported) => {}
+                Ok(AuthorizationOutcome::Unsupported) => {
+                    self.set_peer_online(&record.id, true);
+                }
                 Err(error) => {
+                    // A fresh broadcast still proves the server is reachable
+                    // even if this particular request failed.
+                    self.set_peer_online(
+                        &record.id,
+                        error_is_reachable(&error) || recently_announced,
+                    );
                     // An offline server is a normal transient state. Only
                     // unexpected protocol or local failures are surfaced.
                     if !matches!(
@@ -2571,6 +2769,32 @@ fn map_dav_error(operation: &'static str, error: reqwest_dav::Error, path: &str)
     }
 }
 
+/// Whether a saved server URL is present in the passive discovery snapshot.
+/// The preferred announcement URL and the saved URL can differ (a server
+/// advertises every interface plus loopback), so compare the host and port as
+/// well as the exact URL.
+fn url_is_announced(url: &str, announced: &[DiscoveredPeer]) -> bool {
+    announced
+        .iter()
+        .any(|peer| announced_peer_matches(url, peer))
+}
+
+fn announced_peer_matches(url: &str, peer: &DiscoveredPeer) -> bool {
+    if url == peer.url {
+        return true;
+    }
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    if parsed.port_or_known_default() != Some(peer.port) {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    peer.hosts.iter().any(|candidate| candidate == host)
+}
+
 fn error_is_reachable(error: &DomainError) -> bool {
     match error {
         DomainError::PeerRequest { status, .. } => status.is_some(),
@@ -2886,4 +3110,40 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn announced() -> DiscoveredPeer {
+        DiscoveredPeer {
+            server_id: "server-1".to_owned(),
+            name: "Lab".to_owned(),
+            url: "http://192.168.1.20:4918".to_owned(),
+            hosts: vec!["192.168.1.20".to_owned(), "127.0.0.1".to_owned()],
+            port: 4918,
+            share_count: 2,
+        }
+    }
+
+    #[test]
+    fn saved_url_matches_any_announced_host() {
+        let announced = announced();
+        assert!(announced_peer_matches(
+            "http://192.168.1.20:4918/",
+            &announced
+        ));
+        assert!(announced_peer_matches("http://127.0.0.1:4918", &announced));
+    }
+
+    #[test]
+    fn saved_url_requires_the_announced_port() {
+        let announced = announced();
+        assert!(!announced_peer_matches(
+            "http://192.168.1.20:4919",
+            &announced
+        ));
+        assert!(!announced_peer_matches("not a url", &announced));
+    }
 }

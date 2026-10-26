@@ -17,13 +17,14 @@ use crate::server::{ServerConfig, ServerController};
 use crate::traits::{PeerEvents, ServerEvents};
 use crate::types::{
     AccessRule, AdminLoginResult, AdminSessionInfo, ApprovePendingResult, AuthorizationInfo,
-    ConflictPolicy, DEFAULT_DISCOVERY_PORT, DEFAULT_SERVER_PORT, DirectoryDownloadPlan,
-    DiscoveredPeer, ERROR_EVENT, ExternalEditInfo, InitializeVaultResult, PEER_REVOKED_EVENT,
-    PENDING_CANCELED_EVENT, PENDING_REQUEST_EVENT, PeerAccessRequest, PeerHealth, PeerInfo,
-    PeerListing, PeerRevocationInfo, PeerShare, PendingRequestInfo, PreviewPayload,
-    ResetVaultResult, SERVER_BIND_META, SERVER_DISCOVERY_PORT_META, SERVER_ENABLED_META,
-    SERVER_NAME_META, SERVER_PORT_META, ServerStatus, ShareInfo, SharePermissions,
-    TRANSFER_PROGRESS_EVENT, TransferProgress, TransferResult, UploadCandidate, VaultStatus,
+    ConflictPolicy, DEFAULT_DISCOVERY_PORT, DEFAULT_SERVER_PORT, DISCOVERED_PEERS_EVENT,
+    DirectoryDownloadPlan, DiscoveredPeer, ERROR_EVENT, ExternalEditInfo, InitializeVaultResult,
+    PEER_REVOKED_EVENT, PEER_STATUS_EVENT, PENDING_CANCELED_EVENT, PENDING_REQUEST_EVENT,
+    PeerAccessRequest, PeerHealth, PeerInfo, PeerListing, PeerRevocationInfo, PeerShare,
+    PeerStatus, PendingRequestInfo, PreviewPayload, ResetVaultResult, SERVER_BIND_META,
+    SERVER_DISCOVERY_PORT_META, SERVER_ENABLED_META, SERVER_NAME_META, SERVER_PORT_META,
+    ServerStatus, ShareInfo, SharePermissions, TRANSFER_PROGRESS_EVENT, TransferProgress,
+    TransferResult, UploadCandidate, VaultStatus,
 };
 use crate::vault::Vault;
 
@@ -75,6 +76,18 @@ impl PeerEvents for AppEvents {
     fn peer_revoked(&self, peer: &PeerRevocationInfo) {
         if let Err(emit_error) = self.app.emit(PEER_REVOKED_EVENT, peer) {
             log::error!("failed to emit {PEER_REVOKED_EVENT}: {emit_error}");
+        }
+    }
+
+    fn discovered_peers(&self, peers: &[DiscoveredPeer]) {
+        if let Err(emit_error) = self.app.emit(DISCOVERED_PEERS_EVENT, peers.to_vec()) {
+            log::error!("failed to emit {DISCOVERED_PEERS_EVENT}: {emit_error}");
+        }
+    }
+
+    fn peer_status(&self, status: &PeerStatus) {
+        if let Err(emit_error) = self.app.emit(PEER_STATUS_EVENT, status) {
+            log::error!("failed to emit {PEER_STATUS_EVENT}: {emit_error}");
         }
     }
 }
@@ -213,6 +226,7 @@ pub async fn server_status(server: State<'_, SharedServer>) -> Result<ServerStat
 pub async fn start_server(
     vault: State<'_, SharedVault>,
     server: State<'_, SharedServer>,
+    peers: State<'_, SharedPeers>,
     username: String,
     password: String,
     bind_address: Option<String>,
@@ -241,6 +255,10 @@ pub async fn start_server(
         config.discovery_port,
         config.server_name.clone(),
     );
+    if let Err(error) = peers.ensure_discovery_listener(config.discovery_port) {
+        log::warn!("passive discovery listener could not bind: {error}");
+    }
+    server.set_discovery_listener(peers.discovery_listener());
     let status = server.start(config).await.map_err(AppError::from)?;
     let (bind_address, port, discovery_port, server_name) = persisted;
     run_blocking(move || {
@@ -280,6 +298,7 @@ pub async fn stop_server(
 pub async fn resume_server(
     vault: State<'_, SharedVault>,
     server: State<'_, SharedServer>,
+    peers: State<'_, SharedPeers>,
 ) -> Result<ServerStatus, AppError> {
     let server = Arc::clone(server.inner());
     if server.status().running {
@@ -320,6 +339,10 @@ pub async fn resume_server(
         return Ok(server.status());
     };
 
+    if let Err(error) = peers.ensure_discovery_listener(config.discovery_port) {
+        log::warn!("passive discovery listener could not bind: {error}");
+    }
+    server.set_discovery_listener(peers.discovery_listener());
     match server.start(config).await {
         Ok(status) => Ok(status),
         Err(DomainError::ServerAlreadyRunning) => Ok(server.status()),
@@ -504,6 +527,13 @@ pub async fn scan_lan(
         .scan_lan(port, timeout_ms)
         .await
         .map_err(AppError::from)
+}
+
+/// Returns the current passive discovery snapshot. The UI reads this once on
+/// startup and then follows `app://discovered-peers` events.
+#[tauri::command]
+pub fn discovered_peers(peers: State<'_, SharedPeers>) -> Vec<DiscoveredPeer> {
+    peers.discovered_peers()
 }
 
 /// Returns the local IPv4 LAN subnets used as the default allow rule for a

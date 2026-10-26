@@ -24,7 +24,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::discovery::{self, DiscoveryServer};
+use crate::discovery::{self, DiscoveryListener, DiscoveryServer, LocalAdvert};
 use crate::error::{AppError, DomainError};
 use crate::fs::split_share_path;
 use crate::fs::{RequestCredentials, RestrictedFs, ShareConfig, ShareMap, ShareRoot};
@@ -95,7 +95,39 @@ struct RunningServer {
     address: SocketAddr,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
-    discovery: Option<DiscoveryServer>,
+    discovery: Option<DiscoveryBinding>,
+}
+
+/// Discovery can either be a standalone responder owned by this server or the
+/// application-wide listener shared with the client. The shared listener keeps
+/// a single UDP socket on the discovery port and also publishes the passive
+/// discovery list.
+enum DiscoveryBinding {
+    Standalone(DiscoveryServer),
+    Shared(Arc<DiscoveryListener>),
+}
+
+impl DiscoveryBinding {
+    fn port(&self) -> u16 {
+        match self {
+            Self::Standalone(server) => server.port(),
+            Self::Shared(listener) => listener.port(),
+        }
+    }
+
+    async fn stop(self) {
+        match self {
+            Self::Standalone(server) => server.stop().await,
+            Self::Shared(listener) => listener.clear_advert(),
+        }
+    }
+
+    fn request_shutdown(&mut self) {
+        match self {
+            Self::Standalone(server) => server.request_shutdown(),
+            Self::Shared(listener) => listener.clear_advert(),
+        }
+    }
 }
 
 struct Gate {
@@ -116,6 +148,7 @@ pub struct ServerController {
     authorizations: Arc<std::sync::RwLock<Vec<AuthEntry>>>,
     pending: Arc<Mutex<Vec<PendingRequestInfo>>>,
     grants: Arc<Mutex<Vec<PendingGrant>>>,
+    discovery_listener: Mutex<Option<Arc<DiscoveryListener>>>,
     lifecycle: Mutex<Option<RunningServer>>,
     server_id: String,
 }
@@ -150,9 +183,19 @@ impl ServerController {
             authorizations: Arc::new(std::sync::RwLock::new(authorizations)),
             pending: Arc::new(Mutex::new(Vec::new())),
             grants: Arc::new(Mutex::new(Vec::new())),
+            discovery_listener: Mutex::new(None),
             lifecycle: Mutex::new(None),
             server_id: random_hex(8),
         })
+    }
+
+    /// Shares the application-wide passive discovery listener with the server
+    /// so the server does not bind a second socket to the discovery port.
+    pub(crate) fn set_discovery_listener(&self, listener: Option<Arc<DiscoveryListener>>) {
+        match self.discovery_listener.lock() {
+            Ok(mut slot) => *slot = listener,
+            Err(_) => log::error!("server discovery listener mutex poisoned"),
+        }
     }
 
     pub fn status(&self) -> ServerStatus {
@@ -163,7 +206,7 @@ impl ServerController {
                     true,
                     Some(server.address.to_string()),
                     server.discovery.is_some(),
-                    server.discovery.as_ref().map(DiscoveryServer::port),
+                    server.discovery.as_ref().map(DiscoveryBinding::port),
                 ),
                 None => (false, None, false, None),
             },
@@ -235,24 +278,45 @@ impl ServerController {
             server_name: config.server_name.clone(),
         });
 
+        let shared_listener = match self.discovery_listener.lock() {
+            Ok(slot) => slot.clone(),
+            Err(_) => {
+                log::error!("server discovery listener mutex poisoned");
+                None
+            }
+        };
         let mut discovery = if config.discovery_port == 0 {
+            if let Some(listener) = shared_listener {
+                listener.clear_advert();
+            }
             None
         } else {
             let hosts = discovery::advertised_hosts(&config.bind_address);
-            match discovery::start(
-                config.discovery_port,
-                self.server_id.clone(),
-                config.server_name.clone(),
-                bound.port(),
-                hosts,
-                Arc::clone(&self.shares),
-            )
-            .await
-            {
-                Ok(discovery) => Some(discovery),
-                Err(error) => {
-                    publish_error(self.events.as_ref(), &error);
-                    None
+            if let Some(listener) = shared_listener {
+                listener.set_advert(Some(LocalAdvert {
+                    server_id: self.server_id.clone(),
+                    name: config.server_name.clone(),
+                    port: bound.port(),
+                    hosts,
+                    shares: Arc::clone(&self.shares),
+                }));
+                Some(DiscoveryBinding::Shared(listener))
+            } else {
+                match discovery::start(
+                    config.discovery_port,
+                    self.server_id.clone(),
+                    config.server_name.clone(),
+                    bound.port(),
+                    hosts,
+                    Arc::clone(&self.shares),
+                )
+                .await
+                {
+                    Ok(discovery) => Some(DiscoveryBinding::Standalone(discovery)),
+                    Err(error) => {
+                        publish_error(self.events.as_ref(), &error);
+                        None
+                    }
                 }
             }
         };

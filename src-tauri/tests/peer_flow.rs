@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use peerdav_lib::{
     AccessRule, AppError, ConflictPolicy, DomainError, PeerEvents, PeerInfo, PeerLimits,
-    PeerManager, PeerRevocationInfo, PendingRequestInfo, RuleKind, RuleMatcher, ServerConfig,
-    ServerController, ServerEvents, SharePermissions, Vault,
+    PeerManager, PeerRevocationInfo, PeerStatus, PendingRequestInfo, RuleKind, RuleMatcher,
+    ServerConfig, ServerController, ServerEvents, SharePermissions, Vault,
 };
 
 mod common;
@@ -30,6 +30,7 @@ struct Recording {
     errors: Mutex<Vec<AppError>>,
     pending: Mutex<Vec<PendingRequestInfo>>,
     revoked: Mutex<Vec<PeerRevocationInfo>>,
+    statuses: Mutex<Vec<PeerStatus>>,
 }
 
 impl ServerEvents for Recording {
@@ -49,6 +50,10 @@ impl PeerEvents for Recording {
 
     fn peer_revoked(&self, peer: &PeerRevocationInfo) {
         self.revoked.lock().expect("revoked").push(peer.clone());
+    }
+
+    fn peer_status(&self, status: &PeerStatus) {
+        self.statuses.lock().expect("statuses").push(status.clone());
     }
 }
 
@@ -533,6 +538,38 @@ async fn discovery_deduplicates_replies_from_the_same_server() {
     assert_eq!(connected.shares.len(), 1);
 
     harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn saved_peer_availability_follows_server_lifecycle() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (info, _code) = harness.connect().await;
+
+    let peers = harness.peers.list_peers().expect("peers");
+    assert_eq!(peers.len(), 1);
+    assert!(peers[0].online);
+
+    harness.controller.stop().await;
+    harness
+        .peers
+        .sync_saved_peers()
+        .await
+        .expect("sync after shutdown");
+
+    let peers = harness.peers.list_peers().expect("peers");
+    assert_eq!(peers.len(), 1);
+    assert!(!peers[0].online);
+    let statuses = harness.events.statuses.lock().expect("statuses");
+    assert!(
+        statuses
+            .iter()
+            .any(|status| status.id == info.id && status.online)
+    );
+    assert!(
+        statuses
+            .iter()
+            .any(|status| status.id == info.id && !status.online)
+    );
 }
 
 #[tokio::test]

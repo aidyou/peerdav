@@ -32,8 +32,9 @@ pub use types::{
     InitializeVaultResult, MAX_ACCESS_GRANTS, MAX_ACCESS_REQUEST_ID_CHARS, MAX_PENDING_ATTEMPTS,
     MAX_PENDING_PATH_CHARS, MAX_PENDING_REQUESTS, MIN_ACCESS_REQUEST_ID_CHARS,
     PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT, PeerAccessRequest, PeerEntry, PeerHealth,
-    PeerInfo, PeerListing, PeerRevocationInfo, PeerShare, PendingRequestInfo, PreviewPayload,
-    RuleKind, RuleMatcher, ServerStatus, ShareInfo, SharePermissions, TransferResult, VaultStatus,
+    PeerInfo, PeerListing, PeerRevocationInfo, PeerShare, PeerStatus, PendingRequestInfo,
+    PreviewPayload, RuleKind, RuleMatcher, ServerStatus, ShareInfo, SharePermissions,
+    TransferResult, VaultStatus,
 };
 pub use vault::Vault;
 
@@ -91,7 +92,15 @@ pub fn run() {
                 data_dir.join("peer-temp"),
                 peer_events,
             )?);
-            peers.start_background();
+            // The setup hook is synchronous and has no entered Tokio runtime, so
+            // the peer background tasks (including the UDP discovery listener)
+            // start on the async runtime instead of constructing a socket here.
+            let startup_peers = Arc::clone(&peers);
+            let startup_server = Arc::clone(&server);
+            tauri::async_runtime::spawn(async move {
+                startup_peers.start_background();
+                startup_server.set_discovery_listener(startup_peers.discovery_listener());
+            });
             app.manage(Arc::clone(&vault) as SharedVault);
             app.manage(server as SharedServer);
             app.manage(peers as SharedPeers);
@@ -139,6 +148,7 @@ pub fn run() {
             commands::list_authorizations,
             commands::revoke_authorization,
             commands::scan_lan,
+            commands::discovered_peers,
             commands::local_networks,
             commands::list_peers,
             commands::request_peer_access,

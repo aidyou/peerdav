@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 
 import { confirmAction } from "../lib/confirm";
 import { normalizeAppError } from "../lib/invoke";
@@ -8,9 +8,7 @@ import { t } from "../lib/i18n";
 
 const app = useAppContext();
 
-const discovered = ref([]);
-const scanState = ref("idle");
-const scanError = ref("");
+const discovered = computed(() => app.discovered);
 const activeRequest = ref(null);
 const canceling = ref(false);
 const cancelRequested = ref(false);
@@ -25,16 +23,13 @@ const requestBusy = computed(() =>
   ),
 );
 
-onMounted(() => {
-  if (!hasPeers.value) {
-    void scanLan();
-  }
-});
-
 /// The saved-peer list can arrive after this view mounts, so the live share
 /// counts are driven by a watcher rather than a one-shot mount check.
 watch(
-  () => app.peers.map((peer) => peer.id).join("|"),
+  () =>
+    app.peers
+      .map((peer) => `${peer.id}:${peer.online ? "1" : "0"}`)
+      .join("|"),
   (key) => {
     if (key) void refreshShareCounts();
   },
@@ -42,11 +37,12 @@ watch(
 );
 
 /// Saved peers carry no share list in the local record, so the home cards read
-/// each peer's live catalog to show a real count. An offline or unauthorized
-/// peer falls back to a dash rather than a misleading zero.
+/// each online peer's live catalog to show a real count. Offline or
+/// unauthorized peers fall back to a dash rather than a misleading zero.
 async function refreshShareCounts() {
   const results = await Promise.all(
     app.peers.map(async (peer) => {
+      if (!peer.online) return [peer.id, null];
       try {
         const shares = await app.invoke("list_peer_shares", { peerId: peer.id });
         return [peer.id, shares.length];
@@ -62,19 +58,6 @@ async function refreshShareCounts() {
 function peerCount(peer) {
   const count = shareCounts.value[peer.id];
   return typeof count === "number" ? count : null;
-}
-
-async function scanLan() {
-  if (scanState.value === "scanning") return;
-  scanState.value = "scanning";
-  scanError.value = "";
-  try {
-    discovered.value = await app.invoke("scan_lan");
-    scanState.value = "done";
-  } catch (error) {
-    scanError.value = messageForError(error, "scan LAN for servers");
-    scanState.value = "done";
-  }
 }
 
 function messageForError(error, operation) {
@@ -236,14 +219,19 @@ async function forgetPeer(peer) {
       <ul v-if="hasPeers" class="server-list">
         <li v-for="peer in app.peers" :key="peer.id" class="server-row">
           <div
-            class="server-row__line is-clickable"
-            @click="app.openPeer(peer)"
+            class="server-row__line"
+            :class="{
+              'is-clickable': peer.online,
+              'is-offline': !peer.online,
+            }"
+            @click="peer.online && app.openPeer(peer)"
           >
             <button
               type="button"
               class="server-row__main"
+              :disabled="!peer.online"
               :aria-label="t('home.openServer', { label: peer.label })"
-              @click.stop="app.openPeer(peer)"
+              @click.stop="peer.online && app.openPeer(peer)"
             >
               <span class="server-row__icon" aria-hidden="true">
                 <svg viewBox="0 0 24 24">
@@ -261,6 +249,9 @@ async function forgetPeer(peer) {
               <em v-if="peerCount(peer) !== null">
                 {{ t("home.sharesUnit") }}
               </em>
+            </span>
+            <span v-if="!peer.online" class="server-row__badge is-offline">
+              {{ t("home.offline") }}
             </span>
             <button
               type="button"
@@ -295,18 +286,10 @@ async function forgetPeer(peer) {
     <section class="home-section">
       <header class="section-heading">
         <h2>{{ t("home.discoveredServers") }}</h2>
-        <el-button
-          plain
-          size="small"
-          class="section-scan"
-          :loading="scanState === 'scanning'"
-          @click="scanLan"
-        >
-          {{ scanState === "scanning" ? t("home.scanning") : t("home.scan") }}
-        </el-button>
+        <span class="section-summary">
+          {{ t("home.discoveryListening") }}
+        </span>
       </header>
-
-      <p v-if="scanError" class="home-error">{{ scanError }}</p>
 
       <ul v-if="discovered.length" class="server-list">
         <li
@@ -382,7 +365,7 @@ async function forgetPeer(peer) {
         </li>
       </ul>
 
-      <div v-else-if="scanState === 'done' && !scanError" class="home-empty">
+      <div v-else class="home-empty">
         <span class="home-empty__icon" aria-hidden="true">
           <svg viewBox="0 0 24 24">
             <circle cx="12" cy="12" r="8" />
@@ -390,21 +373,8 @@ async function forgetPeer(peer) {
           </svg>
         </span>
         <div>
-          <strong>{{ t("home.scanEmptyTitle") }}</strong>
-          <p>{{ t("home.scanEmpty") }}</p>
-        </div>
-      </div>
-
-      <div v-else-if="!scanError" class="home-empty">
-        <span class="home-empty__icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24">
-            <circle cx="11" cy="11" r="6" />
-            <path d="M11 11l3.5-3.5M15.5 15.5L19 19" />
-          </svg>
-        </span>
-        <div>
-          <strong>{{ t("home.scanIdleTitle") }}</strong>
-          <p>{{ t("home.scanIdleHint") }}</p>
+          <strong>{{ t("home.discoveryEmptyTitle") }}</strong>
+          <p>{{ t("home.discoveryEmptyHint") }}</p>
         </div>
       </div>
     </section>
@@ -446,10 +416,6 @@ async function forgetPeer(peer) {
   color: var(--app-text-muted);
 }
 
-.section-scan {
-  font-size: 12px;
-}
-
 .server-list {
   list-style: none;
   margin: 0;
@@ -478,6 +444,14 @@ async function forgetPeer(peer) {
 
 .server-row__line.is-clickable {
   cursor: pointer;
+}
+
+.server-row__line.is-offline {
+  opacity: 0.72;
+}
+
+.server-row__line.is-offline:hover {
+  background: transparent;
 }
 
 .server-row__line.is-clickable:hover .server-row__chevron {
@@ -620,6 +594,12 @@ async function forgetPeer(peer) {
   color: color-mix(in oklab, var(--accent-green) 72%, var(--app-text));
 }
 
+.server-row__badge.is-offline {
+  cursor: default;
+  color: var(--app-text-muted);
+  background: var(--app-surface-2);
+}
+
 .server-row__chevron {
   flex: none;
   display: inline-flex;
@@ -703,12 +683,6 @@ async function forgetPeer(peer) {
   font-size: 13px;
   line-height: 1.55;
   color: var(--app-text-muted);
-}
-
-.home-error {
-  margin: 0;
-  color: var(--el-color-danger);
-  font-size: 13px;
 }
 
 @media (max-width: 560px) {

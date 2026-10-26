@@ -1,9 +1,11 @@
 //! UDP LAN discovery.
 //!
-//! The server answers probe datagrams and periodically announces itself to
-//! every directed broadcast address of the local interfaces. The client sends
-//! probes to those same addresses plus loopback (so a machine can discover a
-//! server running on itself) and de-duplicates replies by `server_id`.
+//! A server answers probe datagrams and periodically announces itself to every
+//! directed broadcast address of the local interfaces. The client keeps a
+//! passive listener on the discovery port: announcements join a live registry,
+//! and a server that stops announcing expires after
+//! [`DISCOVERY_PEER_TTL`](crate::types::DISCOVERY_PEER_TTL). The older active
+//! scan remains available for one-shot diagnostics.
 //!
 //! Discovery intentionally exposes only the server name, port and share
 //! count. Share ids are only returned by the authenticated catalog endpoint.
@@ -15,6 +17,7 @@ use std::time::Duration;
 
 use if_addrs::{IfAddr, get_if_addrs};
 use serde::{Deserialize, Serialize};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -22,9 +25,11 @@ use tokio::time::{Instant, MissedTickBehavior, interval, timeout, timeout_at};
 
 use crate::error::DomainError;
 use crate::fs::ShareMap;
+use crate::traits::PeerEvents;
 use crate::types::{
-    DISCOVERY_ANNOUNCE_INTERVAL, DISCOVERY_ANNOUNCE_KIND, DISCOVERY_PROBE_KIND, DISCOVERY_PROTOCOL,
-    DISCOVERY_RECV_BUFFER, DISCOVERY_SCAN_TIMEOUT, DiscoveredPeer, MAX_DISCOVERY_HOSTS,
+    DISCOVERY_ANNOUNCE_INTERVAL, DISCOVERY_ANNOUNCE_KIND, DISCOVERY_PEER_TTL, DISCOVERY_PROBE_KIND,
+    DISCOVERY_PROTOCOL, DISCOVERY_PRUNE_INTERVAL, DISCOVERY_RECV_BUFFER, DISCOVERY_SCAN_TIMEOUT,
+    DiscoveredPeer, MAX_DISCOVERY_HOSTS,
 };
 
 const PROBE_INTERVAL: Duration = Duration::from_millis(250);
@@ -45,6 +50,12 @@ struct WireAnnouncement {
     port: u16,
     share_count: usize,
     hosts: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireEnvelope {
+    protocol: String,
+    kind: String,
 }
 
 /// A running UDP discovery responder.
@@ -86,6 +97,330 @@ impl DiscoveryServer {
     }
 }
 
+/// Identity a running WebDAV server publishes to the LAN. `shares` is shared
+/// with the server so an announcement always carries the live share count.
+pub(crate) struct LocalAdvert {
+    pub(crate) server_id: String,
+    pub(crate) name: String,
+    pub(crate) port: u16,
+    pub(crate) hosts: Vec<String>,
+    pub(crate) shares: Arc<RwLock<ShareMap>>,
+}
+
+#[derive(Clone)]
+struct PeerRecord {
+    peer: DiscoveredPeer,
+    last_seen: Instant,
+}
+
+/// A long-running UDP listener that feeds the passive discovery registry.
+///
+/// The same socket also answers probe datagrams and broadcasts the attached
+/// server advert, so the application never needs a second socket bound to the
+/// discovery port. A server that stops announcing expires after `ttl` and is
+/// removed from the registry.
+pub(crate) struct DiscoveryListener {
+    port: u16,
+    peers: Arc<RwLock<HashMap<String, PeerRecord>>>,
+    advert: Arc<RwLock<Option<LocalAdvert>>>,
+    shutdown: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    task: JoinHandle<()>,
+}
+
+impl DiscoveryListener {
+    pub(crate) fn start(port: u16, events: Arc<dyn PeerEvents>) -> Result<Self, DomainError> {
+        Self::start_with_ttl(port, DISCOVERY_PEER_TTL, events)
+    }
+
+    fn start_with_ttl(
+        port: u16,
+        ttl: Duration,
+        events: Arc<dyn PeerEvents>,
+    ) -> Result<Self, DomainError> {
+        if port == 0 {
+            return Err(DomainError::Discovery {
+                operation: "listen",
+                detail: "discovery port must not be zero".to_owned(),
+            });
+        }
+
+        // `UdpSocket::from_std` requires an entered Tokio runtime context; fail
+        // with a structured error instead of panicking when called from a
+        // synchronous setup path.
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|error| DomainError::Discovery {
+                operation: "listen",
+                detail: format!("no async runtime for the discovery listener: {error}"),
+            })?;
+        let std_socket = bind_shared_socket(port)?;
+        let socket = UdpSocket::from_std(std_socket).map_err(|source| DomainError::Discovery {
+            operation: "listen",
+            detail: format!("failed to attach UDP socket {port}: {source}"),
+        })?;
+        let peers = Arc::new(RwLock::new(HashMap::new()));
+        let advert = Arc::new(RwLock::new(None));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let task = runtime.spawn(run_listener(
+            socket,
+            port,
+            Arc::clone(&peers),
+            Arc::clone(&advert),
+            ttl,
+            Arc::clone(&events),
+            shutdown_rx,
+        ));
+        // Clear a stale frontend list when the listener starts or rebinds.
+        events.discovered_peers(&[]);
+
+        Ok(Self {
+            port,
+            peers,
+            advert,
+            shutdown: std::sync::Mutex::new(Some(shutdown_tx)),
+            task,
+        })
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub(crate) fn set_advert(&self, advert: Option<LocalAdvert>) {
+        match self.advert.write() {
+            Ok(mut slot) => *slot = advert,
+            Err(_) => log::warn!("peerdav.discovery advert lock poisoned"),
+        }
+    }
+
+    pub(crate) fn clear_advert(&self) {
+        self.set_advert(None);
+    }
+
+    pub(crate) fn peers(&self) -> Vec<DiscoveredPeer> {
+        match self.peers.read() {
+            Ok(registry) => sorted_peers(registry.values().map(|record| record.peer.clone())),
+            Err(_) => {
+                log::warn!("peerdav.discovery registry lock poisoned");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Best-effort synchronous shutdown used when rebinding or exiting.
+    pub(crate) fn request_shutdown(&self) {
+        if let Ok(mut sender) = self.shutdown.lock()
+            && let Some(sender) = sender.take()
+        {
+            let _ = sender.send(());
+        }
+        self.task.abort();
+    }
+}
+
+impl Drop for DiscoveryListener {
+    fn drop(&mut self) {
+        self.request_shutdown();
+    }
+}
+
+async fn run_listener(
+    socket: UdpSocket,
+    discovery_port: u16,
+    peers: Arc<RwLock<HashMap<String, PeerRecord>>>,
+    advert: Arc<RwLock<Option<LocalAdvert>>>,
+    ttl: Duration,
+    events: Arc<dyn PeerEvents>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    let mut announce = interval(DISCOVERY_ANNOUNCE_INTERVAL);
+    announce.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut prune = interval(DISCOVERY_PRUNE_INTERVAL);
+    prune.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut buffer = vec![0_u8; DISCOVERY_RECV_BUFFER];
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            _ = announce.tick() => {
+                if let Some(announcement) = current_announcement(&advert) {
+                    send_announcement(&socket, &announcement, discovery_port).await;
+                }
+            }
+            _ = prune.tick() => {
+                let removed = match peers.write() {
+                    Ok(mut registry) => prune_expired(&mut registry, Instant::now(), ttl),
+                    Err(_) => {
+                        log::warn!("peerdav.discovery registry lock poisoned");
+                        false
+                    }
+                };
+                if removed {
+                    emit_snapshot(&peers, events.as_ref());
+                }
+            }
+            received = socket.recv_from(&mut buffer) => {
+                match received {
+                    Ok((length, peer)) => {
+                        handle_datagram(&socket, &peers, &advert, events.as_ref(), &buffer[..length], peer).await;
+                    }
+                    Err(error) => {
+                        log::warn!("peerdav.discovery receive failed: {error}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn handle_datagram(
+    socket: &UdpSocket,
+    peers: &RwLock<HashMap<String, PeerRecord>>,
+    advert: &RwLock<Option<LocalAdvert>>,
+    events: &dyn PeerEvents,
+    payload: &[u8],
+    from: SocketAddr,
+) {
+    let Ok(envelope) = serde_json::from_slice::<WireEnvelope>(payload) else {
+        return;
+    };
+    if envelope.protocol != DISCOVERY_PROTOCOL {
+        return;
+    }
+
+    if envelope.kind == DISCOVERY_PROBE_KIND {
+        if let Some(announcement) = current_announcement(advert) {
+            let reply = match serde_json::to_vec(&announcement) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    log::error!("peerdav.discovery failed to encode announcement: {error}");
+                    return;
+                }
+            };
+            if let Err(error) = socket.send_to(&reply, from).await {
+                log::debug!("peerdav.discovery failed to answer {from}: {error}");
+            }
+        }
+        return;
+    }
+
+    if envelope.kind != DISCOVERY_ANNOUNCE_KIND {
+        return;
+    }
+    let Some(announcement) = parse_announcement(payload) else {
+        return;
+    };
+    let changed = match peers.write() {
+        Ok(mut registry) => upsert_live(&mut registry, announcement, from, Instant::now()),
+        Err(_) => {
+            log::warn!("peerdav.discovery registry lock poisoned");
+            false
+        }
+    };
+    if changed {
+        emit_snapshot(peers, events);
+    }
+}
+
+fn emit_snapshot(peers: &RwLock<HashMap<String, PeerRecord>>, events: &dyn PeerEvents) {
+    let snapshot = match peers.read() {
+        Ok(registry) => sorted_peers(registry.values().map(|record| record.peer.clone())),
+        Err(_) => {
+            log::warn!("peerdav.discovery registry lock poisoned");
+            return;
+        }
+    };
+    events.discovered_peers(&snapshot);
+}
+
+fn current_announcement(advert: &RwLock<Option<LocalAdvert>>) -> Option<WireAnnouncement> {
+    let advert = advert.read().ok()?;
+    advert.as_ref().map(announcement_for_advert)
+}
+
+fn announcement_for_advert(advert: &LocalAdvert) -> WireAnnouncement {
+    WireAnnouncement {
+        protocol: DISCOVERY_PROTOCOL.to_owned(),
+        kind: DISCOVERY_ANNOUNCE_KIND.to_owned(),
+        server_id: advert.server_id.clone(),
+        name: advert.name.clone(),
+        port: advert.port,
+        share_count: share_count(&advert.shares),
+        hosts: advert.hosts.clone(),
+    }
+}
+
+fn prune_expired(registry: &mut HashMap<String, PeerRecord>, now: Instant, ttl: Duration) -> bool {
+    let before = registry.len();
+    registry.retain(|_, record| now.duration_since(record.last_seen) <= ttl);
+    before != registry.len()
+}
+
+fn upsert_live(
+    registry: &mut HashMap<String, PeerRecord>,
+    announcement: WireAnnouncement,
+    from: SocketAddr,
+    now: Instant,
+) -> bool {
+    let key = announcement_key(&announcement, from);
+    if let Some(record) = registry.get_mut(&key) {
+        let previous = record.peer.clone();
+        update_discovered_peer(&mut record.peer, &announcement);
+        record.last_seen = now;
+        return record.peer != previous;
+    }
+    registry.insert(
+        key,
+        PeerRecord {
+            peer: new_discovered_peer(&announcement),
+            last_seen: now,
+        },
+    );
+    true
+}
+
+fn bind_shared_socket(port: u16) -> Result<std::net::UdpSocket, DomainError> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).map_err(|source| {
+        DomainError::Discovery {
+            operation: "create socket",
+            detail: source.to_string(),
+        }
+    })?;
+    socket
+        .set_reuse_address(true)
+        .map_err(|source| DomainError::Discovery {
+            operation: "reuse address",
+            detail: source.to_string(),
+        })?;
+    #[cfg(unix)]
+    socket
+        .set_reuse_port(true)
+        .map_err(|source| DomainError::Discovery {
+            operation: "reuse port",
+            detail: source.to_string(),
+        })?;
+    socket
+        .set_broadcast(true)
+        .map_err(|source| DomainError::Discovery {
+            operation: "enable broadcast",
+            detail: source.to_string(),
+        })?;
+    let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    socket
+        .bind(&address.into())
+        .map_err(|source| DomainError::Discovery {
+            operation: "bind",
+            detail: format!("failed to bind UDP port {port}: {source}"),
+        })?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|source| DomainError::Discovery {
+            operation: "set nonblocking",
+            detail: source.to_string(),
+        })?;
+    Ok(socket.into())
+}
+
 #[derive(Debug, Clone)]
 struct ServerIdentity {
     server_id: String,
@@ -110,18 +445,18 @@ pub async fn start(
         });
     }
 
-    let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
-        .await
+    let std_socket = bind_shared_socket(port)?;
+    let local_port = std_socket
+        .local_addr()
         .map_err(|source| DomainError::Discovery {
-            operation: "bind",
-            detail: format!("failed to bind UDP port {port}: {source}"),
-        })?;
-    socket
-        .set_broadcast(true)
-        .map_err(|source| DomainError::Discovery {
-            operation: "enable broadcast",
+            operation: "inspect socket",
             detail: source.to_string(),
-        })?;
+        })?
+        .port();
+    let socket = UdpSocket::from_std(std_socket).map_err(|source| DomainError::Discovery {
+        operation: "bind",
+        detail: format!("failed to attach UDP socket {port}: {source}"),
+    })?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let identity = Arc::new(ServerIdentity {
@@ -130,13 +465,6 @@ pub async fn start(
         webdav_port,
         hosts,
     });
-    let local_port = socket
-        .local_addr()
-        .map_err(|source| DomainError::Discovery {
-            operation: "inspect socket",
-            detail: source.to_string(),
-        })?
-        .port();
     let task = tokio::spawn(async move {
         run_responder(socket, local_port, identity, shares, shutdown_rx).await;
     });
@@ -383,17 +711,9 @@ pub async fn scan(port: u16, timeout_ms: Option<u64>) -> Result<Vec<DiscoveredPe
                         });
                     }
                     Ok(Ok((length, from))) => {
-                        let Ok(announcement) =
-                            serde_json::from_slice::<WireAnnouncement>(&buffer[..length])
-                        else {
+                        let Some(announcement) = parse_announcement(&buffer[..length]) else {
                             continue;
                         };
-                        if announcement.protocol != DISCOVERY_PROTOCOL
-                            || announcement.kind != DISCOVERY_ANNOUNCE_KIND
-                            || announcement.port == 0
-                        {
-                            continue;
-                        }
                         merge_announcement(&mut found, announcement, from);
                     }
                 }
@@ -408,14 +728,7 @@ pub async fn scan(port: u16, timeout_ms: Option<u64>) -> Result<Vec<DiscoveredPe
         });
     }
 
-    let mut peers: Vec<DiscoveredPeer> = found.into_values().collect();
-    peers.sort_by(|left, right| {
-        left.name
-            .to_lowercase()
-            .cmp(&right.name.to_lowercase())
-            .then_with(|| left.url.cmp(&right.url))
-    });
-    Ok(peers)
+    Ok(sorted_peers(found.into_values()))
 }
 
 fn merge_announcement(
@@ -423,30 +736,72 @@ fn merge_announcement(
     announcement: WireAnnouncement,
     from: SocketAddr,
 ) {
-    let key = if announcement.server_id.is_empty() {
+    let key = announcement_key(&announcement, from);
+    match found.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            update_discovered_peer(entry.get_mut(), &announcement);
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(new_discovered_peer(&announcement));
+        }
+    }
+}
+
+fn parse_announcement(bytes: &[u8]) -> Option<WireAnnouncement> {
+    let announcement = serde_json::from_slice::<WireAnnouncement>(bytes).ok()?;
+    if announcement.protocol != DISCOVERY_PROTOCOL
+        || announcement.kind != DISCOVERY_ANNOUNCE_KIND
+        || announcement.port == 0
+    {
+        return None;
+    }
+    Some(announcement)
+}
+
+fn announcement_key(announcement: &WireAnnouncement, from: SocketAddr) -> String {
+    if announcement.server_id.is_empty() {
         format!("{}:{}", from.ip(), announcement.port)
     } else {
         announcement.server_id.clone()
-    };
+    }
+}
 
-    let entry = found.entry(key).or_insert_with(|| DiscoveredPeer {
+fn new_discovered_peer(announcement: &WireAnnouncement) -> DiscoveredPeer {
+    let mut hosts = Vec::new();
+    for host in &announcement.hosts {
+        push_host(&mut hosts, host.clone());
+    }
+    DiscoveredPeer {
         server_id: announcement.server_id.clone(),
         name: announcement.name.clone(),
-        url: choose_url(&announcement.hosts, announcement.port).unwrap_or_default(),
-        hosts: announcement.hosts.clone(),
+        url: choose_url(&hosts, announcement.port).unwrap_or_default(),
+        hosts,
         port: announcement.port,
         share_count: announcement.share_count,
-    });
+    }
+}
 
-    for host in announcement.hosts {
-        if entry.hosts.len() < MAX_DISCOVERY_HOSTS && !entry.hosts.contains(&host) {
-            entry.hosts.push(host);
-        }
+fn update_discovered_peer(peer: &mut DiscoveredPeer, announcement: &WireAnnouncement) {
+    peer.name = announcement.name.clone();
+    peer.port = announcement.port;
+    peer.share_count = announcement.share_count;
+    for host in &announcement.hosts {
+        push_host(&mut peer.hosts, host.clone());
     }
-    if entry.url.is_empty() {
-        entry.url = choose_url(&entry.hosts, entry.port).unwrap_or_default();
+    if let Some(url) = choose_url(&peer.hosts, peer.port) {
+        peer.url = url;
     }
-    entry.share_count = entry.share_count.max(announcement.share_count);
+}
+
+fn sorted_peers(peers: impl Iterator<Item = DiscoveredPeer>) -> Vec<DiscoveredPeer> {
+    let mut peers: Vec<DiscoveredPeer> = peers.collect();
+    peers.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.url.cmp(&right.url))
+    });
+    peers
 }
 
 fn choose_url(hosts: &[String], port: u16) -> Option<String> {
@@ -506,6 +861,58 @@ fn broadcast_targets(port: u16) -> Vec<SocketAddrV4> {
 mod tests {
     use super::*;
 
+    use std::sync::Mutex;
+
+    use crate::error::AppError;
+    use crate::types::PeerRevocationInfo;
+
+    #[derive(Default)]
+    struct RecordingEvents {
+        snapshots: Mutex<Vec<Vec<DiscoveredPeer>>>,
+    }
+
+    impl PeerEvents for RecordingEvents {
+        fn error(&self, _error: &AppError) {}
+
+        fn peer_revoked(&self, _peer: &PeerRevocationInfo) {}
+
+        fn discovered_peers(&self, peers: &[DiscoveredPeer]) {
+            self.snapshots
+                .lock()
+                .expect("snapshots")
+                .push(peers.to_vec());
+        }
+    }
+
+    fn free_udp_port() -> u16 {
+        std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("reserve port")
+            .local_addr()
+            .expect("local addr")
+            .port()
+    }
+
+    async fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
+        for _ in 0..150 {
+            if predicate() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{message}");
+    }
+
+    fn discovered_peer(id: &str) -> DiscoveredPeer {
+        DiscoveredPeer {
+            server_id: id.to_owned(),
+            name: id.to_owned(),
+            url: format!("http://{id}:4918"),
+            hosts: vec![id.to_owned()],
+            port: 4918,
+            share_count: 1,
+        }
+    }
+
     #[test]
     fn url_prefers_a_routable_host() {
         let hosts = vec![Ipv4Addr::LOCALHOST.to_string(), "192.168.1.9".to_owned()];
@@ -544,5 +951,150 @@ mod tests {
             choose_url(&["::1".to_owned()], 4918),
             Some("http://[::1]:4918".to_owned())
         );
+    }
+
+    #[test]
+    fn listener_start_without_runtime_returns_an_error() {
+        let events = Arc::new(RecordingEvents::default());
+        let result = DiscoveryListener::start_with_ttl(4919, DISCOVERY_PEER_TTL, events);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn announced_hosts_are_bounded() {
+        let announcement = WireAnnouncement {
+            protocol: DISCOVERY_PROTOCOL.to_owned(),
+            kind: DISCOVERY_ANNOUNCE_KIND.to_owned(),
+            server_id: "server-1".to_owned(),
+            name: "Lab".to_owned(),
+            port: 4918,
+            share_count: 0,
+            hosts: (0..MAX_DISCOVERY_HOSTS + 5)
+                .map(|index| format!("10.0.0.{index}"))
+                .collect(),
+        };
+
+        let peer = new_discovered_peer(&announcement);
+        assert_eq!(peer.hosts.len(), MAX_DISCOVERY_HOSTS);
+    }
+
+    #[test]
+    fn expired_servers_are_pruned_but_fresh_ones_survive() {
+        let now = Instant::now();
+        let mut registry = HashMap::new();
+        registry.insert(
+            "old".to_owned(),
+            PeerRecord {
+                peer: discovered_peer("old"),
+                last_seen: now - Duration::from_secs(11),
+            },
+        );
+        registry.insert(
+            "fresh".to_owned(),
+            PeerRecord {
+                peer: discovered_peer("fresh"),
+                last_seen: now,
+            },
+        );
+
+        assert!(prune_expired(&mut registry, now, DISCOVERY_PEER_TTL));
+        assert!(!registry.contains_key("old"));
+        assert!(registry.contains_key("fresh"));
+        assert!(!prune_expired(&mut registry, now, DISCOVERY_PEER_TTL));
+    }
+
+    #[tokio::test]
+    async fn passive_listener_adds_and_expires_announcements() {
+        let port = free_udp_port();
+        let events = Arc::new(RecordingEvents::default());
+        let listener = DiscoveryListener::start_with_ttl(
+            port,
+            Duration::from_millis(80),
+            Arc::clone(&events) as Arc<dyn PeerEvents>,
+        )
+        .expect("listener");
+
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("sender");
+        let announcement = WireAnnouncement {
+            protocol: DISCOVERY_PROTOCOL.to_owned(),
+            kind: DISCOVERY_ANNOUNCE_KIND.to_owned(),
+            server_id: "server-1".to_owned(),
+            name: "Lab".to_owned(),
+            port: 4918,
+            share_count: 2,
+            hosts: vec!["192.168.1.20".to_owned()],
+        };
+        sender
+            .send_to(
+                &serde_json::to_vec(&announcement).expect("encode"),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            )
+            .await
+            .expect("send announcement");
+
+        wait_until(
+            || !listener.peers().is_empty(),
+            "announcement was not added",
+        )
+        .await;
+        let peers = listener.peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name, "Lab");
+        assert_eq!(peers[0].url, "http://192.168.1.20:4918");
+        assert_eq!(peers[0].share_count, 2);
+
+        wait_until(|| listener.peers().is_empty(), "server did not expire").await;
+        let snapshots = events.snapshots.lock().expect("snapshots");
+        assert!(
+            snapshots
+                .iter()
+                .any(|snapshot| snapshot.iter().any(|peer| peer.name == "Lab"))
+        );
+        assert_eq!(snapshots.last().map(Vec::len), Some(0));
+    }
+
+    #[tokio::test]
+    async fn listener_answers_probes_when_a_server_advert_is_attached() {
+        let port = free_udp_port();
+        let events = Arc::new(RecordingEvents::default());
+        let listener = DiscoveryListener::start_with_ttl(
+            port,
+            DISCOVERY_PEER_TTL,
+            Arc::clone(&events) as Arc<dyn PeerEvents>,
+        )
+        .expect("listener");
+        listener.set_advert(Some(LocalAdvert {
+            server_id: "self".to_owned(),
+            name: "Self host".to_owned(),
+            port: 4918,
+            hosts: vec![Ipv4Addr::LOCALHOST.to_string()],
+            shares: Arc::new(RwLock::new(ShareMap::new())),
+        }));
+
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("client");
+        let probe = serde_json::to_vec(&WireProbe {
+            protocol: DISCOVERY_PROTOCOL.to_owned(),
+            kind: DISCOVERY_PROBE_KIND.to_owned(),
+        })
+        .expect("encode probe");
+        client
+            .send_to(&probe, SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+            .await
+            .expect("send probe");
+
+        let mut buffer = vec![0_u8; DISCOVERY_RECV_BUFFER];
+        let (length, _) = timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+            .await
+            .expect("probe reply timed out")
+            .expect("receive probe reply");
+        let reply = parse_announcement(&buffer[..length]).expect("announcement reply");
+        assert_eq!(reply.server_id, "self");
+        assert_eq!(reply.name, "Self host");
+        assert_eq!(reply.port, 4918);
+        assert_eq!(reply.share_count, 0);
     }
 }

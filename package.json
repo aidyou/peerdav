@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "icons": "tauri icon design/icon/peerdav-app-icon.svg --ios-color \"#3672E9\" && node --input-type=module -e \"import { copyFileSync } from 'node:fs'; copyFileSync('design/icon/peerdav-app-icon.svg', 'public/peerdav.svg')\""
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

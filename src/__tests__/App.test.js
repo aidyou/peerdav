@@ -74,6 +74,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  window.history.replaceState(null, "", window.location.pathname);
   for (const message of document.querySelectorAll(".el-message")) {
     message.remove();
   }
@@ -99,7 +100,7 @@ const PEER = {
   id: "peer-1",
   label: "Office",
   url: "http://192.168.1.10:4918",
-  online: false,
+  online: true,
   shares: [],
 };
 
@@ -135,7 +136,7 @@ function mockCommands(overrides = {}) {
     list_shares: async () => [],
     list_pending_requests: async () => [],
     list_authorizations: async () => [],
-    scan_lan: async () => [],
+    discovered_peers: async () => [],
     check_peer_health: async () => ({
       online: true,
       authorized: false,
@@ -476,19 +477,18 @@ describe("peer health and LAN state", () => {
     wrapper.unmount();
   });
 
-  it("shows an explicit empty state after a LAN scan finds nothing", async () => {
+  it("shows the passive discovery empty state", async () => {
     const wrapper = await mountReady();
     await signIn(wrapper);
     await clickButton(wrapper, "客户端");
 
-    await clickButton(wrapper, "扫描局域网");
     expect(wrapper.text()).toContain(
-      "未发现服务器，请确认对方已启动服务且处于同一网段。",
+      "暂未发现服务器，对方上线后会自动出现在这里。",
     );
 
     await switchLanguage(wrapper, "en");
     expect(wrapper.text()).toContain(
-      "No server found. Check that the other device is running PeerDav and on the same LAN.",
+      "No server yet. One will appear here when it comes online.",
     );
 
     wrapper.unmount();
@@ -664,7 +664,7 @@ describe("home workspace", () => {
       list_peers: async () => [PEER],
     });
 
-    expect(wrapper.text()).toContain("已连接的服务器");
+    expect(wrapper.text()).toContain("已授权服务器");
     expect(wrapper.text()).toContain("Office");
     expect(wrapper.text()).toContain("http://192.168.1.10:4918");
 
@@ -694,28 +694,58 @@ describe("home workspace", () => {
     wrapper.unmount();
   });
 
-  it("shows a dash instead of a misleading zero when a peer is offline", async () => {
+  it("disables an offline peer and removes it from the rail", async () => {
     localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const listShares = vi.fn(async () => []);
+    const wrapper = await mountReady({
+      admin_session: async () => ({
+        username: "admin",
+        mustChangePassword: false,
+      }),
+      list_peers: async () => [{ ...PEER, online: false }],
+      list_peer_shares: listShares,
+    });
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("离线");
+    expect(wrapper.find(".server-row__count strong").text()).toBe("—");
+    expect(wrapper.find("button.server-row__main").attributes("disabled")).toBeDefined();
+    expect(wrapper.findAll(".rail-avatar")).toHaveLength(0);
+    expect(listShares).not.toHaveBeenCalled();
+
+    await wrapper.find("button.server-row__main").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".peer-browser").exists()).toBe(false);
+
+    wrapper.unmount();
+  });
+
+  it("updates the rail and row when a peer status changes", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
     const wrapper = await mountReady({
       admin_session: async () => ({
         username: "admin",
         mustChangePassword: false,
       }),
       list_peers: async () => [PEER],
-      list_peer_shares: async () => {
-        throw {
-          code: "PEER_REQUEST_FAILED",
-          message: "offline",
-          detail: null,
-          context: null,
-        };
-      },
     });
     await flushPromises();
+    expect(wrapper.findAll(".rail-avatar")).toHaveLength(1);
+    expect(wrapper.find("button.server-row__main").attributes("disabled")).toBeUndefined();
 
-    expect(wrapper.text()).toContain("—");
-    warnSpy.mockRestore();
+    const publish = eventHandlers.get("app://peer-status");
+    expect(typeof publish).toBe("function");
+
+    publish({ payload: { id: PEER.id, online: false } });
+    await flushPromises();
+    expect(wrapper.findAll(".rail-avatar")).toHaveLength(0);
+    expect(wrapper.find("button.server-row__main").attributes("disabled")).toBeDefined();
+    expect(wrapper.text()).toContain("离线");
+
+    publish({ payload: { id: PEER.id, online: true } });
+    await flushPromises();
+    expect(wrapper.findAll(".rail-avatar")).toHaveLength(1);
+    expect(wrapper.find("button.server-row__main").attributes("disabled")).toBeUndefined();
 
     wrapper.unmount();
   });
@@ -819,7 +849,7 @@ describe("home workspace", () => {
         username: "admin",
         mustChangePassword: false,
       }),
-      scan_lan: async () => [DISCOVERED],
+      discovered_peers: async () => [DISCOVERED],
       list_peers: async () => savedPeers,
       request_peer_access: requestAccess,
       wait_for_peer_access: waitForAccess,
@@ -862,7 +892,7 @@ describe("home workspace", () => {
         username: "admin",
         mustChangePassword: false,
       }),
-      scan_lan: async () => [DISCOVERED],
+      discovered_peers: async () => [DISCOVERED],
       list_peers: async () => savedPeers,
       wait_for_peer_access: waitForAccess,
     });
@@ -903,7 +933,7 @@ describe("home workspace", () => {
         username: "admin",
         mustChangePassword: false,
       }),
-      scan_lan: async () => [DISCOVERED],
+      discovered_peers: async () => [DISCOVERED],
       list_peers: async () => [],
       wait_for_peer_access: waitForAccess,
       cancel_peer_access: cancelAccess,
@@ -922,6 +952,31 @@ describe("home workspace", () => {
       requestId: "request-1",
     });
     expect(wrapper.text()).toContain("已取消访问申请。");
+
+    wrapper.unmount();
+  });
+
+  it("adds and removes LAN servers from passive discovery events", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    const wrapper = await mountReady({
+      admin_session: async () => ({
+        username: "admin",
+        mustChangePassword: false,
+      }),
+      list_peers: async () => [],
+    });
+    await flushPromises();
+
+    const publish = eventHandlers.get("app://discovered-peers");
+    expect(typeof publish).toBe("function");
+
+    publish({ payload: [DISCOVERED] });
+    await flushPromises();
+    expect(wrapper.text()).toContain("Lab");
+
+    publish({ payload: [] });
+    await flushPromises();
+    expect(wrapper.text()).not.toContain("Lab");
 
     wrapper.unmount();
   });
@@ -1985,6 +2040,47 @@ describe("admin session restore", () => {
     expect(wrapper.text()).toContain("局域网中的服务器");
 
     wrapper.unmount();
+  });
+
+  it("keeps the open server page after a webview reload", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    const overrides = {
+      admin_session: async () => ({
+        username: "admin",
+        mustChangePassword: false,
+      }),
+      list_peers: async () => [PEER],
+    };
+    const wrapper = await mountReady(overrides);
+    await wrapper.find("button.server-row__main").trigger("click");
+    await flushPromises();
+
+    expect(window.location.hash).toBe("#/peer/peer-1");
+    expect(wrapper.find(".peer-browser").exists()).toBe(true);
+    wrapper.unmount();
+
+    const restored = await mountReady(overrides);
+    expect(restored.find(".peer-browser").exists()).toBe(true);
+    restored.unmount();
+  });
+
+  it("keeps the selected settings tab after a webview reload", async () => {
+    const wrapper = await mountReady();
+    await signIn(wrapper);
+    await clickButton(wrapper, "客户端");
+
+    expect(window.location.hash).toBe("#/settings/clients");
+    expect(wrapper.find("#pane-clients").exists()).toBe(true);
+    wrapper.unmount();
+
+    const restored = await mountReady({
+      admin_session: async () => ({
+        username: "admin",
+        mustChangePassword: false,
+      }),
+    });
+    expect(restored.find("#pane-clients").exists()).toBe(true);
+    restored.unmount();
   });
 
   it("starts on Home for a returning admin after the first login", async () => {

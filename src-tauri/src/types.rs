@@ -143,8 +143,14 @@ pub const AUTHORIZATION_PROTOCOL: &str = "peerdav-authorization/1";
 pub const CLIENT_ID_HEADER: &str = "x-peerdav-client-id";
 pub const MIN_CLIENT_ID_CHARS: usize = 16;
 pub const MAX_CLIENT_ID_CHARS: usize = 64;
-/// Backend interval for checking saved peers against their server bindings.
+/// Default interval for checking saved peers against their server bindings.
+/// The same request doubles as the lightweight reachability probe for servers
+/// that are online or have just announced themselves over UDP.
 pub const PEER_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+/// How often saved peers are matched against passive announcements. This only
+/// reads the in-memory discovery snapshot and the saved-peer rows; it never
+/// performs network requests.
+pub const PEER_PRESENCE_INTERVAL: Duration = Duration::from_secs(2);
 pub const MIN_ACCESS_REQUEST_ID_CHARS: usize = 16;
 pub const MAX_ACCESS_REQUEST_ID_CHARS: usize = 128;
 /// How long an approved code waits for the client to claim it.
@@ -179,6 +185,10 @@ pub const PENDING_CANCELED_EVENT: &str = "app://pending-canceled";
 pub const TRANSFER_PROGRESS_EVENT: &str = "app://transfer-progress";
 /// Event emitted when a saved peer is removed because its server revoked it.
 pub const PEER_REVOKED_EVENT: &str = "app://peer-revoked";
+/// Event emitted when a saved server's reachable state changes.
+pub const PEER_STATUS_EVENT: &str = "app://peer-status";
+/// Event emitted with the current passive LAN discovery snapshot.
+pub const DISCOVERED_PEERS_EVENT: &str = "app://discovered-peers";
 /// Event emitted when the user asks to quit from the tray menu.
 pub const QUIT_REQUEST_EVENT: &str = "app://quit-request";
 /// Label of the main application window.
@@ -328,6 +338,12 @@ pub const MAX_DIRECTORY_DOWNLOAD_FILES: usize = 10_000;
 /// Upper bound for advertised discovery hosts.
 pub const MAX_DISCOVERY_HOSTS: usize = 16;
 pub const DISCOVERY_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(3);
+/// A server that stops announcing disappears from the passive discovery list
+/// after this grace period. Three missed announcements are tolerated before a
+/// server is treated as offline.
+pub const DISCOVERY_PEER_TTL: Duration = Duration::from_secs(10);
+/// How often the passive discovery registry drops expired servers.
+pub const DISCOVERY_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 pub const DISCOVERY_SCAN_TIMEOUT: Duration = Duration::from_millis(1200);
 pub const DISCOVERY_RECV_BUFFER: usize = 8 * 1024;
 /// Timeout applied to every peer HTTP request.
@@ -336,7 +352,7 @@ pub const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MAX_AUTHORIZATION_CODE_CHARS: usize = 512;
 
 /// One server seen on the LAN through UDP discovery.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredPeer {
     pub server_id: String,
@@ -375,6 +391,14 @@ pub struct PeerInfo {
     pub url: String,
     pub online: bool,
     pub shares: Vec<PeerShare>,
+}
+
+/// Reachability change for one saved server.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerStatus {
+    pub id: String,
+    pub online: bool,
 }
 
 /// Result of asking a server to record this client as pending.

@@ -46,8 +46,7 @@ const shareCanDelete = ref(false);
 const editingShareId = ref("");
 const showShareForm = ref(false);
 
-const lanServers = ref([]);
-const lanScanned = ref(false);
+const lanServers = computed(() => app.discovered);
 const manualOpen = ref(false);
 const peerUrl = ref("");
 const peerHealth = ref({});
@@ -319,13 +318,6 @@ async function revokeAuthorization(authorization) {
   });
 }
 
-async function scanLan() {
-  await run(async () => {
-    lanServers.value = await app.invoke("scan_lan");
-    lanScanned.value = true;
-  });
-}
-
 async function requestPeerAccess(url = peerUrl.value) {
   const target = String(url ?? "").trim();
   if (!target || peerWaiting.value) return;
@@ -511,7 +503,7 @@ async function loadInitialData() {
         :class="{ 'is-active': app.settingsTab === tab.name }"
         :aria-selected="app.settingsTab === tab.name"
         :aria-controls="`pane-${tab.name}`"
-        @click="app.settingsTab = tab.name"
+        @click="app.selectSettingsTab(tab.name)"
       >
         {{ t(tab.label) }}
       </button>
@@ -902,28 +894,20 @@ async function loadInitialData() {
                     <p class="hint">{{ t("client.addHint") }}</p>
                   </div>
                   <div class="actions">
-                    <el-button
-                      type="primary"
-                      plain
-                      :loading="busy"
-                      :disabled="busy || peerWaiting"
-                      @click="scanLan"
-                    >
-                      {{ t("client.scan") }}
-                    </el-button>
                     <el-button plain @click="manualOpen = !manualOpen">
                       {{ t("client.manual") }}
                     </el-button>
                   </div>
                 </div>
 
-                <p v-if="lanScanned" class="hint">
+                <p v-if="lanServers.length" class="hint">
                   {{
-                    lanServers.length
-                      ? t("client.scanFound", { count: lanServers.length })
-                      : t("client.scanEmpty")
+                    t("client.discoveredCount", {
+                      count: lanServers.length,
+                    })
                   }}
                 </p>
+                <p v-else class="hint">{{ t("client.discoveredEmpty") }}</p>
 
                 <ul v-if="lanServers.length" class="list">
                   <li v-for="server in lanServers" :key="server.serverId">
@@ -1008,7 +992,7 @@ async function loadInitialData() {
                     <div class="actions">
                       <el-button
                         type="primary"
-                        :disabled="busy"
+                        :disabled="busy || !peer.online"
                         @click="app.openPeer(peer)"
                       >
                         {{ t("client.open") }}
