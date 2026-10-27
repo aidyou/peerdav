@@ -137,11 +137,14 @@ const activePeer = computed(
       : null),
 );
 
-function setTransferProgress(payload) {
+function setTransferProgress(payload, register = false) {
   if (!payload?.transferId) return;
+  if (!register && payload.direction === "upload" && !(payload.transferId in transfers.value)) {
+    return;
+  }
   transfers.value = {
     ...transfers.value,
-    [payload.transferId]: payload,
+    [payload.transferId]: { ...payload, updatedAt: Date.now() },
   };
 }
 
@@ -782,7 +785,14 @@ provide(
 </script>
 
 <template>
-  <div class="window-frame" :class="{ 'is-maximized': isMaximized }">
+  <div
+    class="window-frame"
+    :class="{ 'is-maximized': isMaximized }"
+    :style="{
+      '--window-overlay-inset': isMaximized ? '0px' : '1px',
+      '--window-overlay-radius': isMaximized ? '0px' : 'var(--window-inner-radius)',
+    }"
+  >
     <header
       class="titlebar"
       :class="{ 'titlebar--mac': isMacOS, 'titlebar--win': !isMacOS }"
@@ -1028,7 +1038,7 @@ provide(
   position: relative;
   z-index: 20;
   flex: none;
-  height: 42px;
+  height: var(--titlebar-height);
   box-sizing: border-box;
   display: flex;
   align-items: center;
@@ -1298,12 +1308,39 @@ provide(
   background: var(--app-border);
 }
 
+/* Element Plus teleports some overlays to body. Read the live window geometry
+   there too, so every dialog/message box respects chrome and maximization. */
+body:has(.window-frame) > .el-overlay,
+.window-frame .el-overlay {
+  --overlay-inset: var(--window-overlay-inset, 1px);
+  --overlay-radius: var(--window-overlay-radius, var(--window-inner-radius));
+  top: calc(var(--titlebar-height) + var(--overlay-inset));
+  right: var(--overlay-inset);
+  bottom: var(--overlay-inset);
+  left: var(--overlay-inset);
+  height: auto;
+  border-radius: 0 0 var(--overlay-radius) var(--overlay-radius);
+  overflow: hidden;
+  clip-path: inset(0 round 0 0 var(--overlay-radius) var(--overlay-radius));
+}
+
+body:has(.window-frame.is-maximized) > .el-overlay {
+  --window-overlay-inset: 0px;
+  --window-overlay-radius: 0px;
+}
+
+body:has(.window-frame) .el-overlay-dialog {
+  position: absolute;
+  inset: 0;
+}
+
 :root {
   /* Window chrome geometry: the single source of truth for the rounded
      transparent frame. The titlebar carries the inner radius so its
      backdrop-filter layer is clipped by its own corners instead of relying
      on the parent's overflow, which WebKit does not apply to composited
      backdrop-filter layers. */
+  --titlebar-height: 42px;
   --window-radius: 15px;
   --window-inner-radius: calc(var(--window-radius) - 1px);
 

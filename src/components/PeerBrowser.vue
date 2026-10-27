@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, ref, shallowRef, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from "vue";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 
 import FileGlyph from "./FileGlyph.vue";
@@ -60,6 +60,49 @@ const uploadDialogOpen = ref(false);
 const uploadQueue = ref([]);
 const uploadRunning = ref(false);
 const uploadCanceled = ref(false);
+const uploadTransferId = ref("");
+const uploadClock = ref(Date.now());
+let uploadClockTimer;
+let browserDisposed = false;
+watch(uploadRunning, (running) => {
+  clearInterval(uploadClockTimer);
+  if (running) {
+    uploadClockTimer = setInterval(() => { uploadClock.value = Date.now(); }, 500);
+  }
+});
+const currentUpload = computed(() =>
+  uploadQueue.value.find((item) => item.status === "uploading"),
+);
+const uploadTransfer = computed(
+  () => app.transfers?.[uploadTransferId.value] ?? null,
+);
+const uploadPhase = computed(() => uploadTransfer.value?.phase ?? "hashing");
+const uploadFilePercent = computed(() => {
+  const progress = uploadTransfer.value;
+  if (!progress?.total) return 0;
+  return Math.min(100, Math.floor((progress.transferred / progress.total) * 100));
+});
+const uploadSpeed = computed(() => {
+  const progress = uploadTransfer.value;
+  if (
+    uploadPhase.value !== "uploading" ||
+    !progress?.updatedAt ||
+    uploadClock.value - progress.updatedAt > 2000
+  ) return 0;
+  return progress.bytesPerSecond || 0;
+});
+
+onBeforeUnmount(() => {
+  browserDisposed = true;
+  uploadCanceled.value = true;
+  clearInterval(uploadClockTimer);
+  if (uploadTransferId.value && uploadRunning.value) {
+    void app.invoke("cancel_peer_upload", {
+      transferId: uploadTransferId.value,
+    }).catch(app.handleFailure);
+  }
+  app.clearTransfer?.(uploadTransferId.value);
+});
 
 const activeShare = computed(
   () => peerShares.value.find((share) => share.id === activeShareId.value) ?? null,
@@ -154,7 +197,13 @@ const uploadFinished = computed(
 
 const uploadPercent = computed(() => {
   if (!uploadQueue.value.length) return 0;
-  return Math.round((uploadFinished.value / uploadQueue.value.length) * 100);
+  const total = uploadQueue.value.reduce((sum, item) => sum + (Number(item.size) || 0), 0);
+  const finished = uploadQueue.value.filter((item) => item.status === "done")
+    .reduce((sum, item) => sum + (Number(item.size) || 0), 0);
+  const current = currentUpload.value && ["uploading", "committing", "completed"].includes(uploadPhase.value)
+    ? Number(uploadTransfer.value?.transferred) || 0 : 0;
+  if (uploadQueue.value.every((item) => item.status === "done")) return 100;
+  return total ? Math.min(99, Math.floor(((finished + current) / total) * 100)) : 0;
 });
 
 const uploadSummary = computed(() =>
@@ -738,13 +787,30 @@ function markRemainingCanceled() {
 }
 
 async function uploadQueueItem(item, remoteDir, conflict) {
-  return app.invoke("upload_peer_file", {
-    peerId: props.peer.id,
-    shareId: activeShareId.value,
-    localPath: item.localPath,
-    remoteDir,
-    conflict,
-  });
+  const transferId = await app.invoke("begin_peer_upload");
+  uploadTransferId.value = transferId;
+  app.setTransferProgress({
+    transferId,
+    direction: "upload",
+    phase: "hashing",
+    transferred: 0,
+    total: item.size,
+    bytesPerSecond: 0,
+  }, true);
+  try {
+    if (uploadCanceled.value) await app.invoke("cancel_peer_upload", { transferId });
+    return await app.invoke("upload_peer_file", {
+      peerId: props.peer.id,
+      shareId: activeShareId.value,
+      localPath: item.localPath,
+      remoteDir,
+      conflict,
+      transferId,
+    });
+  } finally {
+    app.clearTransfer?.(transferId);
+    if (uploadTransferId.value === transferId) uploadTransferId.value = "";
+  }
 }
 
 async function processUploadQueue() {
@@ -764,6 +830,11 @@ async function processUploadQueue() {
       completed += 1;
     } catch (error) {
       const normalized = normalizeAppError(error);
+      if (normalized.code === "TRANSFER_CANCELED") {
+        item.status = "canceled";
+        markRemainingCanceled();
+        break;
+      }
       if (normalized.code !== "TRANSFER_CONFLICT") {
         item.status = "error";
         item.error = normalized.message;
@@ -793,6 +864,11 @@ async function processUploadQueue() {
         item.status = "done";
         completed += 1;
       } catch (retryError) {
+        if (normalizeAppError(retryError).code === "TRANSFER_CANCELED") {
+          item.status = "canceled";
+          markRemainingCanceled();
+          break;
+        }
         item.status = "error";
         item.error = normalizeAppError(retryError).message;
         markRemainingCanceled();
@@ -802,19 +878,32 @@ async function processUploadQueue() {
     }
   }
   uploadRunning.value = false;
+  if (browserDisposed) return;
   await loadPath(peerPath.value);
   if (!uploadCanceled.value && completed > 0) {
     app.setNotice("peer.uploadFinished", { count: completed });
   }
 }
 
-function cancelUploadQueue() {
+async function cancelUploadQueue() {
   if (!uploadRunning.value || uploadCanceled.value) return;
   uploadCanceled.value = true;
   markRemainingCanceled();
+  const transferId = uploadTransferId.value;
+  if (!transferId) return;
+  try {
+    await app.invoke("cancel_peer_upload", { transferId });
+  } catch (error) {
+    uploadCanceled.value = false;
+    app.handleFailure(error);
+  }
 }
 
 function uploadStatusText(item) {
+  if (item.status === "uploading") {
+    return t({ hashing: "peer.uploadHashing", committing: "peer.uploadCommitting",
+      completed: "peer.uploadCommitting", uploading: "peer.uploadStatusUploading" }[uploadPhase.value]);
+  }
   const key = {
     pending: "peer.uploadStatusPending",
     uploading: "peer.uploadStatusUploading",
@@ -1542,6 +1631,27 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
       <div class="transfer-dialog">
         <p class="hint">{{ uploadSummary }}</p>
         <el-progress :percentage="uploadPercent" :stroke-width="8" />
+        <div v-if="currentUpload" class="upload-current">
+          <strong>{{ baseName(currentUpload.relativePath) }}</strong>
+          <p class="hint" role="status">
+            {{ uploadStatusText(currentUpload) }}
+            <template v-if="uploadTransfer && uploadPhase !== 'committing' && uploadPhase !== 'completed'">
+              · {{ uploadFilePercent }}%
+            </template>
+          </p>
+          <el-progress
+            :percentage="uploadFilePercent"
+            :indeterminate="!uploadTransfer || uploadPhase === 'committing' || uploadPhase === 'completed'"
+            :show-text="false"
+            :aria-label="baseName(currentUpload.relativePath)"
+            :stroke-width="6"
+          />
+          <p v-if="uploadPhase === 'committing' || uploadPhase === 'completed'" class="hint">{{ t("peer.uploadCommitHint") }}</p>
+          <p v-if="uploadTransfer" class="hint upload-current__metrics">
+            {{ formatBytes(uploadTransfer.transferred) }} / {{ formatBytes(uploadTransfer.total) }}
+            <span v-if="uploadPhase === 'uploading'"> · {{ formatBytes(uploadSpeed) }}/s</span>
+          </p>
+        </div>
         <ul class="transfer-queue">
           <li
             v-for="(item, index) in uploadQueue"
@@ -2782,6 +2892,18 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   flex-direction: column;
   gap: 12px;
 }
+
+.upload-current {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--app-border);
+  border-radius: 10px;
+  overflow-wrap: anywhere;
+}
+
+.upload-current p { margin: 0; }
+.upload-current__metrics { font-variant-numeric: tabular-nums; }
 
 .transfer-dialog__name {
   margin: 0;

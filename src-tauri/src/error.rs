@@ -183,6 +183,9 @@ pub enum DomainError {
     #[error("invalid remote path: {detail}")]
     RemotePathInvalid { detail: String },
 
+    #[error("the file transfer was canceled")]
+    TransferCanceled,
+
     #[error("file size {size} exceeds the {limit} byte limit")]
     TransferTooLarge { size: u64, limit: u64 },
 
@@ -322,6 +325,7 @@ fn error_code(error: &DomainError) -> &'static str {
         DomainError::PeerNotFound { .. } => "PEER_NOT_FOUND",
         DomainError::PeerProtocol { .. } => "PEER_PROTOCOL_ERROR",
         DomainError::RemotePathInvalid { .. } => "PEER_INVALID_PATH",
+        DomainError::TransferCanceled => "TRANSFER_CANCELED",
         DomainError::TransferTooLarge { .. } => "TRANSFER_TOO_LARGE",
         DomainError::PreviewTooLarge { .. } => "PEER_PREVIEW_TOO_LARGE",
         DomainError::PreviewTooManyLines { .. } => "PEER_PREVIEW_TOO_MANY_LINES",
@@ -478,6 +482,9 @@ fn user_message(error: &DomainError) -> String {
         }
         DomainError::RemotePathInvalid { .. } => {
             "远程路径无效 / The remote path is invalid.".to_owned()
+        }
+        DomainError::TransferCanceled => {
+            "已取消文件传输 / The file transfer was canceled.".to_owned()
         }
         DomainError::TransferTooLarge { .. } => {
             "文件超过大小限制 / The file exceeds the size limit.".to_owned()

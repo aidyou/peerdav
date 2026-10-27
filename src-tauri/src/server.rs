@@ -136,6 +136,7 @@ impl DiscoveryBinding {
 }
 
 struct Gate {
+    uploads: crate::types::UploadSessions,
     vault: Arc<Vault>,
     shares: Arc<std::sync::RwLock<ShareMap>>,
     authorizations: Arc<std::sync::RwLock<Vec<AuthEntry>>>,
@@ -340,6 +341,7 @@ impl ServerController {
             .build_handler();
 
         let gate = Arc::new(Gate {
+            uploads: tokio::sync::Mutex::new(HashMap::new()),
             vault: Arc::clone(&self.vault),
             shares: Arc::clone(&self.shares),
             authorizations: Arc::clone(&self.authorizations),
@@ -1186,10 +1188,12 @@ async fn handle_request(
             &relative,
             &identity,
             &gate.vault.transfer_directory(),
+            &gate.uploads,
         )
         .await
         {
             Ok(status) => empty_response(status),
+            Err(DomainError::TransferCanceled) => empty_response(StatusCode::CONFLICT),
             Err(error) => {
                 publish_error(gate.events.as_ref(), &error);
                 empty_response(StatusCode::BAD_REQUEST)

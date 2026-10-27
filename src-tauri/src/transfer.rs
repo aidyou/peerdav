@@ -3,7 +3,11 @@
 
 use crate::error::DomainError;
 use crate::peer::TransferProgressCallback;
-use crate::types::{ConflictPolicy, TRANSFER_MAX_WORKERS, TRANSFER_PART_BYTES};
+use crate::types::{
+    ConflictPolicy, PEER_TRANSFER_REQUEST_TIMEOUT, PEER_UPLOAD_CANCEL_TIMEOUT,
+    PEER_UPLOAD_COMMIT_TIMEOUT, TRANSFER_MAX_WORKERS, TRANSFER_PART_BYTES, UploadPhase,
+    UploadProgressCallback,
+};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use reqwest_dav::Client;
 use sha2::{Digest, Sha256};
@@ -158,6 +162,7 @@ pub(crate) async fn download(
                         .start_request(reqwest::Method::GET, remote)
                         .await
                         .map_err(dav)?
+                        .timeout(PEER_TRANSFER_REQUEST_TIMEOUT)
                         .header(
                             reqwest::header::RANGE,
                             format!("bytes={start}-{}", start + expected - 1),
@@ -248,105 +253,346 @@ pub(crate) async fn upload(
     remote: &str,
     local: &Path,
     size: u64,
+    progress: Option<UploadProgressCallback>,
+    cancellation: Option<(String, tokio::sync::watch::Receiver<bool>)>,
 ) -> Result<(), DomainError> {
+    let (keep_cancel, default_cancel) = tokio::sync::watch::channel(false);
+    let (session_id, mut cancel) = cancellation.unwrap_or_else(|| {
+        let mut id = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+        (hex::encode(id), default_cancel)
+    });
+    let _keep_cancel = keep_cancel;
+    let report = |phase, bytes, sent| {
+        if let Some(callback) = &progress {
+            callback(phase, bytes, size, sent);
+        }
+    };
+    report(UploadPhase::Hashing, 0, 0);
+    let mut hashed = 0;
     let mut input = tokio::fs::File::open(local)
         .await
         .map_err(|e| io(local, e))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
-        let len = input.read(&mut buffer).await.map_err(|e| io(local, e))?;
+        if *cancel.borrow() {
+            return Err(DomainError::TransferCanceled);
+        }
+        let len = tokio::select! {
+            biased;
+            _ = cancel.changed() => return Err(DomainError::TransferCanceled),
+            result = input.read(&mut buffer) => result.map_err(|e| io(local, e))?,
+        };
         if len == 0 {
             break;
         }
         hasher.update(&buffer[..len]);
+        hashed += len as u64;
+        report(UploadPhase::Hashing, hashed, 0);
     }
     let digest = hex::encode(hasher.finalize());
+    report(UploadPhase::Uploading, 0, 0);
+    let completed = Arc::new(AtomicU64::new(0));
+    let sent = Arc::new(AtomicU64::new(0));
     let count = size.div_ceil(TRANSFER_PART_BYTES).max(1);
-    stream::iter(0..count)
-        .map(|index| {
-            let client = client.clone();
-            let digest = digest.clone();
-            async move {
-                let request = |method| async {
-                    client
-                        .start_request(method, remote)
-                        .await
-                        .map_err(dav)
-                        .map(|r| {
-                            r.header("x-peerdav-transfer", &digest)
-                                .header("x-peerdav-size", size)
-                                .header("x-peerdav-part", index)
-                        })
-                };
-                let mut input = tokio::fs::File::open(local)
-                    .await
-                    .map_err(|e| io(local, e))?;
-                use tokio::io::AsyncSeekExt;
-                input
-                    .seek(std::io::SeekFrom::Start(index * TRANSFER_PART_BYTES))
-                    .await
-                    .map_err(|e| io(local, e))?;
-                let length = size
-                    .saturating_sub(index * TRANSFER_PART_BYTES)
-                    .min(TRANSFER_PART_BYTES) as usize;
-                let mut bytes = vec![0u8; length];
-                input
-                    .read_exact(&mut bytes)
-                    .await
-                    .map_err(|e| io(local, e))?;
-                let part_hash = hex::encode(Sha256::digest(&bytes));
-                let existing = request(reqwest::Method::HEAD)
-                    .await?
-                    .header("x-peerdav-part-sha256", &part_hash)
-                    .send()
-                    .await
-                    .map_err(transport)?;
-                if existing.status() == reqwest::StatusCode::NO_CONTENT {
-                    return Ok::<_, DomainError>(());
-                }
-                let response = request(reqwest::Method::PATCH)
-                    .await?
-                    .header("x-peerdav-part-sha256", &part_hash)
-                    .body(bytes)
-                    .send()
-                    .await
-                    .map_err(transport)?;
-                if !response.status().is_success() {
-                    return Err(protocol(format!(
-                        "upload part returned {}",
-                        response.status()
-                    )));
-                }
-                Ok(())
+    let outcome = {
+        let transferring = async {
+            stream::iter(0..count)
+                .map(|index| {
+                    let client = client.clone();
+                    let digest = digest.clone();
+                    let session_id = session_id.clone();
+                    let completed = Arc::clone(&completed);
+                    let sent = Arc::clone(&sent);
+                    let progress = progress.clone();
+                    async move {
+                        let request = |method| async {
+                            client
+                                .start_request(method, remote)
+                                .await
+                                .map_err(dav)
+                                .map(|r| {
+                                    r.timeout(PEER_TRANSFER_REQUEST_TIMEOUT)
+                                        .header("x-peerdav-session", &session_id)
+                                        .header("x-peerdav-transfer", &digest)
+                                        .header("x-peerdav-size", size)
+                                        .header("x-peerdav-part", index)
+                                })
+                        };
+                        let mut input = tokio::fs::File::open(local)
+                            .await
+                            .map_err(|e| io(local, e))?;
+                        use tokio::io::AsyncSeekExt;
+                        input
+                            .seek(std::io::SeekFrom::Start(index * TRANSFER_PART_BYTES))
+                            .await
+                            .map_err(|e| io(local, e))?;
+                        let length = size
+                            .saturating_sub(index * TRANSFER_PART_BYTES)
+                            .min(TRANSFER_PART_BYTES) as usize;
+                        let mut bytes = vec![0u8; length];
+                        input
+                            .read_exact(&mut bytes)
+                            .await
+                            .map_err(|e| io(local, e))?;
+                        let part_hash = hex::encode(Sha256::digest(&bytes));
+                        let existing = request(reqwest::Method::HEAD)
+                            .await?
+                            .header("x-peerdav-part-sha256", &part_hash)
+                            .send()
+                            .await
+                            .map_err(transport)?;
+                        if existing.status() == reqwest::StatusCode::NO_CONTENT {
+                            let bytes = completed.fetch_add(length as u64, Ordering::Relaxed)
+                                + length as u64;
+                            if let Some(progress) = &progress {
+                                progress(
+                                    UploadPhase::Uploading,
+                                    bytes,
+                                    size,
+                                    sent.load(Ordering::Relaxed),
+                                );
+                            }
+                            return Ok::<_, DomainError>(());
+                        }
+                        let completed_for_body = Arc::clone(&completed);
+                        let sent_for_body = Arc::clone(&sent);
+                        let progress_for_body = progress.clone();
+                        let body = stream::unfold(
+                            (bytes::Bytes::from(bytes), 0usize),
+                            move |(bytes, offset)| {
+                                let completed = Arc::clone(&completed_for_body);
+                                let sent = Arc::clone(&sent_for_body);
+                                let progress = progress_for_body.clone();
+                                async move {
+                                    if offset == bytes.len() {
+                                        return None;
+                                    }
+                                    let end = (offset + 64 * 1024).min(bytes.len());
+                                    let chunk = bytes.slice(offset..end);
+                                    let transferred = completed
+                                        .fetch_add(chunk.len() as u64, Ordering::Relaxed)
+                                        + chunk.len() as u64;
+                                    let network_bytes = sent
+                                        .fetch_add(chunk.len() as u64, Ordering::Relaxed)
+                                        + chunk.len() as u64;
+                                    if let Some(progress) = progress {
+                                        progress(
+                                            UploadPhase::Uploading,
+                                            transferred,
+                                            size,
+                                            network_bytes,
+                                        );
+                                    }
+                                    Some((Ok::<_, std::io::Error>(chunk), (bytes, end)))
+                                }
+                            },
+                        );
+                        let response = request(reqwest::Method::PATCH)
+                            .await?
+                            .header("x-peerdav-part-sha256", &part_hash)
+                            .header(reqwest::header::CONTENT_LENGTH, length)
+                            .body(reqwest::Body::wrap_stream(body))
+                            .send()
+                            .await
+                            .map_err(transport)?;
+                        if !response.status().is_success() {
+                            return Err(protocol(format!(
+                                "upload part returned {}",
+                                response.status()
+                            )));
+                        }
+                        Ok(())
+                    }
+                })
+                .buffer_unordered(workers(size))
+                .try_collect::<Vec<_>>()
+                .await?;
+            report(UploadPhase::Committing, size, sent.load(Ordering::Relaxed));
+            let response = client
+                .start_request(reqwest::Method::PUT, remote)
+                .await
+                .map_err(dav)?
+                .timeout(PEER_UPLOAD_COMMIT_TIMEOUT)
+                .header("x-peerdav-session", &session_id)
+                .header("x-peerdav-transfer", &digest)
+                .header("x-peerdav-size", size)
+                .header("x-peerdav-commit", "1")
+                .body(Vec::new())
+                .send()
+                .await
+                .map_err(transport)?;
+            if !response.status().is_success() {
+                return Err(protocol(format!(
+                    "upload commit returned {}",
+                    response.status()
+                )));
             }
-        })
-        .buffer_unordered(workers(size))
-        .try_collect::<Vec<_>>()
-        .await?;
-    let response = client
-        .start_request(reqwest::Method::PUT, remote)
-        .await
-        .map_err(dav)?
-        .header("x-peerdav-transfer", digest)
-        .header("x-peerdav-size", size)
-        .header("x-peerdav-commit", "1")
-        .body(Vec::new())
-        .send()
-        .await
-        .map_err(transport)?;
-    if !response.status().is_success() {
-        return Err(protocol(format!(
-            "upload commit returned {}",
-            response.status()
-        )));
+            Ok::<_, DomainError>(())
+        };
+        tokio::pin!(transferring);
+        if *cancel.borrow() {
+            Err(DomainError::TransferCanceled)
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancel.changed() => Err(DomainError::TransferCanceled),
+                result = &mut transferring => result,
+            }
+        }
+    }; // Drop all active request bodies before asking the server to clean up.
+    if matches!(outcome, Err(DomainError::TransferCanceled)) {
+        let response = client
+            .start_request(reqwest::Method::DELETE, remote)
+            .await
+            .map_err(dav)?
+            .timeout(PEER_UPLOAD_CANCEL_TIMEOUT)
+            .header("x-peerdav-transfer", &digest)
+            .header("x-peerdav-session", &session_id)
+            .header("x-peerdav-size", size)
+            .header("x-peerdav-cancel", "1")
+            .send()
+            .await
+            .map_err(transport)?;
+        match response.status() {
+            reqwest::StatusCode::OK => {} // Atomic replacement won the race.
+            reqwest::StatusCode::NO_CONTENT => return Err(DomainError::TransferCanceled),
+            status => return Err(protocol(format!("upload cancellation returned {status}"))),
+        }
+    } else {
+        outcome?;
     }
+    report(UploadPhase::Completed, size, sent.load(Ordering::Relaxed));
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn upload_requests_override_the_ordinary_client_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            for (method, status) in [("HEAD", 404), ("PATCH", 204), ("PUT", 201)] {
+                let (mut socket, _) = listener.accept().await.expect("connection");
+                let mut headers = Vec::new();
+                loop {
+                    let byte = socket.read_u8().await.expect("request header");
+                    headers.push(byte);
+                    if headers.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                assert!(headers.starts_with(method.as_bytes()));
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                socket
+                    .write_all(
+                        format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .as_bytes(),
+                    )
+                    .await
+                    .expect("response");
+            }
+        });
+        let agent = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(1))
+            .build()
+            .expect("agent");
+        let client = reqwest_dav::ClientBuilder::new()
+            .set_agent(agent)
+            .set_host(format!("http://{address}"))
+            .build()
+            .expect("DAV client");
+        let source = tempfile::NamedTempFile::new().expect("empty source");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            upload(&client, "/empty.bin", source.path(), 0, None, None).await?;
+            server.await.expect("server task");
+            Ok::<_, DomainError>(())
+        })
+        .await;
+        assert!(matches!(result, Ok(Ok(()))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_a_stalled_part_request_and_confirms_remote_cleanup() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stalled, _) = listener.accept().await.expect("part HEAD");
+            let mut headers = Vec::new();
+            loop {
+                headers.push(stalled.read_u8().await.expect("header"));
+                if headers.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(headers.starts_with(b"HEAD"));
+            started.send(()).expect("started");
+            // Deliberately never respond to the HEAD. Cancellation must open
+            // a separate authenticated request instead of waiting for it.
+            let (mut cleanup, _) = listener.accept().await.expect("cleanup");
+            let mut headers = Vec::new();
+            loop {
+                headers.push(cleanup.read_u8().await.expect("cancel header"));
+                if headers.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(headers.starts_with(b"DELETE"));
+            let headers = String::from_utf8(headers)
+                .expect("headers")
+                .to_ascii_lowercase();
+            assert!(headers.contains("x-peerdav-cancel: 1"));
+            assert!(headers.contains("x-peerdav-session: aa"));
+            cleanup
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("cleanup response");
+        });
+        let agent = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("agent");
+        let client = reqwest_dav::ClientBuilder::new()
+            .set_agent(agent)
+            .set_host(format!("http://{address}"))
+            .build()
+            .expect("client");
+        let source = tempfile::NamedTempFile::new().expect("empty file");
+        let (cancel, receiver) = tokio::sync::watch::channel(false);
+        let uploading = upload(
+            &client,
+            "/file",
+            source.path(),
+            0,
+            None,
+            Some(("aa".into(), receiver)),
+        );
+        let canceling = async {
+            observed.await.expect("request started");
+            cancel.send_replace(true);
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let (result, ()) = tokio::join!(uploading, canceling);
+            server.await.expect("server");
+            result
+        })
+        .await
+        .expect("cancel must not wait for request timeout");
+        assert!(matches!(result, Err(DomainError::TransferCanceled)));
+    }
+
     #[test]
     fn concurrency_tracks_ten_mebibyte_boundaries_and_is_capped() {
         for (bytes, expected) in [

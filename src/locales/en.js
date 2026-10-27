@@ -3,7 +3,7 @@ export default {
   "app.eyebrow": "PeerDav · Local encrypted vault",
   "app.title": "Encrypted Vault",
   "app.lede": "A local key file encrypts sensitive records; secrets are stored as ciphertext in SQLite.",
-  "app.footer": "Access and manage files on other computers just like local folders.",
+  "app.footer": "With PeerDav, securely access and manage files on other computers just like working in a local folder.",
 
   "language.label": "Interface language",
   "language.zh": "简体中文",
@@ -337,6 +337,9 @@ export default {
   "peer.cancelingUpload": "Canceling…",
   "peer.uploadStatusPending": "Waiting",
   "peer.uploadStatusUploading": "Uploading…",
+  "peer.uploadHashing": "Checking file…",
+  "peer.uploadCommitting": "Assembling and saving…",
+  "peer.uploadCommitHint": "Transfer finished. The server is assembling and saving the file.",
   "peer.uploadStatusDone": "Done",
   "peer.uploadStatusSkipped": "Skipped",
   "peer.uploadStatusCanceled": "Canceled",

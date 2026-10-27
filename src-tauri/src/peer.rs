@@ -338,6 +338,7 @@ pub struct PeerManager {
     limits: PeerLimits,
     edits: Mutex<HashMap<String, ExternalEdit>>,
     access_cancellations: Mutex<HashSet<String>>,
+    upload_cancellations: Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
     events: Arc<dyn PeerEvents>,
     background: std::sync::Mutex<Option<RunningPeerBackground>>,
     discovery: std::sync::Mutex<Option<Arc<DiscoveryListener>>>,
@@ -431,6 +432,7 @@ impl PeerManager {
             limits,
             edits: Mutex::new(HashMap::new()),
             access_cancellations: Mutex::new(HashSet::new()),
+            upload_cancellations: Mutex::new(HashMap::new()),
             events,
             background: std::sync::Mutex::new(None),
             discovery: std::sync::Mutex::new(None),
@@ -2013,6 +2015,79 @@ impl PeerManager {
         .await
     }
 
+    pub async fn begin_upload(&self) -> String {
+        let id = random_hex(16);
+        let (sender, _) = tokio::sync::watch::channel(false);
+        self.upload_cancellations
+            .lock()
+            .await
+            .insert(id.clone(), sender);
+        id
+    }
+
+    pub async fn cancel_upload(&self, transfer_id: &str) {
+        if let Some(sender) = self.upload_cancellations.lock().await.get(transfer_id) {
+            sender.send_replace(true);
+        }
+    }
+
+    pub async fn upload_with_progress(
+        &self,
+        peer_id: &str,
+        share_id: &str,
+        local_path: &str,
+        remote_dir: &str,
+        conflict: ConflictPolicy,
+        transfer_id: &str,
+        progress: crate::types::UploadProgressCallback,
+    ) -> Result<TransferResult, DomainError> {
+        let mut cancel = self
+            .upload_cancellations
+            .lock()
+            .await
+            .get(transfer_id)
+            .map(|sender| sender.subscribe())
+            .ok_or_else(|| DomainError::PeerProtocol {
+                detail: "unknown upload transfer".into(),
+            })?;
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started_for_progress = Arc::clone(&started);
+        let tracked_progress: crate::types::UploadProgressCallback =
+            Arc::new(move |phase, bytes, total, sent| {
+                started_for_progress.store(true, std::sync::atomic::Ordering::SeqCst);
+                progress(phase, bytes, total, sent);
+            });
+        let result = if *cancel.borrow() {
+            Err(DomainError::TransferCanceled)
+        } else {
+            let uploading = self.upload_inner(
+                peer_id,
+                share_id,
+                local_path,
+                remote_dir,
+                conflict,
+                Some(tracked_progress),
+                Some((transfer_id.to_owned(), cancel.clone())),
+            );
+            tokio::pin!(uploading);
+            tokio::select! {
+                biased;
+                _ = cancel.changed() => {
+                    if started.load(std::sync::atomic::Ordering::SeqCst) {
+                        // The transfer owns remote cancellation and cleanup once
+                        // it starts. Do not drop its cancellation handshake.
+                        uploading.await
+                    } else {
+                        Err(DomainError::TransferCanceled)
+                    }
+                },
+                result = &mut uploading => result,
+            }
+        };
+        self.upload_cancellations.lock().await.remove(transfer_id);
+        result
+    }
+
     pub async fn upload(
         &self,
         peer_id: &str,
@@ -2020,6 +2095,22 @@ impl PeerManager {
         local_path: &str,
         remote_dir: &str,
         conflict: ConflictPolicy,
+    ) -> Result<TransferResult, DomainError> {
+        self.upload_inner(
+            peer_id, share_id, local_path, remote_dir, conflict, None, None,
+        )
+        .await
+    }
+
+    async fn upload_inner(
+        &self,
+        peer_id: &str,
+        share_id: &str,
+        local_path: &str,
+        remote_dir: &str,
+        conflict: ConflictPolicy,
+        progress: Option<crate::types::UploadProgressCallback>,
+        cancellation: Option<(String, tokio::sync::watch::Receiver<bool>)>,
     ) -> Result<TransferResult, DomainError> {
         let (_, client) = self.peer_client(peer_id)?;
         let local = canonical_local_file(local_path).await?;
@@ -2054,7 +2145,7 @@ impl PeerManager {
         )
         .await?;
 
-        crate::transfer::upload(&client, &remote, &local, size).await?;
+        crate::transfer::upload(&client, &remote, &local, size, progress, cancellation).await?;
 
         Ok(TransferResult {
             transferred: true,

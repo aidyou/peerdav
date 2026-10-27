@@ -4,7 +4,7 @@ export default {
   "app.eyebrow": "PeerDav · 本地加密保险箱",
   "app.title": "加密保险箱",
   "app.lede": "密钥文件用于在本机加密敏感记录，秘密仅以密文写入 SQLite。",
-  "app.footer": "像操作本地文件夹一样，访问和管理其他电脑上的文件。",
+  "app.footer": "「邻盘」让你像使用本地文件夹一样，安全地访问和管理其他电脑上的文件。",
 
   "language.label": "界面语言",
   "language.zh": "简体中文",
@@ -337,6 +337,9 @@ export default {
   "peer.cancelingUpload": "正在取消…",
   "peer.uploadStatusPending": "等待",
   "peer.uploadStatusUploading": "上传中…",
+  "peer.uploadHashing": "正在校验文件…",
+  "peer.uploadCommitting": "正在合并并保存…",
+  "peer.uploadCommitHint": "数据已传完，正在服务器上合并并保存。",
   "peer.uploadStatusDone": "已完成",
   "peer.uploadStatusSkipped": "已跳过",
   "peer.uploadStatusCanceled": "已取消",

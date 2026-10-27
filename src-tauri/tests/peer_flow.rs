@@ -1135,6 +1135,90 @@ async fn download_reports_streaming_progress() {
 }
 
 #[tokio::test]
+async fn ten_gibibyte_upload_boundaries_are_enforced_without_large_allocations() {
+    let limit = 10 * 1024 * 1024 * 1024u64;
+    assert_eq!(PeerLimits::default().max_transfer_bytes, limit);
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (peer, code) = harness.connect().await;
+    let client = harness
+        .vault
+        .encrypted_client(harness.vault.fingerprint())
+        .expect("TLS client");
+    let target = format!("{}/share/{}/boundary.bin", harness.url, harness.share_id);
+    // HEAD validates the declared size and final part index without sending
+    // or hashing a 10 GiB payload. A missing valid part returns 404; the
+    // existing server error mapping returns 400 for rejected upload sizes.
+    for (size, status) in [
+        (256 * 1024 * 1024 + 1, reqwest::StatusCode::NOT_FOUND),
+        (limit - 1, reqwest::StatusCode::NOT_FOUND),
+        (limit, reqwest::StatusCode::NOT_FOUND),
+        (limit + 1, reqwest::StatusCode::BAD_REQUEST),
+    ] {
+        let response = client
+            .head(&target)
+            .basic_auth("peerdav", Some(&code))
+            .header("x-peerdav-transfer", "00".repeat(32))
+            .header("x-peerdav-size", size)
+            .header("x-peerdav-part", size.div_ceil(10 * 1024 * 1024) - 1)
+            .send()
+            .await
+            .expect("size boundary response");
+        assert_eq!(response.status(), status, "declared size {size}");
+    }
+    assert!(!harness.share_root.join("boundary.bin").exists());
+    assert!(
+        harness
+            .events
+            .errors
+            .lock()
+            .expect("errors")
+            .iter()
+            .any(|error| error.code == "TRANSFER_TOO_LARGE"),
+        "the server reports the structured size-limit error"
+    );
+
+    // Sparse files exercise the real client checks without transferring data.
+    let source = harness.share_root.join("oversized.bin");
+    std::fs::File::create(&source)
+        .expect("sparse file")
+        .set_len(limit + 1)
+        .expect("sparse length");
+    let error = harness
+        .peers
+        .upload(
+            &peer.id,
+            &harness.share_id,
+            source.to_str().expect("source path"),
+            "/sub",
+            ConflictPolicy::Fail,
+        )
+        .await
+        .expect_err("client must reject oversized upload");
+    assert!(
+        matches!(error, DomainError::TransferTooLarge { size, limit: actual }
+        if size == limit + 1 && actual == limit)
+    );
+    let destination = harness.directory.path().join("oversized-download.bin");
+    let error = harness
+        .peers
+        .download_to(
+            &peer.id,
+            &harness.share_id,
+            "/oversized.bin",
+            destination.to_str().expect("destination path"),
+        )
+        .await
+        .expect_err("client must reject oversized download");
+    assert!(
+        matches!(error, DomainError::TransferTooLarge { size, limit: actual }
+        if size == limit + 1 && actual == limit)
+    );
+    assert!(!destination.exists());
+    std::fs::remove_file(&source).expect("remove sparse file");
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
 async fn transfer_limits_and_symlink_destinations_are_enforced() {
     let limits = PeerLimits {
         max_transfer_bytes: 16,
@@ -1412,6 +1496,158 @@ async fn failed_access_requests_keep_their_reason() {
 
 #[cfg(debug_assertions)]
 #[tokio::test]
+async fn upload_progress_is_incremental_and_cancellation_stops_the_current_file() {
+    use peerdav_lib::UploadPhase;
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (peer, _) = harness.connect().await;
+    let source = harness.directory.path().join("progress.bin");
+    let size = 21 * 1024 * 1024 + 17;
+    std::fs::write(&source, vec![73u8; size]).expect("source");
+    let id = harness.peers.begin_upload().await;
+    let updates = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&updates);
+    harness
+        .peers
+        .upload_with_progress(
+            &peer.id,
+            &harness.share_id,
+            source.to_str().expect("path"),
+            "/",
+            ConflictPolicy::Fail,
+            &id,
+            Arc::new(move |phase, bytes, total, sent| {
+                recorded
+                    .lock()
+                    .expect("updates")
+                    .push((phase, bytes, total, sent))
+            }),
+        )
+        .await
+        .expect("upload");
+    {
+        let updates = updates.lock().expect("updates");
+        assert!(
+            updates
+                .iter()
+                .any(|(phase, bytes, total, _)| *phase == UploadPhase::Hashing
+                    && *bytes > 0
+                    && bytes < total)
+        );
+        assert!(updates.iter().any(
+            |(phase, bytes, total, sent)| *phase == UploadPhase::Uploading
+                && *bytes > 0
+                && bytes < total
+                && *sent > 0
+        ));
+        assert_eq!(
+            updates.last().map(|u| (u.0, u.1)),
+            Some((UploadPhase::Completed, size as u64))
+        );
+    }
+    assert_eq!(
+        std::fs::metadata(harness.share_root.join("progress.bin"))
+            .expect("uploaded")
+            .len(),
+        size as u64
+    );
+
+    // Both hashing and an active request body can be interrupted. Canceling
+    // must not wait for the file to finish or publish a destination.
+    for cancel_phase in [UploadPhase::Hashing, UploadPhase::Uploading] {
+        let id = harness.peers.begin_upload().await;
+        let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let progress = Arc::new(move |phase, bytes, _, _| {
+            if phase == cancel_phase && (phase == UploadPhase::Hashing || bytes > 0) {
+                started.send(()).expect("cancellation observer");
+            }
+        });
+        let uploading = harness.peers.upload_with_progress(
+            &peer.id,
+            &harness.share_id,
+            source.to_str().expect("path"),
+            "/sub",
+            ConflictPolicy::Fail,
+            &id,
+            progress,
+        );
+        let canceling = async {
+            observed.recv().await.expect("phase started");
+            let start = std::time::Instant::now();
+            harness.peers.cancel_upload(&id).await;
+            start
+        };
+        let (result, start) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(uploading, canceling)
+        })
+        .await
+        .expect("cancel must not wait for the file");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "cancellation was not prompt"
+        );
+        assert!(matches!(result, Err(DomainError::TransferCanceled)));
+        assert!(!harness.share_root.join("sub/progress.bin").exists());
+        let transfers = harness.directory.path().join("peerdav.transfers");
+        assert_eq!(
+            std::fs::read_dir(&transfers)
+                .expect("transfer root")
+                .count(),
+            0,
+            "cancel must clean all temporary parts"
+        );
+    }
+
+    // Cancel at the commit boundary as well: the server must discard staged
+    // content rather than finishing a save after the UI reports cancellation.
+    let id = harness.peers.begin_upload().await;
+    let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let uploading = harness.peers.upload_with_progress(
+        &peer.id,
+        &harness.share_id,
+        source.to_str().expect("path"),
+        "/sub",
+        ConflictPolicy::Fail,
+        &id,
+        Arc::new(move |phase, _, _, _| {
+            if phase == UploadPhase::Committing {
+                started.send(()).expect("commit observer");
+            }
+        }),
+    );
+    let canceling = async {
+        observed.recv().await.expect("commit started");
+        harness.peers.cancel_upload(&id).await;
+    };
+    let (result, ()) = tokio::join!(uploading, canceling);
+    assert!(matches!(result, Err(DomainError::TransferCanceled)));
+    assert!(!harness.share_root.join("sub/progress.bin").exists());
+    assert_eq!(
+        std::fs::read_dir(harness.directory.path().join("peerdav.transfers"))
+            .expect("transfer root")
+            .count(),
+        0
+    );
+
+    // A cancel received before the upload command is polled is not lost.
+    let id = harness.peers.begin_upload().await;
+    harness.peers.cancel_upload(&id).await;
+    let result = harness
+        .peers
+        .upload_with_progress(
+            &peer.id,
+            &harness.share_id,
+            source.to_str().expect("path"),
+            "/sub",
+            ConflictPolicy::Fail,
+            &id,
+            Arc::new(|_, _, _, _| panic!("canceled before start")),
+        )
+        .await;
+    assert!(matches!(result, Err(DomainError::TransferCanceled)));
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
 async fn multipart_round_trip_handles_boundaries_and_empty_files() {
     let harness = Harness::new(vec![loopback_rule()], false).await;
     let (peer, _) = harness.connect().await;
@@ -1470,6 +1706,136 @@ async fn multipart_round_trip_handles_boundaries_and_empty_files() {
         .await
         .expect("empty download");
     assert!(std::fs::read(&destination).expect("empty").is_empty());
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn remote_upload_cancel_cleans_parts_rejects_late_requests_and_preserves_completed_files() {
+    use sha2::{Digest, Sha256};
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (_, code) = harness.connect().await;
+    let client = harness
+        .vault
+        .encrypted_client(harness.vault.fingerprint())
+        .expect("client");
+    let payload = b"cancel remote upload";
+    let digest = hex::encode(Sha256::digest(payload));
+    let target = format!("{}/share/{}/cancel.txt", harness.url, harness.share_id);
+    std::fs::write(harness.share_root.join("cancel.txt"), b"original").expect("original");
+    let request = |method: reqwest::Method, session: &str| {
+        client
+            .request(method, &target)
+            .basic_auth("peerdav", Some(&code))
+            .header("x-peerdav-transfer", &digest)
+            .header("x-peerdav-size", payload.len())
+            .header("x-peerdav-session", session)
+            .header("x-peerdav-part", "0")
+    };
+    assert_eq!(
+        request(reqwest::Method::PATCH, "aa")
+            .body(payload.to_vec())
+            .send()
+            .await
+            .expect("part")
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    // An unauthenticated request cannot cancel another device's upload.
+    let foreign_vault =
+        Vault::open(&harness.directory.path().join("foreign.pd")).expect("foreign device");
+    let foreign_client = foreign_vault
+        .encrypted_client(harness.vault.fingerprint())
+        .expect("foreign TLS client");
+    assert_eq!(
+        foreign_client
+            .delete(&target)
+            .header("x-peerdav-transfer", &digest)
+            .header("x-peerdav-size", payload.len())
+            .header("x-peerdav-cancel", "1")
+            .send()
+            .await
+            .expect("unauthorized cancel")
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        request(reqwest::Method::HEAD, "aa")
+            .send()
+            .await
+            .expect("still exists")
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        request(reqwest::Method::DELETE, "aa")
+            .header("x-peerdav-cancel", "1")
+            .send()
+            .await
+            .expect("cancel")
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        request(reqwest::Method::PATCH, "aa")
+            .body(payload.to_vec())
+            .send()
+            .await
+            .expect("late part")
+            .status(),
+        reqwest::StatusCode::CONFLICT
+    );
+    assert_eq!(
+        std::fs::read_dir(harness.directory.path().join("peerdav.transfers"))
+            .expect("transfer root")
+            .count(),
+        0
+    );
+    assert_eq!(
+        std::fs::read(harness.share_root.join("cancel.txt")).expect("original"),
+        b"original"
+    );
+    // A fresh attempt works, and cancellation after atomic replacement must
+    // never delete the successfully saved destination.
+    assert!(
+        request(reqwest::Method::PATCH, "bb")
+            .body(payload.to_vec())
+            .send()
+            .await
+            .expect("retry")
+            .status()
+            .is_success()
+    );
+    assert_eq!(
+        request(reqwest::Method::PUT, "bb")
+            .header("x-peerdav-commit", "1")
+            .send()
+            .await
+            .expect("commit")
+            .status(),
+        reqwest::StatusCode::CREATED
+    );
+    assert_eq!(
+        request(reqwest::Method::DELETE, "bb")
+            .header("x-peerdav-cancel", "1")
+            .send()
+            .await
+            .expect("late cancel")
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        std::fs::read(harness.share_root.join("cancel.txt")).expect("saved"),
+        payload
+    );
+    assert!(
+        !std::fs::read_dir(&harness.share_root)
+            .expect("share")
+            .any(|entry| entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".peerdav-"))
+    );
     harness.controller.stop().await;
 }
 
