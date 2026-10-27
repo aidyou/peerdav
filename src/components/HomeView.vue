@@ -5,7 +5,7 @@ import { confirmAction } from "../lib/confirm";
 import { findAccessRequest, findSavedPeer, accessRowState } from "../lib/access";
 import { pendingIdentity } from "../lib/deviceCode";
 import { useAppContext } from "../lib/appContext";
-import { t } from "../lib/i18n";
+import { localizeMessage, t } from "../lib/i18n";
 import { statusTagTone } from "../lib/tagTone";
 import ListSkeleton from "./ListSkeleton.vue";
 
@@ -104,7 +104,7 @@ async function scanTcp() {
 
 function requestMessage(server) {
   const state = rowState(server);
-  if (state.message) return state.message;
+  if (state.message) return localizeMessage(state.message);
   return state.messageKey ? t(state.messageKey) : "";
 }
 

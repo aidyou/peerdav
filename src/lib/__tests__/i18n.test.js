@@ -207,6 +207,16 @@ describe("error mapping", () => {
     expect(normalized.context).toBeNull();
   });
 
+  it("renders structured causes through i18n without stacking backend messages", () => {
+    const error = { code: "PEER_REQUEST_FAILED", message: "outer: nested: ignored", detail: "full diagnostics",
+      context: { reason: "upstream rejected: maintenance window", status: 503 } };
+    expect(toUserMessage(error)).toBe("发送请求失败：HTTP 503 (upstream rejected: maintenance window)");
+    expect(toUserMessage({ ...error, code: "PEER_IDENTITY_MISMATCH" })).toBe("发送请求失败：服务器端指纹不匹配");
+    setLocale("en");
+    expect(toUserMessage(error)).toBe("Request failed: HTTP 503 (upstream rejected: maintenance window)");
+    expect(error.detail).toBe("full diagnostics");
+  });
+
   it("localizes the user message without touching detail", () => {
     const error = {
       code: "VAULT_LOCKED",
@@ -214,9 +224,9 @@ describe("error mapping", () => {
       detail: "raw cause",
       context: { operation: "unlock" },
     };
-    expect(toUserMessage(error)).toBe("保险箱已锁定，请先解锁");
+    expect(toUserMessage(error)).toBe("操作保险箱失败：保险箱已锁定，请先解锁");
     setLocale("en");
-    expect(toUserMessage(error)).toBe("The vault is locked. Unlock it first.");
+    expect(toUserMessage(error)).toBe("Vault operation failed: the vault is locked; unlock it first");
     expect(normalizeAppError(error).detail).toBe("raw cause");
   });
 });

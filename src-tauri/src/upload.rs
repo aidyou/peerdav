@@ -1,5 +1,6 @@
-//! Resumable uploads are scoped to the authenticated device, destination and
-//! content digest. Partial bytes stay outside shares until the full hash matches.
+//! Resumable uploads are scoped to the authenticated device and destination.
+//! V1 uses a content digest; V2 uses a resume key and submits the content digest
+//! at commit. Parts remain outside shares and are verified before publication.
 
 use crate::error::DomainError;
 use crate::fs::ShareConfig;
@@ -12,7 +13,7 @@ use hyper::body::{Body, Incoming};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 fn invalid(detail: impl Into<String>) -> DomainError {
     DomainError::PeerProtocol {
@@ -210,66 +211,26 @@ async fn receive(
             .map_err(|e| io(&directory, e))?;
     }
     if request.method() == http::Method::PUT && get("x-peerdav-commit").as_deref() == Some("1") {
-        let assembled = directory.join("assembled");
-        let mut output = tokio::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&assembled)
-            .await
-            .map_err(|e| io(&assembled, e))?;
-        let mut hash = Sha256::new();
-        let mut total = 0;
-        let mut buffer = vec![0u8; 64 * 1024];
-        for index in 0..count {
-            let path = directory.join(index.to_string());
-            let expected = size
-                .saturating_sub(index * TRANSFER_PART_BYTES)
-                .min(TRANSFER_PART_BYTES);
-            let metadata = tokio::fs::symlink_metadata(&path)
-                .await
-                .map_err(|e| io(&path, e))?;
-            if !metadata.is_file()
-                || metadata.file_type().is_symlink()
-                || metadata.len() != expected
-            {
-                return Err(invalid("upload part is incomplete"));
-            }
-            let mut input = tokio::fs::File::open(&path)
-                .await
-                .map_err(|e| io(&path, e))?;
-            loop {
-                if *session.cancel.borrow() {
-                    return Err(DomainError::TransferCanceled);
-                }
-                let len = input.read(&mut buffer).await.map_err(|e| io(&path, e))?;
-                if len == 0 {
-                    break;
-                }
-                total += len as u64;
-                if total > size {
-                    return Err(invalid("upload exceeds declared size"));
-                }
-                hash.update(&buffer[..len]);
-                output
-                    .write_all(&buffer[..len])
-                    .await
-                    .map_err(|e| io(&assembled, e))?;
-            }
-        }
-        if total != size || hex::encode(hash.finalize()) != digest {
-            return Err(invalid(
-                "upload content changed; retry with the current file",
-            ));
-        }
-        output.sync_all().await.map_err(|e| io(&assembled, e))?;
-        drop(output);
+        let expected_digest = if get("x-peerdav-upload-version").as_deref() == Some("2") {
+            get("x-peerdav-content-sha256")
+                .and_then(|value| crate::tls::normalize_fingerprint(Some(&value)))
+                .ok_or_else(|| invalid("missing upload content digest"))?
+        } else {
+            digest
+        };
         let share = share.clone();
         let destination = relative.to_path_buf();
-        let source = assembled.clone();
+        let source = directory.clone();
         tokio::task::spawn_blocking(move || {
             let _active = active;
-            crate::fs::commit_upload(&share, &destination, &source, &session)
+            crate::fs::commit_upload_parts(
+                &share,
+                &destination,
+                &source,
+                size,
+                &expected_digest,
+                &session,
+            )
         })
         .await
         .map_err(|e| DomainError::Internal {

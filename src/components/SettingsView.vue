@@ -10,6 +10,7 @@ import {
 import { useAppContext } from "../lib/appContext";
 import { buildBindOptions } from "../lib/bindScope";
 import { confirmAction } from "../lib/confirm";
+import { toUserMessage } from "../lib/invoke";
 import { localizeMessage, t } from "../lib/i18n";
 import { accessRowState, findAccessRequest, findSavedPeer } from "../lib/access";
 import { statusTagTone } from "../lib/tagTone";
@@ -34,6 +35,30 @@ const serverBind = ref("0.0.0.0");
 const serverPort = ref(4918);
 const serverDiscoveryPort = ref(4919);
 const serverName = ref("PeerDav");
+const tcpEnabled = ref(false);
+const tcpNetworks = ref([]);
+const tcpOptions = computed(() => [...new Set([...defaultAllowRules.value, ...tcpNetworks.value])]);
+
+async function loadServiceSettings() {
+  try {
+    const settings = await app.invoke("service_settings");
+    if (!settings) return;
+    serverName.value = settings.name;
+    serverBind.value = settings.bindAddress;
+    serverPort.value = settings.port;
+    serverDiscoveryPort.value = settings.discoveryPort;
+    tcpEnabled.value = settings.tcp.enabled;
+    tcpNetworks.value = settings.tcp.networks;
+  } catch (error) { app.handleFailure(error); }
+}
+
+async function saveTcpSettings() {
+  await run(async () => {
+    await app.invoke("set_tcp_discovery", {
+      ...adminArgs(), settings: { enabled: tcpEnabled.value, networks: tcpNetworks.value },
+    });
+  });
+}
 
 /* 绑定范围首选广域网/局域网/本机三项，其余本机网卡地址（VPN tun、多网卡）
    跟在后面；下拉框同时允许输入，公网地址或 IPv6 也能直接填。
@@ -595,7 +620,7 @@ function healthText(health) {
     : health.authorized
       ? t("client.onlineAuthorized", { latency: health.latencyMs ?? "—" })
       : t("client.onlineUnauthorized");
-  const reason = health.message ? localizeMessage(health.message) : "";
+  const reason = health.error ? toUserMessage(health.error) : health.message ? localizeMessage(health.message) : "";
   return reason && reason !== label ? `${label} · ${reason}` : label;
 }
 
@@ -674,6 +699,7 @@ async function chooseVaultKey() {
 }
 
 onMounted(() => {
+  void loadServiceSettings();
   void loadLocalNetworks();
   void loadLanAddress();
   void loadAutostart();
@@ -808,6 +834,17 @@ async function loadInitialData() {
               {{ t("server.stopService") }}
             </el-button>
           </div>
+          <div class="settings-toggle tcp-discovery-settings">
+            <div><strong>{{ t("server.tcpDiscovery") }}</strong><p class="hint">{{ t("server.tcpHint") }}</p></div>
+            <el-switch v-model="tcpEnabled" />
+          </div>
+          <label>
+            {{ t("server.tcpNetworks") }}
+            <el-select v-model="tcpNetworks" multiple filterable allow-create :disabled="!tcpEnabled">
+              <el-option v-for="network in tcpOptions" :key="network" :label="network" :value="network" />
+            </el-select>
+          </label>
+          <el-button :disabled="busy" @click="saveTcpSettings">{{ t("server.saveDiscovery") }}</el-button>
           <div class="settings-toggle">
             <div>
               <strong>{{ t("settings.autostart") }}</strong>

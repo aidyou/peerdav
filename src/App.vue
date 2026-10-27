@@ -4,8 +4,8 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ElMessage } from "element-plus";
 
-import { errorStrategy, invoke, normalizeAppError } from "./lib/invoke";
-import { locale, localizeMessage, setLocale, t } from "./lib/i18n";
+import { errorStrategy, invoke, normalizeAppError, toUserMessage } from "./lib/invoke";
+import { locale, setLocale, t } from "./lib/i18n";
 import { resolvedTheme, setTheme, theme } from "./lib/theme";
 import { SUPPORTED_ACCENTS, accent, setAccent } from "./lib/accent";
 import {
@@ -108,7 +108,7 @@ function setError(key, params) {
 }
 
 function setRawError(error) {
-  showToast(localizeMessage(normalizeAppError(error).message), "error", 5000);
+  showToast(toUserMessage(error), "error", 5000);
 }
 
 function setNotice(key, params) {

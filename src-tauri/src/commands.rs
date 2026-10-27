@@ -543,6 +543,47 @@ pub async fn scan_lan(
 /// Explicit TCP discovery fallback for overlay networks where UDP broadcast is
 /// not forwarded. It probes local private /24s on the default WebDAV port.
 #[tauri::command]
+pub async fn service_settings(
+    vault: State<'_, SharedVault>,
+    peers: State<'_, SharedPeers>,
+) -> Result<crate::types::ServiceSettings, AppError> {
+    Ok(crate::types::ServiceSettings {
+        name: vault
+            .get_setting(SERVER_NAME_META)?
+            .unwrap_or_else(|| "PeerDav".into()),
+        bind_address: vault
+            .get_setting(SERVER_BIND_META)?
+            .unwrap_or_else(|| "0.0.0.0".into()),
+        port: vault
+            .get_setting(SERVER_PORT_META)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SERVER_PORT),
+        discovery_port: vault
+            .get_setting(SERVER_DISCOVERY_PORT_META)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_DISCOVERY_PORT),
+        tcp: peers.tcp_discovery_settings()?,
+    })
+}
+
+#[tauri::command]
+pub async fn set_tcp_discovery(
+    vault: State<'_, SharedVault>,
+    username: String,
+    password: String,
+    settings: crate::types::TcpDiscoverySettings,
+) -> Result<(), AppError> {
+    let vault = Arc::clone(vault.inner());
+    verify_admin(Arc::clone(&vault), username, password).await?;
+    crate::discovery::selected_scan_targets(&settings.networks).map_err(AppError::from)?;
+    let value = serde_json::to_string(&settings).map_err(|source| DomainError::Serialization {
+        operation: "save TCP discovery settings",
+        source,
+    })?;
+    run_blocking(move || vault.set_setting(crate::types::TCP_DISCOVERY_META, &value)).await
+}
+
+#[tauri::command]
 pub async fn scan_lan_tcp(peers: State<'_, SharedPeers>) -> Result<Vec<DiscoveredPeer>, AppError> {
     let peers = Arc::clone(peers.inner());
     peers.scan_lan_tcp().await.map_err(AppError::from)

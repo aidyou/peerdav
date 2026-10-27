@@ -253,7 +253,11 @@ impl AppError {
         let code = error_code(error).to_owned();
         let message = user_message(error);
         let detail = Some(error_chain(error));
-        let context = error_context(error);
+        let mut context = error_context(error).unwrap_or_else(|| json!({}));
+        if let Some(reason) = frontend_reason(error) {
+            context["reason"] = json!(visible_reason(&reason));
+        }
+        let context = Some(context);
 
         log::error!(
             "peerdav.error code={code} message={message:?} detail={detail:?} context={context:?}"
@@ -324,6 +328,11 @@ fn error_code(error: &DomainError) -> &'static str {
         DomainError::PeerAccessTimeout => "PEER_ACCESS_TIMEOUT",
         DomainError::PeerAccessCanceled => "PEER_ACCESS_CANCELED",
         DomainError::PeerAccessDenied { .. } => "PEER_ACCESS_DENIED",
+        DomainError::PeerRequest { detail, .. }
+            if detail.contains("server identity does not match the paired fingerprint") =>
+        {
+            "PEER_IDENTITY_MISMATCH"
+        }
         DomainError::PeerRequest { .. } => "PEER_REQUEST_FAILED",
         DomainError::RemoteNotFound { .. } => "PEER_REMOTE_NOT_FOUND",
         DomainError::PeerNotFound { .. } => "PEER_NOT_FOUND",
@@ -344,16 +353,162 @@ fn error_code(error: &DomainError) -> &'static str {
     }
 }
 
-fn user_message(error: &DomainError) -> String {
+/// Remove only known transport wrappers, never split an arbitrary cause on a
+/// colon: the original reason may itself contain colons or structured values.
+fn visible_reason(detail: &str) -> String {
+    let mut reason = detail.trim();
+    loop {
+        let previous = reason;
+        if reason.starts_with("error sending request for url (") {
+            if let Some((_, rest)) = reason.split_once("): ") {
+                reason = rest;
+            }
+        }
+        for prefix in [
+            "client error (Connect): ",
+            "unexpected error: ",
+            "request failed: ",
+            "connect failed: ",
+            "builder error: ",
+        ] {
+            if let Some(rest) = reason.strip_prefix(prefix) {
+                reason = rest;
+                break;
+            }
+        }
+        if reason == previous {
+            break;
+        }
+    }
+    // Raw diagnostics remain in detail; do not expose URLs (which can carry
+    // credentials/query secrets) or absolute internal paths in the toast.
+    reason
+        .split_whitespace()
+        .map(|word| {
+            let candidate = word.trim_start_matches(['\'', '"', '(', '`']);
+            if candidate.contains("://") {
+                "[地址]".to_owned()
+            } else if candidate.starts_with('/')
+                || candidate.starts_with("\\\\")
+                || candidate.as_bytes().get(1) == Some(&b':')
+            {
+                "[路径]".to_owned()
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" / ", " ／ ")
+}
+
+fn frontend_reason(error: &DomainError) -> Option<String> {
     match error {
-        DomainError::Database { .. } => {
-            "访问本地数据库失败 / Failed to access the local database.".to_owned()
+        DomainError::Database { source, .. } | DomainError::DatabaseOpen { source, .. } => {
+            Some(source.to_string())
         }
-        DomainError::DatabaseOpen { .. } => {
-            "打开本地数据库失败 / Failed to open the local database.".to_owned()
+        DomainError::Io { source, .. } | DomainError::ServerBind { source, .. } => {
+            Some(source.to_string())
         }
+        DomainError::Serialization { source, .. } => Some(source.to_string()),
+        DomainError::PasswordHash { source } => Some(source.to_string()),
+        DomainError::Crypto { detail, .. }
+        | DomainError::Corrupted { detail }
+        | DomainError::KeyFileInvalid { detail, .. }
+        | DomainError::InvalidKeyDirectory { detail }
+        | DomainError::InvalidShareConfig { detail }
+        | DomainError::InvalidPolicyRule { detail }
+        | DomainError::ServerTask { detail }
+        | DomainError::InvalidPeerUrl { detail }
+        | DomainError::PeerRequest { detail, .. }
+        | DomainError::PeerProtocol { detail }
+        | DomainError::RemotePathInvalid { detail }
+        | DomainError::ExternalOpen { detail, .. }
+        | DomainError::ExternalReveal { detail, .. }
+        | DomainError::Discovery { detail, .. }
+        | DomainError::Internal { detail } => Some(detail.clone()),
+        DomainError::WeakPassword { reason } | DomainError::InvalidUsername { reason } => {
+            Some((*reason).into())
+        }
+        _ => None,
+    }
+}
+
+fn failure(chinese: &str, english: &str, reason: &str) -> String {
+    let reason = visible_reason(reason);
+    format!("{chinese}：{reason} / {english}: {reason}")
+}
+
+fn user_message(error: &DomainError) -> String {
+    let message = error_reason(error);
+    let Some((chinese, english)) = message.split_once(" / ") else {
+        return message;
+    };
+    // Detailed failures already have exactly one operation prefix. State and
+    // validation errors use the same shape instead of a separate UI convention.
+    if chinese.contains('：') {
+        return message;
+    }
+    let (zh, en) = match error {
+        DomainError::VaultNotInitialized
+        | DomainError::VaultAlreadyInitialized
+        | DomainError::VaultLocked
+        | DomainError::VaultMustBeLocked => ("操作保险箱失败", "Vault operation failed"),
+        DomainError::KeyFileNotConfigured
+        | DomainError::KeyFileExists { .. }
+        | DomainError::KeyFileMissing { .. }
+        | DomainError::VaultKeyMismatch => ("加载密钥文件失败", "Key file load failed"),
+        DomainError::RecoveryCodeNotConfigured | DomainError::InvalidRecoveryCode => {
+            ("重置保险箱失败", "Vault reset failed")
+        }
+        DomainError::WeakPassword { .. }
+        | DomainError::InvalidUsername { .. }
+        | DomainError::PasswordUnchanged
+        | DomainError::AdminPasswordChangeRequired => {
+            ("验证管理员信息失败", "Admin validation failed")
+        }
+        DomainError::ReservedSecretName
+        | DomainError::InvalidSecretName
+        | DomainError::SecretNotFound { .. } => ("操作秘密记录失败", "Secret operation failed"),
+        DomainError::ShareNotFound { .. } => ("访问共享失败", "Share access failed"),
+        DomainError::PendingRequestNotFound { .. } | DomainError::AuthorizationNotFound { .. } => {
+            ("处理授权失败", "Authorization failed")
+        }
+        DomainError::ServerAlreadyRunning => ("启动服务失败", "Server start failed"),
+        DomainError::SelfConnectionForbidden
+        | DomainError::InvalidPeerUrl { .. }
+        | DomainError::PeerAuthorizationRequired
+        | DomainError::PeerAuthorizationRejected
+        | DomainError::PeerAccessExpired
+        | DomainError::PeerAccessTimeout
+        | DomainError::PeerAccessCanceled
+        | DomainError::PeerAccessDenied { .. }
+        | DomainError::PeerNotFound { .. } => ("连接服务器失败", "Server connection failed"),
+        DomainError::RemoteNotFound { .. }
+        | DomainError::TransferCanceled
+        | DomainError::TransferTooLarge { .. }
+        | DomainError::TransferConflict { .. } => ("传输文件失败", "File transfer failed"),
+        DomainError::PreviewTooLarge { .. } | DomainError::PreviewTooManyLines { .. } => {
+            ("预览文件失败", "File preview failed")
+        }
+        DomainError::ExternalEditNotFound { .. } => ("编辑文件失败", "File edit failed"),
+        DomainError::UploadQueueTooLarge { .. } => {
+            ("添加上传任务失败", "Upload queue update failed")
+        }
+        DomainError::DownloadQueueTooLarge { .. } => {
+            ("添加下载任务失败", "Download queue update failed")
+        }
+        _ => ("执行操作失败", "Operation failed"),
+    };
+    format!("{zh}：{} / {en}: {}", chinese.trim(), english.trim())
+}
+
+fn error_reason(error: &DomainError) -> String {
+    match error {
+        DomainError::Database { source, .. } => failure("访问本地数据库失败", "Database access failed", &source.to_string()),
+        DomainError::DatabaseOpen { source, .. } => failure("打开本地数据库失败", "Database open failed", &source.to_string()),
         DomainError::SelfConnectionForbidden => "发布版本不允许连接本机 / Release builds cannot connect to this device.".to_owned(),
-        DomainError::Io { .. } => "文件操作失败 / File operation failed.".to_owned(),
+        DomainError::Io { source, .. } => failure("文件操作失败", "File operation failed", &source.to_string()),
         DomainError::VaultNotInitialized => {
             "保险箱尚未初始化 / The vault has not been initialized.".to_owned()
         }
@@ -374,15 +529,11 @@ fn user_message(error: &DomainError) -> String {
             "找不到保险箱密钥文件，请重新选择备份密钥 / The vault key file is missing; select a backup key file."
                 .to_owned()
         }
-        DomainError::KeyFileInvalid { .. } => {
-            "保险箱密钥文件无效 / The vault key file is invalid.".to_owned()
-        }
+        DomainError::KeyFileInvalid { detail, .. } => failure("加载密钥文件失败", "Key file load failed", detail),
         DomainError::VaultKeyMismatch => {
             "密钥文件与当前保险箱不匹配 / The key file does not match this vault.".to_owned()
         }
-        DomainError::InvalidKeyDirectory { .. } => {
-            "密钥保存目录无效 / The key storage directory is invalid.".to_owned()
-        }
+        DomainError::InvalidKeyDirectory { detail } => failure("选择密钥目录失败", "Key directory selection failed", detail),
         DomainError::VaultMustBeLocked => {
             "请先锁定保险箱再执行重置 / Lock the vault before resetting it.".to_owned()
         }
@@ -403,16 +554,10 @@ fn user_message(error: &DomainError) -> String {
             "新密码不能与当前密码相同 / The new password must differ from the current password."
                 .to_owned()
         }
-        DomainError::Crypto { .. } => {
-            "保险箱加密操作失败 / Vault cryptographic operation failed.".to_owned()
-        }
-        DomainError::PasswordHash { .. } => {
-            "密码处理失败 / Password processing failed.".to_owned()
-        }
-        DomainError::Serialization { .. } => "内部数据处理失败 / Internal data processing failed.".to_owned(),
-        DomainError::Corrupted { .. } => {
-            "保险箱数据已损坏 / The vault data is corrupted.".to_owned()
-        }
+        DomainError::Crypto { detail, .. } => failure("保险箱加密操作失败", "Vault cryptographic operation failed", detail),
+        DomainError::PasswordHash { source } => failure("密码处理失败", "Password processing failed", &source.to_string()),
+        DomainError::Serialization { source, .. } => failure("数据处理失败", "Data processing failed", &source.to_string()),
+        DomainError::Corrupted { detail } => failure("读取保险箱失败", "Vault read failed", detail),
         DomainError::ReservedSecretName => {
             "该秘密名称由系统保留 / This secret name is reserved by the system.".to_owned()
         }
@@ -428,12 +573,8 @@ fn user_message(error: &DomainError) -> String {
         DomainError::ShareNotFound { .. } => {
             "未找到该共享目录 / The shared directory was not found.".to_owned()
         }
-        DomainError::InvalidShareConfig { .. } => {
-            "共享目录配置无效 / The shared directory configuration is invalid.".to_owned()
-        }
-        DomainError::InvalidPolicyRule { .. } => {
-            "访问规则无效 / The access rule is invalid.".to_owned()
-        }
+        DomainError::InvalidShareConfig { detail } => failure("配置共享失败", "Share configuration failed", detail),
+        DomainError::InvalidPolicyRule { detail } => failure("设置访问规则失败", "Access rule configuration failed", detail),
         DomainError::PendingRequestNotFound { .. } => {
             "该待审批请求已不存在 / The pending request no longer exists.".to_owned()
         }
@@ -443,13 +584,8 @@ fn user_message(error: &DomainError) -> String {
         DomainError::ServerAlreadyRunning => {
             "服务已在运行 / The server is already running.".to_owned()
         }
-        DomainError::ServerBind { .. } => {
-            "启动服务失败：无法绑定地址 / Failed to start the server: cannot bind the address."
-                .to_owned()
-        }
-        DomainError::ServerTask { .. } => {
-            "服务任务异常退出 / The server task stopped unexpectedly.".to_owned()
-        }
+        DomainError::ServerBind { source, .. } => failure("启动服务失败", "Server start failed", &source.to_string()),
+        DomainError::ServerTask { detail } => failure("服务任务失败", "Server task failed", detail),
         DomainError::InvalidPeerUrl { .. } => {
             "服务器地址无效，仅支持 https:// 地址（例如 https://10.0.0.5:4918）/ The server address is invalid; only https:// addresses are supported (for example https://10.0.0.5:4918)."
                 .to_owned()
@@ -478,13 +614,16 @@ fn user_message(error: &DomainError) -> String {
             ),
             None => "服务器按共享访问规则拒绝了本机。请在服务器端把本机地址或所在网段加入共享的允许规则 / The server denied this machine by its share access rules. Add this machine's address or subnet to the share's allow rules.".to_owned(),
         },
-        DomainError::PeerRequest { status, detail, .. } => match status {
-            Some(status) => format!(
-                "请求服务器失败：HTTP {status}（{detail}）/ The request to the server failed: HTTP {status} ({detail})."
-            ),
-            None => format!(
-                "请求服务器失败：{detail} / The request to the server failed: {detail}."
-            ),
+        DomainError::PeerRequest { status, detail, .. } => {
+            if detail.contains("server identity does not match the paired fingerprint") {
+                "发送请求失败：服务器端指纹不匹配 / Request failed: the server fingerprint does not match the paired identity.".to_owned()
+            } else {
+                let reason = match status {
+                    Some(status) => format!("HTTP {status} ({})", visible_reason(detail)),
+                    None => visible_reason(detail),
+                };
+                failure("发送请求失败", "Request failed", &reason)
+            }
         },
         DomainError::RemoteNotFound { .. } => {
             "服务器上不存在该文件 / The file does not exist on the server.".to_owned()
@@ -492,12 +631,8 @@ fn user_message(error: &DomainError) -> String {
         DomainError::PeerNotFound { .. } => {
             "未找到已保存的服务器 / The saved server was not found.".to_owned()
         }
-        DomainError::PeerProtocol { .. } => {
-            "服务器响应无法识别 / The server response could not be understood.".to_owned()
-        }
-        DomainError::RemotePathInvalid { .. } => {
-            "远程路径无效 / The remote path is invalid.".to_owned()
-        }
+        DomainError::PeerProtocol { detail } => failure("处理服务器响应失败", "Server response processing failed", detail),
+        DomainError::RemotePathInvalid { detail } => failure("访问远程路径失败", "Remote path access failed", detail),
         DomainError::TransferCanceled => {
             "已取消文件传输 / The file transfer was canceled.".to_owned()
         }
@@ -518,14 +653,8 @@ fn user_message(error: &DomainError) -> String {
         DomainError::ExternalEditNotFound { .. } => {
             "外部编辑记录已失效 / The external edit session no longer exists.".to_owned()
         }
-        DomainError::ExternalOpen { .. } => {
-            "无法使用外部应用打开该文件 / Could not open the file with an external application."
-                .to_owned()
-        }
-        DomainError::ExternalReveal { .. } => {
-            "无法在文件管理器中显示该文件 / Could not reveal the file in the file manager."
-                .to_owned()
-        }
+        DomainError::ExternalOpen { detail, .. } => failure("打开外部应用失败", "External application open failed", detail),
+        DomainError::ExternalReveal { detail, .. } => failure("在文件管理器中显示失败", "Reveal in file manager failed", detail),
         DomainError::UploadQueueTooLarge { limit, .. } => {
             format!("一次最多上传 {limit} 个文件 / At most {limit} files can be uploaded at once.")
         }
@@ -534,10 +663,8 @@ fn user_message(error: &DomainError) -> String {
                 "一次最多下载 {limit} 个文件或目录 / At most {limit} files or directories can be downloaded at once."
             )
         }
-        DomainError::Discovery { .. } => {
-            "局域网发现失败 / LAN discovery failed.".to_owned()
-        }
-        DomainError::Internal { .. } => "内部错误 / Internal error.".to_owned(),
+        DomainError::Discovery { detail, .. } => failure("探测设备失败", "Device discovery failed", detail),
+        DomainError::Internal { detail } => failure("执行操作失败", "Operation failed", detail),
     }
 }
 
@@ -639,6 +766,60 @@ mod tests {
                 .is_some_and(|detail| detail.contains("HTTP 403"))
         );
         assert_eq!(error.context, Some(json!({ "peerIp": "10.126.0.7" })));
+    }
+
+    #[test]
+    fn identity_mismatch_has_a_concise_message_and_full_details() {
+        let detail = "error sending request for url (https://10.1.1.88:4918/__peerdav/catalog): client error (Connect): unexpected error: server identity does not match the paired fingerprint";
+        let error = AppError::from(DomainError::PeerRequest {
+            operation: "catalog",
+            status: None,
+            detail: detail.into(),
+        });
+        assert_eq!(error.code, "PEER_IDENTITY_MISMATCH");
+        assert!(!error.message.contains("error sending request"));
+        assert!(!error.message.contains("10.1.1.88"));
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|value| value.contains(detail))
+        );
+        let error = AppError::from(DomainError::PeerRequest {
+            operation: "catalog",
+            status: None,
+            detail: "request failed: connect failed: Connection refused (os error 111)".into(),
+        });
+        assert_eq!(
+            error.message,
+            "发送请求失败：Connection refused (os error 111) / Request failed: Connection refused (os error 111)"
+        );
+    }
+
+    #[test]
+    fn causes_keep_colons_and_sensitive_addresses_stay_in_details() {
+        let error = AppError::from(DomainError::PeerRequest {
+            operation: "catalog",
+            status: Some(503),
+            detail: "request failed: connect failed: upstream rejected: maintenance window".into(),
+        });
+        assert_eq!(
+            error.context.as_ref().and_then(|v| v["reason"].as_str()),
+            Some("upstream rejected: maintenance window")
+        );
+        let error = AppError::from(DomainError::Io {
+            operation: "read",
+            path: None,
+            source: std::io::Error::other("cannot open /private/secret.key: Permission denied"),
+        });
+        assert!(!error.message.contains("/private/secret.key"));
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|v| v.contains("/private/secret.key"))
+        );
+        assert!(error.message.contains("Permission denied"));
     }
 
     #[test]

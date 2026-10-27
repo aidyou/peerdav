@@ -443,7 +443,7 @@ describe("error rendering", () => {
     });
 
     expect(wrapper.find(".alert-error").exists()).toBe(false);
-    expect(latestErrorMessage()).toBe("保险箱已锁定，请先解锁");
+    expect(latestErrorMessage()).toBe("操作保险箱失败：保险箱已锁定，请先解锁");
     expect(document.querySelector(".el-message--error")?.style.top).toBe("54px");
 
     wrapper.unmount();
@@ -2576,6 +2576,24 @@ describe("startup launch", () => {
     invoke.mockReset();
   });
 
+  it("restores the service name and saves explicit TCP discovery networks", async () => {
+    const saved = vi.fn(async () => null);
+    const wrapper = await mountReady({
+      service_settings: async () => ({ name: "开发主机", bindAddress: "0.0.0.0", port: 4918, discoveryPort: 4919,
+        tcp: { enabled: true, networks: ["10.2.2.0/24"] } }),
+      set_tcp_discovery: saved,
+    });
+    await signIn(wrapper);
+    await clickButton(wrapper, "服务");
+    expect(wrapper.find('input[placeholder="PeerDav"]').element.value).toBe("开发主机");
+    expect(wrapper.find(".tcp-discovery-settings .el-switch").classes()).toContain("is-checked");
+    await clickButton(wrapper, "保存探测设置");
+    expect(saved).toHaveBeenCalled();
+    const call = invoke.mock.calls.find(([command]) => command === "set_tcp_discovery");
+    expect(call[1].settings).toEqual({ enabled: true, networks: ["10.2.2.0/24"] });
+    wrapper.unmount();
+  });
+
   it("reads and enables the OS autostart setting", async () => {
     const { enable, isEnabled } = await import(
       "@tauri-apps/plugin-autostart"
@@ -2589,7 +2607,7 @@ describe("startup launch", () => {
 
     expect(isEnabled).toHaveBeenCalled();
 
-    await wrapper.find(".settings-toggle .el-switch").trigger("click");
+    await wrapper.find(".settings-toggle:not(.tcp-discovery-settings) .el-switch").trigger("click");
     await flushPromises();
 
     expect(enable).toHaveBeenCalledTimes(1);

@@ -52,7 +52,7 @@ struct WireProbe {
     kind: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct WireAnnouncement {
     protocol: String,
     kind: String,
@@ -125,6 +125,9 @@ struct PeerRecord {
     /// `None` uses the listener's UDP TTL. TCP-scanned entries use a longer
     /// TTL because they are not refreshed by announcements.
     ttl: Option<Duration>,
+    /// A TCP-observed address must not be replaced by advertised NIC addresses.
+    verified_url: Option<String>,
+    udp: bool,
 }
 
 /// A long-running UDP listener that feeds the passive discovery registry.
@@ -234,9 +237,16 @@ impl DiscoveryListener {
                         continue;
                     }
                     if let Some(record) = registry.get_mut(&peer.server_id) {
-                        // Keep the shorter UDP TTL for peers that also
-                        // announce themselves; only the TCP-only entry gets
-                        // the longer scan TTL.
+                        let previous = record.peer.clone();
+                        record.verified_url = Some(peer.url.clone());
+                        record.peer.url = peer.url.clone();
+                        for host in &peer.hosts {
+                            push_host(&mut record.peer.hosts, host.clone());
+                        }
+                        if !record.udp {
+                            record.peer.name = peer.name.clone();
+                        }
+                        changed |= previous != record.peer;
                         record.last_seen = now;
                     } else {
                         registry.insert(
@@ -245,6 +255,8 @@ impl DiscoveryListener {
                                 peer: peer.clone(),
                                 last_seen: now,
                                 ttl: Some(TCP_DISCOVERY_TTL),
+                                verified_url: Some(peer.url.clone()),
+                                udp: false,
                             },
                         );
                         changed = true;
@@ -413,6 +425,22 @@ fn prune_expired(registry: &mut HashMap<String, PeerRecord>, now: Instant, ttl: 
     before != registry.len()
 }
 
+fn announcement_from_source(
+    mut announcement: WireAnnouncement,
+    from: SocketAddr,
+) -> WireAnnouncement {
+    // The datagram's source is the route that reached this machine. Advertised
+    // NIC addresses may belong to unrelated physical/container networks.
+    let source = from.ip();
+    if !source.is_unspecified() && !source.is_loopback() {
+        let host = source.to_string();
+        announcement.hosts.retain(|entry| entry != &host);
+        announcement.hosts.insert(0, host);
+        announcement.hosts.truncate(MAX_DISCOVERY_HOSTS);
+    }
+    announcement
+}
+
 fn upsert_live(
     registry: &mut HashMap<String, PeerRecord>,
     announcement: WireAnnouncement,
@@ -420,10 +448,20 @@ fn upsert_live(
     now: Instant,
     ttl: Duration,
 ) -> bool {
+    let announcement = announcement_from_source(announcement, from);
     let key = announcement_key(&announcement, from);
     if let Some(record) = registry.get_mut(&key) {
         let previous = record.peer.clone();
         update_discovered_peer(&mut record.peer, &announcement);
+        if let Some(url) = &record.verified_url {
+            if let Ok(parsed) = url::Url::parse(url) {
+                if let Some(host) = parsed.host_str() {
+                    push_host(&mut record.peer.hosts, host.to_owned());
+                }
+            }
+            record.peer.url = url.clone();
+        }
+        record.udp = true;
         record.last_seen = now;
         record.ttl = None;
         return record.peer != previous;
@@ -434,6 +472,8 @@ fn upsert_live(
             peer: new_discovered_peer(&announcement),
             last_seen: now,
             ttl: Some(ttl),
+            verified_url: None,
+            udp: true,
         },
     );
     true
@@ -864,8 +904,53 @@ pub(crate) struct ScanTarget {
 /// TCP discovery used when UDP broadcast is not forwarded by the overlay
 /// network. Each private interface contributes the hosts of its local /24;
 /// peers are identified by the public-key fingerprint from the TLS handshake.
-pub(crate) async fn scan_tcp(identity: &DeviceIdentity, port: u16) -> Vec<DiscoveredPeer> {
-    scan_tcp_prioritized(identity, port, local_ipv4_scan_targets(), TCP_SCAN_TIMEOUT).await
+pub(crate) async fn scan_tcp(
+    identity: &DeviceIdentity,
+    port: u16,
+    networks: &[String],
+) -> Result<Vec<DiscoveredPeer>, DomainError> {
+    let targets = selected_scan_targets(networks)?;
+    Ok(scan_tcp_prioritized(identity, port, targets, TCP_SCAN_TIMEOUT).await)
+}
+
+pub(crate) fn selected_scan_targets(networks: &[String]) -> Result<Vec<ScanTarget>, DomainError> {
+    let own: HashSet<Ipv4Addr> = local_ipv4_addresses()
+        .iter()
+        .filter_map(|ip| ip.parse().ok())
+        .collect();
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    for value in networks {
+        let network = value
+            .parse::<ipnet::Ipv4Net>()
+            .map_err(|_| DomainError::Discovery {
+                operation: "select TCP network",
+                detail: format!("invalid IPv4 network: {value}"),
+            })?;
+        // Reject oversized ranges instead of silently scanning an arbitrary subset.
+        if network.prefix_len() < 22 || !is_bindable_lan_address(network.network()) {
+            return Err(DomainError::Discovery {
+                operation: "select TCP network",
+                detail: "Select a private IPv4 network with prefix /22 or narrower".into(),
+            });
+        }
+        for address in network.hosts() {
+            if own.contains(&address) || !seen.insert(address) {
+                continue;
+            }
+            if targets.len() >= TCP_SCAN_TARGET_LIMIT {
+                return Err(DomainError::Discovery {
+                    operation: "select TCP network",
+                    detail: "TCP discovery allows at most 1024 target addresses".into(),
+                });
+            }
+            targets.push(ScanTarget {
+                address,
+                priority: 0,
+            });
+        }
+    }
+    Ok(targets)
 }
 
 #[cfg(test)]
@@ -1022,75 +1107,11 @@ fn is_peerdav_response(head: &[u8]) -> bool {
         })
 }
 
-pub(crate) fn local_ipv4_scan_targets() -> Vec<ScanTarget> {
-    let interfaces = match get_if_addrs() {
-        Ok(interfaces) => interfaces,
-        Err(error) => {
-            log::debug!("peerdav.discovery cannot enumerate interfaces: {error}");
-            return Vec::new();
-        }
-    };
-    // Never probe this machine's own addresses: in debug builds the self
-    // fingerprint is allowed, so a local server would otherwise show up as a
-    // remote peer.
-    let own: HashSet<Ipv4Addr> = interfaces
-        .iter()
-        .filter_map(|interface| match &interface.addr {
-            IfAddr::V4(address) => Some(address.ip),
-            _ => None,
-        })
-        .collect();
-
-    let mut candidates = Vec::new();
-    let primary = primary_lan_address();
-    for interface in &interfaces {
-        let IfAddr::V4(address) = &interface.addr else {
-            continue;
-        };
-        if !is_bindable_lan_address(address.ip) {
-            continue;
-        }
-        let priority = interface_priority(&interface.name, primary, address.ip);
-        candidates.push((address, priority));
-    }
-    // If this machine has a tunnel/VPN interface, the virtual network is the
-    // path the user cares about. Do not wander into the physical LAN, where
-    // local devices can otherwise show up as candidates for a remote peer.
-    let virtual_only = candidates.iter().any(|(_, priority)| *priority == 0);
-
-    let mut targets: Vec<ScanTarget> = Vec::new();
-    for (address, priority) in candidates {
-        if virtual_only && priority > 0 {
-            continue;
-        }
-        for target in scan_targets_for(address.ip, address.netmask) {
-            if own.contains(&target) {
-                continue;
-            }
-            if let Some(existing) = targets.iter_mut().find(|entry| entry.address == target) {
-                existing.priority = existing.priority.min(priority);
-                continue;
-            }
-            if targets.len() >= TCP_SCAN_TARGET_LIMIT {
-                return targets;
-            }
-            targets.push(ScanTarget {
-                address: target,
-                priority,
-            });
-        }
-    }
-    log::debug!(
-        "peerdav.discovery TCP targets: virtual_only={virtual_only}, count={}",
-        targets.len()
-    );
-    targets
-}
-
 /// Virtual interfaces win over physical NICs when a peer is reachable through
 /// both. The default-route interface is ranked last, so an address learned
 /// through EasyTier/WireGuard is preferred even if the adapter name is not
 /// recognised.
+#[cfg(test)]
 fn interface_priority(name: &str, primary: Option<Ipv4Addr>, ip: Ipv4Addr) -> u8 {
     let name = name.to_ascii_lowercase();
     const VIRTUAL_PREFIXES: &[&str] = &[
@@ -1114,6 +1135,7 @@ fn interface_priority(name: &str, primary: Option<Ipv4Addr>, ip: Ipv4Addr) -> u8
     }
 }
 
+#[cfg(test)]
 fn scan_targets_for(ip: Ipv4Addr, netmask: Ipv4Addr) -> Vec<Ipv4Addr> {
     let prefix = u32::from(netmask).count_ones();
     let (base, hosts) = if (24..=30).contains(&prefix) {
@@ -1136,6 +1158,7 @@ fn merge_announcement(
     announcement: WireAnnouncement,
     from: SocketAddr,
 ) {
+    let announcement = announcement_from_source(announcement, from);
     let key = announcement_key(&announcement, from);
     match found.entry(key) {
         std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -1185,9 +1208,11 @@ fn update_discovered_peer(peer: &mut DiscoveredPeer, announcement: &WireAnnounce
     peer.name = announcement.name.clone();
     peer.port = announcement.port;
     peer.share_count = announcement.share_count;
+    let mut hosts = Vec::new();
     for host in &announcement.hosts {
-        push_host(&mut peer.hosts, host.clone());
+        push_host(&mut hosts, host.clone());
     }
+    peer.hosts = hosts;
     if let Some(url) = choose_url(&peer.hosts, peer.port) {
         peer.url = url;
     }
@@ -1474,6 +1499,8 @@ mod tests {
                 peer: discovered_peer("old"),
                 last_seen: now - Duration::from_secs(11),
                 ttl: None,
+                verified_url: None,
+                udp: true,
             },
         );
         registry.insert(
@@ -1482,6 +1509,8 @@ mod tests {
                 peer: discovered_peer("fresh"),
                 last_seen: now,
                 ttl: None,
+                verified_url: None,
+                udp: true,
             },
         );
 
@@ -1607,6 +1636,69 @@ mod tests {
                 .last()
                 .is_some_and(|snapshot| snapshot.iter().any(|entry| entry.server_id == "tcp-peer"))
         );
+    }
+
+    #[test]
+    fn selected_networks_are_explicit_bounded_and_deduplicated() {
+        assert!(selected_scan_targets(&[]).expect("empty").is_empty());
+        let targets = selected_scan_targets(&["10.231.242.0/30".into(), "10.231.242.0/30".into()])
+            .expect("selected");
+        assert_eq!(targets.len(), 2);
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.address.octets()[..3] == [10, 231, 242])
+        );
+        for invalid in ["10.0.0.0/8", "8.8.8.0/24", "invalid"] {
+            assert!(selected_scan_targets(&[invalid.into()]).is_err());
+        }
+        assert!(selected_scan_targets(&["10.231.0.0/22".into(), "10.231.4.0/22".into()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_metadata_and_tcp_reachable_address_share_one_record() {
+        let listener =
+            DiscoveryListener::start(free_udp_port(), Arc::new(RecordingEvents::default()))
+                .expect("listener");
+        let announcement = WireAnnouncement {
+            protocol: DISCOVERY_PROTOCOL.into(),
+            kind: DISCOVERY_ANNOUNCE_KIND.into(),
+            server_id: "same-device".into(),
+            name: "Work Mac".into(),
+            port: 4918,
+            share_count: 3,
+            hosts: vec!["192.168.90.8".into()],
+        };
+        let from = "10.2.2.8:4919".parse().expect("source");
+        {
+            let mut registry = listener.peers.write().expect("registry");
+            upsert_live(
+                &mut registry,
+                announcement.clone(),
+                from,
+                Instant::now(),
+                DISCOVERY_PEER_TTL,
+            );
+        }
+        let mut scanned = discovered_peer("same-device");
+        scanned.url = "https://10.2.2.8:4918".into();
+        scanned.hosts = vec!["10.2.2.8".into()];
+        listener.merge_peers(&[scanned]);
+        {
+            let mut registry = listener.peers.write().expect("registry");
+            upsert_live(
+                &mut registry,
+                announcement,
+                from,
+                Instant::now(),
+                DISCOVERY_PEER_TTL,
+            );
+        }
+        let peers = listener.peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].name, "Work Mac");
+        assert_eq!(peers[0].share_count, 3);
+        assert_eq!(peers[0].url, "https://10.2.2.8:4918");
     }
 
     #[test]

@@ -481,9 +481,18 @@ impl PeerManager {
             // Both intervals complete immediately on their first tick: saved
             // servers get a reachability result after launch, and a returning
             // server is promoted as soon as its announcement is visible.
+            let mut tcp = tokio::time::interval(Duration::from_secs(120));
+            tcp.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
+                    _ = tcp.tick() => {
+                        if manager.vault.is_unlocked() {
+                            if let Err(error) = manager.scan_lan_tcp().await {
+                                manager.events.error(&AppError::from_ref(&error));
+                            }
+                        }
+                    }
                     _ = presence.tick() => {
                         manager.reconcile_announced_peers();
                     }
@@ -675,10 +684,29 @@ impl PeerManager {
     /// TCP fallback for overlay networks that drop UDP broadcast. The scan is
     /// an explicit user action, only covers local private subnets, and merges
     /// results into the same registry the passive listener feeds.
+    pub fn tcp_discovery_settings(
+        &self,
+    ) -> Result<crate::types::TcpDiscoverySettings, DomainError> {
+        self.vault
+            .get_setting(crate::types::TCP_DISCOVERY_META)?
+            .map(|value| {
+                serde_json::from_str(&value).map_err(|source| DomainError::Serialization {
+                    operation: "read TCP discovery settings",
+                    source,
+                })
+            })
+            .transpose()
+            .map(|settings| settings.unwrap_or_default())
+    }
+
     pub async fn scan_lan_tcp(&self) -> Result<Vec<DiscoveredPeer>, DomainError> {
+        let settings = self.tcp_discovery_settings()?;
+        if !settings.enabled || settings.networks.is_empty() {
+            return Ok(Vec::new());
+        }
         let identity = self.vault.current_identity()?;
-        let found = discovery::scan_tcp(&identity, DEFAULT_SERVER_PORT)
-            .await
+        let found = discovery::scan_tcp(&identity, DEFAULT_SERVER_PORT, &settings.networks)
+            .await?
             .into_iter()
             // Discovery must never list this installation, even in debug
             // builds where self-connections are allowed for loopback tests.
@@ -994,6 +1022,7 @@ impl PeerManager {
                     label,
                     status: OutboundAccessStatus::Accessible,
                     message: None,
+                    error: None,
                 },
                 request_id: None,
             },
@@ -1005,6 +1034,7 @@ impl PeerManager {
                         label,
                         status: OutboundAccessStatus::Waiting,
                         message: None,
+                        error: None,
                     },
                     request_id: Some(request_id),
                 },
@@ -1083,6 +1113,7 @@ impl PeerManager {
                     label: None,
                     status: OutboundAccessStatus::Canceled,
                     message: None,
+                    error: None,
                 },
                 request_id: None,
             },
@@ -1126,11 +1157,12 @@ impl PeerManager {
         }
     }
 
-    fn settle_outbound(&self, url: &str, settled: (OutboundAccessStatus, Option<String>)) {
+    fn settle_outbound(&self, url: &str, settled: (OutboundAccessStatus, Option<AppError>)) {
         let entry = match self.outbound_entry(url) {
             Some(mut entry) => {
                 entry.request.status = settled.0;
-                entry.request.message = settled.1;
+                entry.request.message = settled.1.as_ref().map(|error| error.message.clone());
+                entry.request.error = settled.1;
                 entry.request_id = None;
                 entry
             }
@@ -1378,6 +1410,7 @@ impl PeerManager {
                 latency_ms,
                 code: None,
                 message: None,
+                error: None,
                 detail: None,
             },
             Ok(Err(error)) => {
@@ -1387,12 +1420,18 @@ impl PeerManager {
                     online,
                     authorized: false,
                     latency_ms,
+                    error: Some(app_error.clone()),
                     code: Some(app_error.code),
                     message: Some(app_error.message),
                     detail: app_error.detail,
                 }
             }
             Err(_) => PeerHealth {
+                error: Some(AppError::from_ref(&DomainError::PeerRequest {
+                    operation: "check connection",
+                    status: None,
+                    detail: "connection timed out".into(),
+                })),
                 online: false,
                 authorized: false,
                 latency_ms,
@@ -2545,7 +2584,7 @@ impl PeerManager {
             .find(|peer| peer.url == url).and_then(|peer| peer.machine_id)
             .or_else(|| self.pairing_pins.lock().ok().and_then(|pins| pins.get(url).cloned()))
             .or_else(|| self.discovered_peers().into_iter()
-                .find(|peer| announced_peer_matches(url, peer)).map(|peer| peer.server_id))
+                .find(|peer| peer.url == url).map(|peer| peer.server_id))
             .or_else(|| url::Url::parse(url).ok().filter(|url| {
                 matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "localhost"))
             }).map(|_| self.vault.identity().fingerprint.clone()))
@@ -2690,7 +2729,7 @@ fn normalize_peer_url(raw: &str) -> Result<String, DomainError> {
 
 /// 申请失败对应到列表上的终态，并保留一句面向用户的原因（单层文案，来自统一的
 /// 错误映射，不再拼接上下文）。用户主动取消除外：那不是错误。
-fn access_failure(error: &DomainError) -> (OutboundAccessStatus, Option<String>) {
+fn access_failure(error: &DomainError) -> (OutboundAccessStatus, Option<AppError>) {
     let status = match error {
         DomainError::PeerAccessCanceled => OutboundAccessStatus::Canceled,
         DomainError::PeerAccessTimeout | DomainError::PeerAccessExpired => {
@@ -2700,7 +2739,7 @@ fn access_failure(error: &DomainError) -> (OutboundAccessStatus, Option<String>)
     };
     let message = match status {
         OutboundAccessStatus::Canceled => None,
-        _ => Some(AppError::from_ref(error).message),
+        _ => Some(AppError::from_ref(error)),
     };
     (status, message)
 }
@@ -2709,7 +2748,7 @@ fn access_failure(error: &DomainError) -> (OutboundAccessStatus, Option<String>)
 fn settle_outbound_entry(
     url: String,
     label: Option<String>,
-    settled: (OutboundAccessStatus, Option<String>),
+    settled: (OutboundAccessStatus, Option<AppError>),
 ) -> OutboundAccess {
     OutboundAccess {
         request: OutboundAccessRequest {
@@ -2717,7 +2756,8 @@ fn settle_outbound_entry(
             url,
             label,
             status: settled.0,
-            message: settled.1,
+            message: settled.1.as_ref().map(|error| error.message.clone()),
+            error: settled.1,
         },
         request_id: None,
     }

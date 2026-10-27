@@ -174,6 +174,8 @@ pub fn run() {
             commands::revoke_authorization,
             commands::scan_lan,
             commands::scan_lan_tcp,
+            commands::service_settings,
+            commands::set_tcp_discovery,
             commands::discovered_peers,
             commands::local_networks,
             commands::local_addresses,

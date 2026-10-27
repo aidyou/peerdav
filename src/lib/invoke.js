@@ -1,6 +1,6 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
-import { localizeMessage } from "./i18n.js";
+import { localizeMessage, t } from "./i18n.js";
 
 /**
  * Stable code -> UI strategy mapping. Components must branch on `code`,
@@ -10,6 +10,17 @@ const ERROR_STRATEGIES = Object.freeze({
   VAULT_NOT_INITIALIZED: "initialize",
   VAULT_ALREADY_INITIALIZED: "refresh",
   VAULT_LOCKED: "unlock",
+  VAULT_KEY_FILE_NOT_CONFIGURED: "show",
+  VAULT_KEY_FILE_EXISTS: "show",
+  VAULT_KEY_FILE_MISSING: "show",
+  VAULT_KEY_FILE_INVALID: "show",
+  VAULT_KEY_MISMATCH: "show",
+  VAULT_INVALID_KEY_DIRECTORY: "edit",
+  VAULT_MUST_BE_LOCKED: "show",
+  VAULT_RECOVERY_CODE_NOT_CONFIGURED: "show",
+  VAULT_INVALID_RECOVERY_CODE: "retry",
+  VALIDATION_INVALID_USERNAME: "edit",
+  PEER_ACCESS_CANCELED: "ignore",
   VAULT_INVALID_MASTER_PASSWORD: "retry",
   VAULT_DATA_CORRUPTED: "support",
   VAULT_SECRET_NOT_FOUND: "support",
@@ -41,6 +52,7 @@ const ERROR_STRATEGIES = Object.freeze({
   PEER_ACCESS_TIMEOUT: "show",
   PEER_ACCESS_DENIED: "show",
   PEER_REQUEST_FAILED: "show",
+  PEER_IDENTITY_MISMATCH: "show",
   PEER_REMOTE_NOT_FOUND: "show",
   PEER_NOT_FOUND: "peer-refresh",
   PEER_PROTOCOL_ERROR: "support",
@@ -103,9 +115,26 @@ export function errorStrategy(error) {
 }
 
 /**
- * Returns the user-facing message in the active UI language. Backend messages
- * are bilingual; `detail` stays raw for logs and the details panel.
+ * Renders error codes and safe reason parameters through the locale catalog.
+ * Backend message is retained only as a compatibility fallback; detail is never
+ * used as user-facing text.
  */
 export function toUserMessage(error) {
-  return localizeMessage(normalizeAppError(error).message);
+  const normalized = normalizeAppError(error);
+  const key = `errors.${normalized.code}`;
+  let reason = normalized.context?.reason;
+  if (!reason) {
+    const fallback = localizeMessage(normalized.message);
+    reason = fallback.split(/：|: /).slice(1).join(": ") || fallback;
+  }
+  if (["VALIDATION_WEAK_PASSWORD", "VALIDATION_INVALID_USERNAME"].includes(normalized.code)) {
+    const reasonKey = `errors.reason.${normalized.code}.${reason}`;
+    const localized = t(reasonKey);
+    if (localized !== reasonKey) reason = localized;
+  }
+  const params = { ...normalized.context, reason };
+  if (normalized.context?.status) params.reason = `HTTP ${normalized.context.status} (${reason})`;
+  const translated = t(key, params);
+  if (translated !== key) return translated;
+  return localizeMessage(normalized.message);
 }

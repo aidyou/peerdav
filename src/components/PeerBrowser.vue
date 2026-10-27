@@ -7,7 +7,7 @@ import { useAppContext } from "../lib/appContext";
 import { confirmAction } from "../lib/confirm";
 import { canPreview, fileKind, fileKindKey, isReadableText } from "../lib/fileKinds";
 import { t } from "../lib/i18n";
-import { normalizeAppError } from "../lib/invoke";
+import { normalizeAppError, toUserMessage } from "../lib/invoke";
 import { statusTagTone } from "../lib/tagTone";
 import {
   MAX_PREVIEW_BYTES,
@@ -632,7 +632,7 @@ async function processDownloadQueue() {
       completed += 1;
     } catch (error) {
       item.status = "error";
-      item.error = normalizeAppError(error).message;
+      item.error = toUserMessage(error);
       markRemainingDownloadCanceled();
       app.handleFailure(error);
       break;
@@ -837,7 +837,7 @@ async function processUploadQueue() {
       }
       if (normalized.code !== "TRANSFER_CONFLICT") {
         item.status = "error";
-        item.error = normalized.message;
+        item.error = toUserMessage(normalized);
         markRemainingCanceled();
         app.handleFailure(error);
         break;
@@ -870,7 +870,7 @@ async function processUploadQueue() {
           break;
         }
         item.status = "error";
-        item.error = normalizeAppError(retryError).message;
+        item.error = toUserMessage(retryError);
         markRemainingCanceled();
         app.handleFailure(retryError);
         break;

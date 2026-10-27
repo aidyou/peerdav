@@ -2,6 +2,8 @@
 // 前端只负责按同一份数据渲染，因此页面重建、切换标签或 webview 重载都不会让
 // 一台「已申请、等待批准」的服务器退回「可以申请」。
 
+import { toUserMessage } from "./invoke";
+
 /**
  * 把 URL 拆成 host/port。无法解析时返回 null，调用方退回字符串比较。
  * @param {string | null | undefined} url
@@ -121,7 +123,7 @@ export function accessRowState(entry) {
         canRequest: true,
         canCancel: false,
         messageKey: "",
-        message: entry.message ?? "",
+        message: entry.error ? toUserMessage(entry.error) : entry.message ?? "",
       };
     default:
       return {

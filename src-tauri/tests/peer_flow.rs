@@ -1536,9 +1536,8 @@ async fn upload_progress_is_incremental_and_cancellation_stops_the_current_file(
         assert!(
             updates
                 .iter()
-                .any(|(phase, bytes, total, _)| *phase == UploadPhase::Hashing
-                    && *bytes > 0
-                    && bytes < total)
+                .all(|(phase, _, _, _)| *phase != UploadPhase::Hashing),
+            "v2 must start uploading without a full-file pre-scan"
         );
         assert!(updates.iter().any(
             |(phase, bytes, total, sent)| *phase == UploadPhase::Uploading
@@ -1558,13 +1557,12 @@ async fn upload_progress_is_incremental_and_cancellation_stops_the_current_file(
         size as u64
     );
 
-    // Both hashing and an active request body can be interrupted. Canceling
-    // must not wait for the file to finish or publish a destination.
-    for cancel_phase in [UploadPhase::Hashing, UploadPhase::Uploading] {
+    // Both preparation and an active request body can be interrupted.
+    for cancel_before_data in [true, false] {
         let id = harness.peers.begin_upload().await;
         let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
         let progress = Arc::new(move |phase, bytes, _, _| {
-            if phase == cancel_phase && (phase == UploadPhase::Hashing || bytes > 0) {
+            if phase == UploadPhase::Uploading && (cancel_before_data || bytes > 0) {
                 started.send(()).expect("cancellation observer");
             }
         });
@@ -1931,6 +1929,106 @@ async fn upload_parts_survive_restart_and_reject_wrong_content() {
     );
     assert_eq!(
         std::fs::read(harness.share_root.join("resume.txt")).expect("original retained"),
+        payload
+    );
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn streaming_upload_verifies_resumed_parts_and_final_digest() {
+    use sha2::{Digest, Sha256};
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (_, code) = harness.connect().await;
+    let client = harness
+        .vault
+        .encrypted_client(harness.vault.fingerprint())
+        .expect("client");
+    let payload = b"streamed content";
+    let digest = hex::encode(Sha256::digest(payload));
+    let target = format!("{}/share/{}/stream.txt", harness.url, harness.share_id);
+    let request = |method: reqwest::Method| {
+        client
+            .request(method, &target)
+            .basic_auth("peerdav", Some(&code))
+            .header("x-peerdav-transfer", "ab".repeat(32))
+            .header("x-peerdav-size", payload.len())
+            .header("x-peerdav-part", "0")
+            .header("x-peerdav-upload-version", "2")
+    };
+    std::fs::write(harness.share_root.join("stream.txt"), b"original").expect("original");
+    assert_eq!(
+        request(reqwest::Method::PATCH)
+            .header("x-peerdav-part-sha256", "00".repeat(32))
+            .body(payload.to_vec())
+            .send()
+            .await
+            .expect("bad part")
+            .status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        request(reqwest::Method::PATCH)
+            .header("x-peerdav-part-sha256", &digest)
+            .body(payload.to_vec())
+            .send()
+            .await
+            .expect("part")
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        request(reqwest::Method::HEAD)
+            .header("x-peerdav-part-sha256", "00".repeat(32))
+            .send()
+            .await
+            .expect("mismatched resume")
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(reqwest::Method::HEAD)
+            .header("x-peerdav-part-sha256", &digest)
+            .send()
+            .await
+            .expect("verified resume")
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    for expected in [None, Some("00".repeat(32))] {
+        let mut commit = request(reqwest::Method::PUT).header("x-peerdav-commit", "1");
+        if let Some(digest) = expected {
+            commit = commit.header("x-peerdav-content-sha256", digest);
+        }
+        assert_eq!(
+            commit.send().await.expect("invalid commit").status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            std::fs::read(harness.share_root.join("stream.txt")).expect("preserved"),
+            b"original"
+        );
+        assert!(
+            !std::fs::read_dir(&harness.share_root)
+                .expect("share")
+                .any(|entry| entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".peerdav-"))
+        );
+    }
+    assert_eq!(
+        request(reqwest::Method::PUT)
+            .header("x-peerdav-commit", "1")
+            .header("x-peerdav-content-sha256", &digest)
+            .send()
+            .await
+            .expect("commit")
+            .status(),
+        reqwest::StatusCode::CREATED
+    );
+    assert_eq!(
+        std::fs::read(harness.share_root.join("stream.txt")).expect("saved"),
         payload
     );
     harness.controller.stop().await;

@@ -1088,7 +1088,9 @@ async fn handle_request(
     gate: Arc<Gate>,
     handler: DavHandler<RequestCredentials>,
 ) -> Response<Body> {
-    if request.method() == Method::OPTIONS {
+    if request.method() == Method::OPTIONS
+        && !request.headers().contains_key("x-peerdav-upload-probe")
+    {
         return options_response();
     }
     if request.method().as_str() == "PROPPATCH" {
@@ -1182,6 +1184,16 @@ async fn handle_request(
         let Some(identity) = machine_id_value(request.headers()) else {
             return auth_challenge();
         };
+        if request.method() == http::Method::OPTIONS
+            && request.headers().contains_key("x-peerdav-upload-probe")
+        {
+            let mut response = empty_response(StatusCode::NO_CONTENT);
+            response.headers_mut().insert(
+                "x-peerdav-upload-version",
+                http::HeaderValue::from_static("2"),
+            );
+            return response;
+        }
         return match crate::upload::handle(
             request,
             &share,

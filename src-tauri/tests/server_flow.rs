@@ -1713,7 +1713,14 @@ async fn server_lifecycle_and_structured_bind_failures() {
         .expect_err("invalid bind address");
     let structured = AppError::from(invalid);
     assert_eq!(structured.code, "SERVER_BIND_FAILED");
-    assert!(structured.message.contains("绑定地址"));
+    assert!(structured.message.starts_with("启动服务失败："));
+    assert!(
+        structured
+            .context
+            .as_ref()
+            .and_then(|value| value["reason"].as_str())
+            .is_some_and(|reason| !reason.is_empty())
+    );
 
     let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("blocker");
     let occupied = blocker.local_addr().expect("occupied address").port();

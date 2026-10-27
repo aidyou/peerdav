@@ -846,12 +846,107 @@ fn rename_at(_share: &ShareConfig, _from: &Path, _to: &Path) -> FsResult<()> {
 
 /// Commit a verified upload through the same descriptor-relative path checks
 /// as WebDAV. The temporary sibling is never visible at the destination name.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub(crate) fn commit_upload(
     share: &ShareConfig,
     relative: &Path,
     source: &Path,
     session: &crate::types::UploadSession,
+) -> Result<(), DomainError> {
+    commit_upload_with(share, relative, session, |target| {
+        let mut input = File::open(source)?;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            if *session.cancel.borrow() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "upload canceled",
+                ));
+            }
+            let len = input.read(&mut buffer)?;
+            if len == 0 {
+                break;
+            }
+            target.write_all(&buffer[..len])?;
+        }
+        Ok(())
+    })
+}
+
+/// Merge and verify directly into the descriptor-relative destination sibling.
+#[cfg(unix)]
+pub(crate) fn commit_upload_parts(
+    share: &ShareConfig,
+    relative: &Path,
+    directory: &Path,
+    size: u64,
+    digest: &str,
+    session: &crate::types::UploadSession,
+) -> Result<(), DomainError> {
+    use sha2::{Digest, Sha256};
+    commit_upload_with(share, relative, session, |target| {
+        let mut hash = Sha256::new();
+        let mut buffer = vec![0u8; 1024 * 1024];
+        for index in 0..size.div_ceil(crate::types::TRANSFER_PART_BYTES).max(1) {
+            let path = directory.join(index.to_string());
+            let expected = size
+                .saturating_sub(index * crate::types::TRANSFER_PART_BYTES)
+                .min(crate::types::TRANSFER_PART_BYTES);
+            let fd = rustix::fs::open(
+                &path,
+                rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )
+            .map_err(std::io::Error::from)?;
+            let mut input = File::from(fd);
+            let metadata = input.metadata()?;
+            if !metadata.is_file() || metadata.len() != expected {
+                return Err(std::io::Error::other("upload part is incomplete"));
+            }
+            let mut remaining = expected;
+            while remaining > 0 {
+                if *session.cancel.borrow() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "upload canceled",
+                    ));
+                }
+                let length = remaining.min(buffer.len() as u64) as usize;
+                input.read_exact(&mut buffer[..length])?;
+                hash.update(&buffer[..length]);
+                target.write_all(&buffer[..length])?;
+                remaining -= length as u64;
+            }
+        }
+        if hex::encode(hash.finalize()) != digest {
+            return Err(std::io::Error::other(
+                "upload content changed; retry with the current file",
+            ));
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn commit_upload_parts(
+    _share: &ShareConfig,
+    _relative: &Path,
+    _directory: &Path,
+    _size: u64,
+    _digest: &str,
+    _session: &crate::types::UploadSession,
+) -> Result<(), DomainError> {
+    Err(DomainError::InvalidShareConfig {
+        detail: "secure uploads are unavailable on this platform".into(),
+    })
+}
+
+#[cfg(unix)]
+fn commit_upload_with(
+    share: &ShareConfig,
+    relative: &Path,
+    session: &crate::types::UploadSession,
+    write: impl FnOnce(&mut File) -> std::io::Result<()>,
 ) -> Result<(), DomainError> {
     use rustix::fs::{Mode, OFlags};
     let resolved =
@@ -900,21 +995,7 @@ pub(crate) fn commit_upload(
     })?;
     let result = (|| {
         let mut target = File::from(fd);
-        let mut input = File::open(source)?;
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            if *session.cancel.borrow() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "upload canceled",
-                ));
-            }
-            let len = input.read(&mut buffer)?;
-            if len == 0 {
-                break;
-            }
-            target.write_all(&buffer[..len])?;
-        }
+        write(&mut target)?;
         target.sync_all()?;
         // Serialize cancel and atomic replacement. Once renamed, cancellation
         // reports completion and never removes the destination.
@@ -949,18 +1030,6 @@ pub(crate) fn commit_upload(
         });
     }
     Ok(())
-}
-
-#[cfg(not(unix))]
-pub(crate) fn commit_upload(
-    _share: &ShareConfig,
-    _relative: &Path,
-    _source: &Path,
-    _session: &crate::types::UploadSession,
-) -> Result<(), DomainError> {
-    Err(DomainError::InvalidShareConfig {
-        detail: "secure uploads are unavailable on this platform".into(),
-    })
 }
 
 #[cfg(unix)]

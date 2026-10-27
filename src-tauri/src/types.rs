@@ -42,6 +42,24 @@ pub const SERVER_BIND_META: &str = "server.bindAddress";
 pub const SERVER_PORT_META: &str = "server.port";
 pub const SERVER_DISCOVERY_PORT_META: &str = "server.discoveryPort";
 pub const SERVER_NAME_META: &str = "server.name";
+pub const TCP_DISCOVERY_META: &str = "discovery.tcp";
+
+#[derive(Debug, Clone, Default, serde::Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpDiscoverySettings {
+    pub enabled: bool,
+    pub networks: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceSettings {
+    pub name: String,
+    pub bind_address: String,
+    pub port: u16,
+    pub discovery_port: u16,
+    pub tcp: TcpDiscoverySettings,
+}
 /// Stable installation identifier used to bind a server authorization to the
 /// PeerDav client that owns it.
 pub const CLIENT_ID_META: &str = "client.id";
@@ -287,6 +305,7 @@ pub struct OutboundAccessRequest {
     pub status: OutboundAccessStatus,
     /// 失败/过期时面向用户的一句话（后端错误映射出的单层文案）；其他状态为空。
     pub message: Option<String>,
+    pub error: Option<crate::error::AppError>,
 }
 
 /// A client waiting for the administrator to approve access.
@@ -596,6 +615,7 @@ pub struct PeerHealth {
     pub code: Option<String>,
     pub message: Option<String>,
     pub detail: Option<String>,
+    pub error: Option<crate::error::AppError>,
 }
 
 /// One structured directory entry.
