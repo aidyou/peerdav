@@ -23,6 +23,7 @@ const discoveredLoading = computed(
 );
 const requestingUrl = ref("");
 const removingPeerId = ref("");
+const scanningTcp = ref(false);
 // 共享数量放在共享上下文里：页面重挂载时不会先掉成「—」再填回来。
 const shareCounts = computed(() => app.peerShareCounts);
 
@@ -77,6 +78,28 @@ function isSaved(server) {
 /// 所以切换页面或重载后不会退回「可以申请」。
 function rowState(server) {
   return accessRowState(findAccessRequest(app.accessRequests, server));
+}
+
+/// UDP broadcast does not cross every virtual LAN (EasyTier, WireGuard, ...).
+/// This explicit TCP pass probes the local private /24s and merges the result
+/// into the same discovery snapshot the passive listener feeds.
+async function scanTcp() {
+  if (scanningTcp.value) return;
+  scanningTcp.value = true;
+  try {
+    const found = await app.invoke("scan_lan_tcp");
+    await Promise.all([app.refreshDiscovered(), app.refreshPeers()]);
+    const count = Array.isArray(found) ? found.length : 0;
+    if (count > 0) {
+      app.setNotice("home.scanTcpDone", { count });
+    } else {
+      app.setError("home.scanTcpEmpty");
+    }
+  } catch (error) {
+    app.handleFailure(error);
+  } finally {
+    scanningTcp.value = false;
+  }
 }
 
 function requestMessage(server) {
@@ -335,6 +358,16 @@ async function forgetPeer(peer) {
               : t("home.discoveryStopped")
           }}
         </el-tag>
+        <el-button
+          class="list-pill"
+          plain
+          round
+          size="small"
+          :loading="scanningTcp"
+          @click="scanTcp"
+        >
+          {{ t("home.scanTcp") }}
+        </el-button>
       </header>
 
       <list-skeleton v-if="discoveredLoading" variant="card" :rows="3" />

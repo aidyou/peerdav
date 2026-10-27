@@ -10,30 +10,41 @@
 //! Discovery intentionally exposes only the server name, port and share
 //! count. Share ids are only returned by the authenticated catalog endpoint.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use futures_util::stream::{self, StreamExt};
 use if_addrs::{IfAddr, get_if_addrs};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, Socket, Type};
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout, timeout_at};
+use tokio_rustls::TlsConnector;
 
 use crate::error::DomainError;
 use crate::fs::ShareMap;
 use crate::traits::PeerEvents;
 use crate::types::{
-    DISCOVERY_ANNOUNCE_INTERVAL, DISCOVERY_ANNOUNCE_KIND, DISCOVERY_PEER_TTL, DISCOVERY_PROBE_KIND,
-    DISCOVERY_PROTOCOL, DISCOVERY_PRUNE_INTERVAL, DISCOVERY_RECV_BUFFER, DISCOVERY_SCAN_TIMEOUT,
-    DiscoveredPeer, MAX_DISCOVERY_HOSTS,
+    CATALOG_PATH, DISCOVERY_ANNOUNCE_INTERVAL, DISCOVERY_ANNOUNCE_KIND, DISCOVERY_PEER_TTL,
+    DISCOVERY_PROBE_KIND, DISCOVERY_PROTOCOL, DISCOVERY_PRUNE_INTERVAL, DISCOVERY_RECV_BUFFER,
+    DISCOVERY_SCAN_TIMEOUT, DeviceIdentity, DiscoveredPeer, MAX_DISCOVERY_HOSTS,
 };
 
 const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 const DISCOVERY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// TCP fallback for networks where UDP broadcast is not forwarded (EasyTier,
+/// WireGuard, most L3 overlays). Only private interface subnets are scanned.
+pub(crate) const TCP_SCAN_TIMEOUT: Duration = Duration::from_millis(450);
+const TCP_SCAN_CONCURRENCY: usize = 64;
+const TCP_SCAN_TARGET_LIMIT: usize = 1024;
+/// Scanned peers survive longer than UDP announcements because a scan is an
+/// explicit user action and the overlay may never deliver an announcement.
+const TCP_DISCOVERY_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct WireProbe {
@@ -111,6 +122,9 @@ pub(crate) struct LocalAdvert {
 struct PeerRecord {
     peer: DiscoveredPeer,
     last_seen: Instant,
+    /// `None` uses the listener's UDP TTL. TCP-scanned entries use a longer
+    /// TTL because they are not refreshed by announcements.
+    ttl: Option<Duration>,
 }
 
 /// A long-running UDP listener that feeds the passive discovery registry.
@@ -123,6 +137,7 @@ pub(crate) struct DiscoveryListener {
     port: u16,
     peers: Arc<RwLock<HashMap<String, PeerRecord>>>,
     advert: Arc<RwLock<Option<LocalAdvert>>>,
+    events: Arc<dyn PeerEvents>,
     shutdown: std::sync::Mutex<Option<oneshot::Sender<()>>>,
     task: JoinHandle<()>,
 }
@@ -176,6 +191,7 @@ impl DiscoveryListener {
             port,
             peers,
             advert,
+            events,
             shutdown: std::sync::Mutex::new(Some(shutdown_tx)),
             task,
         })
@@ -203,6 +219,46 @@ impl DiscoveryListener {
                 log::warn!("peerdav.discovery registry lock poisoned");
                 Vec::new()
             }
+        }
+    }
+
+    /// Adds TCP-scanned peers to the same registry the passive UDP listener
+    /// uses. A later UDP announcement upgrades the metadata and TTL in place.
+    pub(crate) fn merge_peers(&self, peers: &[DiscoveredPeer]) {
+        let now = Instant::now();
+        let changed = match self.peers.write() {
+            Ok(mut registry) => {
+                let mut changed = false;
+                for peer in peers {
+                    if peer.server_id.is_empty() {
+                        continue;
+                    }
+                    if let Some(record) = registry.get_mut(&peer.server_id) {
+                        // Keep the shorter UDP TTL for peers that also
+                        // announce themselves; only the TCP-only entry gets
+                        // the longer scan TTL.
+                        record.last_seen = now;
+                    } else {
+                        registry.insert(
+                            peer.server_id.clone(),
+                            PeerRecord {
+                                peer: peer.clone(),
+                                last_seen: now,
+                                ttl: Some(TCP_DISCOVERY_TTL),
+                            },
+                        );
+                        changed = true;
+                    }
+                }
+                changed
+            }
+            Err(_) => {
+                log::warn!("peerdav.discovery registry lock poisoned");
+                false
+            }
+        };
+        if changed {
+            emit_snapshot(&self.peers, self.events.as_ref());
         }
     }
 
@@ -261,7 +317,7 @@ async fn run_listener(
             received = socket.recv_from(&mut buffer) => {
                 match received {
                     Ok((length, peer)) => {
-                        handle_datagram(&socket, &peers, &advert, events.as_ref(), &buffer[..length], peer).await;
+                        handle_datagram(&socket, &peers, &advert, events.as_ref(), &buffer[..length], peer, ttl).await;
                     }
                     Err(error) => {
                         log::warn!("peerdav.discovery receive failed: {error}");
@@ -280,6 +336,7 @@ async fn handle_datagram(
     events: &dyn PeerEvents,
     payload: &[u8],
     from: SocketAddr,
+    ttl: Duration,
 ) {
     let Ok(envelope) = serde_json::from_slice::<WireEnvelope>(payload) else {
         return;
@@ -311,7 +368,7 @@ async fn handle_datagram(
         return;
     };
     let changed = match peers.write() {
-        Ok(mut registry) => upsert_live(&mut registry, announcement, from, Instant::now()),
+        Ok(mut registry) => upsert_live(&mut registry, announcement, from, Instant::now(), ttl),
         Err(_) => {
             log::warn!("peerdav.discovery registry lock poisoned");
             false
@@ -352,7 +409,7 @@ fn announcement_for_advert(advert: &LocalAdvert) -> WireAnnouncement {
 
 fn prune_expired(registry: &mut HashMap<String, PeerRecord>, now: Instant, ttl: Duration) -> bool {
     let before = registry.len();
-    registry.retain(|_, record| now.duration_since(record.last_seen) <= ttl);
+    registry.retain(|_, record| now.duration_since(record.last_seen) <= record.ttl.unwrap_or(ttl));
     before != registry.len()
 }
 
@@ -361,12 +418,14 @@ fn upsert_live(
     announcement: WireAnnouncement,
     from: SocketAddr,
     now: Instant,
+    ttl: Duration,
 ) -> bool {
     let key = announcement_key(&announcement, from);
     if let Some(record) = registry.get_mut(&key) {
         let previous = record.peer.clone();
         update_discovered_peer(&mut record.peer, &announcement);
         record.last_seen = now;
+        record.ttl = None;
         return record.peer != previous;
     }
     registry.insert(
@@ -374,6 +433,7 @@ fn upsert_live(
         PeerRecord {
             peer: new_discovered_peer(&announcement),
             last_seen: now,
+            ttl: Some(ttl),
         },
     );
     true
@@ -793,6 +853,284 @@ pub async fn scan(port: u16, timeout_ms: Option<u64>) -> Result<Vec<DiscoveredPe
     Ok(sorted_peers(found.into_values()))
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScanTarget {
+    address: Ipv4Addr,
+    /// 0 = tunnel/VPN interface, 1 = ordinary interface. The lower value wins
+    /// when the same peer is reachable through more than one address.
+    priority: u8,
+}
+
+/// TCP discovery used when UDP broadcast is not forwarded by the overlay
+/// network. Each private interface contributes the hosts of its local /24;
+/// peers are identified by the public-key fingerprint from the TLS handshake.
+pub(crate) async fn scan_tcp(identity: &DeviceIdentity, port: u16) -> Vec<DiscoveredPeer> {
+    scan_tcp_prioritized(identity, port, local_ipv4_scan_targets(), TCP_SCAN_TIMEOUT).await
+}
+
+#[cfg(test)]
+pub(crate) async fn scan_tcp_targets(
+    identity: &DeviceIdentity,
+    port: u16,
+    targets: Vec<Ipv4Addr>,
+    budget: Duration,
+) -> Vec<DiscoveredPeer> {
+    let targets = targets
+        .into_iter()
+        .map(|address| ScanTarget {
+            address,
+            priority: 0,
+        })
+        .collect();
+    scan_tcp_prioritized(identity, port, targets, budget).await
+}
+
+async fn scan_tcp_prioritized(
+    identity: &DeviceIdentity,
+    port: u16,
+    targets: Vec<ScanTarget>,
+    budget: Duration,
+) -> Vec<DiscoveredPeer> {
+    if port == 0 || targets.is_empty() {
+        return Vec::new();
+    }
+    let target_count = targets.len();
+    let config = match crate::tls::probe_client(identity) {
+        Ok(config) => Arc::new(config),
+        Err(error) => {
+            log::warn!("peerdav.discovery TCP probe client unavailable: {error}");
+            return Vec::new();
+        }
+    };
+
+    let found = stream::iter(targets.into_iter().map(|target| {
+        let config = Arc::clone(&config);
+        async move { probe_tcp(target, port, budget, config).await }
+    }))
+    .buffer_unordered(TCP_SCAN_CONCURRENCY)
+    .filter_map(|peer| async move { peer })
+    .collect::<Vec<_>>()
+    .await;
+
+    let peers = merge_scanned(found);
+    log::info!(
+        "peerdav.discovery TCP scan probed {target_count} host(s) on port {port} and found {} peer(s)",
+        peers.len()
+    );
+    peers
+}
+
+/// Deduplicates scan hits by certificate fingerprint. All reachable hosts are
+/// kept, and the URL comes from the highest-priority interface so a virtual
+/// LAN address wins over a physical one for the same server.
+fn merge_scanned(found: Vec<(u8, DiscoveredPeer)>) -> Vec<DiscoveredPeer> {
+    let mut unique: HashMap<String, (u8, DiscoveredPeer)> = HashMap::new();
+    for (priority, peer) in found {
+        match unique.entry(peer.server_id.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let (best_priority, best) = entry.get_mut();
+                for host in &peer.hosts {
+                    push_host(&mut best.hosts, host.clone());
+                }
+                if priority < *best_priority {
+                    *best_priority = priority;
+                    best.name = peer.name;
+                    best.url = peer.url;
+                    best.port = peer.port;
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((priority, peer));
+            }
+        }
+    }
+    sorted_peers(unique.into_values().map(|(_, peer)| peer))
+}
+
+async fn probe_tcp(
+    target: ScanTarget,
+    port: u16,
+    budget: Duration,
+    config: Arc<rustls::ClientConfig>,
+) -> Option<(u8, DiscoveredPeer)> {
+    let address = target.address;
+    let socket = SocketAddr::from((address, port));
+    let stream = timeout(budget, TcpStream::connect(socket))
+        .await
+        .ok()?
+        .ok()?;
+    let connector = TlsConnector::from(config);
+    let server_name = rustls::pki_types::ServerName::try_from("peerdav.local").ok()?;
+    let mut stream = timeout(budget, connector.connect(server_name, stream))
+        .await
+        .ok()?
+        .ok()?;
+    let certificate = stream.get_ref().1.peer_certificates()?.first()?.clone();
+    let server_id = crate::tls::fingerprint(&certificate).ok()?;
+
+    // A bare TLS handshake is not enough: routers, NAS boxes and other HTTPS
+    // services would otherwise be reported as PeerDav. HEAD is routed to the
+    // catalog handler before authentication and never records a pending
+    // request; the Server header identifies the protocol implementation.
+    let host = format!("{address}:{port}");
+    let request = format!(
+        "HEAD {CATALOG_PATH} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: PeerDav-discovery\r\nConnection: close\r\n\r\n"
+    );
+    timeout(budget, stream.write_all(request.as_bytes()))
+        .await
+        .ok()?
+        .ok()?;
+    let mut head = Vec::new();
+    let mut chunk = [0_u8; 512];
+    loop {
+        let count = match timeout(budget, stream.read(&mut chunk)).await.ok()? {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(_) => return None,
+        };
+        head.extend_from_slice(&chunk[..count]);
+        if head.windows(4).any(|window| window == b"\r\n\r\n") || head.len() >= 4096 {
+            break;
+        }
+    }
+    if !is_peerdav_response(&head) {
+        return None;
+    }
+
+    let host = address.to_string();
+    let hosts = vec![host.clone()];
+    Some((
+        target.priority,
+        DiscoveredPeer {
+            server_id,
+            name: format!("PeerDav ({host})"),
+            url: choose_url(&hosts, port).unwrap_or_default(),
+            hosts,
+            port,
+            share_count: 0,
+        },
+    ))
+}
+
+fn is_peerdav_response(head: &[u8]) -> bool {
+    String::from_utf8_lossy(head)
+        .lines()
+        .take(32)
+        .filter_map(|line| line.split_once(':'))
+        .any(|(name, value)| {
+            name.eq_ignore_ascii_case("server") && value.trim().eq_ignore_ascii_case("peerdav")
+        })
+}
+
+pub(crate) fn local_ipv4_scan_targets() -> Vec<ScanTarget> {
+    let interfaces = match get_if_addrs() {
+        Ok(interfaces) => interfaces,
+        Err(error) => {
+            log::debug!("peerdav.discovery cannot enumerate interfaces: {error}");
+            return Vec::new();
+        }
+    };
+    // Never probe this machine's own addresses: in debug builds the self
+    // fingerprint is allowed, so a local server would otherwise show up as a
+    // remote peer.
+    let own: HashSet<Ipv4Addr> = interfaces
+        .iter()
+        .filter_map(|interface| match &interface.addr {
+            IfAddr::V4(address) => Some(address.ip),
+            _ => None,
+        })
+        .collect();
+
+    let mut candidates = Vec::new();
+    let primary = primary_lan_address();
+    for interface in &interfaces {
+        let IfAddr::V4(address) = &interface.addr else {
+            continue;
+        };
+        if !is_bindable_lan_address(address.ip) {
+            continue;
+        }
+        let priority = interface_priority(&interface.name, primary, address.ip);
+        candidates.push((address, priority));
+    }
+    // If this machine has a tunnel/VPN interface, the virtual network is the
+    // path the user cares about. Do not wander into the physical LAN, where
+    // local devices can otherwise show up as candidates for a remote peer.
+    let virtual_only = candidates.iter().any(|(_, priority)| *priority == 0);
+
+    let mut targets: Vec<ScanTarget> = Vec::new();
+    for (address, priority) in candidates {
+        if virtual_only && priority > 0 {
+            continue;
+        }
+        for target in scan_targets_for(address.ip, address.netmask) {
+            if own.contains(&target) {
+                continue;
+            }
+            if let Some(existing) = targets.iter_mut().find(|entry| entry.address == target) {
+                existing.priority = existing.priority.min(priority);
+                continue;
+            }
+            if targets.len() >= TCP_SCAN_TARGET_LIMIT {
+                return targets;
+            }
+            targets.push(ScanTarget {
+                address: target,
+                priority,
+            });
+        }
+    }
+    log::debug!(
+        "peerdav.discovery TCP targets: virtual_only={virtual_only}, count={}",
+        targets.len()
+    );
+    targets
+}
+
+/// Virtual interfaces win over physical NICs when a peer is reachable through
+/// both. The default-route interface is ranked last, so an address learned
+/// through EasyTier/WireGuard is preferred even if the adapter name is not
+/// recognised.
+fn interface_priority(name: &str, primary: Option<Ipv4Addr>, ip: Ipv4Addr) -> u8 {
+    let name = name.to_ascii_lowercase();
+    const VIRTUAL_PREFIXES: &[&str] = &[
+        "tun",
+        "tap",
+        "utun",
+        "wg",
+        "wireguard",
+        "easytier",
+        "tailscale",
+        "zerotier",
+        "zt",
+        "vpn",
+    ];
+    if VIRTUAL_PREFIXES.iter().any(|prefix| name.contains(prefix)) {
+        0
+    } else if primary == Some(ip) {
+        2
+    } else {
+        1
+    }
+}
+
+fn scan_targets_for(ip: Ipv4Addr, netmask: Ipv4Addr) -> Vec<Ipv4Addr> {
+    let prefix = u32::from(netmask).count_ones();
+    let (base, hosts) = if (24..=30).contains(&prefix) {
+        (
+            u32::from(ip) & u32::from(netmask),
+            (1_u32 << (32 - prefix)) - 2,
+        )
+    } else {
+        // A /16 or /32 overlay still gets a bounded, useful probe of the /24
+        // that contains this interface address instead of 65k connections.
+        (u32::from(ip) & 0xFFFF_FF00, 254)
+    };
+    (1..=hosts)
+        .map(|offset| Ipv4Addr::from(base + offset))
+        .collect()
+}
+
 fn merge_announcement(
     found: &mut HashMap<String, DiscoveredPeer>,
     announcement: WireAnnouncement,
@@ -1135,6 +1473,7 @@ mod tests {
             PeerRecord {
                 peer: discovered_peer("old"),
                 last_seen: now - Duration::from_secs(11),
+                ttl: None,
             },
         );
         registry.insert(
@@ -1142,6 +1481,7 @@ mod tests {
             PeerRecord {
                 peer: discovered_peer("fresh"),
                 last_seen: now,
+                ttl: None,
             },
         );
 
@@ -1244,5 +1584,155 @@ mod tests {
         assert_eq!(reply.name, "Self host");
         assert_eq!(reply.port, 4918);
         assert_eq!(reply.share_count, 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_scan_results_are_visible_in_the_shared_registry() {
+        let port = free_udp_port();
+        let events = Arc::new(RecordingEvents::default());
+        let listener = DiscoveryListener::start_with_ttl(
+            port,
+            DISCOVERY_PEER_TTL,
+            Arc::clone(&events) as Arc<dyn PeerEvents>,
+        )
+        .expect("listener");
+        let peer = discovered_peer("tcp-peer");
+
+        listener.merge_peers(std::slice::from_ref(&peer));
+
+        assert_eq!(listener.peers(), vec![peer.clone()]);
+        let snapshots = events.snapshots.lock().expect("snapshots");
+        assert!(
+            snapshots
+                .last()
+                .is_some_and(|snapshot| snapshot.iter().any(|entry| entry.server_id == "tcp-peer"))
+        );
+    }
+
+    #[test]
+    fn tcp_scan_targets_stay_inside_a_bounded_local_network() {
+        let local = scan_targets_for(Ipv4Addr::new(10, 1, 2, 3), Ipv4Addr::new(255, 255, 255, 0));
+        assert_eq!(local.len(), 254);
+        assert!(local.contains(&Ipv4Addr::new(10, 1, 2, 1)));
+        assert!(local.contains(&Ipv4Addr::new(10, 1, 2, 254)));
+        assert!(!local.contains(&Ipv4Addr::new(10, 1, 2, 0)));
+        assert!(!local.contains(&Ipv4Addr::new(10, 1, 2, 255)));
+
+        // A wide or point-to-point interface is bounded to the local /24.
+        assert_eq!(
+            scan_targets_for(Ipv4Addr::new(10, 1, 2, 3), Ipv4Addr::new(255, 255, 0, 0)).len(),
+            254
+        );
+        assert_eq!(
+            scan_targets_for(
+                Ipv4Addr::new(10, 1, 2, 3),
+                Ipv4Addr::new(255, 255, 255, 255)
+            )
+            .len(),
+            254
+        );
+
+        // A /30 only probes its two usable hosts.
+        assert_eq!(
+            scan_targets_for(
+                Ipv4Addr::new(10, 1, 2, 6),
+                Ipv4Addr::new(255, 255, 255, 252)
+            ),
+            vec![Ipv4Addr::new(10, 1, 2, 5), Ipv4Addr::new(10, 1, 2, 6)]
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_scan_reads_the_server_fingerprint_from_the_handshake() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let directory = tempfile::tempdir().expect("directory");
+        let vault =
+            crate::vault::Vault::open(&directory.path().join("vault.db")).expect("open vault");
+        let identity = vault.current_identity().expect("identity");
+        let acceptor = crate::tls::acceptor(&identity).expect("acceptor");
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("listener");
+        let port = listener.local_addr().expect("local addr").port();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut stream = acceptor.accept(stream).await.expect("tls");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 405 Method Not Allowed\r\nServer: PeerDav\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .expect("response");
+        });
+
+        let found = scan_tcp_targets(
+            &identity,
+            port,
+            vec![Ipv4Addr::LOCALHOST],
+            Duration::from_secs(2),
+        )
+        .await;
+        task.abort();
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].server_id, identity.fingerprint);
+        assert_eq!(found[0].url, format!("https://127.0.0.1:{port}"));
+        assert_eq!(found[0].port, port);
+    }
+
+    #[test]
+    fn only_peerdav_server_headers_are_accepted() {
+        assert!(is_peerdav_response(
+            b"HTTP/1.1 405 Method Not Allowed\r\nServer: PeerDav\r\n\r\n"
+        ));
+        assert!(!is_peerdav_response(
+            b"HTTP/1.1 200 OK\r\nServer: nginx\r\n\r\n"
+        ));
+        assert!(!is_peerdav_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn virtual_interfaces_outrank_physical_ones() {
+        let address = Ipv4Addr::new(10, 0, 0, 7);
+        for name in ["tun0", "utun4", "wg0", "easytier0", "tailscale0"] {
+            assert_eq!(interface_priority(name, None, address), 0, "{name}");
+        }
+        for name in ["en0", "eth0", "WLAN"] {
+            assert_eq!(interface_priority(name, None, address), 1, "{name}");
+        }
+        // The default-route interface ranks below every other physical NIC.
+        assert_eq!(interface_priority("eth0", Some(address), address), 2);
+    }
+
+    #[test]
+    fn scanned_addresses_from_a_virtual_interface_win() {
+        let physical = DiscoveredPeer {
+            server_id: "same".to_owned(),
+            name: "PeerDav (10.1.1.88)".to_owned(),
+            url: "https://10.1.1.88:4918".to_owned(),
+            hosts: vec!["10.1.1.88".to_owned()],
+            port: 4918,
+            share_count: 0,
+        };
+        let virtual_lan = DiscoveredPeer {
+            server_id: "same".to_owned(),
+            name: "PeerDav (10.2.2.8)".to_owned(),
+            url: "https://10.2.2.8:4918".to_owned(),
+            hosts: vec!["10.2.2.8".to_owned()],
+            port: 4918,
+            share_count: 0,
+        };
+
+        let merged = merge_scanned(vec![(1, physical), (0, virtual_lan)]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].url, "https://10.2.2.8:4918");
+        assert_eq!(merged[0].name, "PeerDav (10.2.2.8)");
+        assert!(merged[0].hosts.contains(&"10.1.1.88".to_owned()));
+        assert!(merged[0].hosts.contains(&"10.2.2.8".to_owned()));
     }
 }

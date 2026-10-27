@@ -854,6 +854,32 @@ describe("home workspace", () => {
     wrapper.unmount();
   });
 
+  it("falls back to TCP discovery when UDP broadcasts are not forwarded", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    let scanned = false;
+    const wrapper = await mountReady({
+      admin_session: async () => ({
+        username: "admin",
+        mustChangePassword: false,
+      }),
+      scan_lan_tcp: async () => {
+        scanned = true;
+        return [DISCOVERED];
+      },
+      discovered_peers: async () => (scanned ? [DISCOVERED] : []),
+    });
+    await flushPromises();
+
+    await clickButton(wrapper, "TCP 扫描");
+    await flushPromises();
+
+    expect(scanned).toBe(true);
+    expect(wrapper.text()).toContain("Lab");
+    expect(wrapper.text()).toContain("http://192.168.1.20:4918");
+
+    wrapper.unmount();
+  });
+
   it("lists authorized servers and opens their file browser", async () => {
     localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
     const wrapper = await mountReady({

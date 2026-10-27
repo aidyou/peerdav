@@ -1012,6 +1012,9 @@ async function loadInitialData() {
                   />
                 </el-select>
               </label>
+              <p v-if="!shareAllow.length" class="hint share-form__warning">
+                {{ t("shares.allowRequired") }}
+              </p>
               <label>
                 {{ t("shares.denyRules") }}
                 <el-select
@@ -1238,6 +1241,9 @@ async function loadInitialData() {
                 {{ t("client.request") }}
               </el-button>
             </form>
+            <p v-if="manualOpen" class="hint manual-hint">
+              {{ t("client.manualHint") }}
+            </p>
 
             <!-- 只显示「正在发送」这种瞬时动作；申请结果来自后端状态，切换页面后仍在。 -->
             <div v-if="manualEntry?.status === 'waiting'" class="request-progress">
@@ -1683,6 +1689,10 @@ async function loadInitialData() {
   stroke-linejoin: round;
 }
 
+.share-form__warning {
+  color: var(--el-color-warning);
+}
+
 .share-item__title {
   display: flex;
   flex-direction: column;
@@ -2086,6 +2096,10 @@ async function loadInitialData() {
 .manual-connect :deep(.el-input) {
   flex: 1;
   min-width: 0;
+}
+
+.manual-hint {
+  margin: -8px 0 16px;
 }
 
 .request-progress {

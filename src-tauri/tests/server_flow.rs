@@ -11,8 +11,8 @@ use http::{HeaderMap, Method, StatusCode};
 use peerdav_lib::{
     ACCESS_REQUEST_HEADER, ACCESS_STATUS_PATH, AccessRequestStatus, AccessRule,
     AccessStatusResponse, AppError, DomainError, MACHINE_ID_HEADER, MAX_PENDING_ATTEMPTS,
-    MAX_PENDING_PATH_CHARS, MAX_PENDING_REQUESTS, PendingRequestInfo, RuleKind, RuleMatcher,
-    ServerConfig, ServerController, ServerEvents, SharePermissions, Vault,
+    MAX_PENDING_PATH_CHARS, MAX_PENDING_REQUESTS, OBSERVED_PEER_HEADER, PendingRequestInfo,
+    RuleKind, RuleMatcher, ServerConfig, ServerController, ServerEvents, SharePermissions, Vault,
 };
 
 mod common;
@@ -786,6 +786,14 @@ async fn network_policy_denies_empty_allow_and_deny_rules_win() {
         )
         .await;
     assert_eq!(response.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        response
+            .headers
+            .get(OBSERVED_PEER_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some("127.0.0.1"),
+        "a policy denial must name the address the server saw"
+    );
     assert!(
         harness
             .controller

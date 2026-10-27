@@ -44,8 +44,8 @@ use crate::types::{
     AuthorizationStatus, AuthorizationStatusResponse, CATALOG_PATH, CATALOG_PROTOCOL,
     CLIENT_ID_HEADER, CatalogResponse, DEFAULT_SERVER_PORT, MACHINE_ID_HEADER, MAX_ACCESS_GRANTS,
     MAX_ACCESS_REQUEST_ID_CHARS, MAX_CLIENT_ID_CHARS, MAX_PENDING_ATTEMPTS, MAX_PENDING_PATH_CHARS,
-    MAX_PENDING_REQUESTS, MIN_ACCESS_REQUEST_ID_CHARS, MIN_CLIENT_ID_CHARS, PeerShare,
-    PendingRequestInfo, ServerStatus, ShareInfo, SharePermissions,
+    MAX_PENDING_REQUESTS, MIN_ACCESS_REQUEST_ID_CHARS, MIN_CLIENT_ID_CHARS, OBSERVED_PEER_HEADER,
+    PeerShare, PendingRequestInfo, ServerStatus, ShareInfo, SharePermissions,
 };
 use crate::vault::Vault;
 
@@ -1148,7 +1148,7 @@ async fn handle_request(
             peer.ip(),
             share.id
         );
-        return empty_response(StatusCode::FORBIDDEN);
+        return forbidden_for_peer(peer);
     }
 
     let authorization = verified_authorization(&gate, request.headers());
@@ -1267,7 +1267,7 @@ async fn handle_catalog(
             "peerdav.server catalog denied peer {}: no share allows it",
             peer.ip()
         );
-        return empty_response(StatusCode::FORBIDDEN);
+        return forbidden_for_peer(peer);
     }
 
     let authorized = verified_authorization(&gate, request.headers());
@@ -1973,6 +1973,7 @@ fn auth_challenge() -> Response<Body> {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
         .header(WWW_AUTHENTICATE, AUTH_CHALLENGE)
+        .header("Server", SERVER_AGENT)
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap_or_else(|_| Response::new(Body::empty()))
@@ -1985,6 +1986,7 @@ fn method_not_allowed() -> Response<Body> {
             "Allow",
             "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL, COPY, MOVE, LOCK, UNLOCK",
         )
+        .header("Server", SERVER_AGENT)
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap_or_else(|_| Response::new(Body::empty()))
@@ -1993,9 +1995,22 @@ fn method_not_allowed() -> Response<Body> {
 fn empty_response(status: StatusCode) -> Response<Body> {
     Response::builder()
         .status(status)
+        .header("Server", SERVER_AGENT)
         .header(CONTENT_LENGTH, "0")
         .body(Body::empty())
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// Policy denial. The client gets the address the server actually saw so a
+/// virtual-LAN address mismatch can be diagnosed without reading server logs.
+fn forbidden_for_peer(peer: SocketAddr) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(OBSERVED_PEER_HEADER, canonical_ip(peer.ip()).to_string())
+        .header("Server", SERVER_AGENT)
+        .header(CONTENT_LENGTH, "0")
+        .body(Body::empty())
+        .unwrap_or_else(|_| empty_response(StatusCode::FORBIDDEN))
 }
 
 fn json_response(body: &[u8]) -> Response<Body> {
@@ -2007,6 +2022,7 @@ fn json_response_with_status(status: StatusCode, body: &[u8]) -> Response<Body> 
         .status(status)
         .header(CONTENT_TYPE, "application/json")
         .header(CACHE_CONTROL, "no-store")
+        .header("Server", SERVER_AGENT)
         .header(CONTENT_LENGTH, body.len())
         .body(Body::from(bytes::Bytes::from(body.to_vec())))
         .unwrap_or_else(|_| empty_response(StatusCode::INTERNAL_SERVER_ERROR))

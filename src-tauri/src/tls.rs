@@ -329,6 +329,77 @@ pub(crate) fn self_connection_allowed(local: &str, remote: &str) -> bool {
     cfg!(debug_assertions) || local != remote
 }
 
+/// Scan-only certificate verifier. Discovery has no pin yet: the handshake
+/// reads the certificate so the UI can show its fingerprint, and trust is
+/// granted only after the administrator approves the access request.
+#[derive(Debug)]
+struct DiscoveryServer;
+
+impl ServerCertVerifier for DiscoveryServer {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            signature,
+            &provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            signature,
+            &provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Mutual-TLS client used only for TCP discovery. It presents this device's
+/// certificate (the server requires one) and accepts the server certificate
+/// so the caller can derive its fingerprint from the completed handshake.
+pub(crate) fn probe_client(identity: &DeviceIdentity) -> Result<rustls::ClientConfig, DomainError> {
+    let mut config = rustls::ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|error| tls_error("configure discovery TLS client", error))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(DiscoveryServer))
+        .with_client_auth_cert(
+            vec![identity.certificate.clone()],
+            identity.key.clone_key().into(),
+        )
+        .map_err(|error| tls_error("configure discovery client identity", error))?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
+}
+
 pub(crate) fn agent(
     vault: &Vault,
     expected: &str,

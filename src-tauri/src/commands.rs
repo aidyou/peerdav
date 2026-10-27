@@ -540,6 +540,14 @@ pub async fn scan_lan(
         .map_err(AppError::from)
 }
 
+/// Explicit TCP discovery fallback for overlay networks where UDP broadcast is
+/// not forwarded. It probes local private /24s on the default WebDAV port.
+#[tauri::command]
+pub async fn scan_lan_tcp(peers: State<'_, SharedPeers>) -> Result<Vec<DiscoveredPeer>, AppError> {
+    let peers = Arc::clone(peers.inner());
+    peers.scan_lan_tcp().await.map_err(AppError::from)
+}
+
 /// Returns the current passive discovery snapshot. The UI reads this once on
 /// startup and then follows `app://discovered-peers` events.
 #[tauri::command]

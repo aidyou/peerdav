@@ -1394,7 +1394,14 @@ async fn network_policy_denial_does_not_create_pending_or_authorization() {
         .request_access(&harness.url)
         .await
         .expect_err("policy denial");
-    assert_eq!(code_of(&error), "PEER_REQUEST_FAILED");
+    let app_error = AppError::from_ref(&error);
+    assert_eq!(app_error.code, "PEER_ACCESS_DENIED");
+    assert!(
+        app_error.message.contains("127.0.0.1"),
+        "the error must name the address the server saw: {}",
+        app_error.message
+    );
+    assert!(app_error.message.contains("允许规则"));
     assert_eq!(harness.controller.list_pending().len(), 0);
     assert_eq!(harness.controller.list_authorizations().len(), 0);
     harness.controller.stop().await;

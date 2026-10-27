@@ -40,13 +40,13 @@ use crate::types::{
     AUTHORIZATION_PROTOCOL, AccessRequestStatus, AccessStatusResponse,
     AuthorizationBindingResponse, AuthorizationStatus, AuthorizationStatusResponse, CATALOG_PATH,
     CATALOG_PROTOCOL, CLIENT_ID_HEADER, CatalogResponse, ConflictPolicy, DEFAULT_DISCOVERY_PORT,
-    DirectoryDownloadPlan, DiscoveredPeer, DownloadCandidate, ExternalEditInfo,
-    MAX_ACCESS_REQUEST_ID_CHARS, MAX_AUTHORIZATION_CODE_CHARS, MAX_DIR_ENTRIES,
+    DEFAULT_SERVER_PORT, DirectoryDownloadPlan, DiscoveredPeer, DownloadCandidate,
+    ExternalEditInfo, MAX_ACCESS_REQUEST_ID_CHARS, MAX_AUTHORIZATION_CODE_CHARS, MAX_DIR_ENTRIES,
     MAX_DIRECTORY_DOWNLOAD_FILES, MAX_PREVIEW_BYTES, MAX_PREVIEW_LINES, MAX_REMOTE_PATH_BYTES,
-    MAX_TRANSFER_BYTES, MIN_ACCESS_REQUEST_ID_CHARS, OutboundAccessRequest, OutboundAccessStatus,
-    PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT, PEER_PRESENCE_INTERVAL, PEER_REQUEST_TIMEOUT,
-    PEER_SYNC_INTERVAL, PeerAccessRequest, PeerEntry, PeerHealth, PeerInfo, PeerListing,
-    PeerRecord, PeerRevocationInfo, PeerShare, PeerStatus, PreviewPayload,
+    MAX_TRANSFER_BYTES, MIN_ACCESS_REQUEST_ID_CHARS, OBSERVED_PEER_HEADER, OutboundAccessRequest,
+    OutboundAccessStatus, PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT, PEER_PRESENCE_INTERVAL,
+    PEER_REQUEST_TIMEOUT, PEER_SYNC_INTERVAL, PeerAccessRequest, PeerEntry, PeerHealth, PeerInfo,
+    PeerListing, PeerRecord, PeerRevocationInfo, PeerShare, PeerStatus, PreviewPayload,
     SERVER_DISCOVERY_PORT_META, SHARE_URL_PREFIX, TransferResult,
 };
 use crate::vault::Vault;
@@ -672,6 +672,70 @@ impl PeerManager {
             .collect())
     }
 
+    /// TCP fallback for overlay networks that drop UDP broadcast. The scan is
+    /// an explicit user action, only covers local private subnets, and merges
+    /// results into the same registry the passive listener feeds.
+    pub async fn scan_lan_tcp(&self) -> Result<Vec<DiscoveredPeer>, DomainError> {
+        let identity = self.vault.current_identity()?;
+        let found = discovery::scan_tcp(&identity, DEFAULT_SERVER_PORT)
+            .await
+            .into_iter()
+            // Discovery must never list this installation, even in debug
+            // builds where self-connections are allowed for loopback tests.
+            .filter(|peer| peer.server_id != self.vault.fingerprint())
+            .collect::<Vec<_>>();
+        if let Some(listener) = self.discovery_listener() {
+            listener.merge_peers(&found);
+        }
+        for peer in &found {
+            log::info!(
+                "peerdav.peer TCP discovery found {} at {} (hosts: {:?})",
+                crate::tls::short_fingerprint(&peer.server_id),
+                peer.url,
+                peer.hosts
+            );
+        }
+        self.rebind_scanned_peers(&found)?;
+        Ok(found)
+    }
+
+    /// TCP discovery is fingerprint-verified, so a saved peer that appears on
+    /// a new address can be rebound immediately. This moves a peer from a
+    /// stale saved URL to the address found on the current network.
+    fn rebind_scanned_peers(&self, peers: &[DiscoveredPeer]) -> Result<(), DomainError> {
+        if peers.is_empty() {
+            return Ok(());
+        }
+        for mut record in self.vault.list_peer_records()? {
+            let Some(machine_id) = record.machine_id.as_deref() else {
+                continue;
+            };
+            let Some(candidate) = peers.iter().find(|peer| peer.server_id == machine_id) else {
+                continue;
+            };
+            if record.url == candidate.url {
+                continue;
+            }
+            // The scan uses the default port. Do not rewrite a saved custom
+            // port just because the same identity also listens on 4918.
+            let record_port = Url::parse(&record.url)
+                .ok()
+                .and_then(|url| url.port_or_known_default());
+            if record_port != Some(candidate.port) {
+                continue;
+            }
+            log::info!(
+                "peerdav.peer rebinding {} from {} to {}",
+                record.id,
+                record.url,
+                candidate.url
+            );
+            record.url = candidate.url.clone();
+            self.vault.save_peer_record(&record)?;
+        }
+        Ok(())
+    }
+
     pub fn outbound_connections(&self) -> Result<Vec<crate::types::ConnectionInfo>, DomainError> {
         use crate::types::{ConnectionInfo, ConnectionState};
         let peers = self.list_peers()?;
@@ -773,9 +837,10 @@ impl PeerManager {
     }
 
     /// Asks a server to record this client as pending. The server's policy is
-    /// still enforced: a denied peer receives `PEER_REQUEST_FAILED`, and
-    /// nothing is approved automatically. The returned request id is used to
-    /// claim the code after an administrator approves the request.
+    /// still enforced: a peer denied by its access rules receives
+    /// `PEER_ACCESS_DENIED` with the address the server saw, and nothing is
+    /// approved automatically. The returned request id is used to claim the
+    /// code after an administrator approves the request.
     ///
     /// 请求同时带上本机机器码：服务端按机器码而不是 IP 识别申请方，所以换网段、
     /// 重新分配地址之后仍然是同一条申请，不会在对方控台里变成一台新设备。
@@ -812,6 +877,14 @@ impl PeerManager {
                 requested: true,
                 request_id: Some(request_id),
             });
+        }
+        if status == StatusCode::FORBIDDEN {
+            let peer_ip = response
+                .headers()
+                .get(OBSERVED_PEER_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            return Err(DomainError::PeerAccessDenied { peer_ip });
         }
         Err(DomainError::PeerRequest {
             operation: "request access",
@@ -1423,7 +1496,24 @@ impl PeerManager {
                     &candidate.url,
                     Auth::Basic(CLIENT_USERNAME.into(), code.code),
                 )?;
-                if catalog(&probe).await.is_ok() {
+                let reachable = match catalog(&probe).await {
+                    Ok(_) => true,
+                    Err(error) => {
+                        // 401/403 still proves the new address reaches the
+                        // same TLS identity. Keeping the stale URL would make
+                        // the next request fail with a transport error instead
+                        // of showing the real authorization/policy reason.
+                        let reachable = error_is_reachable(&error);
+                        if !reachable {
+                            log::debug!(
+                                "peerdav.peer candidate {} is not reachable: {error}",
+                                candidate.url
+                            );
+                        }
+                        reachable
+                    }
+                };
+                if reachable {
                     record.url = candidate.url.clone();
                     self.vault.save_peer_record(&record)?;
                 }
@@ -3245,7 +3335,10 @@ fn map_transport(operation: &'static str, error: &reqwest::Error) -> DomainError
     DomainError::PeerRequest {
         operation,
         status: error.status().map(|status| status.as_u16()),
-        detail: error.to_string(),
+        // Keep the whole reqwest source chain: the outer "error sending
+        // request" text does not distinguish a refused connection, a TLS
+        // fingerprint mismatch or a timeout.
+        detail: crate::error::error_chain(error),
     }
 }
 
@@ -3628,5 +3721,75 @@ mod tests {
             &announced
         ));
         assert!(!announced_peer_matches("not a url", &announced));
+    }
+
+    #[test]
+    fn a_scanned_address_rebinds_the_saved_peer() {
+        let directory = tempfile::tempdir().expect("directory");
+        let vault =
+            Arc::new(Vault::open(&directory.path().join("peerdav.pd")).expect("open vault"));
+        let key_dir = directory.path().join("keys");
+        std::fs::create_dir_all(&key_dir).expect("key directory");
+        vault
+            .initialize(
+                key_dir.to_str().expect("utf8 key dir"),
+                "peerdav-admin",
+                "admin password peer 2026",
+            )
+            .expect("initialize");
+        vault
+            .save_peer_record(&crate::types::PeerRecord {
+                id: "peer-1".to_owned(),
+                label: "Mac".to_owned(),
+                url: "https://10.1.1.88:4918".to_owned(),
+                authorization_id: None,
+                machine_id: Some("fingerprint".to_owned()),
+                created_at: 0,
+                last_connected_at: None,
+            })
+            .expect("save peer");
+        vault
+            .save_peer_record(&crate::types::PeerRecord {
+                id: "peer-2".to_owned(),
+                label: "Custom port".to_owned(),
+                url: "https://10.1.1.88:9443".to_owned(),
+                authorization_id: None,
+                machine_id: Some("fingerprint".to_owned()),
+                created_at: 0,
+                last_connected_at: None,
+            })
+            .expect("save custom peer");
+        let manager =
+            PeerManager::new(Arc::clone(&vault), directory.path().join("temp")).expect("manager");
+        let discovered = DiscoveredPeer {
+            server_id: "fingerprint".to_owned(),
+            name: "PeerDav (10.2.2.8)".to_owned(),
+            url: "https://10.2.2.8:4918".to_owned(),
+            hosts: vec!["10.2.2.8".to_owned()],
+            port: 4918,
+            share_count: 0,
+        };
+
+        manager
+            .rebind_scanned_peers(std::slice::from_ref(&discovered))
+            .expect("rebind");
+
+        assert_eq!(
+            vault
+                .peer_record("peer-1")
+                .expect("read")
+                .expect("peer")
+                .url,
+            "https://10.2.2.8:4918"
+        );
+        assert_eq!(
+            vault
+                .peer_record("peer-2")
+                .expect("read")
+                .expect("peer")
+                .url,
+            "https://10.1.1.88:9443",
+            "a custom-port peer must not be moved to the scan's default port"
+        );
     }
 }

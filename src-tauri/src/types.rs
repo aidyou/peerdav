@@ -144,6 +144,9 @@ pub const CLIENT_ID_HEADER: &str = "x-peerdav-client-id";
 /// 设备机器码。随每个 PeerDav 请求发送，服务端据此把「同一台设备」的申请、授权
 /// 和已保存对端关联起来；IP 会变，机器码不会。
 pub const MACHINE_ID_HEADER: &str = "x-peerdav-machine-id";
+/// 服务端在按访问规则拒绝请求时回传的来源地址。客户端把它展示给用户，
+/// 这样虚拟局域网里的地址不匹配能直接看到，而不是只剩一句“请求失败”。
+pub const OBSERVED_PEER_HEADER: &str = "x-peerdav-observed-ip";
 pub const MIN_CLIENT_ID_CHARS: usize = 16;
 pub const MAX_CLIENT_ID_CHARS: usize = 64;
 /// Default interval for checking saved peers against their server bindings.

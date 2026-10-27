@@ -39,6 +39,7 @@ const ERROR_STRATEGIES = Object.freeze({
   PEER_AUTHORIZATION_REJECTED: "show",
   PEER_ACCESS_EXPIRED: "show",
   PEER_ACCESS_TIMEOUT: "show",
+  PEER_ACCESS_DENIED: "show",
   PEER_REQUEST_FAILED: "show",
   PEER_REMOTE_NOT_FOUND: "show",
   PEER_NOT_FOUND: "peer-refresh",

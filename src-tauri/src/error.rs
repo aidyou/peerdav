@@ -164,6 +164,9 @@ pub enum DomainError {
     #[error("the client canceled the access request")]
     PeerAccessCanceled,
 
+    #[error("the server denied this peer by its access rules (HTTP 403)")]
+    PeerAccessDenied { peer_ip: Option<String> },
+
     #[error("peer request `{operation}` failed: {detail}")]
     PeerRequest {
         operation: &'static str,
@@ -320,6 +323,7 @@ fn error_code(error: &DomainError) -> &'static str {
         DomainError::PeerAccessExpired => "PEER_ACCESS_EXPIRED",
         DomainError::PeerAccessTimeout => "PEER_ACCESS_TIMEOUT",
         DomainError::PeerAccessCanceled => "PEER_ACCESS_CANCELED",
+        DomainError::PeerAccessDenied { .. } => "PEER_ACCESS_DENIED",
         DomainError::PeerRequest { .. } => "PEER_REQUEST_FAILED",
         DomainError::RemoteNotFound { .. } => "PEER_REMOTE_NOT_FOUND",
         DomainError::PeerNotFound { .. } => "PEER_NOT_FOUND",
@@ -447,7 +451,7 @@ fn user_message(error: &DomainError) -> String {
             "服务任务异常退出 / The server task stopped unexpectedly.".to_owned()
         }
         DomainError::InvalidPeerUrl { .. } => {
-            "服务器地址无效，仅支持局域网 http:// 地址 / The server address is invalid; only LAN http:// addresses are supported."
+            "服务器地址无效，仅支持 https:// 地址（例如 https://10.0.0.5:4918）/ The server address is invalid; only https:// addresses are supported (for example https://10.0.0.5:4918)."
                 .to_owned()
         }
         DomainError::PeerAuthorizationRequired => {
@@ -468,9 +472,20 @@ fn user_message(error: &DomainError) -> String {
         DomainError::PeerAccessCanceled => {
             "已取消访问申请 / The access request was canceled.".to_owned()
         }
-        DomainError::PeerRequest { .. } => {
-            "请求服务器失败 / The request to the server failed.".to_owned()
-        }
+        DomainError::PeerAccessDenied { peer_ip } => match peer_ip {
+            Some(peer_ip) => format!(
+                "服务器按共享访问规则拒绝了本机（服务器看到的来源地址：{peer_ip}）。请在服务器端把该地址或所在网段加入共享的允许规则 / The server denied this machine by its share access rules (source address seen by the server: {peer_ip}). Add that address or its subnet to the share's allow rules."
+            ),
+            None => "服务器按共享访问规则拒绝了本机。请在服务器端把本机地址或所在网段加入共享的允许规则 / The server denied this machine by its share access rules. Add this machine's address or subnet to the share's allow rules.".to_owned(),
+        },
+        DomainError::PeerRequest { status, detail, .. } => match status {
+            Some(status) => format!(
+                "请求服务器失败：HTTP {status}（{detail}）/ The request to the server failed: HTTP {status} ({detail})."
+            ),
+            None => format!(
+                "请求服务器失败：{detail} / The request to the server failed: {detail}."
+            ),
+        },
         DomainError::RemoteNotFound { .. } => {
             "服务器上不存在该文件 / The file does not exist on the server.".to_owned()
         }
@@ -593,6 +608,7 @@ fn error_context(error: &DomainError) -> Option<Value> {
         DomainError::PeerRequest {
             operation, status, ..
         } => Some(json!({ "operation": operation, "status": status })),
+        DomainError::PeerAccessDenied { peer_ip } => Some(json!({ "peerIp": peer_ip })),
         DomainError::Discovery { operation, .. } => Some(json!({ "operation": operation })),
         DomainError::ServerBind { address, .. } => Some(json!({ "address": address })),
         DomainError::KeyFileExists { path }
@@ -600,5 +616,47 @@ fn error_context(error: &DomainError) -> Option<Value> {
         | DomainError::KeyFileInvalid { path, .. } => Some(json!({ "path": path })),
         DomainError::InvalidKeyDirectory { detail } => Some(json!({ "detail": detail })),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_denial_names_the_address_the_server_saw() {
+        let error = AppError::from(DomainError::PeerAccessDenied {
+            peer_ip: Some("10.126.0.7".to_owned()),
+        });
+
+        assert_eq!(error.code, "PEER_ACCESS_DENIED");
+        assert!(error.message.contains("10.126.0.7"));
+        assert!(error.message.contains("允许规则"));
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("HTTP 403"))
+        );
+        assert_eq!(error.context, Some(json!({ "peerIp": "10.126.0.7" })));
+    }
+
+    #[test]
+    fn generic_peer_failure_keeps_the_transport_reason_visible() {
+        let error = AppError::from(DomainError::PeerRequest {
+            operation: "request access",
+            status: Some(403),
+            detail: "Forbidden".to_owned(),
+        });
+
+        assert_eq!(error.code, "PEER_REQUEST_FAILED");
+        assert!(error.message.contains("HTTP 403"));
+        assert!(error.message.contains("Forbidden"));
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("Forbidden"))
+        );
     }
 }
