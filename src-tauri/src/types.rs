@@ -429,8 +429,8 @@ pub(crate) struct AuthorizationRecord {
 
 /// Prefix of the vault secret that stores a peer's authorization code.
 pub(crate) const PEER_SECRET_PREFIX: &str = "peer.";
-/// Maximum size of a single download or upload.
-pub const MAX_TRANSFER_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum size of a single download or upload (10 GiB).
+pub const MAX_TRANSFER_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// Maximum size of a backend preview payload.
 pub const MAX_PREVIEW_BYTES: u64 = 10 * 1024 * 1024;
 /// Maximum physical line count accepted for an online text preview.
@@ -452,8 +452,14 @@ pub const DISCOVERY_PEER_TTL: Duration = Duration::from_secs(10);
 pub const DISCOVERY_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 pub const DISCOVERY_SCAN_TIMEOUT: Duration = Duration::from_millis(1200);
 pub const DISCOVERY_RECV_BUFFER: usize = 8 * 1024;
-/// Timeout applied to every peer HTTP request.
+/// Default timeout for ordinary peer HTTP requests.
 pub const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Per-request timeout for file parts, independent of the whole file size.
+pub const PEER_TRANSFER_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Upload commits also hash, assemble and durably copy the entire file.
+pub const PEER_UPLOAD_COMMIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Bound cancellation confirmation when the remote peer becomes unreachable.
+pub const PEER_UPLOAD_CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Upper bound for an authorization code accepted from the backend or a peer.
 pub const MAX_AUTHORIZATION_CODE_CHARS: usize = 512;
 
@@ -644,7 +650,38 @@ pub struct TransferProgress {
     pub transferred: u64,
     /// Zero when the server did not provide a content length.
     pub total: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<UploadPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_per_second: Option<f64>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadOutcome {
+    Active,
+    Canceled,
+    Completed,
+}
+
+pub(crate) struct UploadSession {
+    pub cancel: tokio::sync::watch::Sender<bool>,
+    pub active: std::sync::Arc<tokio::sync::RwLock<()>>,
+    pub outcome: std::sync::Mutex<UploadOutcome>,
+}
+
+pub(crate) type UploadSessions =
+    tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<UploadSession>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UploadPhase {
+    Hashing,
+    Uploading,
+    Committing,
+    Completed,
+}
+
+pub type UploadProgressCallback = std::sync::Arc<dyn Fn(UploadPhase, u64, u64, u64) + Send + Sync>;
 
 /// One local file discovered for an upload queue. `relative_path` keeps the
 /// selected directory hierarchy, using `/` separators.

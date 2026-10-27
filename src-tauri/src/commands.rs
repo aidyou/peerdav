@@ -809,6 +809,8 @@ pub async fn download_peer_file_to(
             file_name: file_name.clone(),
             transferred,
             total,
+            phase: None,
+            bytes_per_second: None,
         };
         if let Err(error) = app.emit(TRANSFER_PROGRESS_EVENT, &payload) {
             log::warn!("failed to emit {TRANSFER_PROGRESS_EVENT}: {error}");
@@ -1009,22 +1011,87 @@ async fn ensure_downloaded_file(path: &str) -> Result<(), AppError> {
 }
 
 #[tauri::command]
+pub async fn begin_peer_upload(peers: State<'_, SharedPeers>) -> Result<String, AppError> {
+    Ok(peers.begin_upload().await)
+}
+
+#[tauri::command]
+pub async fn cancel_peer_upload(
+    peers: State<'_, SharedPeers>,
+    transfer_id: String,
+) -> Result<(), AppError> {
+    peers.cancel_upload(&transfer_id).await;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn upload_peer_file(
+    app: AppHandle,
     peers: State<'_, SharedPeers>,
     peer_id: String,
     share_id: String,
     local_path: String,
     remote_dir: String,
     conflict: Option<ConflictPolicy>,
+    transfer_id: String,
 ) -> Result<TransferResult, AppError> {
     let peers = Arc::clone(peers.inner());
+    let file_name = Path::new(&local_path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let state = Mutex::new((
+        None,
+        Instant::now() - Duration::from_secs(1),
+        0u64,
+        0u64,
+        0.0,
+    ));
+    let event_id = transfer_id.clone();
+    let progress: crate::types::UploadProgressCallback =
+        Arc::new(move |phase, transferred, total, sent| {
+            let Ok(mut state) = state.lock() else {
+                return;
+            };
+            let now = Instant::now();
+            let elapsed = now.duration_since(state.1).as_secs_f64();
+            let changed = state.0 != Some(phase);
+            if !changed && elapsed < 0.1 && transferred != total {
+                return;
+            }
+            if changed {
+                state.2 = sent;
+                state.3 = 0;
+                state.4 = 0.0;
+            } else if phase == crate::types::UploadPhase::Uploading && elapsed > 0.0 {
+                state.4 = sent.saturating_sub(state.2) as f64 / elapsed;
+            }
+            state.0 = Some(phase);
+            state.1 = now;
+            state.2 = sent.max(state.2);
+            state.3 = transferred.max(state.3);
+            let payload = TransferProgress {
+                transfer_id: event_id.clone(),
+                direction: "upload".to_owned(),
+                file_name: file_name.clone(),
+                transferred: state.3.min(total),
+                total,
+                phase: Some(phase),
+                bytes_per_second: Some(state.4),
+            };
+            if let Err(error) = app.emit(TRANSFER_PROGRESS_EVENT, &payload) {
+                log::warn!("failed to emit {TRANSFER_PROGRESS_EVENT}: {error}");
+            }
+        });
     peers
-        .upload(
+        .upload_with_progress(
             &peer_id,
             &share_id,
             &local_path,
             &remote_dir,
             conflict.unwrap_or_default(),
+            &transfer_id,
+            progress,
         )
         .await
         .map_err(AppError::from)

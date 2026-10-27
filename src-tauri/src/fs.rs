@@ -851,6 +851,7 @@ pub(crate) fn commit_upload(
     share: &ShareConfig,
     relative: &Path,
     source: &Path,
+    session: &crate::types::UploadSession,
 ) -> Result<(), DomainError> {
     use rustix::fs::{Mode, OFlags};
     let resolved =
@@ -900,16 +901,46 @@ pub(crate) fn commit_upload(
     let result = (|| {
         let mut target = File::from(fd);
         let mut input = File::open(source)?;
-        std::io::copy(&mut input, &mut target)?;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            if *session.cancel.borrow() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "upload canceled",
+                ));
+            }
+            let len = input.read(&mut buffer)?;
+            if len == 0 {
+                break;
+            }
+            target.write_all(&buffer[..len])?;
+        }
         target.sync_all()?;
+        // Serialize cancel and atomic replacement. Once renamed, cancellation
+        // reports completion and never removes the destination.
+        let mut outcome = session
+            .outcome
+            .lock()
+            .map_err(|_| std::io::Error::other("upload state lock poisoned"))?;
+        if *outcome == crate::types::UploadOutcome::Canceled {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "upload canceled",
+            ));
+        }
         rustix::fs::renameat(&resolved.parent, &temporary, &resolved.parent, &name)
-            .map_err(std::io::Error::from)
+            .map_err(std::io::Error::from)?;
+        *outcome = crate::types::UploadOutcome::Completed;
+        Ok::<_, std::io::Error>(())
     })();
     if let Err(source) = result {
         if let Err(error) =
             rustix::fs::unlinkat(&resolved.parent, &temporary, rustix::fs::AtFlags::empty())
         {
             log::warn!("failed to remove upload staging entry: {error}");
+        }
+        if source.kind() == std::io::ErrorKind::Interrupted && *session.cancel.borrow() {
+            return Err(DomainError::TransferCanceled);
         }
         return Err(DomainError::Io {
             operation: "commit upload",
@@ -925,6 +956,7 @@ pub(crate) fn commit_upload(
     _share: &ShareConfig,
     _relative: &Path,
     _source: &Path,
+    _session: &crate::types::UploadSession,
 ) -> Result<(), DomainError> {
     Err(DomainError::InvalidShareConfig {
         detail: "secure uploads are unavailable on this platform".into(),
@@ -964,4 +996,71 @@ fn copy_at(share: &ShareConfig, from: &Path, to: &Path) -> FsResult<()> {
 #[cfg(not(unix))]
 fn copy_at(_share: &ShareConfig, _from: &Path, _to: &Path) -> FsResult<()> {
     Err(FsError::Forbidden)
+}
+
+#[cfg(all(test, unix))]
+mod upload_tests {
+    use super::*;
+    use crate::types::{UploadOutcome, UploadSession};
+
+    #[test]
+    fn cancel_during_staging_copy_preserves_destination_and_removes_sibling() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let source = directory.path().join("source");
+        File::create(&source)
+            .expect("source")
+            .set_len(128 * 1024 * 1024)
+            .expect("sparse source");
+        let root = directory.path().join("share");
+        std::fs::create_dir(&root).expect("share");
+        std::fs::write(root.join("target"), b"original").expect("original");
+        let share = ShareConfig {
+            id: "test".into(),
+            name: "test".into(),
+            root_path: root.clone(),
+            permissions: SharePermissions {
+                can_read: true,
+                can_write: true,
+                can_delete: true,
+            },
+            rules: Vec::new(),
+            display_rules: Vec::new(),
+            root: Arc::new(ShareRoot::open(&root).expect("root")),
+        };
+        let (cancel, _) = tokio::sync::watch::channel(false);
+        let session = Arc::new(UploadSession {
+            cancel,
+            active: Arc::new(tokio::sync::RwLock::new(())),
+            outcome: std::sync::Mutex::new(UploadOutcome::Active),
+        });
+        let copying_session = Arc::clone(&session);
+        let copying = std::thread::spawn(move || {
+            commit_upload(&share, Path::new("target"), &source, &copying_session)
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let writing = std::fs::read_dir(&root).expect("entries").any(|entry| {
+                let entry = entry.expect("entry");
+                entry.file_name().to_string_lossy().starts_with(".peerdav-")
+                    && entry.metadata().expect("metadata").len() > 0
+            });
+            if writing {
+                let mut outcome = session.outcome.lock().expect("outcome");
+                *outcome = UploadOutcome::Canceled;
+                session.cancel.send_replace(true);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "copy never started");
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            copying.join().expect("copy thread"),
+            Err(DomainError::TransferCanceled)
+        ));
+        assert_eq!(
+            std::fs::read(root.join("target")).expect("retained"),
+            b"original"
+        );
+        assert_eq!(std::fs::read_dir(&root).expect("clean root").count(), 1);
+    }
 }

@@ -142,6 +142,8 @@ function mockCommands(overrides = {}) {
       status: "canceled",
       message: null,
     }),
+    begin_peer_upload: async () => crypto.randomUUID(),
+    cancel_peer_upload: async () => {},
     list_peer_shares: async () => [],
     admin_login: async () => ({
       username: "admin",
@@ -2312,6 +2314,71 @@ describe("Finder-style peer browser", () => {
     wrapper.unmount();
   });
 
+  it("shows per-file upload progress and speed and cancels the active file", async () => {
+    let rejectUpload;
+    const upload = vi.fn(() => new Promise((_, reject) => { rejectUpload = reject; }));
+    const cancel = vi.fn(async () => {
+      rejectUpload({ code: "TRANSFER_CANCELED", message: "已取消文件传输" });
+    });
+    const { wrapper } = await openBrowser({
+      begin_peer_upload: async () => "upload-current",
+      upload_peer_file: upload,
+      cancel_peer_upload: cancel,
+      collect_upload_paths: async () => [
+        { localPath: "/tmp/large.bin", relativePath: "large.bin", size: 700 * 1024 * 1024 },
+        { localPath: "/tmp/next.bin", relativePath: "next.bin", size: 1 },
+      ],
+    });
+    await wrapper.find('button[aria-label="上传文件"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".upload-current").text()).toContain("正在校验文件");
+    const progress = eventHandlers.get("app://transfer-progress");
+    progress({ payload: { transferId: "unrelated", direction: "upload", phase: "uploading", total: 1, transferred: 1 } });
+    progress({ payload: { transferId: "upload-current", direction: "upload", phase: "uploading",
+      total: 700 * 1024 * 1024, transferred: 350 * 1024 * 1024, bytesPerSecond: 12 * 1024 * 1024 } });
+    await flushPromises();
+    expect(wrapper.find(".upload-current").text()).toContain("50%");
+    expect(wrapper.find(".upload-current").text()).toContain("12.0 MB/s");
+    expect(wrapper.find(".upload-current").text()).toContain("350.0 MB / 700.0 MB");
+    await clickButton(wrapper, "取消上传");
+    expect(cancel).toHaveBeenCalledWith({ transferId: "upload-current" });
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(wrapper.text()).not.toContain("正在取消");
+    expect(wrapper.findAll(".transfer-queue .el-tag").map((tag) => tag.text())).toEqual(["已取消", "已取消"]);
+    expect(latestErrorMessage()).toBe("");
+    progress({ payload: { transferId: "upload-current", direction: "upload", phase: "uploading", total: 1, transferred: 1 } });
+    await flushPromises();
+    expect(wrapper.find(".upload-current").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("keeps upload completion below 100 percent until the atomic save finishes", async () => {
+    let finish;
+    const cancel = vi.fn(async () => {});
+    const { wrapper } = await openBrowser({
+      begin_peer_upload: async () => "upload-save",
+      upload_peer_file: () => new Promise((resolve) => { finish = resolve; }),
+      cancel_peer_upload: cancel,
+    });
+    await wrapper.find('button[aria-label="上传文件"]').trigger("click");
+    await flushPromises();
+    eventHandlers.get("app://transfer-progress")({ payload: {
+      transferId: "upload-save", direction: "upload", phase: "committing", transferred: 5, total: 5, bytesPerSecond: 0,
+    } });
+    await flushPromises();
+    expect(wrapper.find(".upload-current").text()).toContain("正在合并并保存");
+    expect(wrapper.text()).toContain("99%");
+    await clickButton(wrapper, "取消上传");
+    expect(cancel).toHaveBeenCalledWith({ transferId: "upload-save" });
+    expect(wrapper.text()).toContain("正在取消");
+    // If atomic replacement already won, the backend returns its true result.
+    finish({ transferred: true, bytes: 5 });
+    await flushPromises();
+    expect(wrapper.text()).toContain("100%");
+    expect(wrapper.text()).not.toContain("正在取消");
+    wrapper.unmount();
+  });
+
   it("preserves folder hierarchy when uploading a directory", async () => {
     const collectUploadPaths = vi.fn(async () => [
       {
@@ -2585,6 +2652,23 @@ describe("admin session restore", () => {
     initTheme();
     initAccent();
     invoke.mockReset();
+  });
+
+  it("clips all dialog overlays below the draggable titlebar and follows window geometry", async () => {
+    const source = readFileSync("src/App.vue", "utf8");
+    expect(source).toContain("body:has(.window-frame) > .el-overlay");
+    expect(source).toContain("top: calc(var(--titlebar-height) + var(--overlay-inset))");
+    expect(source).toContain("border-radius: 0 0 var(--overlay-radius) var(--overlay-radius)");
+    expect(source).toContain("clip-path: inset(0 round 0 0 var(--overlay-radius) var(--overlay-radius))");
+    expect(source).toMatch(/\.el-overlay-dialog\s*\{\s*position: absolute;\s*inset: 0;/);
+    const wrapper = await mountReady();
+    expect(wrapper.find(".titlebar").attributes()).toHaveProperty("data-tauri-drag-region");
+    expect(wrapper.find(".window-frame").attributes("style")).toContain("--window-overlay-inset: 1px");
+    windowMock.isMaximized.mockResolvedValueOnce(true);
+    for (const handler of resizeHandlers) handler();
+    await flushPromises();
+    expect(wrapper.find(".window-frame").attributes("style")).toContain("--window-overlay-radius: 0px");
+    wrapper.unmount();
   });
 
   it("squares the window corners when the window is maximized", async () => {

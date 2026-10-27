@@ -44,6 +44,7 @@ const ERROR_STRATEGIES = Object.freeze({
   PEER_NOT_FOUND: "peer-refresh",
   PEER_PROTOCOL_ERROR: "support",
   PEER_INVALID_PATH: "edit",
+  TRANSFER_CANCELED: "ignore",
   TRANSFER_TOO_LARGE: "show",
   PEER_PREVIEW_TOO_LARGE: "show",
   PEER_PREVIEW_TOO_MANY_LINES: "show",

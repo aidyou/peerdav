@@ -41,7 +41,7 @@ pub use types::{
     PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT, PeerAccessRequest, PeerEntry, PeerHealth,
     PeerInfo, PeerListing, PeerRevocationInfo, PeerShare, PeerStatus, PendingRequestInfo,
     PreviewPayload, RuleKind, RuleMatcher, ServerStatus, ShareInfo, SharePermissions,
-    TransferResult, VaultStatus,
+    TransferResult, UploadPhase, VaultStatus,
 };
 pub use vault::Vault;
 
@@ -197,6 +197,8 @@ pub fn run() {
             commands::open_local_file,
             commands::reveal_local_file,
             commands::collect_upload_paths,
+            commands::begin_peer_upload,
+            commands::cancel_peer_upload,
             commands::upload_peer_file,
             commands::preview_peer_file,
             commands::prepare_peer_external_edit,
