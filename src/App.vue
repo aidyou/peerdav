@@ -22,6 +22,7 @@ import SettingsView from "./components/SettingsView.vue";
 import TitleBarMenu from "./components/TitleBarMenu.vue";
 
 const loading = ref(true);
+const sessionResolved = ref(false);
 const status = ref({
   initialized: false,
   unlocked: false,
@@ -124,6 +125,7 @@ const view = computed(() => {
   if (loading.value) return "loading";
   if (!status.value.initialized) return "initialize";
   if (!status.value.unlocked) return "unlock";
+  if (!sessionResolved.value) return "loading";
   if (mustChangeAdminPassword.value) return "change-admin";
   if (!loggedIn.value) return "login";
   return "ready";
@@ -387,8 +389,8 @@ function handleHashChange() {
 /// Restores the in-memory admin session after a webview reload. The backend
 /// keeps the session until the vault is locked or the admin logs out.
 async function restoreAdminSession() {
-  if (!status.value.unlocked) return;
   try {
+    if (!status.value.unlocked) return;
     const session = await invoke("admin_session");
     if (session?.username) {
       adminUsername.value = session.username;
@@ -401,6 +403,9 @@ async function restoreAdminSession() {
     }
   } catch (error) {
     console.warn("PeerDav admin session restore failed", error);
+  } finally {
+    // Unknown authentication state must never render the sign-in form.
+    sessionResolved.value = true;
   }
 }
 
@@ -938,7 +943,7 @@ provide(
       </div>
     </header>
 
-    <main class="shell" :class="{ 'shell--workspace': view === 'ready' }">
+    <main class="shell" :class="{ 'shell--workspace': view === 'ready' || view === 'loading' }">
       <AuthView v-if="view !== 'ready'" :view="view" />
 
       <div v-else class="workspace">
@@ -974,7 +979,7 @@ provide(
         </div>
       </div>
 
-      <footer v-if="view !== 'ready'" class="footer">
+      <footer v-if="view !== 'ready' && view !== 'loading'" class="footer">
         {{ t("app.footer") }}
       </footer>
     </main>
@@ -1001,13 +1006,16 @@ provide(
 
 <style scoped>
 .window-frame {
+  box-sizing: border-box;
   height: 100vh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
   border-radius: var(--window-radius);
   border: 1px solid var(--app-frame-border);
-  background:
+  /* Keep the opaque fill even when the WebView cannot render color-mix(). */
+  background-color: var(--app-bg-solid);
+  background-image:
     radial-gradient(
       circle at top left,
       color-mix(in oklab, var(--accent) 12%, transparent),
@@ -1017,8 +1025,7 @@ provide(
       circle at bottom right,
       color-mix(in oklab, var(--accent-green) 10%, transparent),
       transparent 32%
-    ),
-    var(--app-bg-solid);
+    );
   box-shadow: 0 18px 48px rgba(22, 32, 46, 0.18);
 }
 
@@ -1047,6 +1054,7 @@ provide(
   border-radius: var(--window-inner-radius) var(--window-inner-radius) 0 0;
   background: var(--titlebar-bg);
   border-bottom: 1px solid var(--titlebar-border);
+  -webkit-backdrop-filter: blur(14px);
   backdrop-filter: blur(14px);
   user-select: none;
 }
@@ -1352,6 +1360,9 @@ body:has(.window-frame) .el-overlay-dialog {
   --accent-yellow: oklch(72% 0.16 92);
 
   --accent: var(--accent-blue);
+  --accent-rgb: 54, 114, 233;
+  --selection-bg: linear-gradient(rgba(var(--accent-rgb), 0.14), rgba(var(--accent-rgb), 0.14)) var(--app-surface);
+  --selection-border: rgba(var(--accent-rgb), 0.5);
   --accent-on: #ffffff;
 
   /* 语义色：一个颜色只表示一个含义。强调色只用于可操作元素（主按钮、当前选中、
@@ -1437,6 +1448,15 @@ body:has(.window-frame) .el-overlay-dialog {
   --el-color-danger-light-9: color-mix(in oklab, var(--tone-danger) 10%, var(--tone-mix-base));
   --el-color-danger-dark-2: color-mix(in oklab, var(--tone-danger) 85%, var(--tone-mix-shade));
 
+  /* ElMessage uses "error", while buttons and tags use "danger". */
+  --el-color-error: var(--el-color-danger);
+  --el-color-error-light-3: var(--el-color-danger-light-3);
+  --el-color-error-light-5: var(--el-color-danger-light-5);
+  --el-color-error-light-7: var(--el-color-danger-light-7);
+  --el-color-error-light-8: var(--el-color-danger-light-8);
+  --el-color-error-light-9: var(--el-color-danger-light-9);
+  --el-color-error-dark-2: var(--el-color-danger-dark-2);
+
   --el-color-warning: var(--tone-warning);
   --el-color-warning-light-3: color-mix(in oklab, var(--tone-warning) 80%, var(--tone-mix-base));
   --el-color-warning-light-5: color-mix(in oklab, var(--tone-warning) 65%, var(--tone-mix-base));
@@ -1454,18 +1474,36 @@ body:has(.window-frame) .el-overlay-dialog {
   --el-color-info-dark-2: color-mix(in oklab, var(--tone-info) 85%, var(--tone-mix-shade));
 }
 
+/* Unsupported functions inside custom properties do not fall back to earlier
+   declarations. Override the consuming properties with ordinary theme colors. */
+@supports not (color: color-mix(in oklab, red, white)) {
+  :root .el-message {
+    background-color: var(--app-surface);
+    border-color: var(--app-border);
+  }
+
+  :root .el-message .el-message__content,
+  :root .el-message [class*="el-message-icon--"] {
+    color: var(--app-text);
+  }
+}
+
 /* Accent switching: only the base changes; all tints follow. */
 :root[data-accent="red"] {
   --accent: var(--accent-red);
+  --accent-rgb: 200, 60, 62;
 }
 :root[data-accent="purple"] {
   --accent: var(--accent-purple);
+  --accent-rgb: 143, 65, 200;
 }
 :root[data-accent="green"] {
   --accent: var(--accent-green);
+  --accent-rgb: 38, 151, 89;
 }
 :root[data-accent="yellow"] {
   --accent: var(--accent-yellow);
+  --accent-rgb: 193, 161, 0;
   /* A bright yellow needs dark text to stay readable on filled controls. */
   --accent-on: #241a00;
 }

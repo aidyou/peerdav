@@ -251,8 +251,8 @@ function backToLogin() {
 </script>
 
 <template>
-  <section v-if="view === 'loading'" class="card">
-    <p>{{ t("vault.loading") }}</p>
+  <section v-if="view === 'loading'" class="startup-loading" role="status" aria-live="polite" aria-busy="true">
+    <p>{{ t("common.loading") }}</p>
   </section>
 
   <section v-else-if="view === 'initialize'" class="card">
@@ -559,6 +559,20 @@ function backToLogin() {
 </template>
 
 <style scoped>
+/* Keep the window background stable; fast restores show no interim card. */
+.startup-loading {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--app-text-muted);
+  font-size: 13px;
+}
+
+.startup-loading p {
+  margin: 0;
+}
+
 .path-picker {
   display: flex;
   align-items: center;
