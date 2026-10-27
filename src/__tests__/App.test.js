@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 
@@ -1500,6 +1501,7 @@ describe("settings information architecture", () => {
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
     await flushPromises();
     expect(wrapper.findAll(".list-skeleton")).toHaveLength(1);
+    expect(wrapper.find("#pane-shares .share-empty").exists()).toBe(false);
 
     // 客户端两个折叠面板：入站列表等管理员数据，出站列表等发现快照与已保存对等端。
     await clickButton(wrapper, "客户端");
@@ -1516,7 +1518,9 @@ describe("settings information architecture", () => {
     await clickButton(wrapper, "共享");
     await flushPromises();
     expect(wrapper.findAll(".list-skeleton")).toHaveLength(0);
-    expect(wrapper.text()).toContain("暂无共享目录。");
+    const shareEmpty = wrapper.find("#pane-shares .share-empty");
+    expect(shareEmpty.exists()).toBe(true);
+    expect(shareEmpty.find(".hint").text()).toBe("暂无共享目录。");
 
     wrapper.unmount();
   });
@@ -2698,6 +2702,66 @@ describe("admin session restore", () => {
     invoke.mockReset();
   });
 
+  it.each([
+    ["dark", false, "dark"],
+    ["light", true, "light"],
+    ["system", true, "dark"],
+    ["invalid", false, "light"],
+    ["unavailable", true, "dark"],
+  ])("paints the pre-mount surface using %s appearance", (preference, systemDark, expected) => {
+    const html = readFileSync("index.html", "utf8");
+    const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+    const root = { dataset: {} };
+    runInNewContext(script, {
+      document: { documentElement: root },
+      localStorage: {
+        getItem: () => {
+          if (preference === "unavailable") throw new Error("storage denied");
+          return preference;
+        },
+      },
+      window: { matchMedia: () => ({ matches: systemDark }) },
+    });
+    expect(root.dataset.theme).toBe(expected);
+    expect(html).toMatch(/#app:empty\s*\{[^}]*box-sizing: border-box;[^}]*border-radius: 15px;[^}]*background-color: #f3f6fa;/);
+    expect(html).toMatch(/html\[data-theme="dark"\] #app:empty\s*\{[^}]*background-color: #14181f;/);
+    const authSource = readFileSync("src/components/AuthView.vue", "utf8");
+    expect(authSource).not.toContain("startup-hint");
+  });
+
+  it("uses compatible selection colors in every file browser layout", () => {
+    const appSource = readFileSync("src/App.vue", "utf8");
+    const browserSource = readFileSync("src/components/PeerBrowser.vue", "utf8");
+    for (const selector of [".file-tile.is-selected", ".file-table tbody tr.is-selected", ".column-row.is-selected", ".gallery-thumb.is-selected"]) {
+      const start = browserSource.indexOf(`${selector} {`);
+      expect(start).toBeGreaterThan(-1);
+      const rule = browserSource.slice(start, browserSource.indexOf("}", start));
+      expect(rule).toContain("background: var(--selection-bg);");
+      expect(rule).not.toContain("color-mix");
+    }
+    expect(appSource).toContain("--selection-bg: linear-gradient(rgba(var(--accent-rgb), 0.14), rgba(var(--accent-rgb), 0.14)) var(--app-surface);");
+    for (const accent of ["red", "purple", "green", "yellow"]) {
+      const start = appSource.indexOf(`:root[data-accent="${accent}"]`);
+      const rule = appSource.slice(start, appSource.indexOf("}", start));
+      expect(rule).toContain("--accent-rgb:");
+    }
+  });
+
+  it("provides the error toast palette and legacy WebKit fallbacks", () => {
+    const source = readFileSync("src/App.vue", "utf8");
+    const palette = source.match(/:root\[data-theme\]\s*\{([^}]+)\}/)[1];
+    for (const suffix of ["", "-light-3", "-light-5", "-light-7", "-light-8", "-light-9", "-dark-2"]) {
+      expect(palette).toContain(`--el-color-error${suffix}: var(--el-color-danger${suffix});`);
+    }
+    expect(source).toContain("-webkit-backdrop-filter: blur(14px);");
+    const fallback = source.slice(source.indexOf("@supports not (color: color-mix(in oklab, red, white))"), source.indexOf("/* Accent switching:"));
+    expect(fallback).toContain("background-color: var(--app-surface);");
+    expect(fallback).toContain("border-color: var(--app-border);");
+    expect(fallback).toContain("color: var(--app-text);");
+    expect(fallback).not.toContain("var(--tone-");
+    expect(fallback).not.toContain("var(--el-color-");
+  });
+
   it("clips all dialog overlays below the draggable titlebar and follows window geometry", async () => {
     const source = readFileSync("src/App.vue", "utf8");
     expect(source).toContain("body:has(.window-frame) > .el-overlay");
@@ -2720,6 +2784,48 @@ describe("admin session restore", () => {
     const wrapper = await mountReady();
     expect(wrapper.find(".window-frame").classes()).toContain("is-maximized");
     wrapper.unmount();
+  });
+
+  it.each([
+    ["signed-in", { username: "admin", mustChangePassword: false }, "ready"],
+    ["signed-out", null, "login"],
+    ["password-change", { username: "admin", mustChangePassword: true }, "change-admin"],
+    ["failed", null, "login"],
+  ])("keeps a neutral surface while restoring a %s session", async (scenario, session, expectedView) => {
+    let resolveSession;
+    let rejectSession;
+    const pendingSession = new Promise((resolve, reject) => {
+      resolveSession = resolve;
+      rejectSession = reject;
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const wrapper = await mountReady({ admin_session: () => pendingSession });
+
+    const waiting = wrapper.find(".startup-loading");
+    expect(waiting.exists()).toBe(true);
+    expect(waiting.attributes("role")).toBe("status");
+    expect(waiting.classes()).not.toContain("card");
+    expect(wrapper.find(".footer").exists()).toBe(false);
+    expect(wrapper.find("form").exists()).toBe(false);
+    expect(wrapper.findComponent({ name: "AuthView" }).props("view")).toBe("loading");
+
+    if (scenario === "failed") {
+      rejectSession(new Error("session unavailable"));
+    } else {
+      resolveSession(session);
+    }
+    await flushPromises();
+
+    expect(wrapper.find(".startup-loading").exists()).toBe(false);
+    if (expectedView === "ready") {
+      expect(wrapper.find(".workspace").exists()).toBe(true);
+      expect(wrapper.text()).not.toContain("管理员登录");
+    } else {
+      expect(wrapper.findComponent({ name: "AuthView" }).props("view")).toBe(expectedView);
+      expect(wrapper.find("form").exists()).toBe(true);
+    }
+    wrapper.unmount();
+    warning.mockRestore();
   });
 
   it("restores the signed-in admin after a reload", async () => {

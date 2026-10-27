@@ -5,6 +5,35 @@
     <link rel="icon" type="image/svg+xml" href="/peerdav.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PeerDav</title>
+    <script>
+      // Apply the saved appearance before the module bundle can paint.
+      (() => {
+        let preference;
+        try {
+          preference = localStorage.getItem("peerdav.theme");
+        } catch {
+          // Storage can be unavailable; follow the system appearance instead.
+        }
+        const dark = preference === "dark" ||
+          (preference !== "light" && window.matchMedia?.("(prefers-color-scheme: dark)").matches);
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+      })();
+    </script>
+    <style>
+      html, body { margin: 0; }
+      /* Vue replaces this empty host; never make the rounded window's corners opaque. */
+      #app:empty {
+        box-sizing: border-box;
+        height: 100vh;
+        border: 1px solid rgba(22, 32, 46, 0.08);
+        border-radius: 15px;
+        background-color: #f3f6fa;
+      }
+      html[data-theme="dark"] #app:empty {
+        border-color: rgba(255, 255, 255, 0.08);
+        background-color: #14181f;
+      }
+    </style>
   </head>
 
   <body>

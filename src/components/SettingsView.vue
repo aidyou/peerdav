@@ -986,7 +986,9 @@ async function loadInitialData() {
               </ul>
             </el-collapse-item>
           </el-collapse>
-          <p v-else class="hint">{{ t("shares.empty") }}</p>
+          <div v-else class="share-empty">
+            <p class="hint">{{ t("shares.empty") }}</p>
+          </div>
 
           <el-dialog
             v-model="showShareForm"
@@ -1922,6 +1924,7 @@ async function loadInitialData() {
 }
 
 /* 空态与折叠面板同款外框，保证同一套设计语言 */
+.share-empty,
 .client-empty {
   display: flex;
   align-items: center;
@@ -1932,6 +1935,10 @@ async function loadInitialData() {
   border: 1px solid var(--app-border);
   border-radius: 8px;
   background: var(--app-surface);
+}
+
+.share-empty .hint {
+  margin: 0;
 }
 
 .client-empty__icon {

@@ -2003,7 +2003,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
 .share-link.is-active {
   color: var(--app-text);
-  background: var(--app-surface);
+  background: var(--app-surface-2);
   box-shadow: 0 1px 5px rgba(22, 32, 46, 0.07);
 }
 
@@ -2128,8 +2128,8 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 }
 
 .file-tile.is-selected {
-  border-color: color-mix(in oklab, var(--el-color-primary) 40%, var(--app-border));
-  background: color-mix(in oklab, var(--el-color-primary) 8%, var(--app-surface));
+  border-color: var(--selection-border);
+  background: var(--selection-bg);
 }
 
 .file-tile__name {
@@ -2177,7 +2177,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 }
 
 .file-table tbody tr.is-selected {
-  background: color-mix(in oklab, var(--el-color-primary) 8%, var(--app-surface));
+  background: var(--selection-bg);
 }
 
 .table-name {
@@ -2236,7 +2236,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
 .column-row.is-selected {
   color: var(--app-text);
-  background: color-mix(in oklab, var(--el-color-primary) 10%, var(--app-surface-2));
+  background: var(--selection-bg);
 }
 
 .column-chevron {
@@ -2369,8 +2369,8 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 }
 
 .gallery-thumb.is-selected {
-  border-color: color-mix(in oklab, var(--el-color-primary) 35%, var(--app-border));
-  background: color-mix(in oklab, var(--el-color-primary) 8%, var(--app-surface));
+  border-color: var(--selection-border);
+  background: var(--selection-bg);
 }
 
 .file-empty {
