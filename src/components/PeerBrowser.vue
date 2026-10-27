@@ -1074,6 +1074,9 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
               </button>
             </template>
           </div>
+        </div>
+
+        <Teleport to="#titlebar-file-actions">
           <div class="pathbar-actions">
             <div class="view-switch" role="group" :aria-label="t('peer.viewMode')">
               <el-tooltip
@@ -1120,71 +1123,72 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 </button>
               </el-tooltip>
             </div>
-            <div class="view-switch" role="group" :aria-label="t('peer.viewMode')">
-            <el-tooltip
-              :content="t('peer.refresh')"
-              placement="bottom"
-              :show-after="200"
-              :hide-after="0"
-              :enterable="false"
-            >
-              <button
-                type="button"
-                class="view-switch__button"
-                :aria-label="t('peer.refresh')"
-                :disabled="busy || !activeShareId"
-                @click="refreshListing"
+            <span class="titlebar-divider" aria-hidden="true"></span>
+            <div class="view-switch" role="group" :aria-label="t('peer.fileActions')">
+              <el-tooltip
+                :content="t('peer.refresh')"
+                placement="bottom"
+                :show-after="200"
+                :hide-after="0"
+                :enterable="false"
               >
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M20 11a8 8 0 1 0-2.3 5.7" />
-                  <path d="M20 5v6h-6" />
-                </svg>
-              </button>
-            </el-tooltip>
-            <el-tooltip
-              :content="t('peer.uploadFiles')"
-              placement="bottom"
-              :show-after="200"
-              :hide-after="0"
-              :enterable="false"
-            >
-              <button
-                type="button"
-                class="view-switch__button"
-                :aria-label="t('peer.uploadFiles')"
-                :disabled="busy || !activeShareId"
-                @click="chooseUploadFiles"
+                <button
+                  type="button"
+                  class="view-switch__button"
+                  :aria-label="t('peer.refresh')"
+                  :disabled="busy || !activeShareId"
+                  @click="refreshListing"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M20 11a8 8 0 1 0-2.3 5.7" />
+                    <path d="M20 5v6h-6" />
+                  </svg>
+                </button>
+              </el-tooltip>
+              <el-tooltip
+                :content="t('peer.uploadFiles')"
+                placement="bottom"
+                :show-after="200"
+                :hide-after="0"
+                :enterable="false"
               >
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M12 16V4" />
-                  <path d="m8 8 4-4 4 4" />
-                  <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
-                </svg>
-              </button>
-            </el-tooltip>
-            <el-tooltip
-              :content="t('peer.uploadFolder')"
-              placement="bottom"
-              :show-after="200"
-              :hide-after="0"
-              :enterable="false"
-            >
-              <button
-                type="button"
-                class="view-switch__button"
-                :aria-label="t('peer.uploadFolder')"
-                :disabled="busy || !activeShareId"
-                @click="chooseUploadFolder"
+                <button
+                  type="button"
+                  class="view-switch__button"
+                  :aria-label="t('peer.uploadFiles')"
+                  :disabled="busy || !activeShareId"
+                  @click="chooseUploadFiles"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M12 16V4" />
+                    <path d="m8 8 4-4 4 4" />
+                    <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
+                  </svg>
+                </button>
+              </el-tooltip>
+              <el-tooltip
+                :content="t('peer.uploadFolder')"
+                placement="bottom"
+                :show-after="200"
+                :hide-after="0"
+                :enterable="false"
               >
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M3.5 7.5c0-.8.7-1.5 1.5-1.5h4l1.8 2H19c.8 0 1.5.7 1.5 1.5v8c0 .8-.7 1.5-1.5 1.5H5c-.8 0-1.5-.7-1.5-1.5z" />
-                  <path d="M12 17v-5M9.5 14.5 12 12l2.5 2.5" />
-                </svg>
-              </button>
-            </el-tooltip>
+                <button
+                  type="button"
+                  class="view-switch__button"
+                  :aria-label="t('peer.uploadFolder')"
+                  :disabled="busy || !activeShareId"
+                  @click="chooseUploadFolder"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M3.5 7.5c0-.8.7-1.5 1.5-1.5h4l1.8 2H19c.8 0 1.5.7 1.5 1.5v8c0 .8-.7 1.5-1.5 1.5H5c-.8 0-1.5-.7-1.5-1.5z" />
+                    <path d="M12 17v-5M9.5 14.5 12 12l2.5 2.5" />
+                  </svg>
+                </button>
+              </el-tooltip>
             </div>
           </div>
-        </div>
+        </Teleport>
 
         <p v-if="peerNotice" class="browser-notice">{{ peerNotice }}</p>
 
@@ -1773,28 +1777,44 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   flex: none;
   display: flex;
   gap: 2px;
-  padding: 3px;
-  border: 1px solid var(--app-border);
-  border-radius: 9px;
-  background: var(--app-surface-2);
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 
 .view-switch__button {
-  width: 30px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   border: 0;
-  border-radius: 6px;
+  border-radius: 999px;
   background: transparent;
   color: var(--app-text-muted);
   cursor: pointer;
+  -webkit-app-region: no-drag;
 }
 
 .view-switch__button:hover {
   color: var(--app-text);
-  background: var(--app-surface-3);
+  background: var(--pill-bg);
+}
+
+.view-switch__button:focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: 1px;
+}
+
+.view-switch__button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.view-switch__button:disabled:hover {
+  color: var(--app-text-muted);
+  background: transparent;
 }
 
 .view-switch__button.is-active {
@@ -1804,8 +1824,8 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 }
 
 .view-switch__button svg {
-  width: 16px;
-  height: 16px;
+  width: 15px;
+  height: 15px;
   fill: none;
   stroke: currentColor;
   stroke-width: 1.5;
@@ -1951,7 +1971,8 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   flex: none;
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: 0;
+  -webkit-app-region: no-drag;
 }
 
 .browser-notice {
@@ -2868,8 +2889,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
     flex-direction: column;
   }
 
-  .selection-actions,
-  .pathbar-actions {
+  .selection-actions {
     flex-wrap: wrap;
   }
 

@@ -15,7 +15,6 @@ export default {
   "theme.light": "亮色",
   "theme.dark": "暗色",
 
-  "titlebar.name": "邻盘",
   "titlebar.language": "切换语言",
   "titlebar.theme": "切换主题",
   "titlebar.accent": "切换主题色",
@@ -291,6 +290,7 @@ export default {
 
   "peer.shares": "共享",
   "peer.viewMode": "浏览方式",
+  "peer.fileActions": "文件操作",
   "peer.icons": "图标",
   "peer.list": "列表",
   "peer.columns": "分栏",

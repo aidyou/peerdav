@@ -142,11 +142,19 @@ function initials(peer) {
   background: transparent;
 }
 
+/* Avatar tiles sit quietly on the rail until hovered. */
+.rail-avatar {
+  background: var(--app-surface-3);
+}
+
 .rail-home {
   margin-bottom: 2px;
 }
 
-.rail-avatar:hover,
+.rail-avatar:hover {
+  background: var(--pill-bg);
+}
+
 .rail-action:hover {
   background: var(--app-surface-3);
 }

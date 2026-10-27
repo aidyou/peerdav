@@ -14,7 +14,6 @@ export default {
   "theme.light": "Light",
   "theme.dark": "Dark",
 
-  "titlebar.name": "PeerDav",
   "titlebar.language": "Switch language",
   "titlebar.theme": "Switch theme",
   "titlebar.accent": "Switch accent colour",
@@ -290,6 +289,7 @@ export default {
 
   "peer.shares": "Shares",
   "peer.viewMode": "View",
+  "peer.fileActions": "File actions",
   "peer.icons": "Icons",
   "peer.list": "List",
   "peer.columns": "Columns",

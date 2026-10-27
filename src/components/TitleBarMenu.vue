@@ -98,10 +98,10 @@ onBeforeUnmount(() => {
 }
 
 .titlebar-menu__trigger {
-    width: 30px;
-    height: 30px;
+    width: 26px;
+    height: 26px;
     border: 0;
-    border-radius: 8px;
+    border-radius: 999px;
     padding: 0;
     display: inline-flex;
     align-items: center;
@@ -112,13 +112,19 @@ onBeforeUnmount(() => {
     -webkit-app-region: no-drag;
     transition:
         background 0.15s ease,
-        color 0.15s ease;
+        color 0.15s ease,
+        box-shadow 0.15s ease;
 }
 
-.titlebar-menu__trigger:hover,
-.titlebar-menu__trigger.is-open {
+.titlebar-menu__trigger:hover {
     color: var(--app-text);
     background: var(--pill-bg);
+}
+
+.titlebar-menu__trigger.is-open {
+    color: var(--app-text);
+    background: var(--app-surface);
+    box-shadow: 0 1px 4px rgba(22, 32, 46, 0.1);
 }
 
 .titlebar-menu__trigger:focus-visible {
@@ -127,8 +133,8 @@ onBeforeUnmount(() => {
 }
 
 .titlebar-menu__trigger :deep(svg) {
-    width: 16px;
-    height: 16px;
+    width: 15px;
+    height: 15px;
     fill: none;
     stroke: currentColor;
     stroke-width: 1.6;

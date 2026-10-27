@@ -79,6 +79,7 @@ afterEach(() => {
   for (const message of document.querySelectorAll(".el-message")) {
     message.remove();
   }
+  document.body.innerHTML = "";
 });
 
 function latestErrorMessage() {
@@ -171,7 +172,9 @@ function mockCommands(overrides = {}) {
 
 async function mountReady(overrides = {}) {
   mockCommands(overrides);
-  const wrapper = mount(App);
+  // Teleport targets are resolved through the document, so the app must be
+  // attached while testing the titlebar file-action slot.
+  const wrapper = mount(App, { attachTo: document.body });
   await flushPromises();
   return wrapper;
 }
@@ -2350,6 +2353,36 @@ describe("Finder-style peer browser", () => {
 
     wrapper.unmount();
   });
+
+  it("shows the file actions in the titlebar only while the browser is open", async () => {
+    const { wrapper } = await openBrowser();
+
+    const slot = wrapper.find("#titlebar-file-actions");
+    expect(slot.exists()).toBe(true);
+    expect(slot.findAll(".view-switch")).toHaveLength(2);
+    expect(slot.findAll(".view-switch__button")).toHaveLength(7);
+    expect(slot.findAll(".titlebar-divider")).toHaveLength(1);
+    expect(slot.find(".pathbar-actions").classes()).not.toContain(
+      "titlebar-pill",
+    );
+    expect(wrapper.find(".titlebar-pill").exists()).toBe(false);
+    expect(wrapper.find(".pathbar .pathbar-actions").exists()).toBe(false);
+    // The appearance controls stay in the titlebar next to the file actions.
+    expect(wrapper.find(".titlebar .titlebar-actions").exists()).toBe(true);
+    expect(
+      wrapper.find(".titlebar-slot--end > .titlebar-divider").exists(),
+    ).toBe(true);
+
+    await wrapper.find(".rail-home").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".peer-browser").exists()).toBe(false);
+    expect(
+      wrapper.find("#titlebar-file-actions").element.children,
+    ).toHaveLength(0);
+
+    wrapper.unmount();
+  });
 });
 
 describe("titlebar appearance controls", () => {
@@ -2377,15 +2410,30 @@ describe("titlebar appearance controls", () => {
     wrapper.unmount();
   });
 
-  it("localizes the titlebar brand while keeping the English name", async () => {
+  it("uses a translation icon for the language menu", async () => {
     const wrapper = await mountReady(VAULT_NOT_INITIALIZED);
-    expect(wrapper.find(".titlebar-title").text()).toBe("邻盘");
 
-    await switchLanguage(wrapper, "en");
-    expect(wrapper.find(".titlebar-title").text()).toBe("PeerDav");
+    const trigger = wrapper.find(
+      '[data-menu="language"] .titlebar-menu__trigger',
+    );
+    const icon = trigger.find("svg");
+    expect(icon.exists()).toBe(true);
+    expect(icon.find("path").classes()).toContain("titlebar-icon-fill");
+    expect(trigger.text()).toBe("");
 
-    await switchLanguage(wrapper, "zh-CN");
-    expect(wrapper.find(".titlebar-title").text()).toBe("邻盘");
+    wrapper.unmount();
+  });
+
+  it("keeps the titlebar free of a brand label and file actions outside the browser", async () => {
+    const wrapper = await mountReady(VAULT_NOT_INITIALIZED);
+
+    expect(wrapper.find(".titlebar-title").exists()).toBe(false);
+    const appearance = wrapper.find(".titlebar .titlebar-actions");
+    expect(appearance.exists()).toBe(true);
+    expect(wrapper.find(".titlebar-pill").exists()).toBe(false);
+    expect(
+      wrapper.find("#titlebar-file-actions").element.children,
+    ).toHaveLength(0);
 
     wrapper.unmount();
   });

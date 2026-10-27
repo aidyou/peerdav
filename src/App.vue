@@ -785,132 +785,146 @@ provide(
   <div class="window-frame" :class="{ 'is-maximized': isMaximized }">
     <header
       class="titlebar"
-      :class="{ 'titlebar--win': !isMacOS }"
+      :class="{ 'titlebar--mac': isMacOS, 'titlebar--win': !isMacOS }"
       data-tauri-drag-region
     >
-      <div
-        class="traffic-lights"
-        :class="{ 'traffic-lights--windows': !isMacOS }"
-      >
-        <el-tooltip
-          :content="t('window.close')"
-          placement="bottom"
-          :show-after="200"
-          :hide-after="0"
-          :enterable="false"
+      <div id="titlebar-start" class="titlebar-slot titlebar-slot--start">
+        <div
+          class="traffic-lights"
+          :class="{ 'traffic-lights--windows': !isMacOS }"
         >
-          <button
-            type="button"
-            class="traffic-light close"
-            :aria-label="t('window.close')"
-            @click="closeWindow"
+          <el-tooltip
+            :content="t('window.close')"
+            placement="bottom"
+            :show-after="200"
+            :hide-after="0"
+            :enterable="false"
           >
-            <svg viewBox="0 0 12 12" aria-hidden="true">
-              <path d="M3.2 3.2l5.6 5.6M8.8 3.2L3.2 8.8" />
-            </svg>
-          </button>
-        </el-tooltip>
-        <el-tooltip
-          :content="t('window.minimize')"
-          placement="bottom"
-          :show-after="200"
-          :hide-after="0"
-          :enterable="false"
-        >
-          <button
-            type="button"
-            class="traffic-light minimize"
-            :aria-label="t('window.minimize')"
-            @click="minimizeWindow"
+            <button
+              type="button"
+              class="traffic-light close"
+              :aria-label="t('window.close')"
+              @click="closeWindow"
+            >
+              <svg viewBox="0 0 12 12" aria-hidden="true">
+                <path d="M3.2 3.2l5.6 5.6M8.8 3.2L3.2 8.8" />
+              </svg>
+            </button>
+          </el-tooltip>
+          <el-tooltip
+            :content="t('window.minimize')"
+            placement="bottom"
+            :show-after="200"
+            :hide-after="0"
+            :enterable="false"
           >
-            <svg viewBox="0 0 12 12" aria-hidden="true">
-              <path d="M3 6h6" />
-            </svg>
-          </button>
-        </el-tooltip>
-        <el-tooltip
-          :content="t('window.maximize')"
-          placement="bottom"
-          :show-after="200"
-          :hide-after="0"
-          :enterable="false"
-        >
-          <button
-            type="button"
-            class="traffic-light maximize"
-            :aria-label="t('window.maximize')"
-            @click="toggleMaximizeWindow"
+            <button
+              type="button"
+              class="traffic-light minimize"
+              :aria-label="t('window.minimize')"
+              @click="minimizeWindow"
+            >
+              <svg viewBox="0 0 12 12" aria-hidden="true">
+                <path d="M3 6h6" />
+              </svg>
+            </button>
+          </el-tooltip>
+          <el-tooltip
+            :content="t('window.maximize')"
+            placement="bottom"
+            :show-after="200"
+            :hide-after="0"
+            :enterable="false"
           >
-            <svg viewBox="0 0 12 12" aria-hidden="true">
-              <path d="M3.2 8.8L8.8 3.2M6.2 3.2h2.6v2.6" />
-            </svg>
-          </button>
-        </el-tooltip>
+            <button
+              type="button"
+              class="traffic-light maximize"
+              :aria-label="t('window.maximize')"
+              @click="toggleMaximizeWindow"
+            >
+              <svg viewBox="0 0 12 12" aria-hidden="true">
+                <path d="M3.2 8.8L8.8 3.2M6.2 3.2h2.6v2.6" />
+              </svg>
+            </button>
+          </el-tooltip>
+        </div>
       </div>
-      <span class="titlebar-title">{{ t("titlebar.name") }}</span>
-      <div class="titlebar-actions">
-        <TitleBarMenu
-          name="language"
-          :aria-label="t('titlebar.language')"
-          :model-value="locale"
-          :items="languageItems"
-          @update:model-value="setLocale"
-        >
-          <template #icon>
-            <span class="titlebar-lang">{{
-              locale === "zh-CN" ? "中" : "EN"
-            }}</span>
-          </template>
-        </TitleBarMenu>
-        <TitleBarMenu
-          name="theme"
-          :aria-label="t('titlebar.theme')"
-          :model-value="theme"
-          :items="themeItems"
-          @update:model-value="setTheme"
-        >
-          <template #icon>
-            <svg
-              v-if="resolvedTheme === 'dark'"
-              viewBox="0 0 24 24"
-              aria-hidden="true"
-            >
-              <path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z" />
-            </svg>
-            <svg
-              v-else-if="resolvedTheme === 'light'"
-              viewBox="0 0 24 24"
-              aria-hidden="true"
-            >
-              <circle cx="12" cy="12" r="4" />
-              <path
-                d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"
-              />
-            </svg>
-            <svg v-else viewBox="0 0 24 24" aria-hidden="true">
-              <circle cx="12" cy="12" r="9" />
-              <path d="M12 3a9 9 0 0 1 0 18z" class="titlebar-icon-fill" />
-            </svg>
-          </template>
-        </TitleBarMenu>
-        <TitleBarMenu
-          name="accent"
-          :aria-label="t('titlebar.accent')"
-          :model-value="accent"
-          :items="accentItems"
-          @update:model-value="setAccent"
-        >
-          <template #icon>
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path
-                d="M12 3a9 9 0 1 0 0 18c1.4 0 2-1 2-2 0-1.2-1-1.5-1-2.6 0-1 .8-1.4 1.8-1.4H17a4 4 0 0 0 4-4c0-4-4-8-9-8z"
-              />
-              <circle cx="8" cy="10" r="1" />
-              <circle cx="12" cy="7.5" r="1" />
-              <circle cx="16" cy="10" r="1" />
-            </svg>
-          </template>
-        </TitleBarMenu>
+
+      <div
+        id="titlebar-center"
+        class="titlebar-slot titlebar-slot--center"
+      ></div>
+
+      <div id="titlebar-end" class="titlebar-slot titlebar-slot--end">
+        <div class="titlebar-actions">
+          <TitleBarMenu
+            name="language"
+            :aria-label="t('titlebar.language')"
+            :model-value="locale"
+            :items="languageItems"
+            @update:model-value="setLocale"
+          >
+            <template #icon>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  class="titlebar-icon-fill"
+                  d="m18.5 10l4.4 11h-2.155l-1.201-3h-4.09l-1.199 3h-2.154L16.5 10zM10 2v2h6v2h-1.968a18.2 18.2 0 0 1-3.62 6.301a15 15 0 0 0 2.335 1.707l-.75 1.878A17 17 0 0 1 9 13.725a16.7 16.7 0 0 1-6.201 3.548l-.536-1.929a14.7 14.7 0 0 0 5.327-3.042A18 18 0 0 1 4.767 8h2.24A16 16 0 0 0 9 10.877a16.2 16.2 0 0 0 2.91-4.876L2 6V4h6V2zm7.5 10.885L16.253 16h2.492z"
+                />
+              </svg>
+            </template>
+          </TitleBarMenu>
+          <TitleBarMenu
+            name="theme"
+            :aria-label="t('titlebar.theme')"
+            :model-value="theme"
+            :items="themeItems"
+            @update:model-value="setTheme"
+          >
+            <template #icon>
+              <svg
+                v-if="resolvedTheme === 'dark'"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+              >
+                <path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z" />
+              </svg>
+              <svg
+                v-else-if="resolvedTheme === 'light'"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="12" r="4" />
+                <path
+                  d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"
+                />
+              </svg>
+              <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 3a9 9 0 0 1 0 18z" class="titlebar-icon-fill" />
+              </svg>
+            </template>
+          </TitleBarMenu>
+          <TitleBarMenu
+            name="accent"
+            :aria-label="t('titlebar.accent')"
+            :model-value="accent"
+            :items="accentItems"
+            @update:model-value="setAccent"
+          >
+            <template #icon>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M12 3a9 9 0 1 0 0 18c1.4 0 2-1 2-2 0-1.2-1-1.5-1-2.6 0-1 .8-1.4 1.8-1.4H17a4 4 0 0 0 4-4c0-4-4-8-9-8z"
+                />
+                <circle cx="8" cy="10" r="1" />
+                <circle cx="12" cy="7.5" r="1" />
+                <circle cx="16" cy="10" r="1" />
+              </svg>
+            </template>
+          </TitleBarMenu>
+        </div>
+        <span class="titlebar-divider" aria-hidden="true"></span>
+        <div id="titlebar-file-actions" class="titlebar-file-actions"></div>
       </div>
     </header>
 
@@ -1018,6 +1032,7 @@ provide(
   box-sizing: border-box;
   display: flex;
   align-items: center;
+  gap: 8px;
   padding: 0 14px;
   border-radius: var(--window-inner-radius) var(--window-inner-radius) 0 0;
   background: var(--titlebar-bg);
@@ -1026,15 +1041,82 @@ provide(
   user-select: none;
 }
 
+/* Three reusable regions: start, centre and end. The centre stays empty for
+   now and simply absorbs the free width, so pages can mount content there
+   later without changing the platform-specific ordering below. */
+.titlebar-slot {
+  flex: none;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.titlebar-slot--center {
+  flex: 1 1 auto;
+}
+
+.titlebar-slot--end {
+  gap: 0;
+}
+
+/* macOS: window controls start the bar; file actions and appearance controls
+   end it, with appearance anchored at the outer edge. */
+.titlebar--mac .titlebar-slot--start {
+  order: 0;
+}
+
+.titlebar--mac .titlebar-slot--center {
+  order: 1;
+}
+
+.titlebar--mac .titlebar-slot--end {
+  order: 2;
+}
+
+.titlebar--mac .titlebar-file-actions {
+  order: 0;
+}
+
+.titlebar--mac .titlebar-slot--end > .titlebar-divider {
+  order: 1;
+}
+
+.titlebar--mac .titlebar-actions {
+  order: 2;
+}
+
+/* Windows / Linux: app controls start the bar; window controls end it. The
+   file actions stay next to the appearance group, far from the window
+   buttons, so the two never compete for the same edge. */
+.titlebar--win .titlebar-slot--end {
+  order: 0;
+}
+
+.titlebar--win .titlebar-slot--center {
+  order: 1;
+}
+
+.titlebar--win .titlebar-slot--start {
+  order: 2;
+}
+
+.titlebar--win .titlebar-actions {
+  order: 0;
+}
+
+.titlebar--win .titlebar-slot--end > .titlebar-divider {
+  order: 1;
+}
+
+.titlebar--win .titlebar-file-actions {
+  order: 2;
+}
+
 .traffic-lights {
   flex: none;
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-.traffic-lights--windows {
-  margin-left: auto;
 }
 
 .traffic-lights--windows .traffic-light.close {
@@ -1090,44 +1172,33 @@ provide(
   background: #4bbd38;
 }
 
-.titlebar-title {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  pointer-events: none;
-  font-size: 12px;
-  line-height: 1;
-  font-weight: 600;
-  color: var(--app-text-muted);
-  letter-spacing: 0.04em;
-}
-
-.titlebar-lang {
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 1;
-  letter-spacing: 0.02em;
-}
-
 .titlebar-actions {
   flex: none;
   display: flex;
   align-items: center;
-  gap: 2px;
-  margin-left: auto;
+  gap: 4px;
   -webkit-app-region: no-drag;
 }
 
-/* Windows / Linux: window buttons sit right, app controls sit left. */
-.titlebar--win .titlebar-actions {
-  margin-left: 0;
-  order: -1;
+.titlebar-file-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  -webkit-app-region: no-drag;
 }
 
-/* With controls on the left, menus must open toward the content edge so they
-   never run off the left side of the window. */
+/* The slot is shared by every page; only the file browser fills it. */
+.titlebar-file-actions:empty {
+  display: none;
+}
+
+/* The separator only exists while a page owns the file-action slot. */
+.titlebar-slot--end:has(.titlebar-file-actions:empty) > .titlebar-divider {
+  display: none;
+}
+
+/* On Windows / Linux the appearance menu sits on the left, so its dropdown
+   must open toward the content edge instead of running off-screen. */
 .titlebar--win :deep(.titlebar-menu__list) {
   right: auto;
   left: 0;
@@ -1218,6 +1289,15 @@ provide(
 </style>
 
 <style>
+/* Shared vertical rule used between titlebar groups. */
+.titlebar-divider {
+  flex: none;
+  width: 1px;
+  height: 16px;
+  margin: 0 6px;
+  background: var(--app-border);
+}
+
 :root {
   /* Window chrome geometry: the single source of truth for the rounded
      transparent frame. The titlebar carries the inner radius so its
