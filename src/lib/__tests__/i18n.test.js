@@ -217,6 +217,14 @@ describe("error mapping", () => {
     expect(error.detail).toBe("full diagnostics");
   });
 
+  it("renders approval polling timeout once in the active language", () => {
+    const error = { code: "PEER_REQUEST_FAILED", message: "发送请求失败：the status request timed out",
+      context: { operation: "wait for approval", reason: "the status request timed out" } };
+    expect(toUserMessage(error)).toBe("查询审批状态失败：请求超时");
+    setLocale("en");
+    expect(toUserMessage(error)).toBe("Approval status query failed: request timed out");
+  });
+
   it("localizes the user message without touching detail", () => {
     const error = {
       code: "VAULT_LOCKED",

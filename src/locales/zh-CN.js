@@ -1,6 +1,8 @@
 // Simplified Chinese product copy. Keep this catalogue strictly Chinese;
 // identifiers, algorithm names and user data are the only Latin text.
 export default {
+  "errors.APPROVAL_STATUS_TIMEOUT": "查询审批状态失败：请求超时",
+  "errors.REQUEST_TIMEOUT": "发送请求失败：请求超时",
   "errors.reason.VALIDATION_WEAK_PASSWORD.blank": "密码不能为空白",
   "errors.reason.VALIDATION_WEAK_PASSWORD.too_long": "密码不能超过 1024 个字符",
   "errors.reason.VALIDATION_WEAK_PASSWORD.edge_whitespace": "密码首尾不能包含空格",

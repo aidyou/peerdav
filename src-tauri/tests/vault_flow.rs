@@ -546,11 +546,11 @@ fn secret_records_validate_names_and_detect_tampering() {
 }
 
 #[test]
-fn app_error_mapping_is_structured_and_bilingual() {
+fn app_error_mapping_is_structured_and_single_message() {
     let error = AppError::from(DomainError::VaultLocked);
     assert_eq!(error.code, "VAULT_LOCKED");
     assert!(error.message.contains("保险箱已锁定"));
-    assert!(error.message.contains("vault is locked"));
+    assert!(!error.message.contains(" / "));
     assert!(error.detail.is_some());
 
     let error = AppError::from(DomainError::KeyFileMissing {
@@ -558,7 +558,7 @@ fn app_error_mapping_is_structured_and_bilingual() {
     });
     assert_eq!(error.code, "VAULT_KEY_FILE_MISSING");
     assert!(error.message.contains("密钥文件"));
-    assert!(error.message.contains("key file"));
+    assert!(!error.message.contains(" / "));
     assert_eq!(error.context.expect("context")["path"], "/tmp/missing.key");
 
     let error = AppError::from(DomainError::WeakPassword {
@@ -566,7 +566,7 @@ fn app_error_mapping_is_structured_and_bilingual() {
     });
     assert_eq!(error.code, "VALIDATION_WEAK_PASSWORD");
     assert!(error.message.contains("至少为 6"));
-    assert!(error.message.contains("at least 6"));
+    assert!(!error.message.contains(" / "));
 }
 
 #[test]

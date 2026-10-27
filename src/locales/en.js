@@ -1,5 +1,7 @@
 // English product copy. Keys must match src/locales/zh-CN.js exactly.
 export default {
+  "errors.APPROVAL_STATUS_TIMEOUT": "Approval status query failed: request timed out",
+  "errors.REQUEST_TIMEOUT": "Request failed: request timed out",
   "errors.reason.VALIDATION_WEAK_PASSWORD.blank": "password must not be blank",
   "errors.reason.VALIDATION_WEAK_PASSWORD.too_long": "password must not exceed 1024 characters",
   "errors.reason.VALIDATION_WEAK_PASSWORD.edge_whitespace": "password must not start or end with whitespace",

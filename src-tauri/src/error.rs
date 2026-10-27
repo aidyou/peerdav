@@ -259,9 +259,13 @@ impl AppError {
         }
         let context = Some(context);
 
-        log::error!(
-            "peerdav.error code={code} message={message:?} detail={detail:?} context={context:?}"
-        );
+        // Log the diagnostic once. The display message and reason parameter
+        // repeat the same cause and are deliberately omitted from this record.
+        let mut log_context = context.clone();
+        if let Some(fields) = log_context.as_mut().and_then(Value::as_object_mut) {
+            fields.remove("reason");
+        }
+        log::error!("peerdav.error code={code} detail={detail:?} context={log_context:?}");
 
         Self {
             code,
@@ -277,7 +281,12 @@ pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut rendered = error.to_string();
     let mut source = error.source();
     while let Some(cause) = source {
-        let _ = write!(rendered, ": {cause}");
+        let text = cause.to_string();
+        // Some libraries' Display already renders the entire source chain.
+        // Keep a cause only when it adds diagnostic information.
+        if !text.is_empty() && !rendered.contains(&text) {
+            let _ = write!(rendered, ": {text}");
+        }
         source = cause.source();
     }
     rendered
@@ -441,15 +450,15 @@ fn failure(chinese: &str, english: &str, reason: &str) -> String {
 
 fn user_message(error: &DomainError) -> String {
     let message = error_reason(error);
-    let Some((chinese, english)) = message.split_once(" / ") else {
+    let Some((chinese, _)) = message.split_once(" / ") else {
         return message;
     };
     // Detailed failures already have exactly one operation prefix. State and
     // validation errors use the same shape instead of a separate UI convention.
     if chinese.contains('：') {
-        return message;
+        return chinese.to_owned();
     }
-    let (zh, en) = match error {
+    let (zh, _en) = match error {
         DomainError::VaultNotInitialized
         | DomainError::VaultAlreadyInitialized
         | DomainError::VaultLocked
@@ -500,7 +509,7 @@ fn user_message(error: &DomainError) -> String {
         }
         _ => ("执行操作失败", "Operation failed"),
     };
-    format!("{zh}：{} / {en}: {}", chinese.trim(), english.trim())
+    format!("{zh}：{}", chinese.trim())
 }
 
 fn error_reason(error: &DomainError) -> String {
@@ -792,7 +801,7 @@ mod tests {
         });
         assert_eq!(
             error.message,
-            "发送请求失败：Connection refused (os error 111) / Request failed: Connection refused (os error 111)"
+            "发送请求失败：Connection refused (os error 111)"
         );
     }
 
@@ -820,6 +829,23 @@ mod tests {
                 .is_some_and(|v| v.contains("/private/secret.key"))
         );
         assert!(error.message.contains("Permission denied"));
+    }
+
+    #[test]
+    fn approval_timeout_has_one_message() {
+        let error = AppError::from(DomainError::PeerRequest {
+            operation: "wait for approval",
+            status: None,
+            detail: "the status request timed out".into(),
+        });
+        assert_eq!(
+            error
+                .message
+                .matches("the status request timed out")
+                .count(),
+            1
+        );
+        assert!(!error.message.contains(" / "));
     }
 
     #[test]

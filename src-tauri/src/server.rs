@@ -2132,7 +2132,7 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].code, "SERVER_ALREADY_RUNNING");
         assert!(errors[0].message.contains("服务已在运行"));
-        assert!(errors[0].message.contains("already running"));
+        assert!(!errors[0].message.contains(" / "));
         assert!(errors[0].detail.is_some());
     }
 

@@ -79,9 +79,10 @@ export async function invoke(command, args = {}) {
     return await tauriInvoke(command, args);
   } catch (raw) {
     const error = normalizeAppError(raw);
-    console.error(`[peerdav:${error.code}] ${error.message}`, {
-      detail: error.detail,
-      context: error.context,
+    const { reason: _reason, ...context } = error.context ?? {};
+    console.error(`[peerdav:${error.code}]`, {
+      detail: error.detail ?? error.message,
+      context,
     });
     throw error;
   }
@@ -126,6 +127,11 @@ export function toUserMessage(error) {
   if (!reason) {
     const fallback = localizeMessage(normalized.message);
     reason = fallback.split(/：|: /).slice(1).join(": ") || fallback;
+  }
+  const timeoutReasons = new Set(["the status request timed out", "the connection timed out", "connection timed out", "operation timed out"]);
+  if (normalized.code === "PEER_REQUEST_FAILED" && timeoutReasons.has(reason)) {
+    return t(normalized.context?.operation === "wait for approval"
+      ? "errors.APPROVAL_STATUS_TIMEOUT" : "errors.REQUEST_TIMEOUT");
   }
   if (["VALIDATION_WEAK_PASSWORD", "VALIDATION_INVALID_USERNAME"].includes(normalized.code)) {
     const reasonKey = `errors.reason.${normalized.code}.${reason}`;
