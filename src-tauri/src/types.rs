@@ -141,6 +141,9 @@ pub const ACCESS_REQUEST_HEADER: &str = "x-peerdav-access-request";
 pub const AUTHORIZATION_PATH: &str = "/__peerdav/authorization";
 pub const AUTHORIZATION_PROTOCOL: &str = "peerdav-authorization/1";
 pub const CLIENT_ID_HEADER: &str = "x-peerdav-client-id";
+/// 设备机器码。随每个 PeerDav 请求发送，服务端据此把「同一台设备」的申请、授权
+/// 和已保存对端关联起来；IP 会变，机器码不会。
+pub const MACHINE_ID_HEADER: &str = "x-peerdav-machine-id";
 pub const MIN_CLIENT_ID_CHARS: usize = 16;
 pub const MAX_CLIENT_ID_CHARS: usize = 64;
 /// Default interval for checking saved peers against their server bindings.
@@ -248,7 +251,39 @@ pub struct ShareInfo {
 pub struct AuthorizationInfo {
     pub id: String,
     pub label: String,
+    /// 申请方上报的机器码。它是授权身份，IP 只是方便识别的展示信息：
+    /// 换网段或重新分配 DHCP 地址不会让同一台设备变成新设备。
+    pub machine_id: Option<String>,
     pub created_at: i64,
+}
+
+/// 出站访问申请的结果。它是后端内存状态而不是前端组件状态：切换页面或 webview
+/// 重载后，列表必须还能看到「已发送，等待对方批准」，而不是退回「可以申请」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum OutboundAccessStatus {
+    /// 申请已在对方登记，等待对方管理员批准。
+    Waiting,
+    /// 对方没有开启授权要求，当前版本无法自动加入。
+    Accessible,
+    /// 用户自己取消了申请。
+    Canceled,
+    /// 对方已经不认这条申请（超时或已过期）。
+    Expired,
+    /// 申请或等待过程失败，原因在 `message` 里。
+    Failed,
+}
+
+/// 一台服务器的出站访问申请快照。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboundAccessRequest {
+    pub url: String,
+    pub fingerprint: Option<String>,
+    pub label: Option<String>,
+    pub status: OutboundAccessStatus,
+    /// 失败/过期时面向用户的一句话（后端错误映射出的单层文案）；其他状态为空。
+    pub message: Option<String>,
 }
 
 /// A client waiting for the administrator to approve access.
@@ -258,8 +293,11 @@ pub struct PendingRequestInfo {
     pub id: String,
     pub share_id: String,
     pub share_name: String,
+    /// 展示用地址：会随网络变化，因此不参与身份判定。
     pub peer_ip: String,
     pub peer_mac: Option<String>,
+    /// 申请方上报的机器码，缺失时退回 `peer_ip` 作为身份。
+    pub machine_id: Option<String>,
     pub requested_path: String,
     pub first_seen: i64,
     pub last_seen: i64,
@@ -279,6 +317,72 @@ pub struct ApprovePendingResult {
     /// True when the code was queued for automatic delivery to the client.
     pub auto_delivery: bool,
 }
+
+/// Installation identity is independent of hardware and network addresses.
+pub(crate) struct DeviceIdentity {
+    pub certificate: rustls::pki_types::CertificateDer<'static>,
+    pub key: rustls::pki_types::PrivatePkcs8KeyDer<'static>,
+    pub fingerprint: String,
+}
+
+/// Logical dimensions survive changes to monitor scale factors; positions
+/// are physical and are validated against the currently connected work areas.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WindowPreference {
+    pub width: f64,
+    pub height: f64,
+    pub x: i32,
+    pub y: i32,
+    pub monitor: Option<String>,
+    pub maximized: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ScreenArea {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub scale: f64,
+}
+
+pub(crate) struct InboundConnectionGuard {
+    pub registry:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, ConnectionInfo>>>,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionInfo {
+    pub fingerprint: String,
+    pub name: String,
+    pub address: String,
+    pub state: ConnectionState,
+    pub authorized: bool,
+    pub active_connections: usize,
+    pub last_seen: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConnectionState {
+    Discovered,
+    Requesting,
+    Pending,
+    Approved,
+    Connected,
+    Disconnected,
+    Canceled,
+    Rejected,
+    Expired,
+    Failed,
+}
+
+/// Transfer workers operate on 10 MiB parts, capped per file.
+pub const TRANSFER_PART_BYTES: u64 = 10 * 1024 * 1024;
+pub const TRANSFER_MAX_WORKERS: usize = 5;
 
 /// Runtime server state exposed to the UI.
 #[derive(Debug, Clone, Serialize)]
@@ -317,6 +421,8 @@ pub(crate) struct AuthorizationRecord {
     pub label: String,
     pub code_hash: String,
     pub client_id: Option<String>,
+    /// 申请方上报的机器码；历史数据为 None，此时仍按 IP 匹配。
+    pub machine_id: Option<String>,
     pub created_at: i64,
     pub revoked_at: Option<i64>,
 }
@@ -369,6 +475,10 @@ pub struct DiscoveredPeer {
 pub struct CatalogResponse {
     pub protocol: String,
     pub server_name: String,
+    /// 服务端自己的机器码：客户端保存对端记录时用它建立「同一台设备」的对应关系，
+    /// 这样解绑出站设备时能连带清掉本机为它开过的入站授权。未知时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
     pub shares: Vec<PeerShare>,
 }
 
@@ -387,6 +497,7 @@ pub struct PeerShare {
 #[serde(rename_all = "camelCase")]
 pub struct PeerInfo {
     pub id: String,
+    pub fingerprint: Option<String>,
     pub label: String,
     pub url: String,
     pub online: bool,
@@ -599,6 +710,9 @@ pub(crate) struct PeerRecord {
     pub label: String,
     pub url: String,
     pub authorization_id: Option<String>,
+    /// 对端设备上报的机器码（连接时从其目录里读到）。解绑时用它找到本机为同一台
+    /// 设备开过的入站授权，一并撤销，避免对方还留在「其他设备访问此设备」里。
+    pub machine_id: Option<String>,
     pub created_at: i64,
     pub last_connected_at: Option<i64>,
 }

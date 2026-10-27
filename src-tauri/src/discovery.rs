@@ -657,11 +657,11 @@ fn prioritize_primary(mut addresses: Vec<String>, primary: Option<Ipv4Addr>) -> 
     let Some(value) = primary.map(|address| address.to_string()) else {
         return addresses;
     };
-    if let Some(index) = addresses.iter().position(|address| *address == value) {
-        if index > 0 {
-            let address = addresses.remove(index);
-            addresses.insert(0, address);
-        }
+    if let Some(index) = addresses.iter().position(|address| *address == value)
+        && index > 0
+    {
+        let address = addresses.remove(index);
+        addresses.insert(0, address);
     }
     addresses
 }
@@ -876,7 +876,7 @@ fn choose_url(hosts: &[String], port: u16) -> Option<String> {
     } else {
         host.clone()
     };
-    Some(format!("http://{host}:{port}"))
+    Some(format!("https://{host}:{port}"))
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -1054,7 +1054,7 @@ mod tests {
         DiscoveredPeer {
             server_id: id.to_owned(),
             name: id.to_owned(),
-            url: format!("http://{id}:4918"),
+            url: format!("https://{id}:4918"),
             hosts: vec![id.to_owned()],
             port: 4918,
             share_count: 1,
@@ -1066,11 +1066,11 @@ mod tests {
         let hosts = vec![Ipv4Addr::LOCALHOST.to_string(), "192.168.1.9".to_owned()];
         assert_eq!(
             choose_url(&hosts, 4918),
-            Some("http://192.168.1.9:4918".to_owned())
+            Some("https://192.168.1.9:4918".to_owned())
         );
         assert_eq!(
             choose_url(&[Ipv4Addr::LOCALHOST.to_string()], 4918),
-            Some("http://127.0.0.1:4918".to_owned())
+            Some("https://127.0.0.1:4918".to_owned())
         );
     }
 
@@ -1097,7 +1097,7 @@ mod tests {
     fn ipv6_urls_are_bracketed() {
         assert_eq!(
             choose_url(&["::1".to_owned()], 4918),
-            Some("http://[::1]:4918".to_owned())
+            Some("https://[::1]:4918".to_owned())
         );
     }
 
@@ -1190,7 +1190,7 @@ mod tests {
         let peers = listener.peers();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].name, "Lab");
-        assert_eq!(peers[0].url, "http://192.168.1.20:4918");
+        assert_eq!(peers[0].url, "https://192.168.1.20:4918");
         assert_eq!(peers[0].share_count, 2);
 
         wait_until(|| listener.peers().is_empty(), "server did not expire").await;

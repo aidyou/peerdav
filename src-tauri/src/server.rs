@@ -1,17 +1,21 @@
 //! LAN WebDAV server: request authentication/policy gate, pending approval
 //! flow, share catalog, task lifecycle, and the background error outlet.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
 use base64::Engine as _;
 use dav_server::DavHandler;
 use dav_server::body::Body;
 use dav_server::davpath::DavPath;
 use dav_server::fakels::FakeLs;
-use http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE};
+#[cfg(test)]
+use http::header::AUTHORIZATION;
+use http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, WWW_AUTHENTICATE};
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -38,7 +42,7 @@ use crate::types::{
     AUTHORIZATION_PATH, AUTHORIZATION_PROTOCOL, AccessRequestStatus, AccessRule,
     AccessStatusResponse, ApprovePendingResult, AuthorizationBindingResponse, AuthorizationInfo,
     AuthorizationStatus, AuthorizationStatusResponse, CATALOG_PATH, CATALOG_PROTOCOL,
-    CLIENT_ID_HEADER, CatalogResponse, DEFAULT_SERVER_PORT, MAX_ACCESS_GRANTS,
+    CLIENT_ID_HEADER, CatalogResponse, DEFAULT_SERVER_PORT, MACHINE_ID_HEADER, MAX_ACCESS_GRANTS,
     MAX_ACCESS_REQUEST_ID_CHARS, MAX_CLIENT_ID_CHARS, MAX_PENDING_ATTEMPTS, MAX_PENDING_PATH_CHARS,
     MAX_PENDING_REQUESTS, MIN_ACCESS_REQUEST_ID_CHARS, MIN_CLIENT_ID_CHARS, PeerShare,
     PendingRequestInfo, ServerStatus, ShareInfo, SharePermissions,
@@ -77,7 +81,6 @@ impl Default for ServerConfig {
 
 struct AuthEntry {
     info: AuthorizationInfo,
-    hash: [u8; 32],
     client_id: Option<String>,
     revoked: bool,
 }
@@ -86,6 +89,8 @@ struct AuthEntry {
 struct PendingGrant {
     client_request_id: String,
     peer_ip: String,
+    /// 申请方机器码；有值时按机器码认领，IP 变化不影响领取授权码。
+    machine_id: Option<String>,
     authorization_id: String,
     code: String,
     expires_at: Instant,
@@ -138,6 +143,10 @@ struct Gate {
     grants: Arc<Mutex<Vec<PendingGrant>>>,
     events: Arc<dyn ServerEvents>,
     server_name: String,
+    /// 本机机器码：随目录响应发给客户端，客户端据此把「已保存的对端」和本机
+    /// 开出的入站授权对上。取不到时为 None，此时只能按 IP 对应。
+    machine_id: Option<String>,
+    connections: Arc<Mutex<HashMap<String, crate::types::ConnectionInfo>>>,
 }
 
 /// Owns the share/authorization catalog and the running server task.
@@ -151,6 +160,7 @@ pub struct ServerController {
     discovery_listener: Mutex<Option<Arc<DiscoveryListener>>>,
     lifecycle: Mutex<Option<RunningServer>>,
     server_id: String,
+    connections: Arc<Mutex<HashMap<String, crate::types::ConnectionInfo>>>,
 }
 
 impl ServerController {
@@ -177,6 +187,7 @@ impl ServerController {
         }
 
         Ok(Self {
+            server_id: vault.identity().fingerprint.clone(),
             vault,
             events,
             shares: Arc::new(std::sync::RwLock::new(shares)),
@@ -185,7 +196,7 @@ impl ServerController {
             grants: Arc::new(Mutex::new(Vec::new())),
             discovery_listener: Mutex::new(None),
             lifecycle: Mutex::new(None),
-            server_id: random_hex(8),
+            connections: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -196,6 +207,66 @@ impl ServerController {
             Ok(mut slot) => *slot = listener,
             Err(_) => log::error!("server discovery listener mutex poisoned"),
         }
+    }
+
+    pub fn inbound_connections(&self) -> Result<Vec<crate::types::ConnectionInfo>, DomainError> {
+        use crate::types::{ConnectionInfo, ConnectionState};
+        let authorizations = self.list_authorizations();
+        let pending = self.list_pending();
+        let mut registry = self.connections.lock().map_err(|_| DomainError::Internal {
+            detail: "inbound registry lock poisoned".into(),
+        })?;
+        for row in registry.values_mut() {
+            row.authorized = false;
+            row.state = if row.active_connections > 0 {
+                ConnectionState::Connected
+            } else {
+                ConnectionState::Disconnected
+            };
+        }
+        for authorization in authorizations {
+            if let Some(fingerprint) = authorization.machine_id {
+                let row = registry
+                    .entry(fingerprint.clone())
+                    .or_insert(ConnectionInfo {
+                        fingerprint,
+                        name: authorization.label.clone(),
+                        address: String::new(),
+                        state: ConnectionState::Approved,
+                        authorized: true,
+                        active_connections: 0,
+                        last_seen: authorization.created_at,
+                    });
+                row.name = authorization.label;
+                row.authorized = true;
+                if row.active_connections > 0 {
+                    row.state = ConnectionState::Connected;
+                } else if row.state != ConnectionState::Disconnected {
+                    row.state = ConnectionState::Approved;
+                }
+            }
+        }
+        for pending in pending {
+            if let Some(fingerprint) = pending.machine_id {
+                let row = registry
+                    .entry(fingerprint.clone())
+                    .or_insert(ConnectionInfo {
+                        fingerprint,
+                        name: pending.share_name,
+                        address: pending.peer_ip.clone(),
+                        state: ConnectionState::Pending,
+                        authorized: false,
+                        active_connections: 0,
+                        last_seen: pending.last_seen,
+                    });
+                row.state = ConnectionState::Pending;
+                row.address = pending.peer_ip;
+                row.last_seen = pending.last_seen;
+            }
+        }
+        let mut rows: Vec<_> = registry.values().cloned().collect();
+        rows.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+        Ok(rows)
     }
 
     pub fn status(&self) -> ServerStatus {
@@ -276,6 +347,8 @@ impl ServerController {
             grants: Arc::clone(&self.grants),
             events: Arc::clone(&self.events),
             server_name: config.server_name.clone(),
+            machine_id: Some(self.vault.identity().fingerprint.clone()),
+            connections: Arc::clone(&self.connections),
         });
 
         let shared_listener = match self.discovery_listener.lock() {
@@ -408,7 +481,23 @@ impl ServerController {
             }
         }
 
+        // 服务停了就不该再有人「待审批」：清掉队列，免得控台继续显示已经没人在等的
+        // 申请，甚至被误批准出一条谁也领不到的授权。
+        self.clear_pending_state();
+
         self.status()
+    }
+
+    /// 清空待审批队列与待领取的授权码。两者都只活在内存里，服务停止后必然过期。
+    fn clear_pending_state(&self) {
+        match self.pending.lock() {
+            Ok(mut pending) => pending.clear(),
+            Err(_) => log::warn!("pending request lock poisoned while stopping the server"),
+        }
+        match self.grants.lock() {
+            Ok(mut grants) => grants.clear(),
+            Err(_) => log::warn!("access grant lock poisoned while stopping the server"),
+        }
     }
 
     /// Best-effort synchronous shutdown for application exit.
@@ -627,11 +716,23 @@ impl ServerController {
 
         let code = random_hex(32);
         let hash = hash_code(&code);
-        let label = format!("{} ({})", request.peer_ip, request.share_name);
+        // 标签以机器码开头：IP 只是当时的地址，识别设备靠机器码。
+        let label = match request.machine_id.as_deref() {
+            Some(machine_id) => format!(
+                "{} · {} ({})",
+                crate::tls::short_fingerprint(machine_id),
+                request.peer_ip,
+                request.share_name
+            ),
+            None => format!("{} ({})", request.peer_ip, request.share_name),
+        };
         let authorization_id = random_hex(8);
-        let record = self
-            .vault
-            .add_authorization(&authorization_id, &label, &hex::encode(hash))?;
+        let record = self.vault.add_authorization(
+            &authorization_id,
+            &label,
+            &hex::encode(hash),
+            request.machine_id.as_deref(),
+        )?;
 
         let mut authorizations =
             self.authorizations
@@ -643,9 +744,9 @@ impl ServerController {
             info: AuthorizationInfo {
                 id: record.id,
                 label: record.label,
+                machine_id: record.machine_id,
                 created_at: record.created_at,
             },
-            hash,
             client_id: None,
             revoked: false,
         });
@@ -660,9 +761,13 @@ impl ServerController {
         drop(authorizations);
 
         let auto_delivery = match request.client_request_id.as_deref() {
-            Some(client_request_id) => {
-                self.queue_grant(client_request_id, &request.peer_ip, &info.id, &code)
-            }
+            Some(client_request_id) => self.queue_grant(
+                client_request_id,
+                &request.peer_ip,
+                request.machine_id.as_deref(),
+                &info.id,
+                &code,
+            ),
             None => false,
         };
         Ok(ApprovePendingResult {
@@ -682,12 +787,34 @@ impl ServerController {
         )
     }
 
+    /// 撤销某台设备在本机上的全部入站授权，返回撤销的条数。
+    ///
+    /// 解绑一台已保存的对端设备时调用：两台设备互相授权过，只删掉本机的出站记录
+    /// 会让对方还留在「其他设备访问此设备」里，看起来像幽灵设备。明确的解绑意味着
+    /// 整段互信关系结束，而不只是本机不再访问对方。
+    pub fn revoke_authorizations_for_machine(
+        &self,
+        machine_id: &str,
+    ) -> Result<usize, DomainError> {
+        let ids = self.vault.authorization_ids_for_machine(machine_id)?;
+        let mut revoked = 0;
+        for id in ids {
+            match self.revoke_authorization(&id) {
+                Ok(()) => revoked += 1,
+                Err(DomainError::AuthorizationNotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(revoked)
+    }
+
     /// Queues the approved code for the client identified by its request key.
     /// The code is removed as soon as the client claims it.
     fn queue_grant(
         &self,
         client_request_id: &str,
         peer_ip: &str,
+        machine_id: Option<&str>,
         authorization_id: &str,
         code: &str,
     ) -> bool {
@@ -711,6 +838,7 @@ impl ServerController {
         grants.push(PendingGrant {
             client_request_id: client_request_id.to_owned(),
             peer_ip: peer_ip.to_owned(),
+            machine_id: machine_id.map(str::to_owned),
             authorization_id: authorization_id.to_owned(),
             code: code.to_owned(),
             expires_at: now + ACCESS_GRANT_TTL,
@@ -827,19 +955,33 @@ fn load_authorization(
     let bytes = hex::decode(&record.code_hash).map_err(|error| DomainError::Corrupted {
         detail: format!("authorization hash is not valid hex: {error}"),
     })?;
-    let hash: [u8; 32] = bytes.try_into().map_err(|_| DomainError::Corrupted {
+    let _validated_hash: [u8; 32] = bytes.try_into().map_err(|_| DomainError::Corrupted {
         detail: "authorization hash has the wrong length".to_owned(),
     })?;
     Ok(AuthEntry {
         info: AuthorizationInfo {
             id: record.id.clone(),
             label: record.label.clone(),
+            machine_id: record.machine_id.clone(),
             created_at: record.created_at,
         },
-        hash,
         client_id: record.client_id.clone(),
         revoked: record.revoked_at.is_some(),
     })
+}
+
+impl Drop for crate::types::InboundConnectionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = self.registry.lock()
+            && let Some(row) = registry.get_mut(&self.fingerprint)
+        {
+            row.active_connections = row.active_connections.saturating_sub(1);
+            if row.active_connections == 0 && row.state == crate::types::ConnectionState::Connected
+            {
+                row.state = crate::types::ConnectionState::Disconnected;
+            }
+        }
+    }
 }
 
 async fn run_server(
@@ -858,9 +1000,41 @@ async fn run_server(
                     Ok((stream, peer)) => {
                         let handler = handler.clone();
                         let gate = Arc::clone(&gate);
+                        let tls = match gate.vault.current_identity().and_then(|identity| crate::tls::acceptor(&identity)) {
+                            Ok(tls) => tls,
+                            Err(error) => { publish_error(gate.events.as_ref(), &error); continue; }
+                        };
                         connections.spawn(async move {
+                            let stream = match tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await {
+                                Ok(Ok(stream)) => stream,
+                                Ok(Err(error)) => { log::debug!("TLS connection rejected: {error}"); return; }
+                                Err(_) => { log::debug!("TLS handshake timed out"); return; }
+                            };
+                            let Some(certificate) = stream.get_ref().1.peer_certificates().and_then(|certs| certs.first()) else { return; };
+                            let identity = match crate::tls::fingerprint(certificate) {
+                                Ok(identity) => identity,
+                                Err(error) => { publish_error(gate.events.as_ref(), &error); return; }
+                            };
+                            if !crate::tls::self_connection_allowed(gate.vault.fingerprint(), &identity) { return; }
+                            let _connection_guard = crate::types::InboundConnectionGuard { registry: Arc::clone(&gate.connections), fingerprint: identity.clone() };
+                            if let Ok(mut registry) = gate.connections.lock() {
+                                let row = registry.entry(identity.clone()).or_insert(crate::types::ConnectionInfo {
+                                    fingerprint: identity.clone(), name: crate::tls::short_fingerprint(&identity), address: peer.ip().to_string(),
+                                    state: crate::types::ConnectionState::Connected, authorized: false, active_connections: 0, last_seen: now_unix(),
+                                });
+                                row.active_connections += 1;
+                                row.address = peer.ip().to_string();
+                                row.last_seen = now_unix();
+                                row.state = crate::types::ConnectionState::Connected;
+                            }
                             let io = TokioIo::new(stream);
-                            let service = service_fn(move |request: Request<Incoming>| {
+                            let service = service_fn(move |mut request: Request<Incoming>| {
+                                // Only the TLS session determines identity. Never trust a
+                                // caller-supplied machine-id or client-id header.
+                                if let Ok(value) = http::HeaderValue::from_str(&identity) {
+                                    request.headers_mut().insert(MACHINE_ID_HEADER, value.clone());
+                                    request.headers_mut().insert(CLIENT_ID_HEADER, value);
+                                }
                                 let handler = handler.clone();
                                 let gate = Arc::clone(&gate);
                                 async move {
@@ -962,11 +1136,9 @@ async fn handle_request(
         return empty_response(StatusCode::NOT_FOUND);
     };
 
-    // MAC lookup is intentionally not implemented yet: a missing MAC must not
-    // grant access, and MAC rules simply do not match.
     let policy_peer = PeerContext {
         ip: canonical_ip(peer.ip()),
-        mac: None,
+        mac: crate::policy::neighbor_mac(peer.ip()),
     };
     if evaluate(&share.rules, &policy_peer) == PolicyDecision::Deny {
         log::info!(
@@ -977,11 +1149,7 @@ async fn handle_request(
         return empty_response(StatusCode::FORBIDDEN);
     }
 
-    let token = auth_token(request.headers());
-    let authorization = token.and_then(|token| {
-        let hash = hash_code(&token);
-        find_authorization(&gate, &hash)
-    });
+    let authorization = verified_authorization(&gate, request.headers());
 
     let Some(authorization) = authorization else {
         // Only read-style discovery on a structurally valid, in-share target
@@ -992,16 +1160,42 @@ async fn handle_request(
             && let Some(requested_path) = pending_target(&relative)
         {
             let client_request_id = access_request_id(request.headers());
+            let machine_id = machine_id_value(request.headers());
             record_pending(
                 &gate,
                 &share,
                 peer,
                 &requested_path,
                 client_request_id.as_deref(),
+                machine_id.as_deref(),
             );
         }
         return auth_challenge();
     };
+
+    if request.headers().contains_key("x-peerdav-transfer") {
+        if !share.permissions.can_write {
+            return empty_response(StatusCode::FORBIDDEN);
+        }
+        let Some(identity) = machine_id_value(request.headers()) else {
+            return auth_challenge();
+        };
+        return match crate::upload::handle(
+            request,
+            &share,
+            &relative,
+            &identity,
+            &gate.vault.transfer_directory(),
+        )
+        .await
+        {
+            Ok(status) => empty_response(status),
+            Err(error) => {
+                publish_error(gate.events.as_ref(), &error);
+                empty_response(StatusCode::BAD_REQUEST)
+            }
+        };
+    }
 
     let Some(required) = required_for_method(request.method()) else {
         return method_not_allowed();
@@ -1041,7 +1235,7 @@ async fn handle_catalog(
 
     let peer_context = PeerContext {
         ip: canonical_ip(peer.ip()),
-        mac: None,
+        mac: crate::policy::neighbor_mac(peer.ip()),
     };
     let allowed: Vec<Arc<ShareConfig>> = match gate.shares.read() {
         Ok(shares) => {
@@ -1072,11 +1266,19 @@ async fn handle_catalog(
         return empty_response(StatusCode::FORBIDDEN);
     }
 
-    let authorized = auth_token(request.headers())
-        .and_then(|token| find_authorization(&gate, &hash_code(&token)));
+    let authorized = verified_authorization(&gate, request.headers());
     if authorized.is_none() {
         let client_request_id = access_request_id(request.headers());
-        record_pending(&gate, &allowed[0], peer, "", client_request_id.as_deref());
+        // 机器码是设备身份：同一台设备换 IP 后仍然只排一次队、审批一次。
+        let machine_id = machine_id_value(request.headers());
+        record_pending(
+            &gate,
+            &allowed[0],
+            peer,
+            "",
+            client_request_id.as_deref(),
+            machine_id.as_deref(),
+        );
         return auth_challenge();
     }
 
@@ -1091,6 +1293,7 @@ async fn handle_catalog(
     let catalog = CatalogResponse {
         protocol: CATALOG_PROTOCOL.to_owned(),
         server_name: gate.server_name.clone(),
+        machine_id: gate.machine_id.clone(),
         shares,
     };
     match serde_json::to_vec(&catalog) {
@@ -1134,12 +1337,19 @@ async fn cancel_access_request(
         return empty_response(StatusCode::BAD_REQUEST);
     };
     let peer_ip = canonical_ip(peer.ip()).to_string();
+    let machine_id = machine_id_value(request.headers());
 
     let grant = match gate.grants.lock() {
         Ok(mut grants) => grants
             .iter()
             .position(|grant| {
-                grant.client_request_id == client_request_id && grant.peer_ip == peer_ip
+                grant.client_request_id == client_request_id
+                    && same_requester(
+                        grant.machine_id.as_deref(),
+                        &grant.peer_ip,
+                        machine_id.as_deref(),
+                        &peer_ip,
+                    )
             })
             .map(|position| grants.remove(position)),
         Err(_) => {
@@ -1157,8 +1367,13 @@ async fn cancel_access_request(
         Ok(mut pending) => pending
             .iter()
             .position(|request| {
-                request.peer_ip == peer_ip
-                    && request.client_request_id.as_deref() == Some(client_request_id.as_str())
+                request.client_request_id.as_deref() == Some(client_request_id.as_str())
+                    && same_requester(
+                        request.machine_id.as_deref(),
+                        &request.peer_ip,
+                        machine_id.as_deref(),
+                        &peer_ip,
+                    )
             })
             .map(|position| pending.remove(position)),
         Err(_) => {
@@ -1203,6 +1418,7 @@ async fn handle_access_poll(
         return empty_response(StatusCode::BAD_REQUEST);
     };
     let peer_ip = canonical_ip(peer.ip()).to_string();
+    let machine_id = machine_id_value(request.headers());
     let now = Instant::now();
 
     let grant = match gate.grants.lock() {
@@ -1211,7 +1427,13 @@ async fn handle_access_poll(
             grants
                 .iter()
                 .position(|grant| {
-                    grant.client_request_id == client_request_id && grant.peer_ip == peer_ip
+                    grant.client_request_id == client_request_id
+                        && same_requester(
+                            grant.machine_id.as_deref(),
+                            &grant.peer_ip,
+                            machine_id.as_deref(),
+                            &peer_ip,
+                        )
                 })
                 .map(|position| grants.remove(position))
         }
@@ -1236,8 +1458,13 @@ async fn handle_access_poll(
 
     let pending = match gate.pending.lock() {
         Ok(pending) => pending.iter().any(|request| {
-            request.peer_ip == peer_ip
-                && request.client_request_id.as_deref() == Some(client_request_id.as_str())
+            request.client_request_id.as_deref() == Some(client_request_id.as_str())
+                && same_requester(
+                    request.machine_id.as_deref(),
+                    &request.peer_ip,
+                    machine_id.as_deref(),
+                    &peer_ip,
+                )
         }),
         Err(_) => {
             publish_error(
@@ -1275,11 +1502,11 @@ async fn handle_authorization(request: Request<Incoming>, gate: Arc<Gate>) -> Re
     if !matches!(method.as_str(), "GET" | "POST" | "DELETE") {
         return method_not_allowed();
     }
-    let Some(code) = auth_token(request.headers()) else {
+    let Some(identity) = machine_id_value(request.headers()) else {
         return auth_challenge();
     };
     let Some((authorization_id, stored_client_id, revoked)) =
-        find_authorization_entry(&gate, &hash_code(&code))
+        find_authorization_entry(&gate, &identity)
     else {
         return auth_challenge();
     };
@@ -1516,33 +1743,27 @@ fn client_id_value(headers: &HeaderMap) -> Option<String> {
     Some(value.to_owned())
 }
 
-fn find_authorization(gate: &Gate, hash: &[u8; 32]) -> Option<String> {
-    match gate.authorizations.read() {
-        Ok(authorizations) => authorizations
-            .iter()
-            .filter(|entry| !entry.revoked)
-            .find(|entry| constant_time_eq(&entry.hash, hash))
-            .map(|entry| entry.info.id.clone()),
-        Err(_) => {
-            publish_error(
-                gate.events.as_ref(),
-                &DomainError::Internal {
-                    detail: "authorization catalog lock poisoned".to_owned(),
-                },
-            );
-            None
-        }
-    }
+/// 读取请求方上报的机器码。格式不对就当没报，服务端退回 IP 身份，
+/// 这样老客户端和不发该头的普通 WebDAV 客户端仍能正常走审批流程。
+fn machine_id_value(headers: &HeaderMap) -> Option<String> {
+    crate::tls::normalize_fingerprint(headers.get(MACHINE_ID_HEADER)?.to_str().ok())
 }
 
-fn find_authorization_entry(
-    gate: &Gate,
-    hash: &[u8; 32],
-) -> Option<(String, Option<String>, bool)> {
+fn verified_authorization(gate: &Gate, headers: &HeaderMap) -> Option<String> {
+    let identity = machine_id_value(headers)?;
+    let authorizations = gate.authorizations.read().ok()?;
+    authorizations
+        .iter()
+        .find(|entry| !entry.revoked && entry.info.machine_id.as_deref() == Some(identity.as_str()))
+        .map(|entry| entry.info.id.clone())
+}
+
+fn find_authorization_entry(gate: &Gate, identity: &str) -> Option<(String, Option<String>, bool)> {
     match gate.authorizations.read() {
         Ok(authorizations) => authorizations
             .iter()
-            .find(|entry| constant_time_eq(&entry.hash, hash))
+            .rev()
+            .find(|entry| entry.info.machine_id.as_deref() == Some(identity))
             .map(|entry| {
                 (
                     entry.info.id.clone(),
@@ -1634,6 +1855,7 @@ fn record_pending(
     peer: SocketAddr,
     requested_path: &str,
     client_request_id: Option<&str>,
+    machine_id: Option<&str>,
 ) {
     let now = now_unix();
     let peer_ip = canonical_ip(peer.ip()).to_string();
@@ -1651,12 +1873,19 @@ fn record_pending(
         }
     };
 
-    if let Some(existing) = pending.iter_mut().find(|request| {
-        request.share_id == share.id && request.peer_ip == peer_ip && request.peer_mac.is_none()
-    }) {
+    if let Some(existing) = pending
+        .iter_mut()
+        .find(|request| same_pending_entry(request, &share.id, machine_id, &peer_ip))
+    {
         existing.last_seen = now;
         existing.attempts = next_attempt_count(existing.attempts);
         existing.requested_path = requested_path.to_owned();
+        // 同一台设备可能已经换到别的地址，展示用地址要跟着更新。
+        existing.peer_ip = peer_ip;
+        // 先前的请求没带机器码、这次带了：补上身份，之后就能按机器码认领和清理。
+        if existing.machine_id.is_none() {
+            existing.machine_id = machine_id.map(str::to_owned);
+        }
         if let Some(client_request_id) = client_request_id {
             existing.client_request_id = Some(client_request_id.to_owned());
         }
@@ -1674,6 +1903,7 @@ fn record_pending(
         share_name: share.name.clone(),
         peer_ip,
         peer_mac: None,
+        machine_id: machine_id.map(str::to_owned),
         requested_path: requested_path.to_owned(),
         first_seen: now,
         last_seen: now,
@@ -1683,6 +1913,42 @@ fn record_pending(
     pending.push(request.clone());
     drop(pending);
     gate.events.pending_request(&request);
+}
+
+/// 新请求是否该并入已排队的这条申请（同一共享下）：
+/// - 双方都有机器码：相同才是同一条，不同一定是两台设备，各排各的；
+/// - 任一方没报机器码（老客户端、普通 WebDAV 客户端，或某条请求路径不带该头）：
+///   按地址归并，免得同一台设备重复排队。
+fn same_pending_entry(
+    stored: &PendingRequestInfo,
+    share_id: &str,
+    machine_id: Option<&str>,
+    peer_ip: &str,
+) -> bool {
+    if stored.share_id != share_id {
+        return false;
+    }
+    match (stored.machine_id.as_deref(), machine_id) {
+        (Some(stored_machine), Some(incoming)) => stored_machine == incoming,
+        _ => stored.peer_ip == peer_ip,
+    }
+}
+
+/// 认领授权码/取消申请时判断是否同一个申请方：记录里存了机器码就按机器码比，
+/// 没存（历史记录或普通 WebDAV 客户端）才按 IP 比。这样对端换 IP 后仍能领到码，
+/// 而换了设备却用同一 IP 的访问者不会顶替前者的申请。
+fn same_requester(
+    stored_machine_id: Option<&str>,
+    stored_ip: &str,
+    machine_id: Option<&str>,
+    peer_ip: &str,
+) -> bool {
+    match stored_machine_id {
+        Some(stored) => machine_id == Some(stored),
+        // 记录里只有 IP（历史数据或普通 WebDAV 客户端）：只接受同样没报机器码的请求，
+        // 免得同一地址上的另一台设备顶替这条申请。
+        None => machine_id.is_none() && stored_ip == peer_ip,
+    }
 }
 
 fn options_response() -> Response<Body> {
@@ -1745,6 +2011,7 @@ fn json_response_with_status(status: StatusCode, body: &[u8]) -> Response<Body> 
 /// Extracts a share authorization code from `Authorization`. Basic auth uses
 /// the password as the code; when it is empty the username is used, matching
 /// the share-token convention. Bearer tokens are accepted as well.
+#[cfg(test)]
 fn auth_token(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(AUTHORIZATION)?.to_str().ok()?.trim();
     let (scheme, credentials) = value.split_once(' ')?;
@@ -1778,6 +2045,7 @@ fn hash_code(code: &str) -> [u8; 32] {
     Sha256::digest(code.as_bytes()).into()
 }
 
+#[cfg(test)]
 fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
     let mut difference = 0_u8;
     for (left, right) in left.iter().zip(right.iter()) {
@@ -1911,5 +2179,102 @@ mod tests {
             MAX_PENDING_ATTEMPTS
         );
         assert_eq!(next_attempt_count(u32::MAX), MAX_PENDING_ATTEMPTS);
+    }
+
+    #[test]
+    fn pending_entries_merge_by_machine_code_and_fall_back_to_the_address() {
+        let stored = |machine: Option<&str>, ip: &str| PendingRequestInfo {
+            id: "id".to_owned(),
+            share_id: "share".to_owned(),
+            share_name: "Docs".to_owned(),
+            peer_ip: ip.to_owned(),
+            peer_mac: None,
+            machine_id: machine.map(str::to_owned),
+            requested_path: String::new(),
+            first_seen: 0,
+            last_seen: 0,
+            attempts: 1,
+            client_request_id: None,
+        };
+
+        let machine_entry = stored(Some("abc"), "10.0.0.5");
+        // 同一台设备换地址（机器码相同）仍是同一条申请。
+        assert!(same_pending_entry(
+            &machine_entry,
+            "share",
+            Some("abc"),
+            "10.0.0.9"
+        ));
+        // 机器码不同就是另一台设备，哪怕地址相同。
+        assert!(!same_pending_entry(
+            &machine_entry,
+            "share",
+            Some("def"),
+            "10.0.0.5"
+        ));
+        // 另一个共享是另一条申请。
+        assert!(!same_pending_entry(
+            &machine_entry,
+            "other",
+            Some("abc"),
+            "10.0.0.5"
+        ));
+        // 任一方没报机器码时按地址归并。
+        assert!(same_pending_entry(
+            &machine_entry,
+            "share",
+            None,
+            "10.0.0.5"
+        ));
+        assert!(!same_pending_entry(
+            &machine_entry,
+            "share",
+            None,
+            "10.0.0.9"
+        ));
+
+        let address_entry = stored(None, "10.0.0.5");
+        assert!(same_pending_entry(
+            &address_entry,
+            "share",
+            None,
+            "10.0.0.5"
+        ));
+        assert!(same_pending_entry(
+            &address_entry,
+            "share",
+            Some("abc"),
+            "10.0.0.5"
+        ));
+        assert!(!same_pending_entry(
+            &address_entry,
+            "share",
+            Some("abc"),
+            "10.0.0.9"
+        ));
+    }
+
+    #[test]
+    fn claiming_matches_the_stored_identity_not_the_address_alone() {
+        // 存了机器码：只认同一个机器码，换 IP 也能领。
+        assert!(same_requester(
+            Some("abc"),
+            "10.0.0.5",
+            Some("abc"),
+            "10.0.0.9"
+        ));
+        // 机器码不同就是另一台设备，即使 IP 完全相同、请求 key 也相同。
+        assert!(!same_requester(
+            Some("abc"),
+            "10.0.0.5",
+            Some("def"),
+            "10.0.0.5"
+        ));
+        assert!(!same_requester(Some("abc"), "10.0.0.5", None, "10.0.0.5"));
+        // 没存机器码（历史记录）：退回 IP 比对。
+        assert!(same_requester(None, "10.0.0.5", None, "10.0.0.5"));
+        assert!(!same_requester(None, "10.0.0.5", None, "10.0.0.9"));
+        // 存了 IP 身份但新请求带机器码时不能顶替。
+        assert!(!same_requester(None, "10.0.0.5", Some("abc"), "10.0.0.5"));
     }
 }

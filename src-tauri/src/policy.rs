@@ -231,6 +231,33 @@ pub fn format_mac(mac: &[u8; 6]) -> String {
     rendered
 }
 
+/// Resolve a neighbor only from the local OS, never from a request header.
+/// Routed peers may not have a neighbor MAC; callers must not invent one.
+pub(crate) fn neighbor_mac(ip: IpAddr) -> Option<[u8; 6]> {
+    #[cfg(target_os = "linux")]
+    {
+        let content = match std::fs::read_to_string("/proc/net/arp") {
+            Ok(content) => content,
+            Err(error) => {
+                log::debug!("neighbor lookup unavailable: {error}");
+                return None;
+            }
+        };
+        for line in content.lines().skip(1) {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() >= 4
+                && fields[0].parse::<IpAddr>().ok() == Some(canonical_ip(ip))
+                && fields[2] == "0x2"
+            {
+                return parse_mac(fields[3]).ok().filter(|mac| *mac != [0; 6]);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = ip;
+    None
+}
+
 /// Collapses IPv4-mapped IPv6 addresses so a peer reported as
 /// `::ffff:192.168.1.5` matches ordinary IPv4 rules.
 pub fn canonical_ip(address: IpAddr) -> IpAddr {

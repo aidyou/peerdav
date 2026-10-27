@@ -24,10 +24,10 @@ use crate::error::DomainError;
 use crate::keyfile;
 use crate::types::{
     AdminLoginResult, AdminRecord, AdminSessionInfo, AuthorizationRecord, CLIENT_ID_META,
-    InitializeVaultResult, MAX_CLIENT_ID_CHARS, META_KEY_FILE, META_RECOVERY_HASH,
-    META_SCHEMA_VERSION, MIN_CLIENT_ID_CHARS, PEER_SECRET_PREFIX, PeerRecord, PeerSecret,
-    ResetVaultResult, SCHEMA_VERSION, SECRET_ADMIN, SECRET_VAULT_VERIFIER, SharePermissions,
-    ShareRecord, ShareRuleRecord, VAULT_KEY_LEN, VAULT_VERIFIER_PLAINTEXT, VaultStatus,
+    InitializeVaultResult, META_KEY_FILE, META_RECOVERY_HASH, META_SCHEMA_VERSION,
+    PEER_SECRET_PREFIX, PeerRecord, PeerSecret, ResetVaultResult, SCHEMA_VERSION, SECRET_ADMIN,
+    SECRET_VAULT_VERIFIER, SharePermissions, ShareRecord, ShareRuleRecord, VAULT_KEY_LEN,
+    VAULT_VERIFIER_PLAINTEXT, VaultStatus,
 };
 
 #[derive(Default)]
@@ -48,6 +48,7 @@ pub struct Vault {
     path: PathBuf,
     db: Mutex<Database>,
     session: Mutex<Session>,
+    identity: crate::types::DeviceIdentity,
 }
 
 impl Vault {
@@ -56,6 +57,7 @@ impl Vault {
             path: path.to_path_buf(),
             db: Mutex::new(Database::open(path)?),
             session: Mutex::new(Session::default()),
+            identity: crate::tls::load_identity(path)?,
         };
         if let Err(error) = vault.auto_load_key() {
             log::warn!(
@@ -64,6 +66,45 @@ impl Vault {
             );
         }
         Ok(vault)
+    }
+
+    pub(crate) fn identity(&self) -> &crate::types::DeviceIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn transfer_directory(&self) -> PathBuf {
+        self.path.with_extension("transfers")
+    }
+
+    pub(crate) fn current_identity(&self) -> Result<crate::types::DeviceIdentity, DomainError> {
+        let path = self.path.with_extension("identity.json");
+        if !path.is_file() {
+            return Err(DomainError::Io {
+                operation: "read device identity",
+                path: Some(path),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "device identity is missing; restore its backup before reconnecting",
+                ),
+            });
+        }
+        let identity = crate::tls::load_identity(&self.path)?;
+        if identity.fingerprint != self.identity.fingerprint {
+            return Err(DomainError::Crypto { operation: "load device identity", detail: "device identity changed while running; restore the original identity or restart and pair again".into() });
+        }
+        Ok(identity)
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.identity.fingerprint
+    }
+
+    /// A pinned, mutually authenticated client, also usable by headless callers.
+    pub fn encrypted_client(
+        &self,
+        server_fingerprint: &str,
+    ) -> Result<reqwest::Client, DomainError> {
+        crate::tls::agent(self, server_fingerprint, crate::types::PEER_REQUEST_TIMEOUT)
     }
 
     pub fn status(&self) -> Result<VaultStatus, DomainError> {
@@ -462,13 +503,17 @@ impl Vault {
         id: &str,
         label: &str,
         code_hash: &str,
+        machine_id: Option<&str>,
     ) -> Result<AuthorizationRecord, DomainError> {
-        let created_at = self.db()?.insert_authorization(id, label, code_hash)?;
+        let db = self.db()?;
+        let created_at = db.insert_authorization(id, label, code_hash)?;
+        db.set_authorization_machine(id, machine_id)?;
         Ok(AuthorizationRecord {
             id: id.to_owned(),
             label: label.to_owned(),
             code_hash: code_hash.to_owned(),
             client_id: None,
+            machine_id: machine_id.map(str::to_owned),
             created_at,
             revoked_at: None,
         })
@@ -480,6 +525,14 @@ impl Vault {
         client_id: &str,
     ) -> Result<bool, DomainError> {
         self.db()?.set_authorization_client(id, client_id)
+    }
+
+    /// 该机器码名下仍然有效的授权 id。
+    pub(crate) fn authorization_ids_for_machine(
+        &self,
+        machine_id: &str,
+    ) -> Result<Vec<String>, DomainError> {
+        self.db()?.active_authorization_ids_for_machine(machine_id)
     }
 
     pub(crate) fn revoke_authorization(&self, id: &str) -> Result<(), DomainError> {
@@ -515,16 +568,18 @@ impl Vault {
     /// Returns the stable installation id, creating it on first use. It is not
     /// secret; it only prevents one bound client from deleting another client's
     /// server authorization.
+    ///
+    /// 新安装优先用硬件机器码作为安装 id，这样同一台机器重装应用后仍能被对端认成
+    /// 同一台设备；旧安装保留已写入的值，避免切换后历史授权因绑定 id 变化而失效。
     pub(crate) fn ensure_client_id(&self) -> Result<String, DomainError> {
         let db = self.db()?;
-        if let Some(existing) = db.read_meta(CLIENT_ID_META)? {
-            let existing = existing.trim();
-            if valid_client_id(existing) {
-                return Ok(existing.to_owned());
-            }
+        if let Some(existing) = db.read_meta(CLIENT_ID_META)?
+            && existing == self.identity.fingerprint
+        {
+            return Ok(existing);
         }
 
-        let client_id = hex::encode(crypto::random_bytes::<16>());
+        let client_id = self.identity.fingerprint.clone();
         db.write_meta(CLIENT_ID_META, &client_id)?;
         Ok(client_id)
     }
@@ -569,6 +624,15 @@ impl Vault {
     /// Persists a non-secret setting in the metadata table.
     pub fn set_setting(&self, key: &str, value: &str) -> Result<(), DomainError> {
         self.db()?.write_meta(key, value)
+    }
+
+    /// Application preferences are separate from vault lifecycle metadata.
+    pub(crate) fn get_config(&self, key: &str) -> Result<Option<String>, DomainError> {
+        self.db()?.read_config(key)
+    }
+
+    pub(crate) fn set_config(&self, key: &str, value: &str) -> Result<(), DomainError> {
+        self.db()?.write_config(key, value)
     }
 
     fn auto_load_key(&self) -> Result<(), DomainError> {
@@ -785,13 +849,6 @@ fn load_admin_record(db: &Database, key: &[u8; VAULT_KEY_LEN]) -> Result<AdminRe
         })?;
     let plaintext = decrypt_record(key, SECRET_ADMIN, &record.nonce, &record.ciphertext)?;
     admin::decode(&plaintext)
-}
-
-fn valid_client_id(value: &str) -> bool {
-    (MIN_CLIENT_ID_CHARS..=MAX_CLIENT_ID_CHARS).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn peer_secret_name(id: &str) -> Result<String, DomainError> {

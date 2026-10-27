@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 
@@ -122,12 +123,24 @@ function mockCommands(overrides = {}) {
     sync_peers: async () => 0,
     local_networks: async () => ["192.168.1.0/24"],
     local_addresses: async () => ["192.168.1.23"],
-    request_peer_access: async () => ({
-      requested: true,
-      requestId: "request-1",
+    // 出站申请状态由后端保存；测试默认没有任何未完成的申请。
+    access_requests: async () => [],
+    inbound_connections: async () => [],
+    outbound_connections: async () => [],
+    device_fingerprint: async () => "a".repeat(64),
+    request_peer_access: async ({ url, label }) => ({
+      url,
+      label: label ?? null,
+      status: "waiting",
+      message: null,
     }),
     wait_for_peer_access: async () => PEER,
-    cancel_peer_access: async () => {},
+    cancel_peer_access: async ({ url }) => ({
+      url,
+      label: null,
+      status: "canceled",
+      message: null,
+    }),
     list_peer_shares: async () => [],
     admin_login: async () => ({
       username: "admin",
@@ -797,6 +810,45 @@ describe("home workspace", () => {
     invoke.mockReset();
   });
 
+  it("treats the home page as a console for incoming access requests", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    let pending = [
+      {
+        id: "request-1",
+        shareId: "share-1",
+        shareName: "Docs",
+        peerIp: "10.1.1.10",
+        machineId: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        requestedPath: "/",
+        attempts: 1,
+      },
+    ];
+    const wrapper = await mountReady({
+      list_pending_requests: async () => pending,
+      approve_pending_request: async () => {
+        pending = [];
+        return { authorizationCode: "code", autoDelivery: true };
+      },
+    });
+    await signIn(wrapper);
+
+    // 控台排在最前面：别人的申请先出现，地址和机器码都列出来。
+    const consoleSection = wrapper.findAll(".home-section")[0];
+    expect(consoleSection.text()).toContain("待审批的访问申请");
+    expect(consoleSection.findAll(".server-row")).toHaveLength(1);
+    expect(consoleSection.text()).toContain("10.1.1.10");
+    expect(consoleSection.text()).toContain("机器码 a1b2c3d4…8f90");
+    expect(consoleSection.text()).toContain("Docs");
+
+    await clickButton(consoleSection, "批准");
+
+    // 没有待审批申请时整块隐藏，不留空态占位。
+    expect(wrapper.text()).not.toContain("待审批的访问申请");
+    expect(wrapper.text()).not.toContain("10.1.1.10");
+
+    wrapper.unmount();
+  });
+
   it("lists authorized servers and opens their file browser", async () => {
     localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
     const wrapper = await mountReady({
@@ -988,16 +1040,24 @@ describe("home workspace", () => {
   it("requests access and automatically adds the server after approval", async () => {
     localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
     let savedPeers = [];
-    const requestAccess = vi.fn(async () => ({
-      requested: true,
-      requestId: "request-1",
-    }));
-    const waitForAccess = vi.fn(async () => PEER);
+    let entries = [];
+    const requestAccess = vi.fn(async ({ url, label }) => {
+      const entry = { url, label: label ?? null, status: "waiting", message: null };
+      entries = [entry];
+      return { ...entry };
+    });
+    const waitForAccess = vi.fn(async () => {
+      // 后端连接成功后会清掉这条申请，并保存对端。
+      entries = [];
+      savedPeers = [PEER];
+      return PEER;
+    });
     const wrapper = await mountReady({
       admin_session: async () => ({
         username: "admin",
         mustChangePassword: false,
       }),
+      access_requests: async () => entries,
       discovered_peers: async () => [DISCOVERED],
       list_peers: async () => savedPeers,
       request_peer_access: requestAccess,
@@ -1011,16 +1071,15 @@ describe("home workspace", () => {
       wrapper.find(".server-row .el-tag.row-tag").text(),
     ).toBe("共享 2 目录");
 
-    savedPeers = [PEER];
     await clickButton(wrapper, "申请访问");
     await flushPromises();
 
     expect(requestAccess).toHaveBeenCalledWith({
       url: "http://192.168.1.20:4918",
+      label: "Lab",
     });
     expect(waitForAccess).toHaveBeenCalledWith({
       url: "http://192.168.1.20:4918",
-      requestId: "request-1",
       label: "Lab",
     });
     expect(wrapper.find(".peer-browser").exists()).toBe(false);
@@ -1031,7 +1090,13 @@ describe("home workspace", () => {
   it("shows the waiting state until the administrator approves access", async () => {
     localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
     let savedPeers = [];
+    let entries = [];
     let finishWaiting;
+    const requestAccess = vi.fn(async ({ url, label }) => {
+      const entry = { url, label: label ?? null, status: "waiting", message: null };
+      entries = [entry];
+      return { ...entry };
+    });
     const waitForAccess = vi.fn(
       () =>
         new Promise((resolve) => {
@@ -1043,8 +1108,10 @@ describe("home workspace", () => {
         username: "admin",
         mustChangePassword: false,
       }),
+      access_requests: async () => entries,
       discovered_peers: async () => [DISCOVERED],
       list_peers: async () => savedPeers,
+      request_peer_access: requestAccess,
       wait_for_peer_access: waitForAccess,
     });
     await flushPromises();
@@ -1053,7 +1120,9 @@ describe("home workspace", () => {
     await flushPromises();
 
     expect(waitForAccess).toHaveBeenCalled();
+    // 申请状态来自后端快照，重挂载后仍然保持「等待批准」。
     expect(wrapper.text()).toContain("已发送申请，等待对方管理员批准…");
+    expect(wrapper.text()).toContain("取消申请");
 
     savedPeers = [PEER];
     finishWaiting(PEER);
@@ -1066,11 +1135,21 @@ describe("home workspace", () => {
 
   it("reports sending only until the peer accepts the access request", async () => {
     localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    let entries = [];
     let resolveRequest;
     const requestAccess = vi.fn(
-      () =>
+      ({ url, label }) =>
         new Promise((resolve) => {
-          resolveRequest = resolve;
+          resolveRequest = () => {
+            const entry = {
+              url,
+              label: label ?? null,
+              status: "waiting",
+              message: null,
+            };
+            entries = [entry];
+            resolve(entry);
+          };
         }),
     );
     const waitForAccess = vi.fn(() => new Promise(() => {}));
@@ -1079,6 +1158,7 @@ describe("home workspace", () => {
         username: "admin",
         mustChangePassword: false,
       }),
+      access_requests: async () => entries,
       discovered_peers: async () => [],
       list_peers: async () => [],
       request_peer_access: requestAccess,
@@ -1096,50 +1176,64 @@ describe("home workspace", () => {
     await wrapper.find(".manual-connect").trigger("submit");
     await flushPromises();
 
-    // The POST is still in flight: only the local attempt is known.
-    const progress = wrapper.find(".request-progress");
+    // 请求还在飞：此时只能说「正在发送」，不能声称对方已经登记。
     expect(requestAccess).toHaveBeenCalledWith({
       url: "http://192.168.1.99:4918",
+      label: null,
     });
-    expect(progress.text()).toContain("正在发送访问请求…");
-    expect(progress.text()).not.toContain("已发送访问申请");
+    expect(wrapper.find(".request-progress__notice").text()).toContain(
+      "正在发送访问请求…",
+    );
     expect(waitForAccess).not.toHaveBeenCalled();
 
-    resolveRequest({ requested: true, requestId: "request-9" });
+    resolveRequest();
     await flushPromises();
 
     expect(waitForAccess).toHaveBeenCalledWith({
       url: "http://192.168.1.99:4918",
-      requestId: "request-9",
       label: null,
     });
-    expect(progress.text()).toContain("已发送访问申请，等待对方管理员批准…");
+    expect(wrapper.find(".request-progress").text()).toContain(
+      "已发送访问申请",
+    );
 
     wrapper.unmount();
   });
 
   it("cancels a pending access request from the discovered server row", async () => {
     localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    let entries = [];
     let rejectWaiting;
+    const requestAccess = vi.fn(async ({ url, label }) => {
+      const entry = { url, label: label ?? null, status: "waiting", message: null };
+      entries = [entry];
+      return { ...entry };
+    });
     const waitForAccess = vi.fn(
       () =>
         new Promise((_, reject) => {
           rejectWaiting = reject;
         }),
     );
-    const cancelAccess = vi.fn(async () => {
+    const cancelAccess = vi.fn(async ({ url }) => {
+      entries = entries.map((entry) =>
+        entry.url === url ? { ...entry, status: "canceled" } : entry,
+      );
       rejectWaiting({
         code: "PEER_ACCESS_CANCELED",
         message: "已取消访问申请 / The access request was canceled.",
       });
+      return { ...entries[0] };
     });
     const wrapper = await mountReady({
       admin_session: async () => ({
         username: "admin",
         mustChangePassword: false,
       }),
+      access_requests: async () => entries,
       discovered_peers: async () => [DISCOVERED],
       list_peers: async () => [],
+      request_peer_access: requestAccess,
       wait_for_peer_access: waitForAccess,
       cancel_peer_access: cancelAccess,
     });
@@ -1154,9 +1248,91 @@ describe("home workspace", () => {
 
     expect(cancelAccess).toHaveBeenCalledWith({
       url: "http://192.168.1.20:4918",
-      requestId: "request-1",
     });
     expect(wrapper.text()).toContain("已取消访问申请。");
+
+    wrapper.unmount();
+  });
+
+  it("keeps a waiting access request across view switches and a reload", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    let entries = [
+      {
+        url: "http://192.168.1.20:4918",
+        label: "Lab",
+        status: "waiting",
+        message: null,
+      },
+    ];
+    const waitForAccess = vi.fn(() => new Promise(() => {}));
+    const overrides = {
+      admin_session: async () => ({
+        username: "admin",
+        mustChangePassword: false,
+      }),
+      access_requests: async () => entries,
+      discovered_peers: async () => [DISCOVERED],
+      list_peers: async () => [],
+      wait_for_peer_access: waitForAccess,
+    };
+    const wrapper = await mountReady(overrides);
+    await flushPromises();
+
+    // 后端已经记着这条申请：首屏就是「等待批准」，不是「可以申请」。
+    expect(wrapper.text()).toContain("已发送申请，等待对方管理员批准…");
+    expect(() => findButton(wrapper, "申请访问")).toThrow();
+
+    // 切到设置页再回到首页：视图重建不影响状态。
+    await wrapper.find('button[aria-label="打开设置"]').trigger("click");
+    await flushPromises();
+    await wrapper.find(".rail-home").trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("已发送申请，等待对方管理员批准…");
+    wrapper.unmount();
+
+    // 模拟 webview 重载：新的 App 实例从同一份后端快照恢复，并重新接上等待。
+    waitForAccess.mockClear();
+    const reloaded = await mountReady({ ...overrides, access_requests: async () => entries });
+    await flushPromises();
+    expect(reloaded.text()).toContain("已发送申请，等待对方管理员批准…");
+    expect(waitForAccess).toHaveBeenCalledWith({
+      url: "http://192.168.1.20:4918",
+      label: "Lab",
+    });
+    reloaded.unmount();
+  });
+
+  it("re-enters settings with the cached lists instead of flashing a skeleton", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    const wrapper = await mountReady({
+      admin_session: async () => ({
+        username: "admin",
+        mustChangePassword: false,
+      }),
+      list_shares: async () => [
+        {
+          id: "share-1",
+          name: "Docs",
+          rootPath: "/srv/docs",
+          permissions: { canRead: true, canWrite: false, canDelete: false },
+          rules: [],
+        },
+      ],
+    });
+    await flushPromises();
+
+    await wrapper.find('button[aria-label="打开设置"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("Docs");
+
+    await wrapper.find(".rail-home").trigger("click");
+    await flushPromises();
+    await wrapper.find('button[aria-label="打开设置"]').trigger("click");
+    await flushPromises();
+
+    // 数据已经缓存在共享上下文里：重新进入时直接渲染旧列表，不再闪骨架屏。
+    expect(wrapper.findAll(".list-skeleton")).toHaveLength(0);
+    expect(wrapper.text()).toContain("Docs");
 
     wrapper.unmount();
   });
@@ -2446,6 +2622,17 @@ describe("admin session restore", () => {
     expect(localStorage.getItem(SETTINGS_SEEN_STORAGE_KEY)).toBe("1");
 
     wrapper.unmount();
+  });
+
+  it("keeps development reloads explicit and uses the same Tauri/Vite port", () => {
+    const vite = readFileSync("vite.config.js", "utf8");
+    const tauri = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
+    expect(vite).toMatch(/hmr:\s*false/);
+    for (const path of ["src-tauri", "dev_data", ".codegraph", ".cs", "dist"]) {
+      expect(vite).toContain(`**/${path}/**`);
+    }
+    const port = Number(new URL(tauri.build.devUrl).port);
+    expect(vite).toContain(`port: ${port}`);
   });
 
   it("resumes the persisted server when the vault is already unlocked", async () => {

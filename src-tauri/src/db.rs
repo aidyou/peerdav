@@ -66,6 +66,10 @@ impl Database {
                  key   TEXT PRIMARY KEY NOT NULL,
                  value TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS config (
+                 key   TEXT PRIMARY KEY NOT NULL,
+                 value TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS secrets (
                  name       TEXT PRIMARY KEY NOT NULL,
                  nonce      BLOB NOT NULL,
@@ -94,6 +98,7 @@ impl Database {
                  label      TEXT NOT NULL,
                  code_hash  TEXT NOT NULL UNIQUE,
                  client_id  TEXT,
+                 machine_id TEXT,
                  created_at INTEGER NOT NULL,
                  revoked_at INTEGER
              );
@@ -102,6 +107,7 @@ impl Database {
                  label             TEXT NOT NULL,
                  url               TEXT NOT NULL,
                  authorization_id  TEXT,
+                 machine_id        TEXT,
                  created_at        INTEGER NOT NULL,
                  last_connected_at INTEGER
              );",
@@ -109,7 +115,10 @@ impl Database {
         .map_err(database_error("initialize schema"))?;
 
         add_column_if_missing(conn, "authorizations", "client_id", "TEXT")?;
+        // 机器码是设备身份：老库没有这一列时补上，历史记录保持 NULL 并继续按 IP 匹配。
+        add_column_if_missing(conn, "authorizations", "machine_id", "TEXT")?;
         add_column_if_missing(conn, "peers", "authorization_id", "TEXT")?;
+        add_column_if_missing(conn, "peers", "machine_id", "TEXT")?;
         Ok(())
     }
 
@@ -142,6 +151,28 @@ impl Database {
                 params![key, value],
             )
             .map_err(database_error("write metadata"))?;
+        Ok(())
+    }
+
+    pub(crate) fn read_config(&self, key: &str) -> Result<Option<String>, DomainError> {
+        self.conn
+            .query_row(
+                "SELECT value FROM config WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error("read configuration"))
+    }
+
+    pub(crate) fn write_config(&self, key: &str, value: &str) -> Result<(), DomainError> {
+        self.conn
+            .execute(
+                "INSERT INTO config (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .map_err(database_error("write configuration"))?;
         Ok(())
     }
 
@@ -501,13 +532,14 @@ impl Database {
     pub(crate) fn upsert_peer(&self, peer: &PeerRecord) -> Result<(), DomainError> {
         self.conn
             .execute(
-                "INSERT INTO peers (id, label, url, authorization_id, created_at, last_connected_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO peers (id, label, url, authorization_id, created_at, last_connected_at, machine_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
                      label = excluded.label,
                      url = excluded.url,
                      authorization_id = excluded.authorization_id,
-                     last_connected_at = excluded.last_connected_at",
+                     last_connected_at = excluded.last_connected_at,
+                     machine_id = COALESCE(excluded.machine_id, peers.machine_id)",
                 params![
                     peer.id,
                     peer.label,
@@ -515,6 +547,7 @@ impl Database {
                     peer.authorization_id,
                     peer.created_at,
                     peer.last_connected_at,
+                    peer.machine_id,
                 ],
             )
             .map(|_| ())
@@ -524,7 +557,7 @@ impl Database {
     pub(crate) fn get_peer(&self, id: &str) -> Result<Option<PeerRecord>, DomainError> {
         self.conn
             .query_row(
-                "SELECT id, label, url, authorization_id, created_at, last_connected_at
+                "SELECT id, label, url, authorization_id, created_at, last_connected_at, machine_id
                  FROM peers WHERE id = ?1",
                 params![id],
                 peer_from_row,
@@ -537,7 +570,7 @@ impl Database {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT id, label, url, authorization_id, created_at, last_connected_at
+                "SELECT id, label, url, authorization_id, created_at, last_connected_at, machine_id
                  FROM peers ORDER BY label, id",
             )
             .map_err(database_error("prepare peer scan"))?;
@@ -626,13 +659,52 @@ impl Database {
         Ok(changed > 0)
     }
 
+    /// 记录申请方的机器码。授权一旦建立就固定下来：之后对端换 IP 也还是同一条授权。
+    pub(crate) fn set_authorization_machine(
+        &self,
+        id: &str,
+        machine_id: Option<&str>,
+    ) -> Result<(), DomainError> {
+        if machine_id.is_none() {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "UPDATE authorizations SET machine_id = ?2 WHERE id = ?1",
+                params![id, machine_id],
+            )
+            .map(|_| ())
+            .map_err(database_error("bind authorization machine"))
+    }
+
+    /// 该机器码名下仍有效的授权 id。解绑对端设备时用它找出本机为同一台设备
+    /// 开过的入站授权，一并撤销。
+    pub(crate) fn active_authorization_ids_for_machine(
+        &self,
+        machine_id: &str,
+    ) -> Result<Vec<String>, DomainError> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT id FROM authorizations
+                 WHERE machine_id = ?1 AND revoked_at IS NULL
+                 ORDER BY created_at, id",
+            )
+            .map_err(database_error("prepare authorization lookup"))?;
+        let rows = statement
+            .query_map(params![machine_id], |row| row.get::<_, String>(0))
+            .map_err(database_error("lookup authorizations by machine"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(database_error("read authorization id"))
+    }
+
     fn read_authorizations(
         &self,
         operation: &'static str,
         filter: &str,
     ) -> Result<Vec<AuthorizationRecord>, DomainError> {
         let sql = format!(
-            "SELECT id, label, code_hash, client_id, created_at, revoked_at
+            "SELECT id, label, code_hash, client_id, created_at, revoked_at, machine_id
              FROM authorizations{filter}
              ORDER BY created_at, id"
         );
@@ -649,6 +721,7 @@ impl Database {
                     client_id: row.get(3)?,
                     created_at: row.get(4)?,
                     revoked_at: row.get(5)?,
+                    machine_id: row.get(6)?,
                 })
             })
             .map_err(|source| database_error(operation)(source))?;
@@ -666,6 +739,7 @@ fn peer_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeerRecord> {
         authorization_id: row.get(3)?,
         created_at: row.get(4)?,
         last_connected_at: row.get(5)?,
+        machine_id: row.get(6)?,
     })
 }
 

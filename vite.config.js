@@ -6,7 +6,7 @@ import process from "node:process";
 const host = process.env.TAURI_DEV_HOST;
 
 // WebKitGTK sends absolute-form request targets (for example
-// `GET http://127.0.0.1:1420/src/App.vue HTTP/1.1`) when the webview goes
+// `GET http://127.0.0.1:1421/src/App.vue HTTP/1.1`) when the webview goes
 // through a proxy path. Vite matches raw `request.url` against files, so such
 // requests would 404 even though the dev server is healthy. Normalize them
 // back to origin-form before Vite's middlewares run.
@@ -51,20 +51,16 @@ export default defineConfig(() => ({
   clearScreen: false,
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
-    port: 1420,
+    port: 1421,
     strictPort: true,
     host: host || "127.0.0.1",
-    hmr: host
-      ? {
-          protocol: "ws",
-          host,
-          port: 1421,
-        }
-      : undefined,
+    // Desktop state must not be torn down by Vite's full-reload fallback or
+    // websocket reconnect. Source changes are applied by an explicit refresh.
+    hmr: false,
     watch: {
       // 3. tell Vite to ignore watching `src-tauri` and development state.
       // `dev_data` contains test fixtures with intentionally looping symlinks.
-      ignored: ["**/src-tauri/**", "**/dev_data/**"],
+      ignored: ["**/src-tauri/**", "**/dev_data/**", "**/.codegraph/**", "**/.cs/**", "**/dist/**"],
     },
   },
 }));

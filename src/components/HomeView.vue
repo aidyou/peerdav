@@ -2,7 +2,8 @@
 import { computed, ref, watch } from "vue";
 
 import { confirmAction } from "../lib/confirm";
-import { normalizeAppError } from "../lib/invoke";
+import { findAccessRequest, findSavedPeer, accessRowState } from "../lib/access";
+import { pendingIdentity } from "../lib/deviceCode";
 import { useAppContext } from "../lib/appContext";
 import { t } from "../lib/i18n";
 import { statusTagTone } from "../lib/tagTone";
@@ -12,24 +13,20 @@ const app = useAppContext();
 
 const discovered = computed(() => app.discovered);
 const discoveryRunning = computed(() => app.serverStatus.discoveryRunning);
+// 首页是控台：别人发来的访问申请先摆在这里，审批后立即从列表消失。
+const pendingApprovals = computed(() => app.pendingRequests ?? []);
+const approvingId = ref("");
 // 骨架屏只在「还没有任何数据」时出现：已有列表时后台刷新继续显示旧数据，避免闪烁。
 const peersLoading = computed(() => app.peersLoading && app.peers.length === 0);
 const discoveredLoading = computed(
   () => app.discoveredLoading && discovered.value.length === 0,
 );
-const activeRequest = ref(null);
-const canceling = ref(false);
-const cancelRequested = ref(false);
+const requestingUrl = ref("");
 const removingPeerId = ref("");
-const shareCounts = ref({});
+// 共享数量放在共享上下文里：页面重挂载时不会先掉成「—」再填回来。
+const shareCounts = computed(() => app.peerShareCounts);
 
 const hasPeers = computed(() => app.peers.length > 0);
-const requestBusy = computed(() =>
-  Boolean(
-    activeRequest.value &&
-      ["requesting", "waiting"].includes(activeRequest.value.state),
-  ),
-);
 
 /// The saved-peer list can arrive after this view mounts, so the live share
 /// counts are driven by a watcher rather than a one-shot mount check.
@@ -60,7 +57,7 @@ async function refreshShareCounts() {
       }
     }),
   );
-  shareCounts.value = Object.fromEntries(results);
+  app.peerShareCounts = Object.fromEntries(results);
 }
 
 function peerCount(peer) {
@@ -68,128 +65,78 @@ function peerCount(peer) {
   return typeof count === "number" ? count : null;
 }
 
-function messageForError(error, operation) {
-  const normalized = normalizeAppError(error);
-  console.error(`[peerdav:${normalized.code}] ${operation} failed`, {
-    detail: normalized.detail,
-    context: normalized.context,
-  });
-  return normalized.message;
+function savedPeer(server) {
+  return findSavedPeer(app.peers, server);
 }
 
 function isSaved(server) {
-  return app.peers.some((peer) => peer.url === server.url);
+  return Boolean(savedPeer(server));
 }
 
-function requestFor(server) {
-  return activeRequest.value?.url === server.url ? activeRequest.value : null;
+/// 一台服务器的申请状态：读后端的内存快照，而不是本组件的临时变量，
+/// 所以切换页面或重载后不会退回「可以申请」。
+function rowState(server) {
+  return accessRowState(findAccessRequest(app.accessRequests, server));
 }
 
 function requestMessage(server) {
-  const request = requestFor(server);
-  if (!request) return "";
-  if (request.state === "requesting") return t("home.requesting");
-  if (request.state === "waiting") return t("home.addWaiting");
-  if (request.state === "accessible") return t("home.addAlreadyAccessible");
-  if (request.state === "canceled") return t("home.requestCanceled");
-  return "";
-}
-
-function requestError(server) {
-  return requestFor(server)?.error ?? "";
-}
-
-function canRequest(server) {
-  if (isSaved(server)) return false;
-  const request = requestFor(server);
-  return !request || ["accessible", "canceled", "error"].includes(request.state);
-}
-
-function canCancel(server) {
-  const request = requestFor(server);
-  return request?.state === "waiting" && Boolean(request.requestId);
+  const state = rowState(server);
+  if (state.message) return state.message;
+  return state.messageKey ? t(state.messageKey) : "";
 }
 
 async function beginAdd(server) {
-  if (requestBusy.value) {
+  const peer = savedPeer(server);
+  if (peer) {
+    app.openPeer(peer);
+    return;
+  }
+  if (requestingUrl.value) {
     app.setNotice("home.requestInProgress");
     return;
   }
-  if (isSaved(server)) {
-    const peer = app.peers.find((item) => item.url === server.url);
-    if (peer) app.openPeer(peer);
-    return;
-  }
 
-  activeRequest.value = {
-    url: server.url,
-    label: server.name,
-    serverId: server.serverId,
-    requestId: "",
-    state: "requesting",
-    error: "",
-  };
-  cancelRequested.value = false;
-
+  requestingUrl.value = server.url;
   try {
-    const request = await app.invoke("request_peer_access", {
-      url: server.url,
-    });
-    if (!request.requested) {
-      activeRequest.value.state = "accessible";
-      return;
-    }
-    if (!request.requestId) {
-      activeRequest.value.state = "error";
-      activeRequest.value.error = t("home.addRequestMissing");
-      return;
-    }
-
-    activeRequest.value.requestId = request.requestId;
-    activeRequest.value.state = "waiting";
-    const peer = await app.invoke("wait_for_peer_access", {
-      url: server.url,
-      requestId: request.requestId,
-      label: server.name,
-    });
-    await app.refreshPeers();
-    activeRequest.value = null;
-    app.setNotice("home.added", { label: peer.label });
+    await app.beginPeerAccess(server.url, server.name);
   } catch (error) {
-    const normalized = normalizeAppError(error);
-    const canceled =
-      cancelRequested.value || normalized.code === "PEER_ACCESS_CANCELED";
-    if (activeRequest.value) {
-      activeRequest.value.requestId = "";
-      if (canceled) {
-        activeRequest.value.state = "canceled";
-        activeRequest.value.error = "";
-        app.setNotice("home.requestCanceled");
-      } else {
-        activeRequest.value.state = "error";
-        activeRequest.value.error = messageForError(error, "request peer access");
-      }
-    }
+    app.handleFailure(error);
   } finally {
-    cancelRequested.value = false;
-    canceling.value = false;
+    requestingUrl.value = "";
   }
 }
 
 async function cancelRequest(server) {
-  const request = requestFor(server);
-  if (!request?.requestId || canceling.value) return;
-  canceling.value = true;
-  cancelRequested.value = true;
+  const entry = findAccessRequest(app.accessRequests, server);
+  if (!entry || requestingUrl.value) return;
+  requestingUrl.value = entry.url;
   try {
-    await app.invoke("cancel_peer_access", {
-      url: request.url,
-      requestId: request.requestId,
-    });
+    await app.cancelPeerAccess(entry.url);
   } catch (error) {
-    cancelRequested.value = false;
-    request.error = messageForError(error, "cancel peer access");
-    canceling.value = false;
+    app.handleFailure(error);
+  } finally {
+    requestingUrl.value = "";
+  }
+}
+
+/// 申请方的身份说明：机器码才是「哪台设备」，IP 只是它这次拿到的地址。
+function pendingIdentityText(request) {
+  const identity = pendingIdentity(request);
+  return identity.trusted
+    ? t("home.pendingIdentity", { code: identity.short })
+    : t("home.pendingIdentityUnknown");
+}
+
+/// 审批后立即从列表消失：列表由共享上下文里的待审批数据驱动，审批完成即刷新。
+async function approvePending(request) {
+  if (approvingId.value) return;
+  approvingId.value = request.id;
+  try {
+    await app.approvePendingRequest(request.id);
+  } catch (error) {
+    app.handleFailure(error);
+  } finally {
+    approvingId.value = "";
   }
 }
 
@@ -216,6 +163,60 @@ async function forgetPeer(peer) {
 
 <template>
   <div class="home-view">
+    <!-- 没有待审批申请时整块隐藏：空态提示只会占位置，没有可操作的内容。 -->
+    <section v-if="pendingApprovals.length" class="home-section">
+      <header class="section-heading">
+        <h2>
+          {{ t("home.pendingTitle") }}
+          <span
+            class="count-badge"
+            :title="t('home.pendingTotal', { count: pendingApprovals.length })"
+            >{{ pendingApprovals.length }}</span
+          >
+        </h2>
+      </header>
+
+      <ul class="server-list">
+        <li
+          v-for="request in pendingApprovals"
+          :key="request.id"
+          class="server-row"
+        >
+          <div class="server-row__line">
+            <span class="server-row__icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24">
+                <path d="M12 3.6l7 3v5.1c0 4-2.9 7.5-7 8.7-4.1-1.2-7-4.7-7-8.7V6.6z" />
+                <path d="M9.5 11.7l1.8 1.8 3.3-3.6" />
+              </svg>
+            </span>
+            <div class="server-row__title">
+              <strong>{{ request.peerIp }}</strong>
+              <span class="server-row__url">{{ pendingIdentityText(request) }}</span>
+            </div>
+            <el-tag
+              class="row-tag"
+              :type="statusTagTone('pending')"
+              effect="plain"
+              round
+              size="small"
+            >
+              {{ request.shareName }}
+            </el-tag>
+            <el-button
+              class="list-pill"
+              type="primary"
+              round
+              size="small"
+              :disabled="approvingId === request.id"
+              @click="approvePending(request)"
+            >
+              {{ t("home.pendingApprove") }}
+            </el-button>
+          </div>
+        </li>
+      </ul>
+    </section>
+
     <section class="home-section">
       <header class="section-heading">
         <h2>
@@ -347,7 +348,7 @@ async function forgetPeer(peer) {
             <button
               type="button"
               class="server-row__main"
-              :disabled="!isSaved(server) && !canRequest(server)"
+              :disabled="!isSaved(server) && !rowState(server).canRequest"
               :aria-label="
                 isSaved(server)
                   ? t('home.openServer', { label: server.name })
@@ -387,26 +388,26 @@ async function forgetPeer(peer) {
               {{ t("home.connected") }}
             </el-tag>
             <el-button
-              v-else-if="canRequest(server)"
+              v-else-if="rowState(server).canRequest"
               class="list-pill"
               type="primary"
               round
               size="small"
-              :disabled="requestBusy"
+              :disabled="requestingUrl === server.url"
               @click="beginAdd(server)"
             >
               {{ t("home.add") }}
             </el-button>
             <el-button
-              v-else-if="canCancel(server)"
+              v-else-if="rowState(server).canCancel"
               class="list-pill"
               type="primary"
               round
               size="small"
-              :disabled="canceling"
+              :disabled="Boolean(requestingUrl)"
               @click="cancelRequest(server)"
             >
-              {{ canceling ? t("home.canceling") : t("home.requestCancel") }}
+              {{ t("home.requestCancel") }}
             </el-button>
             <span class="server-row__chevron" aria-hidden="true">
               <svg viewBox="0 0 24 24">
@@ -415,11 +416,11 @@ async function forgetPeer(peer) {
             </span>
           </div>
           <p
-            v-if="requestMessage(server) || requestError(server)"
+            v-if="requestMessage(server)"
             class="server-row__status"
-            :class="{ 'is-error': requestError(server) }"
+            :class="{ 'is-error': rowState(server).status === 'error' }"
           >
-            {{ requestError(server) || requestMessage(server) }}
+            {{ requestMessage(server) }}
           </p>
         </li>
       </ul>

@@ -138,15 +138,16 @@ mod tests {
 
     #[test]
     fn gitignore_layers_follow_nested_precedence_and_negation() {
-        let mut layers = Vec::new();
-        layers.push(IgnoreLayer {
-            base: "/project".to_owned(),
-            matcher: build_gitignore("*.log\n*.pyc\nbuild/\n!keep.log\n").expect("root rules"),
-        });
-        layers.push(IgnoreLayer {
-            base: "/project/sub".to_owned(),
-            matcher: build_gitignore("!module.log\n").expect("nested rules"),
-        });
+        let layers = vec![
+            IgnoreLayer {
+                base: "/project".to_owned(),
+                matcher: build_gitignore("*.log\n*.pyc\nbuild/\n!keep.log\n").expect("root rules"),
+            },
+            IgnoreLayer {
+                base: "/project/sub".to_owned(),
+                matcher: build_gitignore("!module.log\n").expect("nested rules"),
+            },
+        ];
 
         assert!(is_path_ignored(
             "/project/sub/other.pyc",

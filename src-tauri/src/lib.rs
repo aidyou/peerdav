@@ -11,13 +11,19 @@ mod fs;
 mod ignore_rules;
 mod keyfile;
 mod logging;
+#[cfg(test)]
+mod machine;
 pub mod paths;
 mod peer;
 mod policy;
 mod server;
+mod tls;
 mod traits;
+mod transfer;
 mod types;
+mod upload;
 mod vault;
+mod window;
 
 pub use error::{AppError, DomainError};
 pub use peer::{PeerLimits, PeerManager};
@@ -29,8 +35,9 @@ pub use types::{
     AccessRequestStatus, AccessRule, AccessStatusResponse, AdminLoginResult, ApprovePendingResult,
     AuthorizationBindingResponse, AuthorizationInfo, AuthorizationStatus,
     AuthorizationStatusResponse, ConflictPolicy, DiscoveredPeer, ExternalEditInfo,
-    InitializeVaultResult, MAX_ACCESS_GRANTS, MAX_ACCESS_REQUEST_ID_CHARS, MAX_PENDING_ATTEMPTS,
-    MAX_PENDING_PATH_CHARS, MAX_PENDING_REQUESTS, MIN_ACCESS_REQUEST_ID_CHARS,
+    InitializeVaultResult, MACHINE_ID_HEADER, MAX_ACCESS_GRANTS, MAX_ACCESS_REQUEST_ID_CHARS,
+    MAX_PENDING_ATTEMPTS, MAX_PENDING_PATH_CHARS, MAX_PENDING_REQUESTS,
+    MIN_ACCESS_REQUEST_ID_CHARS, OutboundAccessRequest, OutboundAccessStatus,
     PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT, PeerAccessRequest, PeerEntry, PeerHealth,
     PeerInfo, PeerListing, PeerRevocationInfo, PeerShare, PeerStatus, PendingRequestInfo,
     PreviewPayload, RuleKind, RuleMatcher, ServerStatus, ShareInfo, SharePermissions,
@@ -83,7 +90,10 @@ pub fn run() {
                 ),
             })?;
             let vault = Arc::new(Vault::open(&data_dir.join(DB_FILE_NAME))?);
-            let events = Arc::new(AppEvents::new(app.handle().clone()));
+            let events = Arc::new(AppEvents::new(
+                app.handle().clone(),
+                vault.fingerprint().to_owned(),
+            ));
             let server_events: Arc<dyn ServerEvents> = Arc::clone(&events) as Arc<dyn ServerEvents>;
             let peer_events: Arc<dyn PeerEvents> = Arc::clone(&events) as Arc<dyn PeerEvents>;
             let server = Arc::new(ServerController::new(Arc::clone(&vault), server_events)?);
@@ -101,13 +111,28 @@ pub fn run() {
                 startup_peers.start_background();
                 startup_server.set_discovery_listener(startup_peers.discovery_listener());
             });
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                window::restore(&window, &vault)?;
+            }
             app.manage(Arc::clone(&vault) as SharedVault);
             app.manage(server as SharedServer);
             app.manage(peers as SharedPeers);
             setup_tray(app);
             Ok(())
         })
+        .on_page_load(|webview, payload| {
+            log::info!(
+                "webview {} page load {:?}",
+                webview.label(),
+                payload.event()
+            );
+        })
         .on_window_event(|window, event| {
+            if window.label() == MAIN_WINDOW_LABEL
+                && matches!(event, WindowEvent::Moved(_) | WindowEvent::Resized(_))
+            {
+                window::save(window);
+            }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let tray_available = window
                     .app_handle()
@@ -153,8 +178,12 @@ pub fn run() {
             commands::local_addresses,
             commands::list_peers,
             commands::request_peer_access,
+            commands::device_fingerprint,
+            commands::inbound_connections,
+            commands::outbound_connections,
             commands::wait_for_peer_access,
             commands::cancel_peer_access,
+            commands::access_requests,
             commands::connect_peer,
             commands::check_peer_health,
             commands::forget_peer,

@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use peerdav_lib::{
-    AccessRule, AppError, ConflictPolicy, DomainError, PeerEvents, PeerInfo, PeerLimits,
-    PeerManager, PeerRevocationInfo, PeerStatus, PendingRequestInfo, RuleKind, RuleMatcher,
-    ServerConfig, ServerController, ServerEvents, SharePermissions, Vault,
+    AccessRule, AppError, ConflictPolicy, DomainError, OutboundAccessStatus, PeerEvents, PeerInfo,
+    PeerLimits, PeerManager, PeerRevocationInfo, PeerStatus, PendingRequestInfo, RuleKind,
+    RuleMatcher, ServerConfig, ServerController, ServerEvents, SharePermissions, Vault,
 };
 
 mod common;
@@ -67,6 +67,7 @@ struct Harness {
     discovery_port: u16,
     share_root: PathBuf,
     admin_username: String,
+    vault: Arc<Vault>,
 }
 
 impl Harness {
@@ -145,10 +146,11 @@ impl Harness {
             peers,
             events,
             share_id: share.id,
-            url: format!("http://127.0.0.1:{port}"),
+            url: format!("https://127.0.0.1:{port}"),
             discovery_port,
             share_root,
             admin_username,
+            vault,
         }
     }
 
@@ -301,7 +303,10 @@ async fn self_connect_needs_approval_and_admin_credentials_are_not_a_code() {
     assert!(matches!(rejected, DomainError::PeerAuthorizationRejected));
 
     // The admin password is not a share token.
-    let response = reqwest::Client::new()
+    let response = harness
+        .vault
+        .encrypted_client(harness.vault.fingerprint())
+        .expect("encrypted client")
         .get(format!("{}/__peerdav/catalog", harness.url))
         .basic_auth(&harness.admin_username, Some(ADMIN_PASSWORD))
         .send()
@@ -453,7 +458,10 @@ async fn client_unbind_revokes_the_server_authorization() {
 
     assert!(harness.peers.list_peers().expect("peers").is_empty());
     assert!(harness.controller.list_authorizations().is_empty());
-    let response = reqwest::Client::new()
+    let response = harness
+        .vault
+        .encrypted_client(harness.vault.fingerprint())
+        .expect("encrypted client")
         .get(format!("{}/__peerdav/catalog", harness.url))
         .basic_auth("peerdav", Some(&code))
         .send()
@@ -1305,6 +1313,408 @@ async fn network_policy_denial_does_not_create_pending_or_authorization() {
     assert_eq!(code_of(&error), "PEER_REQUEST_FAILED");
     assert_eq!(harness.controller.list_pending().len(), 0);
     assert_eq!(harness.controller.list_authorizations().len(), 0);
+    harness.controller.stop().await;
+}
+
+/// 出站申请状态由后端内存持有：页面重建（前端重新调用同样命令）不会重复登记，
+/// 审批通过后连上对端并清掉这条申请。
+#[tokio::test]
+async fn access_request_state_lives_in_the_backend() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+
+    let first = harness
+        .peers
+        .begin_access(&harness.url, Some("lab"))
+        .await
+        .expect("begin access");
+    assert_eq!(first.status, OutboundAccessStatus::Waiting);
+    assert_eq!(first.label.as_deref(), Some("lab"));
+    let snapshot = harness.peers.access_requests();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].url, harness.url);
+
+    // 页面重载后前端会再次调用 begin_access：复用既有申请，不再朝对方登记一条。
+    let again = harness
+        .peers
+        .begin_access(&harness.url, Some("lab"))
+        .await
+        .expect("begin access again");
+    assert_eq!(again.status, OutboundAccessStatus::Waiting);
+    assert_eq!(harness.controller.list_pending().len(), 1);
+
+    let pending = harness.controller.list_pending();
+    harness
+        .controller
+        .approve_pending(&pending[0].id)
+        .expect("approve");
+    let peer = harness
+        .peers
+        .await_access(&harness.url, Some("lab"))
+        .await
+        .expect("connect after approval");
+    assert_eq!(peer.label, "lab");
+    assert!(harness.peers.access_requests().is_empty());
+    assert_eq!(harness.peers.list_peers().expect("saved peers").len(), 1);
+
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn canceling_an_access_request_keeps_the_canceled_state() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    harness
+        .peers
+        .begin_access(&harness.url, None)
+        .await
+        .expect("begin access");
+
+    let canceled = harness
+        .peers
+        .cancel_access_request(&harness.url)
+        .await
+        .expect("cancel access");
+    assert_eq!(canceled.status, OutboundAccessStatus::Canceled);
+    let snapshot = harness.peers.access_requests();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].status, OutboundAccessStatus::Canceled);
+
+    // 取消之后可以重新申请，状态回到等待批准。
+    let again = harness
+        .peers
+        .begin_access(&harness.url, None)
+        .await
+        .expect("request again");
+    assert_eq!(again.status, OutboundAccessStatus::Waiting);
+
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn failed_access_requests_keep_their_reason() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let entry = harness
+        .peers
+        .begin_access("https://127.0.0.1:1", None)
+        .await
+        .expect("begin access");
+    assert_eq!(entry.status, OutboundAccessStatus::Failed);
+    assert!(
+        entry
+            .message
+            .as_deref()
+            .is_some_and(|message| !message.is_empty()),
+        "a failed request must carry a user-facing reason"
+    );
+    assert_eq!(harness.peers.access_requests().len(), 1);
+
+    harness.controller.stop().await;
+}
+
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn multipart_round_trip_handles_boundaries_and_empty_files() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (peer, _) = harness.connect().await;
+    let source = harness.directory.path().join("large.bin");
+    let payload: Vec<u8> = (0..(21 * 1024 * 1024 + 17))
+        .map(|n| (n % 251) as u8)
+        .collect();
+    std::fs::write(&source, &payload).expect("source");
+    harness
+        .peers
+        .upload(
+            &peer.id,
+            &harness.share_id,
+            source.to_str().expect("path"),
+            "/",
+            ConflictPolicy::Overwrite,
+        )
+        .await
+        .expect("multipart upload");
+    assert_eq!(
+        std::fs::read(harness.share_root.join("large.bin")).expect("uploaded"),
+        payload
+    );
+    let destination = harness.directory.path().join("download.bin");
+    harness
+        .peers
+        .download_to(
+            &peer.id,
+            &harness.share_id,
+            "/large.bin",
+            destination.to_str().expect("path"),
+        )
+        .await
+        .expect("parallel download");
+    assert_eq!(std::fs::read(&destination).expect("downloaded"), payload);
+    std::fs::write(&source, b"").expect("empty source");
+    harness
+        .peers
+        .upload(
+            &peer.id,
+            &harness.share_id,
+            source.to_str().expect("path"),
+            "/",
+            ConflictPolicy::Overwrite,
+        )
+        .await
+        .expect("empty upload");
+    harness
+        .peers
+        .download_to(
+            &peer.id,
+            &harness.share_id,
+            "/large.bin",
+            destination.to_str().expect("path"),
+        )
+        .await
+        .expect("empty download");
+    assert!(std::fs::read(&destination).expect("empty").is_empty());
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn upload_parts_survive_restart_and_reject_wrong_content() {
+    use sha2::{Digest, Sha256};
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (_, code) = harness.connect().await;
+    let client = harness
+        .vault
+        .encrypted_client(harness.vault.fingerprint())
+        .expect("TLS client");
+    let payload = b"resume verified upload";
+    let digest = hex::encode(Sha256::digest(payload));
+    let target = format!("{}/share/{}/resume.txt", harness.url, harness.share_id);
+    let request = |method: reqwest::Method| {
+        client
+            .request(method, &target)
+            .basic_auth("peerdav", Some(&code))
+            .header("x-peerdav-transfer", &digest)
+            .header("x-peerdav-size", payload.len())
+            .header("x-peerdav-part", "0")
+    };
+    assert_eq!(
+        request(reqwest::Method::PATCH)
+            .body(payload.to_vec())
+            .send()
+            .await
+            .expect("part")
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert!(!harness.share_root.join("resume.txt").exists());
+    harness.controller.stop().await;
+    let port = url::Url::parse(&harness.url)
+        .expect("url")
+        .port()
+        .expect("port");
+    harness
+        .controller
+        .start(ServerConfig {
+            bind_address: "127.0.0.1".into(),
+            port,
+            ..ServerConfig::default()
+        })
+        .await
+        .expect("restart");
+    assert_eq!(
+        request(reqwest::Method::HEAD)
+            .send()
+            .await
+            .expect("persisted part")
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert!(
+        request(reqwest::Method::PUT)
+            .header("x-peerdav-commit", "1")
+            .send()
+            .await
+            .expect("commit")
+            .status()
+            .is_success()
+    );
+    assert_eq!(
+        std::fs::read(harness.share_root.join("resume.txt")).expect("committed"),
+        payload
+    );
+    assert!(
+        request(reqwest::Method::PATCH)
+            .body(vec![b'x'; payload.len()])
+            .send()
+            .await
+            .expect("wrong bytes")
+            .status()
+            .is_success()
+    );
+    assert_eq!(
+        request(reqwest::Method::PUT)
+            .header("x-peerdav-commit", "1")
+            .send()
+            .await
+            .expect("reject wrong hash")
+            .status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        std::fs::read(harness.share_root.join("resume.txt")).expect("original retained"),
+        payload
+    );
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn download_reuses_verified_parts_and_repairs_corrupt_parts() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (peer, _) = harness.connect().await;
+    let payload = vec![42u8; 11 * 1024 * 1024 + 9];
+    std::fs::write(harness.share_root.join("resume.bin"), &payload).expect("remote");
+    let output = harness.directory.path().join("downloads");
+    std::fs::create_dir(&output).expect("output");
+    std::fs::write(output.join("resume.bin"), b"original").expect("existing destination");
+    let error = harness
+        .peers
+        .download(
+            &peer.id,
+            &harness.share_id,
+            "/resume.bin",
+            output.to_str().expect("path"),
+            ConflictPolicy::Fail,
+        )
+        .await
+        .expect_err("conflict preserves original");
+    assert_eq!(code_of(&error), "TRANSFER_CONFLICT");
+    assert_eq!(
+        std::fs::read(output.join("resume.bin")).expect("original"),
+        b"original"
+    );
+    // Pre-seed persisted parts through a failed commit: they must be verified
+    // before reuse, not trusted merely because their size is right.
+    let destination = output.join("blocked");
+    let blocked = destination.clone();
+    let progress = Arc::new(move |done, total| {
+        if done == total && !blocked.exists() {
+            std::fs::create_dir(&blocked).expect("block commit after download");
+        }
+    });
+    harness
+        .peers
+        .download_to_with_progress(
+            &peer.id,
+            &harness.share_id,
+            "/resume.bin",
+            destination.to_str().expect("path"),
+            Some(progress),
+        )
+        .await
+        .expect_err("blocked destination");
+    let staging = std::fs::read_dir(&output)
+        .expect("staging entries")
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().starts_with(".peerdav-"))
+        .expect("persistent parts")
+        .path();
+    std::fs::write(staging.join("0"), vec![0u8; 10 * 1024 * 1024])
+        .expect("corrupt same-length part");
+    std::fs::remove_dir(&destination).expect("unblock commit");
+    harness
+        .peers
+        .download_to(
+            &peer.id,
+            &harness.share_id,
+            "/resume.bin",
+            destination.to_str().expect("path"),
+        )
+        .await
+        .expect("resume and repair");
+    assert_eq!(std::fs::read(&destination).expect("download"), payload);
+    assert!(
+        !staging.exists(),
+        "successful transfer removes staged parts"
+    );
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn connection_snapshots_keep_identity_across_approval_and_cancel() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let fingerprint = harness.vault.fingerprint().to_owned();
+    harness
+        .peers
+        .begin_access(&harness.url, Some("snapshot peer"))
+        .await
+        .expect("request");
+    let outbound = harness
+        .peers
+        .outbound_connections()
+        .expect("outbound snapshot");
+    assert_eq!(outbound.len(), 1);
+    assert_eq!(outbound[0].fingerprint, fingerprint);
+    assert_eq!(
+        serde_json::to_value(&outbound[0]).expect("serialize")["state"],
+        "pending"
+    );
+    let inbound = harness
+        .controller
+        .inbound_connections()
+        .expect("inbound snapshot");
+    assert_eq!(inbound.len(), 1);
+    assert_eq!(inbound[0].fingerprint, fingerprint);
+    assert!(!inbound[0].authorized);
+    harness
+        .peers
+        .cancel_access_request(&harness.url)
+        .await
+        .expect("cancel");
+    let outbound = harness
+        .peers
+        .outbound_connections()
+        .expect("canceled snapshot");
+    assert_eq!(
+        serde_json::to_value(&outbound[0]).expect("serialize")["state"],
+        "canceled"
+    );
+    harness
+        .peers
+        .begin_access(&harness.url, None)
+        .await
+        .expect("request again");
+    let pending = harness.controller.list_pending();
+    harness
+        .controller
+        .approve_pending(&pending[0].id)
+        .expect("approve");
+    harness
+        .peers
+        .await_access(&harness.url, None)
+        .await
+        .expect("paired");
+    let outbound = harness
+        .peers
+        .outbound_connections()
+        .expect("paired snapshot");
+    assert_eq!(outbound.len(), 1);
+    assert!(outbound[0].authorized);
+    assert_eq!(outbound[0].fingerprint, fingerprint);
+    assert!(
+        harness
+            .controller
+            .inbound_connections()
+            .expect("approved snapshot")[0]
+            .authorized
+    );
+    let authorization = harness.controller.list_authorizations()[0].id.clone();
+    harness
+        .controller
+        .revoke_authorization(&authorization)
+        .expect("revoke");
+    assert!(
+        !harness
+            .controller
+            .inbound_connections()
+            .expect("revoked snapshot")[0]
+            .authorized
+    );
     harness.controller.stop().await;
 }
 

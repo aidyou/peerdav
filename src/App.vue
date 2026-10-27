@@ -61,6 +61,20 @@ const serverStatus = ref({
   pendingCount: 0,
 });
 const pendingRequests = ref([]);
+// 出站访问申请由后端内存保存（access_requests 命令）。视图重挂载或 webview 重载后
+// 都从这份数据渲染，列表状态不会退回「可以申请」。
+const accessRequests = ref([]);
+const inboundConnections = ref([]);
+const outboundConnections = ref([]);
+const deviceFingerprint = ref("");
+let connectionRefreshInFlight = false;
+// 设置页的管理数据（共享 / 授权）也放在共享上下文：重新进入设置页时先用旧数据
+// 渲染，后台刷新再替换，避免每次进入都闪一次骨架屏。
+const adminShares = ref([]);
+const adminAuthorizations = ref([]);
+const adminLoading = ref(true);
+// 每台已连接服务器的实时共享数。放在共享上下文里，首页重挂载时不会先掉成「—」。
+const peerShareCounts = ref({});
 const peers = ref([]);
 // 首屏数据到达前列表要显示骨架屏；标记放在共享上下文里，首页与设置页读同一份，
 // 避免两个视图各自维护一份可能不同步的加载状态。
@@ -154,6 +168,13 @@ onMounted(async () => {
   await refreshServerStatus();
   await resumeServer();
   void syncPeers();
+  // 上次运行留下的「等待批准」申请：后端还记着，前端重新接上等待即可。
+  if (status.value.unlocked) void resumeAccessRequests();
+  void refreshConnections();
+  const connectionTimer = setInterval(() => {
+    if (status.value.unlocked) void refreshConnections();
+  }, 3000);
+  eventUnlisten.push(() => clearInterval(connectionTimer));
 });
 
 onUnmounted(() => {
@@ -427,6 +448,11 @@ function completeLogin(result, password) {
   serverPassword.value = password;
   if (loggedIn.value) {
     landAfterLogin();
+    // 服务可能在本机上次运行时就已经收到申请：登录后立刻拉一次，首页控台才不会漏掉
+    // 那些在打开应用之前就排队的请求（它们不会再触发一次 pending 事件）。
+    void refreshPendingRequests();
+    // 登录后同样要接管上次留下的等待中申请。
+    void resumeAccessRequests();
   }
 }
 
@@ -472,6 +498,107 @@ async function refreshServerStatus() {
   }
 }
 
+/* 审批入站申请在首页控台与设置页「客户端」里是同一个动作：入口放在共享上下文，
+   避免两处各自拼 admin 参数、各自刷新列表而出现短暂不一致。 */
+async function refreshPendingRequests() {
+  try {
+    pendingRequests.value = await invoke("list_pending_requests", {
+      username: adminUsername.value,
+      password: serverPassword.value,
+    });
+    await refreshServerStatus();
+  } catch (error) {
+    handleFailure(error);
+  }
+}
+
+async function approvePendingRequest(requestId) {
+  const result = await invoke("approve_pending_request", {
+    username: adminUsername.value,
+    password: serverPassword.value,
+    requestId,
+  });
+  setNotice(result.autoDelivery ? "pending.approvedAuto" : "pending.approved");
+  // 审批完立即从待审批列表里消失：首页控台和设置页读的是同一份列表。
+  await refreshPendingRequests();
+  return result;
+}
+
+/* 出站访问申请：状态存在后端内存里，前端只负责展示与接线。
+   这样切换页面（视图重建）或 webview 重载都不会让「等待批准」退回「可以申请」。 */
+
+/// 正在等待批准、已经接上长轮询的地址，避免重复发起等待。
+const accessWaits = new Set();
+
+async function refreshAccessRequests() {
+  try {
+    const entries = await invoke("access_requests");
+    accessRequests.value = Array.isArray(entries) ? entries : [];
+  } catch (error) {
+    const normalized = normalizeAppError(error);
+    console.error(
+      `[peerdav:${normalized.code}] access request snapshot failed`,
+      { detail: normalized.detail, context: normalized.context },
+    );
+  }
+}
+
+function accessRequestFor(url) {
+  return accessRequests.value.find((entry) => entry.url === url) ?? null;
+}
+
+/// 等待审批：成功后后端已保存对端，这里只刷新列表；失败原因留在申请状态里，
+/// 列表直接显示，不需要额外的 toast。
+function trackPeerAccess(url, label = null) {
+  if (accessWaits.has(url)) return;
+  accessWaits.add(url);
+  void (async () => {
+    try {
+      const peer = await invoke("wait_for_peer_access", { url, label });
+      await refreshPeers();
+      setNotice("home.added", { label: peer.label });
+    } catch (error) {
+      const normalized = normalizeAppError(error);
+      if (normalized.code === "PEER_ACCESS_CANCELED") {
+        setNotice("home.requestCanceled");
+      } else if (normalized.code === "VAULT_LOCKED") {
+        // 金库锁着只是暂时接不上：后端保留「等待批准」，解锁后会重新接上。
+        handleFailure(error);
+      }
+    } finally {
+      accessWaits.delete(url);
+      await refreshAccessRequests();
+    }
+  })();
+}
+
+/// 申请访问一台服务器。后端会复用同一地址仍在等待的申请，不会重复登记。
+async function beginPeerAccess(url, label = null, fingerprint = null) {
+  const args = { url, label };
+  if (fingerprint) args.fingerprint = fingerprint;
+  const entry = await invoke("request_peer_access", args);
+  await refreshAccessRequests();
+  if (entry.status === "waiting") {
+    trackPeerAccess(url, label);
+  }
+  return entry;
+}
+
+async function cancelPeerAccess(url) {
+  await invoke("cancel_peer_access", { url });
+  await refreshAccessRequests();
+}
+
+/// 启动/登录后恢复：后端记着哪些申请还在等批准，前端只需要重新接上等待。
+async function resumeAccessRequests() {
+  await refreshAccessRequests();
+  for (const entry of accessRequests.value) {
+    if (entry.status === "waiting") {
+      trackPeerAccess(entry.url, entry.label ?? null);
+    }
+  }
+}
+
 /// Restores a server that the administrator left enabled on the previous run.
 /// This runs even while the vault is locked: WebDAV only needs the non-secret
 /// share/authorization catalog, not the vault key.
@@ -480,6 +607,23 @@ async function resumeServer() {
     serverStatus.value = await invoke("resume_server");
   } catch (error) {
     handleFailure(error);
+  }
+}
+
+async function refreshConnections() {
+  if (connectionRefreshInFlight) return;
+  connectionRefreshInFlight = true;
+  try {
+    const [inbound, outbound, fingerprint] = await Promise.all([
+      invoke("inbound_connections"), invoke("outbound_connections"), invoke("device_fingerprint"),
+    ]);
+    inboundConnections.value = Array.isArray(inbound) ? inbound : [];
+    outboundConnections.value = Array.isArray(outbound) ? outbound : [];
+    deviceFingerprint.value = typeof fingerprint === "string" ? fingerprint : "";
+  } catch (error) {
+    console.error("Connection snapshot refresh failed", normalizeAppError(error));
+  } finally {
+    connectionRefreshInFlight = false;
   }
 }
 
@@ -585,6 +729,20 @@ provide(
     serverPassword,
     serverStatus,
     pendingRequests,
+    accessRequests,
+    inboundConnections,
+    outboundConnections,
+    deviceFingerprint,
+    refreshConnections,
+    accessRequestFor,
+    beginPeerAccess,
+    cancelPeerAccess,
+    resumeAccessRequests,
+    refreshAccessRequests,
+    adminShares,
+    adminAuthorizations,
+    adminLoading,
+    peerShareCounts,
     peers,
     peersLoading,
     discovered,
@@ -603,6 +761,8 @@ provide(
     clearTransfer,
     refreshStatus,
     refreshServerStatus,
+    refreshPendingRequests,
+    approvePendingRequest,
     refreshPeers,
     refreshDiscovered,
     completeLogin,
@@ -1196,7 +1356,7 @@ provide(
 /* Solid primary buttons use the accent's on-colour. Plain, text and link
    variants keep Element Plus's accent-coloured foreground so they stay
    readable on their near-white surfaces. */
-:root .el-button--primary:not(.is-plain):not(.is-text):not(.is-link) {
+:root .el-button--primary:not(.is-plain):not(.is-text):not(.is-link):not(.list-pill) {
   --el-button-text-color: var(--accent-on);
   --el-button-hover-text-color: var(--accent-on);
   --el-button-active-text-color: var(--accent-on);

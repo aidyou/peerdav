@@ -43,10 +43,11 @@ use crate::types::{
     DirectoryDownloadPlan, DiscoveredPeer, DownloadCandidate, ExternalEditInfo,
     MAX_ACCESS_REQUEST_ID_CHARS, MAX_AUTHORIZATION_CODE_CHARS, MAX_DIR_ENTRIES,
     MAX_DIRECTORY_DOWNLOAD_FILES, MAX_PREVIEW_BYTES, MAX_PREVIEW_LINES, MAX_REMOTE_PATH_BYTES,
-    MAX_TRANSFER_BYTES, MIN_ACCESS_REQUEST_ID_CHARS, PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT,
-    PEER_PRESENCE_INTERVAL, PEER_REQUEST_TIMEOUT, PEER_SYNC_INTERVAL, PeerAccessRequest, PeerEntry,
-    PeerHealth, PeerInfo, PeerListing, PeerRecord, PeerRevocationInfo, PeerShare, PeerStatus,
-    PreviewPayload, SERVER_DISCOVERY_PORT_META, SHARE_URL_PREFIX, TransferResult,
+    MAX_TRANSFER_BYTES, MIN_ACCESS_REQUEST_ID_CHARS, OutboundAccessRequest, OutboundAccessStatus,
+    PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT, PEER_PRESENCE_INTERVAL, PEER_REQUEST_TIMEOUT,
+    PEER_SYNC_INTERVAL, PeerAccessRequest, PeerEntry, PeerHealth, PeerInfo, PeerListing,
+    PeerRecord, PeerRevocationInfo, PeerShare, PeerStatus, PreviewPayload,
+    SERVER_DISCOVERY_PORT_META, SHARE_URL_PREFIX, TransferResult,
 };
 use crate::vault::Vault;
 
@@ -301,6 +302,13 @@ struct ExternalEdit {
     baseline_etag: Option<String>,
 }
 
+/// 一条出站访问申请：对外快照 + 仅后端使用的轮询请求键。
+#[derive(Debug, Clone)]
+struct OutboundAccess {
+    request: OutboundAccessRequest,
+    request_id: Option<String>,
+}
+
 struct RunningPeerBackground {
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
@@ -326,7 +334,6 @@ enum AuthorizationOutcome {
 /// operation re-reads the code from the vault so revocation is immediate.
 pub struct PeerManager {
     vault: Arc<Vault>,
-    agent: reqwest::Client,
     temp_root: PathBuf,
     limits: PeerLimits,
     edits: Mutex<HashMap<String, ExternalEdit>>,
@@ -335,6 +342,11 @@ pub struct PeerManager {
     background: std::sync::Mutex<Option<RunningPeerBackground>>,
     discovery: std::sync::Mutex<Option<Arc<DiscoveryListener>>>,
     availability: std::sync::Mutex<HashMap<String, PeerAvailability>>,
+    /// 出站访问申请（按规范化后的服务器地址）。列表读取的是这份内存状态，因此
+    /// 切换页面、重建视图或 webview 重载都不会让「等待批准」退回「可以申请」。
+    outbound_access: std::sync::Mutex<HashMap<String, OutboundAccess>>,
+    outbound_connections: std::sync::Mutex<HashMap<String, crate::types::ConnectionInfo>>,
+    pairing_pins: std::sync::Mutex<HashMap<String, String>>,
 }
 
 impl Drop for PeerManager {
@@ -413,16 +425,8 @@ impl PeerManager {
         cleanup_stale_runs(&temp_root);
         let run_root = temp_root.join(format!("run-{}", random_hex(8)));
         create_private_dir(&run_root)?;
-        let agent = reqwest::Client::builder()
-            .timeout(limits.request_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|error| DomainError::Internal {
-                detail: format!("failed to build the peer HTTP client: {error}"),
-            })?;
         Ok(Self {
             vault,
-            agent,
             temp_root: run_root,
             limits,
             edits: Mutex::new(HashMap::new()),
@@ -431,6 +435,9 @@ impl PeerManager {
             background: std::sync::Mutex::new(None),
             discovery: std::sync::Mutex::new(None),
             availability: std::sync::Mutex::new(HashMap::new()),
+            outbound_access: std::sync::Mutex::new(HashMap::new()),
+            outbound_connections: std::sync::Mutex::new(HashMap::new()),
+            pairing_pins: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -554,7 +561,18 @@ impl PeerManager {
         match self.discovery.lock() {
             Ok(slot) => slot
                 .as_ref()
-                .map(|listener| listener.peers())
+                .map(|listener| {
+                    listener
+                        .peers()
+                        .into_iter()
+                        .filter(|peer| {
+                            crate::tls::self_connection_allowed(
+                                self.vault.fingerprint(),
+                                &peer.server_id,
+                            )
+                        })
+                        .collect()
+                })
                 .unwrap_or_default(),
             Err(_) => {
                 log::warn!("peer discovery mutex poisoned");
@@ -643,7 +661,95 @@ impl PeerManager {
         timeout_ms: Option<u64>,
     ) -> Result<Vec<DiscoveredPeer>, DomainError> {
         let port = port.unwrap_or(DEFAULT_DISCOVERY_PORT);
-        discovery::scan(port, timeout_ms).await
+        Ok(discovery::scan(port, timeout_ms)
+            .await?
+            .into_iter()
+            .filter(|peer| {
+                crate::tls::self_connection_allowed(self.vault.fingerprint(), &peer.server_id)
+            })
+            .collect())
+    }
+
+    pub fn outbound_connections(&self) -> Result<Vec<crate::types::ConnectionInfo>, DomainError> {
+        use crate::types::{ConnectionInfo, ConnectionState};
+        let peers = self.list_peers()?;
+        let mut registry = self
+            .outbound_connections
+            .lock()
+            .map_err(|_| DomainError::Internal {
+                detail: "outbound connection registry poisoned".into(),
+            })?;
+        for row in registry.values_mut() {
+            row.authorized = false;
+            row.state = ConnectionState::Disconnected;
+        }
+        for server in self.discovered_peers() {
+            let row = registry
+                .entry(server.server_id.clone())
+                .or_insert(ConnectionInfo {
+                    fingerprint: server.server_id,
+                    name: server.name.clone(),
+                    address: server.url.clone(),
+                    state: ConnectionState::Discovered,
+                    authorized: false,
+                    active_connections: 0,
+                    last_seen: now_unix(),
+                });
+            row.name = server.name;
+            row.address = server.url;
+            row.state = ConnectionState::Discovered;
+            row.last_seen = now_unix();
+        }
+        for entry in self.access_requests() {
+            if let Some(fingerprint) = entry.fingerprint {
+                let row = registry
+                    .entry(fingerprint.clone())
+                    .or_insert(ConnectionInfo {
+                        fingerprint,
+                        name: entry.label.clone().unwrap_or_else(|| entry.url.clone()),
+                        address: entry.url,
+                        state: ConnectionState::Requesting,
+                        authorized: false,
+                        active_connections: 0,
+                        last_seen: now_unix(),
+                    });
+                if !row.authorized {
+                    row.state = match entry.status {
+                        OutboundAccessStatus::Waiting => ConnectionState::Pending,
+                        OutboundAccessStatus::Canceled => ConnectionState::Canceled,
+                        OutboundAccessStatus::Expired => ConnectionState::Expired,
+                        OutboundAccessStatus::Failed => ConnectionState::Failed,
+                        OutboundAccessStatus::Accessible => ConnectionState::Approved,
+                    };
+                }
+            }
+        }
+        for peer in peers {
+            if let Some(fingerprint) = peer.fingerprint {
+                let row = registry
+                    .entry(fingerprint.clone())
+                    .or_insert(ConnectionInfo {
+                        fingerprint,
+                        name: peer.label.clone(),
+                        address: peer.url.clone(),
+                        state: ConnectionState::Approved,
+                        authorized: true,
+                        active_connections: 0,
+                        last_seen: now_unix(),
+                    });
+                row.name = peer.label;
+                row.address = peer.url;
+                row.authorized = true;
+                row.state = if peer.online {
+                    ConnectionState::Connected
+                } else {
+                    ConnectionState::Disconnected
+                };
+            }
+        }
+        let mut rows: Vec<_> = registry.values().cloned().collect();
+        rows.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+        Ok(rows)
     }
 
     pub fn list_peers(&self) -> Result<Vec<PeerInfo>, DomainError> {
@@ -653,6 +759,7 @@ impl PeerManager {
         Ok(records
             .into_iter()
             .map(|record| PeerInfo {
+                fingerprint: record.machine_id.clone(),
                 online: availability.get(&record.id).copied().unwrap_or(false)
                     || url_is_announced(&record.url, &announced),
                 id: record.id,
@@ -667,16 +774,21 @@ impl PeerManager {
     /// still enforced: a denied peer receives `PEER_REQUEST_FAILED`, and
     /// nothing is approved automatically. The returned request id is used to
     /// claim the code after an administrator approves the request.
+    ///
+    /// 请求同时带上本机机器码：服务端按机器码而不是 IP 识别申请方，所以换网段、
+    /// 重新分配地址之后仍然是同一条申请，不会在对方控台里变成一台新设备。
     pub async fn request_access(&self, url: &str) -> Result<PeerAccessRequest, DomainError> {
         let url = normalize_peer_url(url)?;
         let request_id = random_hex(16);
         let endpoint = format!("{url}{CATALOG_PATH}");
         let response = tokio::time::timeout(
             HEALTH_TIMEOUT,
-            self.agent
-                .get(endpoint)
-                .header(ACCESS_REQUEST_HEADER, &request_id)
-                .send(),
+            with_machine_id(
+                self.agent_for(&url)?
+                    .get(endpoint)
+                    .header(ACCESS_REQUEST_HEADER, &request_id),
+            )
+            .send(),
         )
         .await
         .map_err(|_| DomainError::PeerRequest {
@@ -730,10 +842,12 @@ impl PeerManager {
         let endpoint = format!("{url}{ACCESS_STATUS_PATH}");
         let response = tokio::time::timeout(
             HEALTH_TIMEOUT,
-            self.agent
-                .delete(endpoint)
-                .header(ACCESS_REQUEST_HEADER, request_id)
-                .send(),
+            with_machine_id(
+                self.agent_for(&url)?
+                    .delete(endpoint)
+                    .header(ACCESS_REQUEST_HEADER, request_id),
+            )
+            .send(),
         )
         .await
         .map_err(|_| DomainError::PeerRequest {
@@ -768,6 +882,195 @@ impl PeerManager {
                 .unwrap_or("server rejected the cancellation")
                 .to_owned(),
         })
+    }
+
+    /// 发起或复用一次出站访问申请，并把结果记在后端内存里。
+    ///
+    /// 同一地址已经在等待批准时直接返回既有记录：页面重载后前端会再次调用本方法，
+    /// 不能因此朝对方重复登记一条申请。申请失败也记成终态返回，让列表能显示原因，
+    /// 而不是只靠一次性的 toast，刷新页面后消失。
+    pub async fn begin_access(
+        &self,
+        url: &str,
+        label: Option<&str>,
+    ) -> Result<OutboundAccessRequest, DomainError> {
+        let url = normalize_peer_url(url)?;
+        let label = label
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_owned);
+
+        if let Some(existing) = self.outbound_entry(&url)
+            && existing.request.status == OutboundAccessStatus::Waiting
+        {
+            return Ok(existing.request);
+        }
+
+        if let Ok(expected) = self.expected_identity(&url)
+            && !crate::tls::self_connection_allowed(self.vault.fingerprint(), &expected)
+        {
+            return Err(DomainError::SelfConnectionForbidden);
+        }
+        let entry = match self.request_access(&url).await {
+            Ok(request) if !request.requested => OutboundAccess {
+                request: OutboundAccessRequest {
+                    fingerprint: self.expected_identity(&url).ok(),
+                    url: url.clone(),
+                    label,
+                    status: OutboundAccessStatus::Accessible,
+                    message: None,
+                },
+                request_id: None,
+            },
+            Ok(request) => match request.request_id {
+                Some(request_id) => OutboundAccess {
+                    request: OutboundAccessRequest {
+                        fingerprint: self.expected_identity(&url).ok(),
+                        url: url.clone(),
+                        label,
+                        status: OutboundAccessStatus::Waiting,
+                        message: None,
+                    },
+                    request_id: Some(request_id),
+                },
+                // 对方要求授权却没给申请标识：接不上审批结果，只能记为失败。
+                None => {
+                    let error = DomainError::PeerProtocol {
+                        detail: "the server did not return an access request id".to_owned(),
+                    };
+                    settle_outbound_entry(url, label, access_failure(&error))
+                }
+            },
+            Err(error) => settle_outbound_entry(url, label, access_failure(&error)),
+        };
+        self.store_outbound(&entry);
+        Ok(entry.request.clone())
+    }
+
+    /// 等待审批结果并写回共享状态；成功时保存对端并清掉这条申请。
+    pub async fn await_access(
+        &self,
+        url: &str,
+        label: Option<&str>,
+    ) -> Result<PeerInfo, DomainError> {
+        let url = normalize_peer_url(url)?;
+        let request_id = self
+            .outbound_entry(&url)
+            .and_then(|entry| entry.request_id)
+            .ok_or(DomainError::PeerAccessExpired)?;
+
+        let code = match self.wait_for_access(&url, &request_id).await {
+            Ok(code) => code,
+            Err(error) => {
+                // 金库锁着只是暂时连不上，保留「等待批准」；解锁后前端会重新接上。
+                if !matches!(error, DomainError::VaultLocked) {
+                    self.settle_outbound(&url, access_failure(&error));
+                }
+                return Err(error);
+            }
+        };
+
+        let code = Zeroizing::new(code);
+        match self.connect(&url, code.as_str(), label).await {
+            Ok(peer) => {
+                self.clear_outbound(&url);
+                Ok(peer)
+            }
+            Err(error) => {
+                self.settle_outbound(&url, access_failure(&error));
+                Err(error)
+            }
+        }
+    }
+
+    /// 取消等待中的申请，并把状态记为「已取消」。
+    pub async fn cancel_access_request(
+        &self,
+        url: &str,
+    ) -> Result<OutboundAccessRequest, DomainError> {
+        let url = normalize_peer_url(url)?;
+        let request_id = self.outbound_entry(&url).and_then(|entry| entry.request_id);
+        if let Some(request_id) = request_id {
+            self.cancel_access(&url, &request_id).await?;
+        }
+
+        let entry = match self.outbound_entry(&url) {
+            Some(mut entry) => {
+                entry.request.status = OutboundAccessStatus::Canceled;
+                entry.request.message = None;
+                entry.request_id = None;
+                entry
+            }
+            None => OutboundAccess {
+                request: OutboundAccessRequest {
+                    fingerprint: self.expected_identity(&url).ok(),
+                    url: url.clone(),
+                    label: None,
+                    status: OutboundAccessStatus::Canceled,
+                    message: None,
+                },
+                request_id: None,
+            },
+        };
+        self.store_outbound(&entry);
+        Ok(entry.request.clone())
+    }
+
+    /// 所有出站访问申请的快照。按地址排序，列表顺序因此不会随哈希顺序抖动。
+    pub fn access_requests(&self) -> Vec<OutboundAccessRequest> {
+        let mut entries: Vec<OutboundAccessRequest> = match self.outbound_access.lock() {
+            Ok(registry) => registry
+                .values()
+                .map(|entry| entry.request.clone())
+                .collect(),
+            Err(_) => {
+                log::warn!("outbound access registry lock poisoned");
+                Vec::new()
+            }
+        };
+        entries.sort_by(|left, right| left.url.cmp(&right.url));
+        entries
+    }
+
+    fn outbound_entry(&self, url: &str) -> Option<OutboundAccess> {
+        match self.outbound_access.lock() {
+            Ok(registry) => registry.get(url).cloned(),
+            Err(_) => {
+                log::warn!("outbound access registry lock poisoned");
+                None
+            }
+        }
+    }
+
+    fn store_outbound(&self, entry: &OutboundAccess) {
+        match self.outbound_access.lock() {
+            Ok(mut registry) => {
+                registry.insert(entry.request.url.clone(), entry.clone());
+            }
+            Err(_) => log::warn!("outbound access registry lock poisoned while recording"),
+        }
+    }
+
+    fn settle_outbound(&self, url: &str, settled: (OutboundAccessStatus, Option<String>)) {
+        let entry = match self.outbound_entry(url) {
+            Some(mut entry) => {
+                entry.request.status = settled.0;
+                entry.request.message = settled.1;
+                entry.request_id = None;
+                entry
+            }
+            None => return,
+        };
+        self.store_outbound(&entry);
+    }
+
+    fn clear_outbound(&self, url: &str) {
+        match self.outbound_access.lock() {
+            Ok(mut registry) => {
+                registry.remove(url);
+            }
+            Err(_) => log::warn!("outbound access registry lock poisoned while clearing"),
+        }
     }
 
     /// Waits for an administrator to approve a request and returns the
@@ -807,10 +1110,12 @@ impl PeerManager {
             }
             let response = tokio::time::timeout(
                 HEALTH_TIMEOUT,
-                self.agent
-                    .get(&endpoint)
-                    .header(ACCESS_REQUEST_HEADER, request_id)
-                    .send(),
+                with_machine_id(
+                    self.agent_for(&url)?
+                        .get(&endpoint)
+                        .header(ACCESS_REQUEST_HEADER, request_id),
+                )
+                .send(),
             )
             .await
             .map_err(|_| DomainError::PeerRequest {
@@ -907,7 +1212,7 @@ impl PeerManager {
         }
 
         let client = build_client(
-            &self.agent,
+            &self.agent_for(&url)?,
             &url,
             Auth::Basic(CLIENT_USERNAME.to_owned(), code.to_owned()),
         )?;
@@ -919,11 +1224,10 @@ impl PeerManager {
                 detail: "the connection timed out".to_owned(),
             })??;
 
-        let existing = self
-            .vault
-            .list_peer_records()?
-            .into_iter()
-            .find(|record| record.url == url);
+        let existing =
+            self.vault.list_peer_records()?.into_iter().find(|record| {
+                record.machine_id == catalog.machine_id && record.machine_id.is_some()
+            });
         let now = now_unix();
         let id = existing
             .as_ref()
@@ -956,6 +1260,12 @@ impl PeerManager {
             label: label.clone(),
             url: url.clone(),
             authorization_id,
+            // 记住对端机器码：解绑这台设备时用它清掉本机为它开过的入站授权。
+            machine_id: catalog.machine_id.clone().or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|record| record.machine_id.clone())
+            }),
             created_at: existing.as_ref().map_or(now, |record| record.created_at),
             last_connected_at: Some(now),
         };
@@ -970,6 +1280,7 @@ impl PeerManager {
         self.set_peer_online(&id, true);
 
         Ok(PeerInfo {
+            fingerprint: record.machine_id.clone(),
             id,
             label,
             url,
@@ -1041,7 +1352,10 @@ impl PeerManager {
     /// local record is removed when the server confirms removal or reports that
     /// the authorization no longer exists. A transport failure leaves the record
     /// intact so the user can retry.
-    pub async fn forget(&self, peer_id: &str) -> Result<(), DomainError> {
+    ///
+    /// 返回被解绑设备的机器码，供调用方清掉本机为同一台设备开过的入站授权；
+    /// 老记录没有机器码时返回 `None`。
+    pub async fn forget(&self, peer_id: &str) -> Result<Option<String>, DomainError> {
         let record = self
             .vault
             .peer_record(peer_id)?
@@ -1053,7 +1367,8 @@ impl PeerManager {
             Ok(()) | Err(DomainError::PeerAuthorizationRejected) => {}
             Err(error) => return Err(error),
         }
-        self.forget_local(peer_id).await
+        self.forget_local(peer_id).await?;
+        Ok(record.machine_id)
     }
 
     /// Removes a peer only from this installation. This is used after the
@@ -1089,7 +1404,28 @@ impl PeerManager {
         let announced = self.discovered_peers();
         let mut removed = 0;
 
-        for record in records {
+        for mut record in records {
+            if let Some(candidate) = announced
+                .iter()
+                .find(|server| record.machine_id.as_deref() == Some(server.server_id.as_str()))
+                && record.url != candidate.url
+            {
+                let agent = crate::tls::agent(
+                    &self.vault,
+                    candidate.server_id.as_str(),
+                    self.limits.request_timeout,
+                )?;
+                let code = self.vault.load_peer_code(&record.id)?;
+                let probe = build_client(
+                    &agent,
+                    &candidate.url,
+                    Auth::Basic(CLIENT_USERNAME.into(), code.code),
+                )?;
+                if catalog(&probe).await.is_ok() {
+                    record.url = candidate.url.clone();
+                    self.vault.save_peer_record(&record)?;
+                }
+            }
             let recently_announced = url_is_announced(&record.url, &announced);
             // Broadcasts are the primary heartbeat. A known-offline server is
             // skipped entirely and waits for its next announcement; unknown or
@@ -1226,11 +1562,13 @@ impl PeerManager {
         let endpoint = format!("{}{AUTHORIZATION_PATH}", normalize_peer_url(url)?);
         let response = tokio::time::timeout(
             HEALTH_TIMEOUT,
-            self.agent
-                .post(endpoint)
-                .basic_auth(CLIENT_USERNAME, Some(code))
-                .header(CLIENT_ID_HEADER, client_id)
-                .send(),
+            with_machine_id(
+                self.agent_for(url)?
+                    .post(endpoint)
+                    .basic_auth(CLIENT_USERNAME, Some(code))
+                    .header(CLIENT_ID_HEADER, client_id),
+            )
+            .send(),
         )
         .await
         .map_err(|_| DomainError::PeerRequest {
@@ -1277,7 +1615,7 @@ impl PeerManager {
         let endpoint = format!("{}{AUTHORIZATION_PATH}", normalize_peer_url(url)?);
         let response = tokio::time::timeout(
             HEALTH_TIMEOUT,
-            self.agent
+            self.agent_for(url)?
                 .delete(endpoint)
                 .basic_auth(CLIENT_USERNAME, Some(code))
                 .send(),
@@ -1316,7 +1654,7 @@ impl PeerManager {
         let endpoint = format!("{}{AUTHORIZATION_PATH}", normalize_peer_url(url)?);
         let response = tokio::time::timeout(
             HEALTH_TIMEOUT,
-            self.agent
+            self.agent_for(url)?
                 .get(endpoint)
                 .basic_auth(CLIENT_USERNAME, Some(code))
                 .send(),
@@ -1596,21 +1934,9 @@ impl PeerManager {
         let dir = canonical_local_dir(local_dir).await?;
         let destination = resolve_local_destination(&dir, &file_name, conflict).await?;
 
-        let response = client
-            .get_raw(&remote)
-            .await
-            .map_err(|error| map_dav_error("download file", error, &display))?;
-        ensure_status(response.status(), "download file", &display)?;
-
-        let written = write_response_to_file(
-            response,
-            &dir,
-            &destination,
-            self.limits.max_transfer_bytes,
-            conflict,
-            None,
-        )
-        .await?;
+        let written = self
+            .resumable_download(&client, &remote, &display, &destination, conflict, None)
+            .await?;
 
         Ok(TransferResult {
             transferred: true,
@@ -1645,23 +1971,17 @@ impl PeerManager {
     ) -> Result<TransferResult, DomainError> {
         let (_, client) = self.peer_client(peer_id)?;
         let (display, remote, _) = remote_file_target(share_id, remote_path)?;
-        let (directory, destination) = resolve_local_file_destination(local_path).await?;
-
-        let response = client
-            .get_raw(&remote)
-            .await
-            .map_err(|error| map_dav_error("download file", error, &display))?;
-        ensure_status(response.status(), "download file", &display)?;
-
-        let written = write_response_to_file(
-            response,
-            &directory,
-            &destination,
-            self.limits.max_transfer_bytes,
-            ConflictPolicy::Overwrite,
-            progress,
-        )
-        .await?;
+        let (_, destination) = resolve_local_file_destination(local_path).await?;
+        let written = self
+            .resumable_download(
+                &client,
+                &remote,
+                &display,
+                &destination,
+                ConflictPolicy::Overwrite,
+                progress,
+            )
+            .await?;
 
         Ok(TransferResult {
             transferred: true,
@@ -1670,6 +1990,27 @@ impl PeerManager {
             bytes: written,
             skipped_reason: None,
         })
+    }
+
+    async fn resumable_download(
+        &self,
+        client: &Client,
+        remote: &str,
+        display: &str,
+        destination: &Path,
+        conflict: ConflictPolicy,
+        progress: Option<TransferProgressCallback>,
+    ) -> Result<u64, DomainError> {
+        crate::transfer::download(
+            client,
+            remote,
+            display,
+            destination,
+            conflict,
+            self.limits.max_transfer_bytes,
+            progress,
+        )
+        .await
     }
 
     pub async fn upload(
@@ -1713,20 +2054,7 @@ impl PeerManager {
         )
         .await?;
 
-        let file = tokio::fs::File::open(&local)
-            .await
-            .map_err(|error| io_error("open local file", &local, error))?;
-        tokio::time::timeout(
-            TRANSFER_TIMEOUT,
-            client.put(&remote, reqwest::Body::from(file)),
-        )
-        .await
-        .map_err(|_| DomainError::PeerRequest {
-            operation: "upload file",
-            status: None,
-            detail: "the upload timed out".to_owned(),
-        })?
-        .map_err(|error| map_dav_error("upload file", error, &display))?;
+        crate::transfer::upload(&client, &remote, &local, size).await?;
 
         Ok(TransferResult {
             transferred: true,
@@ -1994,6 +2322,58 @@ impl PeerManager {
         Ok(())
     }
 
+    pub fn set_pairing_fingerprint(&self, url: &str, fingerprint: &str) -> Result<(), DomainError> {
+        let url = normalize_peer_url(url)?;
+        let fingerprint =
+            crate::tls::normalize_fingerprint(Some(fingerprint)).ok_or_else(|| {
+                DomainError::PeerProtocol {
+                    detail: "The device fingerprint must contain 64 hexadecimal characters.".into(),
+                }
+            })?;
+        if !crate::tls::self_connection_allowed(self.vault.fingerprint(), &fingerprint) {
+            return Err(DomainError::SelfConnectionForbidden);
+        }
+        if let Some(saved) = self
+            .vault
+            .list_peer_records()?
+            .iter()
+            .find(|peer| peer.url == url)
+            && saved.machine_id.as_deref() != Some(fingerprint.as_str())
+        {
+            return Err(DomainError::PeerProtocol { detail: "The fingerprint differs from the paired device; unbind it before pairing a new identity.".into() });
+        }
+        self.pairing_pins
+            .lock()
+            .map_err(|_| DomainError::Internal {
+                detail: "pairing registry lock poisoned".into(),
+            })?
+            .insert(url, fingerprint);
+        Ok(())
+    }
+
+    fn agent_for(&self, url: &str) -> Result<reqwest::Client, DomainError> {
+        crate::tls::agent(
+            &self.vault,
+            &self.expected_identity(url)?,
+            self.limits.request_timeout,
+        )
+    }
+
+    fn expected_identity(&self, url: &str) -> Result<String, DomainError> {
+        let expected = self.vault.list_peer_records()?.into_iter()
+            .find(|peer| peer.url == url).and_then(|peer| peer.machine_id)
+            .or_else(|| self.pairing_pins.lock().ok().and_then(|pins| pins.get(url).cloned()))
+            .or_else(|| self.discovered_peers().into_iter()
+                .find(|peer| announced_peer_matches(url, peer)).map(|peer| peer.server_id))
+            .or_else(|| url::Url::parse(url).ok().filter(|url| {
+                matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "localhost"))
+            }).map(|_| self.vault.identity().fingerprint.clone()))
+            .ok_or_else(|| DomainError::PeerProtocol {
+                detail: "No verified server fingerprint is available. Select a discovered server or enter its fingerprint before pairing.".into(),
+            })?;
+        Ok(expected)
+    }
+
     fn peer_client(&self, peer_id: &str) -> Result<(PeerRecord, Client), DomainError> {
         let record = self
             .vault
@@ -2013,7 +2393,7 @@ impl PeerManager {
                 other => other,
             })?;
         let client = build_client(
-            &self.agent,
+            &self.agent_for(&record.url)?,
             &record.url,
             Auth::Basic(CLIENT_USERNAME.to_owned(), secret.code),
         )?;
@@ -2030,6 +2410,12 @@ fn build_client(agent: &reqwest::Client, host: &str, auth: Auth) -> Result<Clien
         .map_err(|error| DomainError::PeerProtocol {
             detail: format!("failed to build a WebDAV client: {error}"),
         })
+}
+
+/// 给 PeerDav 协议请求带上本机机器码。取不到机器码时不加这个头：服务端会把
+/// 申请身份退回 IP，老行为保持不变，而不是拒绝请求。
+fn with_machine_id(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    builder
 }
 
 async fn catalog(client: &Client) -> Result<CatalogResponse, DomainError> {
@@ -2082,12 +2468,9 @@ fn normalize_peer_url(raw: &str) -> Result<String, DomainError> {
     let url = Url::parse(trimmed).map_err(|error| DomainError::InvalidPeerUrl {
         detail: format!("`{trimmed}` is not a valid URL: {error}"),
     })?;
-    if url.scheme() != "http" {
+    if url.scheme() != "https" {
         return Err(DomainError::InvalidPeerUrl {
-            detail: format!(
-                "scheme `{}` is not supported; PeerDav currently uses plain http:// on the LAN",
-                url.scheme()
-            ),
+            detail: "PeerDav requires an encrypted https:// connection".to_owned(),
         });
     }
     if !url.username().is_empty() || url.password().is_some() {
@@ -2122,6 +2505,41 @@ fn normalize_peer_url(raw: &str) -> Result<String, DomainError> {
         });
     }
     Ok(url.origin().ascii_serialization())
+}
+
+/// 申请失败对应到列表上的终态，并保留一句面向用户的原因（单层文案，来自统一的
+/// 错误映射，不再拼接上下文）。用户主动取消除外：那不是错误。
+fn access_failure(error: &DomainError) -> (OutboundAccessStatus, Option<String>) {
+    let status = match error {
+        DomainError::PeerAccessCanceled => OutboundAccessStatus::Canceled,
+        DomainError::PeerAccessTimeout | DomainError::PeerAccessExpired => {
+            OutboundAccessStatus::Expired
+        }
+        _ => OutboundAccessStatus::Failed,
+    };
+    let message = match status {
+        OutboundAccessStatus::Canceled => None,
+        _ => Some(AppError::from_ref(error).message),
+    };
+    (status, message)
+}
+
+/// 申请阶段（还没拿到申请标识）就直接失败的条目。
+fn settle_outbound_entry(
+    url: String,
+    label: Option<String>,
+    settled: (OutboundAccessStatus, Option<String>),
+) -> OutboundAccess {
+    OutboundAccess {
+        request: OutboundAccessRequest {
+            fingerprint: None,
+            url,
+            label,
+            status: settled.0,
+            message: settled.1,
+        },
+        request_id: None,
+    }
 }
 
 fn default_label(url: &str) -> String {
@@ -2842,40 +3260,6 @@ async fn read_response_limited(
         }
     }
     Ok(data)
-}
-
-async fn write_response_to_file(
-    response: reqwest::Response,
-    directory: &Path,
-    destination: &Path,
-    limit: u64,
-    conflict: ConflictPolicy,
-    progress: Option<TransferProgressCallback>,
-) -> Result<u64, DomainError> {
-    let temp = directory.join(format!(".peerdav-{}.part", random_hex(8)));
-    let (written, _) =
-        write_response_to_path(response, &temp, limit, "download file", progress).await?;
-
-    if conflict == ConflictPolicy::Fail && destination.exists() {
-        remove_file_best_effort(&temp);
-        return Err(DomainError::TransferConflict {
-            path: destination.display().to_string(),
-        });
-    }
-
-    if let Err(error) = tokio::fs::rename(&temp, destination).await {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            remove_file_best_effort(destination);
-            if let Err(retry) = tokio::fs::rename(&temp, destination).await {
-                remove_file_best_effort(&temp);
-                return Err(io_error("commit download", destination, retry));
-            }
-        } else {
-            remove_file_best_effort(&temp);
-            return Err(io_error("commit download", destination, error));
-        }
-    }
-    Ok(written)
 }
 
 async fn write_response_to_path(

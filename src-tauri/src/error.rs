@@ -33,6 +33,9 @@ pub enum DomainError {
         source: std::io::Error,
     },
 
+    #[error("release builds cannot connect to this device")]
+    SelfConnectionForbidden,
+
     #[error("vault is not initialized")]
     VaultNotInitialized,
 
@@ -307,6 +310,7 @@ fn error_code(error: &DomainError) -> &'static str {
         DomainError::ServerAlreadyRunning => "SERVER_ALREADY_RUNNING",
         DomainError::ServerBind { .. } => "SERVER_BIND_FAILED",
         DomainError::ServerTask { .. } => "SERVER_TASK_FAILED",
+        DomainError::SelfConnectionForbidden => "PEER_SELF_CONNECTION_FORBIDDEN",
         DomainError::InvalidPeerUrl { .. } => "PEER_INVALID_URL",
         DomainError::PeerAuthorizationRequired => "PEER_AUTHORIZATION_REQUIRED",
         DomainError::PeerAuthorizationRejected => "PEER_AUTHORIZATION_REJECTED",
@@ -340,6 +344,7 @@ fn user_message(error: &DomainError) -> String {
         DomainError::DatabaseOpen { .. } => {
             "打开本地数据库失败 / Failed to open the local database.".to_owned()
         }
+        DomainError::SelfConnectionForbidden => "发布版本不允许连接本机 / Release builds cannot connect to this device.".to_owned(),
         DomainError::Io { .. } => "文件操作失败 / File operation failed.".to_owned(),
         DomainError::VaultNotInitialized => {
             "保险箱尚未初始化 / The vault has not been initialized.".to_owned()

@@ -6,18 +6,14 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
-use http::header::{AUTHORIZATION, HOST, WWW_AUTHENTICATE};
-use http::{HeaderMap, Method, Request, StatusCode};
-use http_body_util::{BodyExt, Full};
-use hyper_util::rt::TokioIo;
+use http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
+use http::{HeaderMap, Method, StatusCode};
 use peerdav_lib::{
     ACCESS_REQUEST_HEADER, ACCESS_STATUS_PATH, AccessRequestStatus, AccessRule,
-    AccessStatusResponse, AppError, DomainError, MAX_PENDING_ATTEMPTS, MAX_PENDING_PATH_CHARS,
-    MAX_PENDING_REQUESTS, PendingRequestInfo, RuleKind, RuleMatcher, ServerConfig,
-    ServerController, ServerEvents, SharePermissions, Vault,
+    AccessStatusResponse, AppError, DomainError, MACHINE_ID_HEADER, MAX_PENDING_ATTEMPTS,
+    MAX_PENDING_PATH_CHARS, MAX_PENDING_REQUESTS, PendingRequestInfo, RuleKind, RuleMatcher,
+    ServerConfig, ServerController, ServerEvents, SharePermissions, Vault,
 };
-use tokio::net::TcpStream;
 
 mod common;
 
@@ -51,6 +47,7 @@ struct Harness {
     events: Arc<Recording>,
     share_id: String,
     address: SocketAddr,
+    client: reqwest::Client,
 }
 
 impl Harness {
@@ -92,7 +89,13 @@ impl Harness {
             .parse()
             .expect("socket addr");
 
+        let client_vault =
+            Vault::open(&directory.path().join("client.pd")).expect("client identity");
+        let client = client_vault
+            .encrypted_client(vault.fingerprint())
+            .expect("encrypted client");
         Self {
+            client,
             directory,
             vault,
             controller,
@@ -121,7 +124,7 @@ impl Harness {
         token: Option<&str>,
         body: &[u8],
     ) -> HttpResponse {
-        send(self.address, method, path, token, body).await
+        send(&self.client, self.address, method, path, token, body).await
     }
 
     async fn request_with_headers(
@@ -132,7 +135,16 @@ impl Harness {
         body: &[u8],
         headers: &[(&'static str, String)],
     ) -> HttpResponse {
-        send_with_headers(self.address, method, path, token, body, headers).await
+        send_with_headers(
+            &self.client,
+            self.address,
+            method,
+            path,
+            token,
+            body,
+            headers,
+        )
+        .await
     }
 
     /// Triggers a pending request and approves it, returning the one-time code.
@@ -169,16 +181,18 @@ struct HttpResponse {
 }
 
 async fn send(
+    client: &reqwest::Client,
     address: SocketAddr,
     method: Method,
     path: &str,
     token: Option<&str>,
     body: &[u8],
 ) -> HttpResponse {
-    send_with_headers(address, method, path, token, body, &[]).await
+    send_with_headers(client, address, method, path, token, body, &[]).await
 }
 
 async fn send_with_headers(
+    client: &reqwest::Client,
     address: SocketAddr,
     method: Method,
     path: &str,
@@ -186,49 +200,20 @@ async fn send_with_headers(
     body: &[u8],
     extra_headers: &[(&'static str, String)],
 ) -> HttpResponse {
-    let stream = tokio::time::timeout(AUTH_TIMEOUT, TcpStream::connect(address))
-        .await
-        .expect("connect timeout")
-        .expect("connect");
-    let io = TokioIo::new(stream);
-    let (mut sender, connection) =
-        tokio::time::timeout(AUTH_TIMEOUT, hyper::client::conn::http1::handshake(io))
-            .await
-            .expect("handshake timeout")
-            .expect("handshake");
-    let connection_task = tokio::spawn(async move {
-        if let Err(error) = connection.await {
-            eprintln!("client connection closed: {error}");
-        }
-    });
-
-    let mut builder = Request::builder()
-        .method(method)
-        .uri(path)
-        .header(HOST, address.to_string());
+    let mut builder = client.request(method, format!("https://{address}{path}"));
     if let Some(token) = token {
         builder = builder.header(AUTHORIZATION, basic_auth(token));
     }
     for (name, value) in extra_headers {
         builder = builder.header(*name, value);
     }
-    let request = builder
-        .body(Full::new(Bytes::from(body.to_vec())))
-        .expect("build request");
-
-    let response = tokio::time::timeout(AUTH_TIMEOUT, sender.send_request(request))
+    let response = tokio::time::timeout(AUTH_TIMEOUT, builder.body(body.to_vec()).send())
         .await
         .expect("response timeout")
-        .expect("response");
+        .expect("TLS response");
     let status = response.status();
     let headers = response.headers().clone();
-    let body = tokio::time::timeout(AUTH_TIMEOUT, response.into_body().collect())
-        .await
-        .expect("body timeout")
-        .expect("collect body")
-        .to_bytes()
-        .to_vec();
-    connection_task.abort();
+    let body = response.bytes().await.expect("body").to_vec();
 
     HttpResponse {
         status,
@@ -290,6 +275,35 @@ fn read_write_no_delete() -> SharePermissions {
         can_write: true,
         can_delete: false,
     }
+}
+
+#[tokio::test]
+async fn build_mode_controls_self_connections_while_other_devices_work() {
+    let harness = Harness::new(full_permissions(), vec![loopback_rule()]).await;
+    let self_client = harness.vault.encrypted_client(harness.vault.fingerprint());
+    if cfg!(debug_assertions) {
+        let response = self_client
+            .expect("debug self client")
+            .get(format!("https://{}/__peerdav/catalog", harness.address))
+            .send()
+            .await
+            .expect("debug self connect");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    } else {
+        assert!(matches!(
+            self_client,
+            Err(DomainError::SelfConnectionForbidden)
+        ));
+    }
+    // A distinct installation remains connectable even on the same IP.
+    assert_eq!(
+        harness
+            .request(Method::GET, "/__peerdav/catalog", None, b"")
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+    harness.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -480,6 +494,161 @@ async fn approved_code_is_delivered_once_only_to_the_requesting_client() {
         serde_json::from_slice(&repeated.body).expect("parse consumed status");
     assert_eq!(status.status, AccessRequestStatus::Expired);
     assert!(status.authorization_code.is_none());
+
+    harness.shutdown().await;
+    drop(harness.directory);
+}
+
+/// 授权身份是机器码而不是 IP：同一台设备换申请 key 只排一次队，另一台设备拿同一个
+/// key 也领不走前者审批出来的授权码；解绑时按机器码清掉对应的入站授权。
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_identity_follows_the_machine_code() {
+    let harness = Harness::new(full_permissions(), vec![loopback_rule()]).await;
+    let first_identity =
+        Vault::open(&harness.directory.path().join("first-client.pd")).expect("first identity");
+    let second_identity =
+        Vault::open(&harness.directory.path().join("second-client.pd")).expect("second identity");
+    let machine = first_identity.fingerprint().to_owned();
+    let other_machine = second_identity.fingerprint().to_owned();
+    let first_client = first_identity
+        .encrypted_client(harness.vault.fingerprint())
+        .expect("first TLS client");
+    let second_client = second_identity
+        .encrypted_client(harness.vault.fingerprint())
+        .expect("second TLS client");
+    let first_key = "c".repeat(32);
+    let second_key = "d".repeat(32);
+
+    let request_catalog = |identity: String, key: String| {
+        let client = if identity == machine {
+            first_client.clone()
+        } else {
+            second_client.clone()
+        };
+        let harness = &harness;
+        async move {
+            send_with_headers(
+                &client,
+                harness.address,
+                Method::GET,
+                "/__peerdav/catalog",
+                None,
+                b"",
+                &[
+                    (MACHINE_ID_HEADER, "forged-device-id".into()),
+                    (ACCESS_REQUEST_HEADER, key),
+                ],
+            )
+            .await
+        }
+    };
+    let poll = |identity: String, key: String| {
+        let client = if identity == machine {
+            first_client.clone()
+        } else {
+            second_client.clone()
+        };
+        let harness = &harness;
+        async move {
+            send_with_headers(
+                &client,
+                harness.address,
+                Method::GET,
+                ACCESS_STATUS_PATH,
+                None,
+                b"",
+                &[
+                    (MACHINE_ID_HEADER, "forged-device-id".into()),
+                    (ACCESS_REQUEST_HEADER, key),
+                ],
+            )
+            .await
+        }
+    };
+
+    for key in [&first_key, &second_key] {
+        let challenge = request_catalog(machine.clone(), key.clone()).await;
+        assert_eq!(challenge.status, StatusCode::UNAUTHORIZED);
+    }
+
+    // 同一台设备的两次申请合成一条：IP 只是展示信息，换了地址也还是同一台设备。
+    let pending = harness.controller.list_pending();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].machine_id.as_deref(), Some(machine.as_str()));
+    assert_eq!(pending[0].peer_ip, "127.0.0.1");
+    assert_eq!(
+        pending[0].client_request_id.as_deref(),
+        Some(second_key.as_str())
+    );
+
+    // 另一台设备即使复用了同一个申请 key，也是另一条申请。
+    let challenge = request_catalog(other_machine.clone(), second_key.clone()).await;
+    assert_eq!(challenge.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(harness.controller.list_pending().len(), 2);
+
+    let target = harness
+        .controller
+        .list_pending()
+        .into_iter()
+        .find(|request| request.machine_id.as_deref() == Some(machine.as_str()))
+        .expect("pending request for the first machine");
+    let approved = harness
+        .controller
+        .approve_pending(&target.id)
+        .expect("approve the first machine");
+    assert!(approved.auto_delivery);
+    assert_eq!(
+        approved.authorization.machine_id.as_deref(),
+        Some(machine.as_str())
+    );
+    // 标签以机器码开头，管理员能直接看出这是哪台设备。
+    assert!(
+        approved.authorization.label.starts_with(&machine[..8]),
+        "unexpected label {}",
+        approved.authorization.label
+    );
+
+    // 另一台设备用同一个 key 轮询：只能看到自己那条待审批，拿不到别人的授权码。
+    let stolen = poll(other_machine.clone(), second_key.clone()).await;
+    assert_eq!(stolen.status, StatusCode::ACCEPTED);
+    let stolen: AccessStatusResponse =
+        serde_json::from_slice(&stolen.body).expect("pending status");
+    assert_eq!(stolen.status, AccessRequestStatus::Pending);
+    assert!(stolen.authorization_code.is_none());
+
+    let delivered = poll(machine.clone(), second_key.clone()).await;
+    assert_eq!(delivered.status, StatusCode::OK);
+    let delivered: AccessStatusResponse =
+        serde_json::from_slice(&delivered.body).expect("approved status");
+    assert_eq!(
+        delivered.authorization_code.as_deref(),
+        Some(approved.authorization_code.as_str())
+    );
+
+    // 第二台设备也审批一次，随后只按第一台的机器码解绑，另一条授权必须保留。
+    let other_target = harness
+        .controller
+        .list_pending()
+        .into_iter()
+        .find(|request| request.machine_id.as_deref() == Some(other_machine.as_str()))
+        .expect("pending request for the second machine");
+    harness
+        .controller
+        .approve_pending(&other_target.id)
+        .expect("approve the second machine");
+    assert_eq!(harness.controller.list_authorizations().len(), 2);
+
+    let revoked = harness
+        .controller
+        .revoke_authorizations_for_machine(&machine)
+        .expect("revoke by machine");
+    assert_eq!(revoked, 1);
+    let remaining = harness.controller.list_authorizations();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(
+        remaining[0].machine_id.as_deref(),
+        Some(other_machine.as_str())
+    );
 
     harness.shutdown().await;
     drop(harness.directory);
@@ -1184,6 +1353,23 @@ async fn repeated_unauthenticated_attempts_are_bounded() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn stopping_the_server_clears_pending_requests() {
+    let harness = Harness::new(full_permissions(), vec![loopback_rule()]).await;
+
+    let challenge = harness
+        .request(Method::GET, "/__peerdav/catalog", None, b"")
+        .await;
+    assert_eq!(challenge.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(harness.controller.list_pending().len(), 1);
+
+    // 服务停了就没人还在等审批：控台不该继续显示，也不该允许批准死申请。
+    harness.controller.stop().await;
+    assert!(harness.controller.list_pending().is_empty());
+
+    drop(harness.directory);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pending_queue_is_capacity_bounded() {
     let harness = Harness::new(full_permissions(), vec![loopback_rule()]).await;
     let root = harness.share_root();
@@ -1360,6 +1546,7 @@ async fn shares_and_authorizations_survive_controller_restart() {
         .parse()
         .expect("socket addr");
     let response = send(
+        &harness.client,
         address,
         Method::GET,
         &format!("/share/{}/missing.txt", harness.share_id),
@@ -1426,6 +1613,7 @@ async fn locked_vault_can_still_serve_authorized_clients() {
         .expect("socket addr");
 
     let read = send(
+        &harness.client,
         address,
         Method::GET,
         &format!("/share/{}/before-lock.txt", harness.share_id),
@@ -1437,6 +1625,7 @@ async fn locked_vault_can_still_serve_authorized_clients() {
     assert_eq!(read.body, b"before lock");
 
     let write = send(
+        &harness.client,
         address,
         Method::PUT,
         &format!("/share/{}/after-lock.txt", harness.share_id),
@@ -1486,7 +1675,12 @@ async fn server_lifecycle_and_structured_bind_failures() {
 
     let restarted = controller.start(config.clone()).await.expect("restart");
     let address = restarted.bind_address.expect("address");
+    let client_vault = Vault::open(&directory.path().join("client.pd")).expect("client identity");
+    let client = client_vault
+        .encrypted_client(vault.fingerprint())
+        .expect("TLS client");
     let options = send(
+        &client,
         address.parse().expect("addr"),
         Method::OPTIONS,
         "/share/anything/",
@@ -1562,7 +1756,11 @@ async fn proppatch_and_unknown_methods_are_rejected() {
             b"",
         )
         .await;
-    assert_eq!(unauthenticated_unknown.status, StatusCode::UNAUTHORIZED);
+    // Unsupported methods are rejected before requesting authorization.
+    assert_eq!(
+        unauthenticated_unknown.status,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
 
     harness.shutdown().await;
     drop(harness.directory);

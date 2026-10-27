@@ -19,8 +19,8 @@ use crate::types::{
     AccessRule, AdminLoginResult, AdminSessionInfo, ApprovePendingResult, AuthorizationInfo,
     ConflictPolicy, DEFAULT_DISCOVERY_PORT, DEFAULT_SERVER_PORT, DISCOVERED_PEERS_EVENT,
     DirectoryDownloadPlan, DiscoveredPeer, ERROR_EVENT, ExternalEditInfo, InitializeVaultResult,
-    PEER_REVOKED_EVENT, PEER_STATUS_EVENT, PENDING_CANCELED_EVENT, PENDING_REQUEST_EVENT,
-    PeerAccessRequest, PeerHealth, PeerInfo, PeerListing, PeerRevocationInfo, PeerShare,
+    OutboundAccessRequest, PEER_REVOKED_EVENT, PEER_STATUS_EVENT, PENDING_CANCELED_EVENT,
+    PENDING_REQUEST_EVENT, PeerHealth, PeerInfo, PeerListing, PeerRevocationInfo, PeerShare,
     PeerStatus, PendingRequestInfo, PreviewPayload, ResetVaultResult, SERVER_BIND_META,
     SERVER_DISCOVERY_PORT_META, SERVER_ENABLED_META, SERVER_NAME_META, SERVER_PORT_META,
     ServerStatus, ShareInfo, SharePermissions, TRANSFER_PROGRESS_EVENT, TransferProgress,
@@ -38,11 +38,15 @@ const MAX_UPLOAD_FILES: usize = 10_000;
 /// command failures.
 pub(crate) struct AppEvents {
     app: AppHandle,
+    local_fingerprint: String,
 }
 
 impl AppEvents {
-    pub(crate) fn new(app: AppHandle) -> Self {
-        Self { app }
+    pub(crate) fn new(app: AppHandle, local_fingerprint: String) -> Self {
+        Self {
+            app,
+            local_fingerprint,
+        }
     }
 }
 
@@ -80,7 +84,14 @@ impl PeerEvents for AppEvents {
     }
 
     fn discovered_peers(&self, peers: &[DiscoveredPeer]) {
-        if let Err(emit_error) = self.app.emit(DISCOVERED_PEERS_EVENT, peers.to_vec()) {
+        let visible: Vec<_> = peers
+            .iter()
+            .filter(|peer| {
+                crate::tls::self_connection_allowed(&self.local_fingerprint, &peer.server_id)
+            })
+            .cloned()
+            .collect();
+        if let Err(emit_error) = self.app.emit(DISCOVERED_PEERS_EVENT, visible) {
             log::error!("failed to emit {DISCOVERED_PEERS_EVENT}: {emit_error}");
         }
     }
@@ -558,30 +569,54 @@ pub async fn list_peers(peers: State<'_, SharedPeers>) -> Result<Vec<PeerInfo>, 
 }
 
 #[tauri::command]
+pub fn device_fingerprint(vault: State<'_, SharedVault>) -> Result<String, AppError> {
+    Ok(vault.fingerprint().to_owned())
+}
+
+#[tauri::command]
+pub async fn inbound_connections(
+    server: State<'_, SharedServer>,
+) -> Result<Vec<crate::types::ConnectionInfo>, AppError> {
+    let server = Arc::clone(server.inner());
+    run_blocking(move || server.inbound_connections()).await
+}
+
+#[tauri::command]
+pub async fn outbound_connections(
+    peers: State<'_, SharedPeers>,
+) -> Result<Vec<crate::types::ConnectionInfo>, AppError> {
+    let peers = Arc::clone(peers.inner());
+    run_blocking(move || peers.outbound_connections()).await
+}
+
+#[tauri::command]
 pub async fn request_peer_access(
     peers: State<'_, SharedPeers>,
     url: String,
-) -> Result<PeerAccessRequest, AppError> {
+    label: Option<String>,
+    fingerprint: Option<String>,
+) -> Result<OutboundAccessRequest, AppError> {
     let peers = Arc::clone(peers.inner());
-    peers.request_access(&url).await.map_err(AppError::from)
+    if let Some(fingerprint) = fingerprint {
+        peers
+            .set_pairing_fingerprint(&url, &fingerprint)
+            .map_err(AppError::from)?;
+    }
+    peers
+        .begin_access(&url, label.as_deref())
+        .await
+        .map_err(AppError::from)
 }
 
 #[tauri::command]
 pub async fn wait_for_peer_access(
     peers: State<'_, SharedPeers>,
     url: String,
-    request_id: String,
     label: Option<String>,
 ) -> Result<PeerInfo, AppError> {
     let peers = Arc::clone(peers.inner());
-    let code = Zeroizing::new(
-        peers
-            .wait_for_access(&url, &request_id)
-            .await
-            .map_err(AppError::from)?,
-    );
     peers
-        .connect(&url, code.as_str(), label.as_deref())
+        .await_access(&url, label.as_deref())
         .await
         .map_err(AppError::from)
 }
@@ -590,13 +625,19 @@ pub async fn wait_for_peer_access(
 pub async fn cancel_peer_access(
     peers: State<'_, SharedPeers>,
     url: String,
-    request_id: String,
-) -> Result<(), AppError> {
+) -> Result<OutboundAccessRequest, AppError> {
     let peers = Arc::clone(peers.inner());
     peers
-        .cancel_access(&url, &request_id)
+        .cancel_access_request(&url)
         .await
         .map_err(AppError::from)
+}
+
+/// 出站访问申请的内存快照。列表按这份状态渲染，页面重建或 webview 重载后
+/// 「已发送，等待批准」不会退回「可以申请」。
+#[tauri::command]
+pub fn access_requests(peers: State<'_, SharedPeers>) -> Vec<OutboundAccessRequest> {
+    peers.access_requests()
 }
 
 #[tauri::command]
@@ -624,9 +665,25 @@ pub async fn check_peer_health(
 }
 
 #[tauri::command]
-pub async fn forget_peer(peers: State<'_, SharedPeers>, peer_id: String) -> Result<(), AppError> {
+pub async fn forget_peer(
+    peers: State<'_, SharedPeers>,
+    server: State<'_, SharedServer>,
+    peer_id: String,
+) -> Result<(), AppError> {
     let peers = Arc::clone(peers.inner());
-    peers.forget(&peer_id).await.map_err(AppError::from)
+    let server = Arc::clone(server.inner());
+    // 解绑是双向的：先撤销对端的授权（失败则保留记录以便重试），再删本地记录，
+    // 最后按机器码清掉本机为同一台设备开过的入站授权，避免「其他设备访问此设备」
+    // 里留下已经解绑的幽灵设备。
+    let machine_id = peers.forget(&peer_id).await?;
+    if let Some(machine_id) = machine_id {
+        let revoked =
+            run_blocking(move || server.revoke_authorizations_for_machine(&machine_id)).await?;
+        if revoked > 0 {
+            log::info!("unbinding {peer_id} revoked {revoked} inbound authorization(s)");
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]

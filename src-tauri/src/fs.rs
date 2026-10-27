@@ -844,6 +844,93 @@ fn rename_at(_share: &ShareConfig, _from: &Path, _to: &Path) -> FsResult<()> {
     Err(FsError::Forbidden)
 }
 
+/// Commit a verified upload through the same descriptor-relative path checks
+/// as WebDAV. The temporary sibling is never visible at the destination name.
+#[cfg(unix)]
+pub(crate) fn commit_upload(
+    share: &ShareConfig,
+    relative: &Path,
+    source: &Path,
+) -> Result<(), DomainError> {
+    use rustix::fs::{Mode, OFlags};
+    let resolved =
+        resolve(&share.root, relative).map_err(|error| DomainError::InvalidShareConfig {
+            detail: format!("upload destination: {error:?}"),
+        })?;
+    let Some(name) = resolved.name else {
+        return Err(DomainError::InvalidShareConfig {
+            detail: "cannot replace a share root".into(),
+        });
+    };
+    // Reject links and non-files at the destination before atomic replacement.
+    match rustix::fs::statat(
+        &resolved.parent,
+        &name,
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    ) {
+        Ok(stat) if !rustix::fs::FileType::from_raw_mode(stat.st_mode as _).is_file() => {
+            return Err(DomainError::InvalidShareConfig {
+                detail: "upload destination is not a regular file".into(),
+            });
+        }
+        Ok(_) => {}
+        Err(rustix::io::Errno::NOENT) => {}
+        Err(error) => {
+            return Err(DomainError::Io {
+                operation: "inspect upload destination",
+                path: None,
+                source: error.into(),
+            });
+        }
+    }
+    let mut random = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random);
+    let temporary = format!(".peerdav-{}.part", hex::encode(random));
+    let fd = rustix::fs::openat(
+        &resolved.parent,
+        &temporary,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|error| DomainError::Io {
+        operation: "stage upload",
+        path: None,
+        source: error.into(),
+    })?;
+    let result = (|| {
+        let mut target = File::from(fd);
+        let mut input = File::open(source)?;
+        std::io::copy(&mut input, &mut target)?;
+        target.sync_all()?;
+        rustix::fs::renameat(&resolved.parent, &temporary, &resolved.parent, &name)
+            .map_err(std::io::Error::from)
+    })();
+    if let Err(source) = result {
+        if let Err(error) =
+            rustix::fs::unlinkat(&resolved.parent, &temporary, rustix::fs::AtFlags::empty())
+        {
+            log::warn!("failed to remove upload staging entry: {error}");
+        }
+        return Err(DomainError::Io {
+            operation: "commit upload",
+            path: None,
+            source,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn commit_upload(
+    _share: &ShareConfig,
+    _relative: &Path,
+    _source: &Path,
+) -> Result<(), DomainError> {
+    Err(DomainError::InvalidShareConfig {
+        detail: "secure uploads are unavailable on this platform".into(),
+    })
+}
+
 #[cfg(unix)]
 fn copy_at(share: &ShareConfig, from: &Path, to: &Path) -> FsResult<()> {
     use rustix::fs::{Mode, OFlags};

@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, toRef } from "vue";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   disable as disableAutostart,
@@ -11,7 +11,7 @@ import { useAppContext } from "../lib/appContext";
 import { buildBindOptions } from "../lib/bindScope";
 import { confirmAction } from "../lib/confirm";
 import { localizeMessage, t } from "../lib/i18n";
-import { normalizeAppError } from "../lib/invoke";
+import { accessRowState, findAccessRequest, findSavedPeer } from "../lib/access";
 import { statusTagTone } from "../lib/tagTone";
 import { validatePassword } from "../lib/password";
 import { useAction } from "../composables/useAction";
@@ -54,10 +54,12 @@ const bindOptions = computed(() =>
   }),
 );
 
-const shares = ref([]);
-const authorizations = ref([]);
 // 管理数据（共享、授权、待审批）由一次 loadAdminData 拉取；加载中的列表显示骨架屏。
-const adminLoading = ref(true);
+// 数据本身存在共享上下文里：重新进入设置页先用旧数据渲染，后台刷新再替换，
+// 不再每次进入都闪一次骨架屏。
+const shares = toRef(app, "adminShares");
+const authorizations = toRef(app, "adminAuthorizations");
+const adminLoading = toRef(app, "adminLoading");
 
 const shareName = ref("");
 const shareRoot = ref("");
@@ -76,9 +78,17 @@ const activeOutboundIds = ref([]);
 
 /* 入站与出站共用同一套审批状态：待申请 / 待审批 / 已审批。
    排序把需要用户处理的放在前面，已完成配对放在最后。 */
-const CLIENT_STATUS_RANK = { pending: 0, unrequested: 1, approved: 2 };
+const CLIENT_STATUS_RANK = {
+  pending: 0,
+  error: 0,
+  canceled: 1,
+  unrequested: 1,
+  approved: 2,
+};
 const CLIENT_STATUS_LABEL = {
   pending: "clients.statusPending",
+  error: "clients.statusFailed",
+  canceled: "clients.statusCanceled",
   unrequested: "clients.statusUnrequested",
   approved: "clients.statusApproved",
 };
@@ -111,6 +121,13 @@ const inboundEntries = computed(() => {
     subtitle: request.shareName,
     request,
     details: [
+      // 机器码才是设备身份；IP 只是它这次拿到的地址，所以两行都列出但语义不同。
+      {
+        label: t("pending.machineId"),
+        value: request.machineId ?? t("pending.machineIdUnknown"),
+        mono: true,
+      },
+      { label: t("pending.address"), value: request.peerIp, mono: true },
       { label: t("pending.requestedPath"), value: request.requestedPath, mono: true },
       { label: t("pending.firstSeen"), value: formatStamp(request.firstSeen) },
       { label: t("pending.lastSeen"), value: formatStamp(request.lastSeen) },
@@ -130,38 +147,73 @@ const inboundEntries = computed(() => {
       }),
       authorization,
       details: [
+        {
+          label: t("client.connectionState"),
+          value: (app.inboundConnections ?? []).find((entry) => entry.fingerprint === authorization.machineId)?.activeConnections > 0
+            ? t("client.online") : t("client.offline"),
+        },
         { label: t("auth.idLabel"), value: authorization.id, mono: true },
+        {
+          label: t("auth.machineId"),
+          value: authorization.machineId ?? t("pending.machineIdUnknown"),
+          mono: true,
+        },
       ],
     }));
   return [...pending, ...authorized];
 });
 
-function buildOutboundEntry(server, peer, awaiting) {
-  const status = peer ? "approved" : awaiting ? "pending" : "unrequested";
+function buildOutboundEntry(server, peer, accessEntry) {
+  const row = accessRowState(accessEntry);
+  // 「已连接」优先：申请只是通往连接的过程，已经连上时不再展示申请状态。
+  const status = peer
+    ? "approved"
+    : ["pending", "error", "canceled"].includes(row.status)
+      ? row.status
+      : "unrequested";
   const details = [];
+  const fingerprint = peer?.fingerprint ?? accessEntry?.fingerprint ?? server?.serverId;
+  if (fingerprint) details.push({ label: t("auth.machineId"), value: fingerprint, mono: true });
+  const snapshot = (app.outboundConnections ?? []).find((entry) => entry.fingerprint === fingerprint);
   if (peer) {
     details.push({
       label: t("client.connectionState"),
-      value: peer.online ? t("client.online") : t("client.offline"),
+      value: (snapshot ? snapshot.state === "connected" : peer.online) ? t("client.online") : t("client.offline"),
     });
     details.push({
       label: t("client.shareCount"),
       value: String(peer.shares.length),
     });
-  } else {
+  } else if (server) {
     details.push({
       label: t("client.shareCount"),
       value: String(server.shareCount),
     });
   }
+  // 申请失败/过期的原因写进详情：切换页面回来仍然能看到，而不是只剩一次 toast。
+  if (!peer && row.message) {
+    details.push({ label: t("client.requestState"), value: row.message });
+  }
   return {
-    key: peer ? `peer-${peer.id}` : `server-${server.serverId}`,
+    key: peer
+      ? `peer-${peer.id}`
+      : server
+        ? `server-${server.serverId}`
+        : `access-${accessEntry?.url ?? ""}`,
     status,
-    badgeKey: CLIENT_STATUS_LABEL[status],
-    action: peer ? "open" : awaiting ? "cancel" : "request",
-    title: peer ? peer.label : server.name,
-    url: peer ? peer.url : server.url,
-    hosts: server ? server.hosts : [],
+    badgeKey: CLIENT_STATUS_LABEL[status] ?? CLIENT_STATUS_LABEL.unrequested,
+    action: peer
+      ? "open"
+      : row.canCancel
+        ? "cancel"
+        : row.canRequest
+          ? "request"
+          : "none",
+    title: peer
+      ? peer.label
+      : (server?.name ?? accessEntry?.label ?? accessEntry?.url ?? ""),
+    url: peer ? peer.url : (server?.url ?? accessEntry?.url ?? ""),
+    hosts: server?.hosts ?? [],
     peer: peer ?? null,
     details,
   };
@@ -169,14 +221,26 @@ function buildOutboundEntry(server, peer, awaiting) {
 
 const outboundEntries = computed(() => {
   const rows = [];
+  const coveredPeers = new Set();
+  const coveredAccess = new Set();
   for (const server of lanServers.value) {
-    const peer = app.peers.find((item) => item.url === server.url) ?? null;
-    const awaiting = !peer && peerWaiting.value && peerRequestUrl.value === server.url;
-    rows.push(buildOutboundEntry(server, peer, awaiting));
+    const peer = findSavedPeer(app.peers, server);
+    const accessEntry = findAccessRequest(app.accessRequests, server);
+    if (peer) coveredPeers.add(peer.id);
+    if (accessEntry) coveredAccess.add(accessEntry.url);
+    rows.push(buildOutboundEntry(server, peer, accessEntry));
   }
   for (const peer of app.peers) {
-    if (lanServers.value.some((server) => server.url === peer.url)) continue;
-    rows.push(buildOutboundEntry(null, peer, false));
+    if (coveredPeers.has(peer.id)) continue;
+    coveredPeers.add(peer.id);
+    rows.push(buildOutboundEntry(null, peer, null));
+  }
+  // 手动输入、还没被广播发现的地址同样列出未完成的申请，否则它只存在于一次请求里。
+  for (const entry of app.accessRequests) {
+    if (coveredAccess.has(entry.url)) continue;
+    if (app.peers.some((peer) => peer.url === entry.url)) continue;
+    coveredAccess.add(entry.url);
+    rows.push(buildOutboundEntry(null, null, entry));
   }
   return rows.sort(
     (a, b) => CLIENT_STATUS_RANK[a.status] - CLIENT_STATUS_RANK[b.status],
@@ -197,14 +261,22 @@ const outboundLoading = computed(
 
 const manualOpen = ref(false);
 const peerUrl = ref("");
+const peerFingerprint = ref("");
 const peerHealth = ref({});
-const peerSending = ref(false);
-const peerWaiting = ref(false);
-const peerRequestId = ref("");
-const peerRequestUrl = ref("");
-const peerCancelRequested = ref(false);
-const peerCanceling = ref(false);
+// 只有「正在发这一条申请」的瞬时忙碌态留在组件里；申请结果由后端保存
+// （app.accessRequests），所以切换页面/重载后不会退回「待申请」。
+const requestingUrl = ref("");
 const peerNoticeState = ref(null);
+
+const manualEntry = computed(() =>
+  peerUrl.value
+    ? findAccessRequest(app.accessRequests, { url: peerUrl.value.trim() })
+    : null,
+);
+const manualEntryMessage = computed(() => {
+  const state = accessRowState(manualEntry.value);
+  return state.message || (state.messageKey ? t(state.messageKey) : "");
+});
 
 const adminCurrentPassword = ref("");
 const adminNewPassword = ref("");
@@ -220,7 +292,7 @@ function adminArgs() {
 }
 
 function setPeerNotice(key, params) {
-  peerNoticeState.value = { key, params };
+  peerNoticeState.value = key ? { key, params } : null;
 }
 
 function parseRuleList(values, kind) {
@@ -395,6 +467,8 @@ async function stopServer() {
   await run(async () => {
     app.serverStatus = await app.invoke("stop_server", adminArgs());
     app.setNotice("server.stopNotice");
+    // 服务停了就没有待审批的人了，同步清掉控台上的申请行。
+    await app.refreshPendingRequests();
   });
 }
 
@@ -450,16 +524,7 @@ async function deleteShare(share) {
 }
 
 async function approveRequest(request) {
-  await run(async () => {
-    const result = await app.invoke("approve_pending_request", {
-      ...adminArgs(),
-      requestId: request.id,
-    });
-    app.setNotice(
-      result.autoDelivery ? "pending.approvedAuto" : "pending.approved",
-    );
-    await loadAdminData();
-  });
+  await run(() => app.approvePendingRequest(request.id));
 }
 
 async function revokeAuthorization(authorization) {
@@ -479,73 +544,35 @@ async function revokeAuthorization(authorization) {
   });
 }
 
+/// 申请访问：申请结果记在后端（app.accessRequests），本组件只保留「正在发送」
+/// 这一个瞬时标志，因此离开页面再回来状态不变。
 async function requestPeerAccess(url = peerUrl.value) {
   const target = String(url ?? "").trim();
-  if (!target || peerSending.value || peerWaiting.value) return;
-  // 「正在发送」与「已发送，等待批准」必须分开：request_peer_access 返回前只知道
-  // 本机在发请求，对方是否收到、是否登记了申请都未知，此时不能声称「已发送」。
-  peerSending.value = true;
-  peerWaiting.value = false;
-  peerRequestUrl.value = target;
-  peerRequestId.value = "";
-  peerCancelRequested.value = false;
-  peerNoticeState.value = null;
+  if (!target || requestingUrl.value) return;
+  requestingUrl.value = target;
+  setPeerNotice(null);
   try {
-    const request = await app.invoke("request_peer_access", { url: target });
-    peerSending.value = false;
-    if (!request.requested) {
-      setPeerNotice("client.alreadyAccessible");
-      return;
-    }
-    if (!request.requestId) {
-      setPeerNotice("client.requestMissing");
-      return;
-    }
-
-    peerRequestId.value = request.requestId;
-    peerWaiting.value = true;
-    setPeerNotice("client.waiting");
-    const result = await app.invoke("wait_for_peer_access", {
-      url: target,
-      requestId: request.requestId,
-      label: null,
-    });
-    await app.refreshPeers();
-    setPeerNotice("client.connected", { label: result.label });
+    await app.beginPeerAccess(target, null, peerFingerprint.value.trim() || null);
   } catch (error) {
-    if (
-      peerCancelRequested.value ||
-      normalizeAppError(error).code === "PEER_ACCESS_CANCELED"
-    ) {
-      setPeerNotice("client.canceled");
-    } else {
-      app.handleFailure(error);
-      setPeerNotice("client.failed");
-    }
+    app.handleFailure(error);
   } finally {
-    peerSending.value = false;
-    peerWaiting.value = false;
-    peerRequestId.value = "";
-    peerRequestUrl.value = "";
-    peerCancelRequested.value = false;
-    peerCanceling.value = false;
+    requestingUrl.value = "";
   }
 }
 
-async function cancelPeerRequest() {
-  if (!peerRequestId.value || peerCanceling.value) return;
-  peerCanceling.value = true;
-  peerCancelRequested.value = true;
+async function cancelPeerRequest(url = peerUrl.value) {
+  const entry = findAccessRequest(app.accessRequests, {
+    url: String(url ?? "").trim(),
+  });
+  if (!entry || requestingUrl.value) return;
+  requestingUrl.value = entry.url;
   try {
-    await app.invoke("cancel_peer_access", {
-      url: peerRequestUrl.value,
-      requestId: peerRequestId.value,
-    });
+    await app.cancelPeerAccess(entry.url);
   } catch (error) {
-    peerCancelRequested.value = false;
-    peerCanceling.value = false;
     app.handleFailure(error);
     setPeerNotice("client.cancelFailed");
+  } finally {
+    requestingUrl.value = "";
   }
 }
 
@@ -719,6 +746,7 @@ async function loadInitialData() {
         <div class="server-panel">
           <h3>{{ t("server.title") }}</h3>
           <p class="hint">{{ t("server.verifyHint") }}</p>
+          <p v-if="app.deviceFingerprint" class="hint">{{ t("auth.machineId") }}: {{ app.deviceFingerprint }}</p>
           <!-- 两列固定配对：名称+绑定地址一行，HTTP 服务端口与 UDP 广播端口一行。 -->
           <div class="grid pane-form-grid">
             <label>
@@ -1192,34 +1220,47 @@ async function loadInitialData() {
               <el-input
                 v-model="peerUrl"
                 type="text"
-                placeholder="http://192.168.1.10:4918"
-                :disabled="peerSending || peerWaiting"
+                placeholder="https://192.168.1.10:4918"
+                :disabled="Boolean(requestingUrl)"
+              />
+              <el-input
+                v-model="peerFingerprint"
+                :placeholder="t('client.fingerprint')"
+                :aria-label="t('client.fingerprint')"
+                :disabled="Boolean(requestingUrl)"
               />
               <el-button
                 type="primary"
                 native-type="submit"
-                :loading="peerSending || peerWaiting"
-                :disabled="busy || peerSending || peerWaiting || !peerUrl"
+                :loading="Boolean(requestingUrl)"
+                :disabled="busy || Boolean(requestingUrl) || !peerUrl"
               >
                 {{ t("client.request") }}
               </el-button>
             </form>
 
-            <div v-if="peerSending || peerWaiting" class="request-progress">
-              <span>
-                {{ peerSending ? t("client.sending") : peerNotice || t("client.waiting") }}
-              </span>
+            <!-- 只显示「正在发送」这种瞬时动作；申请结果来自后端状态，切换页面后仍在。 -->
+            <div v-if="manualEntry?.status === 'waiting'" class="request-progress">
+              <span>{{ t("client.waiting") }}</span>
               <el-button
-                v-if="peerWaiting"
                 plain
-                :loading="peerCanceling"
-                @click="cancelPeerRequest"
+                :disabled="Boolean(requestingUrl)"
+                @click="cancelPeerRequest(manualEntry.url)"
               >
                 {{ t("client.cancel") }}
               </el-button>
             </div>
-            <p v-else-if="peerNotice" class="hint request-progress__notice">
-              {{ peerNotice }}
+            <p
+              v-else-if="requestingUrl"
+              class="hint request-progress__notice"
+            >
+              {{ t("client.sending") }}
+            </p>
+            <p
+              v-else-if="manualEntryMessage || peerNotice"
+              class="hint request-progress__notice"
+            >
+              {{ manualEntryMessage || peerNotice }}
             </p>
 
             <list-skeleton v-if="outboundLoading" :rows="3" />
@@ -1269,7 +1310,7 @@ async function loadInitialData() {
                       type="primary"
                       round
                       size="small"
-                      :disabled="busy || peerSending || peerWaiting"
+                      :disabled="busy || Boolean(requestingUrl)"
                       @click="requestPeerAccess(entry.url)"
                     >
                       {{ t("client.connect") }}
@@ -1280,12 +1321,13 @@ async function loadInitialData() {
                       type="primary"
                       round
                       size="small"
-                      :loading="peerCanceling"
-                      @click="cancelPeerRequest"
+                      :loading="requestingUrl === entry.url"
+                      :disabled="Boolean(requestingUrl) && requestingUrl !== entry.url"
+                      @click="cancelPeerRequest(entry.url)"
                     >
                       {{ t("client.cancel") }}
                     </el-button>
-                    <template v-else>
+                    <template v-else-if="entry.peer">
                       <el-button
                         class="list-pill"
                         type="primary"
@@ -1897,6 +1939,10 @@ async function loadInitialData() {
 
 .client-item__icon.is-pending {
   color: var(--el-color-warning);
+}
+
+.client-item__icon.is-error {
+  color: var(--tone-danger);
 }
 
 .client-item__icon.is-approved {
