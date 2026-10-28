@@ -542,7 +542,25 @@ function navigateSelection(delta) {
   });
 }
 
+// 返回上一级目录。通用快捷键是 Alt+↑（Windows 资源管理器、GNOME Files），
+// macOS Finder 用 Cmd+↑，因此两个修饰键都支持。根目录不做任何操作。
+function goUpLevel() {
+  if (!activeShareId.value || busy.value) return;
+  const crumbs = breadcrumbs.value;
+  if (crumbs.length <= 1) return;
+  void browse(crumbs[crumbs.length - 2].path);
+}
+
 function onFileViewKeydown(event) {
+  if (event.key === "ArrowUp" && (event.altKey || event.metaKey)) {
+    const target = event.target;
+    if (target?.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target?.tagName)) {
+      return;
+    }
+    event.preventDefault();
+    goUpLevel();
+    return;
+  }
   const gallery = viewMode.value === "gallery";
   const forward = gallery ? "ArrowRight" : "ArrowDown";
   const back = gallery ? "ArrowLeft" : "ArrowUp";

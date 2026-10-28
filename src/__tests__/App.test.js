@@ -2132,6 +2132,42 @@ describe("Finder-style peer browser", () => {
     wrapper.unmount();
   });
 
+  it("goes up one level with Alt+ArrowUp and selects first or last after entering", async () => {
+    const subListing = {
+      ...LISTING,
+      path: "/sub",
+      entries: [
+        { path: "/sub/a.txt", name: "a.txt", isDir: false, size: 1, modified: 1700000000, contentType: "text/plain" },
+        { path: "/sub/b.txt", name: "b.txt", isDir: false, size: 2, modified: 1700000000, contentType: "text/plain" },
+      ],
+    };
+    const { wrapper } = await openBrowser({
+      list_peer_dir: async ({ path }) => (path === "/sub" ? subListing : LISTING),
+    });
+    const fileView = () => wrapper.find(".file-view");
+
+    // Enter the sub directory, then arrow keys select first or last automatically.
+    await wrapper.find(".file-tile").trigger("dblclick");
+    await flushPromises();
+    expect(wrapper.find(".breadcrumb.is-current").text()).toBe("sub");
+    await fileView().trigger("keydown", { key: "ArrowDown" });
+    await flushPromises();
+    expect(wrapper.find(".file-tile.is-selected .file-tile__name").text()).toBe("a.txt");
+    await fileView().trigger("keydown", { key: "ArrowUp" });
+    await flushPromises();
+    expect(wrapper.find(".file-tile.is-selected .file-tile__name").text()).toBe("b.txt");
+
+    // Alt+ArrowUp returns to the parent directory.
+    await fileView().trigger("keydown", { key: "ArrowUp", altKey: true });
+    await flushPromises();
+    expect(wrapper.find(".breadcrumb.is-current").text()).toBe("Docs");
+    // At the share root Alt+ArrowUp does nothing.
+    await fileView().trigger("keydown", { key: "ArrowUp", altKey: true });
+    await flushPromises();
+    expect(wrapper.find(".breadcrumb.is-current").text()).toBe("Docs");
+    wrapper.unmount();
+  });
+
   it("restores ancestor columns and scrolls to the newest column", async () => {
     const subListing = {
       ...LISTING,
