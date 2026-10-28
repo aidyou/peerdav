@@ -479,7 +479,7 @@ function backToLogin() {
           required
         />
       </label>
-      <el-button type="primary" native-type="submit" :disabled="busy">
+      <el-button type="primary" native-type="submit" :disabled="busy" :loading="busy">
         {{ t("login.submit") }}
       </el-button>
     </form>

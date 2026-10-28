@@ -112,7 +112,7 @@ async function unlockInterface() {
     lastInterfaceActivity = Date.now();
     void refreshPeers();
     void refreshConnections();
-    void invoke("refresh_tray_menu").catch(handleFailure);
+    void invoke("refresh_tray_menu", { locale: locale.value }).catch(handleFailure);
   } catch (error) { setRawError(error); }
   finally { unlockPassword.value = ""; unlockingInterface.value = false; }
 }
@@ -212,10 +212,10 @@ onMounted(async () => {
       if (peer) openPeer(peer);
     }
   }));
-  eventUnlisten.push(watch(() => peers.value.map(({ id, label }) => `${id}:${label}`).join("|"), async () => {
+  eventUnlisten.push(watch(() => [locale.value, peers.value.map(({ id, label }) => `${id}:${label}`).join("|")], async () => {
     if (interfaceLocked.value) return;
-    try { await invoke("refresh_tray_menu"); } catch (error) { console.warn("tray menu refresh failed", error); }
-  }));
+    try { await invoke("refresh_tray_menu", { locale: locale.value }); } catch (error) { console.warn("tray menu refresh failed", error); }
+  }, { immediate: true }));
   const recordActivity = (event) => { if (event.isTrusted) lastInterfaceActivity = Date.now(); };
   for (const name of ["pointerdown", "keydown", "wheel", "touchstart"]) {
     window.addEventListener(name, recordActivity, { passive: true });
@@ -1152,7 +1152,7 @@ provide(
 
 .titlebar {
   position: relative;
-  z-index: 20;
+  z-index: 999999;
   flex: none;
   height: var(--titlebar-height);
   box-sizing: border-box;
@@ -1425,20 +1425,20 @@ provide(
   background: var(--app-border);
 }
 
-/* Element Plus teleports some overlays to body. Read the live window geometry
-   there too, so every dialog/message box respects chrome and maximization. */
+/* Cover the entire window; the titlebar stays above the mask for dragging.
+   Preserve rounded window edges when overlays are teleported to body. */
 body:has(.window-frame) > .el-overlay,
 .window-frame .el-overlay {
   --overlay-inset: var(--window-overlay-inset, 1px);
   --overlay-radius: var(--window-overlay-radius, var(--window-inner-radius));
-  top: calc(var(--titlebar-height) + var(--overlay-inset));
+  top: var(--overlay-inset);
   right: var(--overlay-inset);
   bottom: var(--overlay-inset);
   left: var(--overlay-inset);
   height: auto;
-  border-radius: 0 0 var(--overlay-radius) var(--overlay-radius);
+  border-radius: var(--overlay-radius);
   overflow: hidden;
-  clip-path: inset(0 round 0 0 var(--overlay-radius) var(--overlay-radius));
+  clip-path: inset(0 round var(--overlay-radius));
 }
 
 body:has(.window-frame.is-maximized) > .el-overlay {

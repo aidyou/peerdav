@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-labelledby="peerdav-tray-icon-duo-title">
+  <title id="peerdav-tray-icon-duo-title">邻盘 PeerDav · 菜单栏双色图标</title>
+  <g transform="translate(-1.2 -1.2) scale(1.1)" fill="none" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <g stroke="#2F6BEA">
+      <path d="M4.6 5.4H8a2 2 0 0 1 2 2v3.0"/>
+      <path d="M10 13.6v3.0a2 2 0 0 1-2 2H4.6a2 2 0 0 1-2-2V7.4a2 2 0 0 1 2-2"/>
+      <path d="M4.8 15.4h3"/>
+      <path d="M6.3 12H17.7"/>
+      <path d="M8.1 10.2 6.3 12l1.8 1.8"/>
+      <path d="M15.9 10.2 17.7 12l-1.8 1.8"/>
+    </g>
+    <g stroke="#E8873A">
+      <path d="M16 5.4h3.4a2 2 0 0 1 2 2v9.2a2 2 0 0 1-2 2H16a2 2 0 0 1-2-2v-3.0"/>
+      <path d="M14 10.4V7.4a2 2 0 0 1 2-2"/>
+      <path d="M16.2 15.4h3"/>
+    </g>
+  </g>
+</svg>

@@ -54,7 +54,8 @@ use tauri::{Emitter, Manager, WindowEvent};
 use crate::commands::{AppEvents, SharedPeers, SharedServer, SharedVault};
 use crate::error::error_chain;
 use crate::types::{
-    DB_FILE_NAME, MAIN_WINDOW_LABEL, QUIT_REQUEST_EVENT, TRAY_QUIT_MENU_ID, TRAY_SHOW_MENU_ID,
+    DB_FILE_NAME, MAIN_WINDOW_LABEL, QUIT_REQUEST_EVENT, TRAY_ICON_STYLE_META, TRAY_ID,
+    TRAY_QUIT_MENU_ID, TRAY_SHOW_MENU_ID, TrayIconStyle,
 };
 
 /// Tracks whether the system tray was created, so closing the window can fall
@@ -215,6 +216,8 @@ pub fn run() {
                     commands::scan_lan_tcp,
                     commands::service_settings,
                     commands::set_tcp_discovery,
+                    commands::tray_icon_style,
+                    commands::set_tray_icon_style,
                     commands::discovered_peers,
                     commands::local_networks,
                     commands::local_addresses,
@@ -287,30 +290,41 @@ fn setup_tray(app: &tauri::App) {
     }
 }
 
+pub(crate) fn tray_display_name(locale: &str) -> &'static str {
+    if locale == "en" { "PeerDav" } else { "邻盘" }
+}
+
+pub(crate) fn tray_menu_labels(locale: &str) -> (&'static str, &'static str, &'static str) {
+    if locale == "en" {
+        ("Home", "Settings", "Quit")
+    } else {
+        ("首页", "设置", "退出")
+    }
+}
+
 fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let icon = app
-        .default_window_icon()
-        .ok_or("default window icon is unavailable")?;
-    let show_item = MenuItem::with_id(app, TRAY_SHOW_MENU_ID, "首页 / Home", true, None::<&str>)?;
-    let quit_item = MenuItem::with_id(
-        app,
-        TRAY_QUIT_MENU_ID,
-        "退出 PeerDav / Quit PeerDav",
-        true,
-        None::<&str>,
-    )?;
-    let settings_item =
-        MenuItem::with_id(app, "tray-settings", "设置 / Settings", true, None::<&str>)?;
+    let language = app
+        .state::<SharedVault>()
+        .get_setting("ui.locale")?
+        .unwrap_or_else(|| "zh-CN".into());
+    let (home, settings, quit) = tray_menu_labels(&language);
+    let style = load_tray_icon_style(app);
+    let icon = tray_icon_image(style)?;
+    let show_item = MenuItem::with_id(app, TRAY_SHOW_MENU_ID, home, true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, TRAY_QUIT_MENU_ID, quit, true, None::<&str>)?;
+    let settings_item = MenuItem::with_id(app, "tray-settings", settings, true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show_item, &settings_item, &quit_item])?;
 
-    let builder = TrayIconBuilder::with_id("main-tray")
+    let builder = TrayIconBuilder::with_id(TRAY_ID)
+        .title(tray_display_name(&language))
+        .tooltip(tray_display_name(&language))
         .icon(icon.clone())
         .show_menu_on_left_click(false);
     #[cfg(target_os = "linux")]
     let builder = builder.menu(&menu);
     #[cfg(not(target_os = "linux"))]
     app.manage(std::sync::Mutex::new(menu));
-    builder
+    let tray = builder
         .on_menu_event(|app, event| {
             let id = event.id.as_ref();
             if id == TRAY_SHOW_MENU_ID || id == "tray-settings" || id.starts_with("tray-peer-") {
@@ -366,8 +380,54 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error + Send +
             {
                 show_main_window(tray.app_handle());
             }
-        })
-        .build(app)?;
+        });
+
+    // 单色样式走 macOS 模板图标，系统按 alpha 形状适配深浅色外观；
+    // 蓝色与双色是固定颜色，不参与模板反色。
+    #[cfg(target_os = "macos")]
+    let tray = tray.icon_as_template(matches!(style, TrayIconStyle::Mono));
+
+    tray.build(app)?;
+    Ok(())
+}
+
+/// 托盘图标按样式选择对应内置 PNG：单色、蓝色、双色。
+fn tray_icon_image(style: TrayIconStyle) -> Result<tauri::image::Image<'static>, tauri::Error> {
+    let bytes: &'static [u8] = match style {
+        TrayIconStyle::Mono => include_bytes!("../icons/tray-icon.png"),
+        TrayIconStyle::Blue => include_bytes!("../icons/tray-icon-blue.png"),
+        TrayIconStyle::Duo => include_bytes!("../icons/tray-icon-duo.png"),
+    };
+    tauri::image::Image::from_bytes(bytes)
+}
+
+fn load_tray_icon_style(app: &tauri::App) -> TrayIconStyle {
+    app.try_state::<SharedVault>()
+        .and_then(|vault| vault.get_setting(TRAY_ICON_STYLE_META).ok().flatten())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// 运行时切换托盘图标。托盘不可用时静默跳过，不影响设置保存。
+pub(crate) fn apply_tray_icon_style(
+    app: &tauri::AppHandle,
+    style: TrayIconStyle,
+) -> Result<(), DomainError> {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return Ok(());
+    };
+    let icon = tray_icon_image(style).map_err(|error| DomainError::Internal {
+        detail: error.to_string(),
+    })?;
+    tray.set_icon(Some(icon))
+        .map_err(|error| DomainError::Internal {
+            detail: error.to_string(),
+        })?;
+    #[cfg(target_os = "macos")]
+    tray.set_icon_as_template(matches!(style, TrayIconStyle::Mono))
+        .map_err(|error| DomainError::Internal {
+            detail: error.to_string(),
+        })?;
     Ok(())
 }
 
@@ -388,6 +448,29 @@ fn show_main_window(app: &tauri::AppHandle) {
         }
         if let Err(error) = window.set_focus() {
             log::warn!("failed to focus the main window: {error}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tray_tests {
+    #[test]
+    fn menu_labels_use_one_language() {
+        assert_eq!(super::tray_display_name("zh-CN"), "邻盘");
+        assert_eq!(super::tray_display_name("en"), "PeerDav");
+        assert_eq!(super::tray_menu_labels("en"), ("Home", "Settings", "Quit"));
+        assert_eq!(super::tray_menu_labels("zh-CN"), ("首页", "设置", "退出"));
+    }
+
+    #[test]
+    fn all_embedded_icons_decode() {
+        for style in [
+            super::TrayIconStyle::Mono,
+            super::TrayIconStyle::Blue,
+            super::TrayIconStyle::Duo,
+        ] {
+            let image = super::tray_icon_image(style).expect("embedded PNG");
+            assert!(image.width() > 0 && image.height() > 0);
         }
     }
 }

@@ -23,8 +23,8 @@ use crate::types::{
     PENDING_REQUEST_EVENT, PeerHealth, PeerInfo, PeerListing, PeerRevocationInfo, PeerShare,
     PeerStatus, PendingRequestInfo, PreviewPayload, ResetVaultResult, SERVER_BIND_META,
     SERVER_DISCOVERY_PORT_META, SERVER_ENABLED_META, SERVER_NAME_META, SERVER_PORT_META,
-    ServerStatus, ShareInfo, SharePermissions, TRANSFER_PROGRESS_EVENT, TransferProgress,
-    TransferResult, UploadCandidate, VaultStatus,
+    ServerStatus, ShareInfo, SharePermissions, TRANSFER_PROGRESS_EVENT, TRAY_ICON_STYLE_META,
+    TransferProgress, TransferResult, TrayIconStyle, UploadCandidate, VaultStatus,
 };
 use crate::vault::Vault;
 
@@ -196,7 +196,23 @@ pub async fn admin_session(
 pub async fn refresh_tray_menu(
     app: AppHandle,
     peers: State<'_, SharedPeers>,
+    vault: State<'_, SharedVault>,
+    locale: Option<String>,
 ) -> Result<(), AppError> {
+    let language = match locale.as_deref() {
+        Some("en") => "en".to_owned(),
+        Some("zh-CN") => "zh-CN".to_owned(),
+        _ => vault
+            .get_setting("ui.locale")
+            .map_err(AppError::from)?
+            .unwrap_or_else(|| "zh-CN".into()),
+    };
+    let (home, settings, quit) = crate::tray_menu_labels(&language);
+    if locale.is_some() {
+        vault
+            .set_setting("ui.locale", &language)
+            .map_err(AppError::from)?;
+    }
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     let Some(tray) = app.tray_by_id("main-tray") else {
         return Ok(());
@@ -206,12 +222,16 @@ pub async fn refresh_tray_menu(
             detail: error.to_string(),
         })
     };
+    tray.set_title(Some(crate::tray_display_name(&language)))
+        .map_err(native)?;
+    tray.set_tooltip(Some(crate::tray_display_name(&language)))
+        .map_err(native)?;
     let menu = Menu::new(&app).map_err(native)?;
     menu.append(
         &MenuItem::with_id(
             &app,
             crate::types::TRAY_SHOW_MENU_ID,
-            "首页 / Home",
+            home,
             true,
             None::<&str>,
         )
@@ -240,15 +260,14 @@ pub async fn refresh_tray_menu(
             .map_err(native)?;
     }
     menu.append(
-        &MenuItem::with_id(&app, "tray-settings", "设置 / Settings", true, None::<&str>)
-            .map_err(native)?,
+        &MenuItem::with_id(&app, "tray-settings", settings, true, None::<&str>).map_err(native)?,
     )
     .map_err(native)?;
     menu.append(
         &MenuItem::with_id(
             &app,
             crate::types::TRAY_QUIT_MENU_ID,
-            "退出 / Quit",
+            quit,
             true,
             None::<&str>,
         )
@@ -767,6 +786,31 @@ pub async fn set_tcp_discovery(
         source,
     })?;
     run_blocking(move || vault.set_setting(crate::types::TCP_DISCOVERY_META, &value)).await
+}
+
+#[tauri::command]
+pub async fn tray_icon_style(vault: State<'_, SharedVault>) -> Result<TrayIconStyle, AppError> {
+    let vault = Arc::clone(vault.inner());
+    let raw = run_blocking(move || vault.get_setting(TRAY_ICON_STYLE_META)).await?;
+    Ok(raw
+        .and_then(|value| serde_json::from_str::<TrayIconStyle>(&value).ok())
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+pub async fn set_tray_icon_style(
+    app: AppHandle,
+    vault: State<'_, SharedVault>,
+    style: TrayIconStyle,
+) -> Result<(), AppError> {
+    let vault = Arc::clone(vault.inner());
+    let value = serde_json::to_string(&style).map_err(|source| DomainError::Serialization {
+        operation: "save tray icon style",
+        source,
+    })?;
+    run_blocking(move || vault.set_setting(TRAY_ICON_STYLE_META, &value)).await?;
+    crate::apply_tray_icon_style(&app, style)?;
+    Ok(())
 }
 
 #[tauri::command]

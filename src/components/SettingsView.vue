@@ -20,6 +20,9 @@ import { accessRowState, findAccessRequest, findSavedPeer } from "../lib/access"
 import { statusTagTone } from "../lib/tagTone";
 import { validatePassword } from "../lib/password";
 import { useAction } from "../composables/useAction";
+import trayMonoPreview from "../../design/icon/peerdav-tray-icon.svg";
+import trayBluePreview from "../../design/icon/peerdav-tray-icon-blue.svg";
+import trayDuoPreview from "../../design/icon/peerdav-tray-icon-duo.svg";
 import ListSkeleton from "./ListSkeleton.vue";
 
 const app = useAppContext();
@@ -63,6 +66,14 @@ const tcpEnabled = ref(false);
 const tcpNetworks = ref([]);
 const tcpOptions = computed(() => [...new Set([...defaultAllowRules.value, ...tcpNetworks.value])]);
 
+const trayIconStyle = ref("mono");
+const trayIconBusy = ref(true);
+const trayIconOptions = [
+  { value: "mono", label: "settings.trayIconMono", preview: trayMonoPreview },
+  { value: "blue", label: "settings.trayIconBlue", preview: trayBluePreview },
+  { value: "duo", label: "settings.trayIconDuo", preview: trayDuoPreview },
+];
+
 async function loadServiceSettings() {
   try {
     const settings = await app.invoke("service_settings");
@@ -82,6 +93,24 @@ async function saveTcpSettings() {
       ...adminArgs(), settings: { enabled: tcpEnabled.value, networks: tcpNetworks.value },
     });
   });
+}
+
+async function loadTrayIconStyle() {
+  try {
+    trayIconStyle.value = await app.invoke("tray_icon_style");
+  } catch (error) { app.handleFailure(error); }
+  finally { trayIconBusy.value = false; }
+}
+
+async function changeTrayIconStyle(value) {
+  if (trayIconBusy.value || value === trayIconStyle.value) return;
+  trayIconBusy.value = true;
+  try {
+    await app.invoke("set_tray_icon_style", { style: value });
+    trayIconStyle.value = value;
+  } catch (error) {
+    app.handleFailure(error);
+  } finally { trayIconBusy.value = false; }
 }
 
 /* 绑定范围首选广域网/局域网/本机三项，其余本机网卡地址（VPN tun、多网卡）
@@ -710,6 +739,7 @@ onMounted(() => {
   void loadLocalNetworks();
   void loadLanAddress();
   void loadAutostart();
+  void loadTrayIconStyle();
   void loadInitialData();
 });
 
@@ -771,6 +801,21 @@ async function loadInitialData() {
 
       <section v-if="app.settingsTab === 'general'" id="pane-general" class="settings-pane" role="tabpanel" aria-labelledby="tab-general">
         <h3>{{ t("settings.tabGeneral") }}</h3>
+        <div class="settings-toggle tray-icon-settings">
+          <div>
+            <strong>{{ t("settings.trayIcon") }}</strong>
+            <p class="hint">{{ t("settings.trayIconHint") }}</p>
+          </div>
+          <div class="segmented-control" role="radiogroup" :aria-label="t('settings.trayIcon')" :aria-busy="trayIconBusy">
+            <button v-for="option in trayIconOptions" :key="option.value" type="button" role="radio"
+              class="segmented-control__option" :class="{ 'is-active': trayIconStyle === option.value }"
+              :aria-label="t(option.label)" :aria-checked="trayIconStyle === option.value"
+              :disabled="trayIconBusy" @click="changeTrayIconStyle(option.value)">
+              <img :src="option.preview" alt="" class="tray-icon-preview" :class="{ 'tray-icon-preview--mono': option.value === 'mono' }" />
+              {{ t(option.label) }}
+            </button>
+          </div>
+        </div>
         <div class="grid pane-form-grid">
           <label>{{ t("titlebar.language") }}
             <el-select :model-value="locale" @update:model-value="setLocale">
@@ -1609,6 +1654,16 @@ async function loadInitialData() {
 </template>
 
 <style scoped>
+.tray-icon-preview {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+  vertical-align: middle;
+  margin-inline-end: 6px;
+}
+:global(html[data-theme="dark"]) .tray-icon-preview--mono {
+  filter: invert(1);
+}
 .settings-view {
   max-width: 920px;
   margin: 0 auto;
@@ -2252,6 +2307,49 @@ async function loadInitialData() {
   margin-bottom: 4px;
   font-size: 14px;
   color: var(--app-text-strong);
+}
+
+.tray-icon-settings {
+  align-items: flex-start;
+}
+
+.tray-icon-settings .segmented-control {
+  flex-shrink: 0;
+}
+
+.segmented-control {
+  display: flex;
+  padding: 3px;
+  border: 1px solid var(--app-border);
+  border-radius: 11px;
+  background: color-mix(in oklab, var(--app-surface-2) 74%, transparent);
+}
+
+.segmented-control__option {
+  border: 0;
+  border-radius: 8px;
+  padding: 6px 14px;
+  background: transparent;
+  color: var(--app-text-secondary);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.segmented-control__option:hover {
+  color: var(--app-text);
+  background: var(--app-surface-3);
+}
+
+.segmented-control__option.is-active {
+  color: #fff;
+  background: var(--el-color-primary);
+  box-shadow: 0 2px 8px color-mix(in oklab, var(--el-color-primary) 38%, transparent);
 }
 
 @media (max-width: 560px) {

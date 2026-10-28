@@ -51,7 +51,7 @@ vi.mock("../lib/invoke", async (importOriginal) => {
 });
 
 import App from "../App.vue";
-import { LOCALE_STORAGE_KEY, initLocale } from "../lib/i18n";
+import { LOCALE_STORAGE_KEY, initLocale, setLocale } from "../lib/i18n";
 import { THEME_STORAGE_KEY, initTheme } from "../lib/theme";
 import { ACCENT_STORAGE_KEY, initAccent } from "../lib/accent";
 import { SETTINGS_SEEN_STORAGE_KEY } from "../lib/workspace";
@@ -128,6 +128,8 @@ function mockCommands(overrides = {}) {
     // 出站申请状态由后端保存；测试默认没有任何未完成的申请。
     access_requests: async () => [],
     inbound_connections: async () => [],
+    tray_icon_style: async () => "mono",
+    set_tray_icon_style: async () => {},
     configure_shortcuts: async () => {},
     refresh_tray_menu: async () => {},
     lock_interface: async () => {},
@@ -1436,6 +1438,58 @@ describe("settings information architecture", () => {
     localStorage.clear();
     initLocale();
     invoke.mockReset();
+  });
+
+  it("shows loading while login is pending and prevents duplicate submissions", async () => {
+    let finishLogin;
+    const login = vi.fn(() => new Promise((resolve) => { finishLogin = resolve; }));
+    const wrapper = await mountReady({ admin_login: login });
+    await wrapper.find('input[autocomplete="username"]').setValue("admin");
+    await wrapper.find('input[type="password"]').setValue("secret");
+    await wrapper.find("form").trigger("submit");
+    await flushPromises();
+    expect(wrapper.find('button[type="submit"]').classes()).toContain("is-loading");
+    await wrapper.find("form").trigger("submit");
+    expect(login).toHaveBeenCalledTimes(1);
+    finishLogin({ username: "admin", mustChangePassword: false });
+    await flushPromises();
+    wrapper.unmount();
+  });
+
+  it("updates tray menu language when the UI language changes", async () => {
+    const wrapper = await mountReady();
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("refresh_tray_menu", { locale: "zh-CN" });
+    setLocale("en");
+    await flushPromises();
+    expect(invoke).toHaveBeenLastCalledWith("refresh_tray_menu", { locale: "en" });
+    wrapper.unmount();
+    setLocale("zh-CN");
+  });
+
+  it("restores and switches all three tray icons in General, retaining selection on failure", async () => {
+    let savedStyle = "blue";
+    const wrapper = await mountReady({
+      tray_icon_style: async () => savedStyle,
+      set_tray_icon_style: async ({ style }) => {
+        if (style === "mono") throw { code: "INTERNAL_ERROR", message: "tray unavailable" };
+        savedStyle = style;
+      },
+    });
+    await signIn(wrapper, "secret", "general");
+    const group = wrapper.find('#pane-general [role="radiogroup"]');
+    expect(group.findAll('[role="radio"]')).toHaveLength(3);
+    expect(group.findAll('img')).toHaveLength(3);
+    expect(group.find('[aria-label="蓝色"]').attributes("aria-checked")).toBe("true");
+    await group.find('[aria-label="双色"]').trigger("click");
+    await flushPromises();
+    expect(savedStyle).toBe("duo");
+    expect(group.find('[aria-label="双色"]').attributes("aria-checked")).toBe("true");
+    await group.find('[aria-label="单色"]').trigger("click");
+    await flushPromises();
+    expect(group.find('[aria-label="双色"]').attributes("aria-checked")).toBe("true");
+    expect(invoke).toHaveBeenCalledWith("set_tray_icon_style", { style: "duo" });
+    wrapper.unmount();
   });
 
   it("records and clears shortcuts from General settings", async () => {
@@ -2828,12 +2882,13 @@ describe("admin session restore", () => {
     expect(fallback).not.toContain("var(--el-color-");
   });
 
-  it("clips all dialog overlays below the draggable titlebar and follows window geometry", async () => {
+  it("covers the whole window with overlays while keeping the draggable titlebar on top", async () => {
     const source = readFileSync("src/App.vue", "utf8");
     expect(source).toContain("body:has(.window-frame) > .el-overlay");
-    expect(source).toContain("top: calc(var(--titlebar-height) + var(--overlay-inset))");
-    expect(source).toContain("border-radius: 0 0 var(--overlay-radius) var(--overlay-radius)");
-    expect(source).toContain("clip-path: inset(0 round 0 0 var(--overlay-radius) var(--overlay-radius))");
+    expect(source).toContain("top: var(--overlay-inset)");
+    expect(source).toContain("border-radius: var(--overlay-radius)");
+    expect(source).toContain("clip-path: inset(0 round var(--overlay-radius))");
+    expect(source).toMatch(/\.titlebar\s*\{\s*position: relative;\s*z-index: 999999;/);
     expect(source).toMatch(/\.el-overlay-dialog\s*\{\s*position: absolute;\s*inset: 0;/);
     const wrapper = await mountReady();
     expect(wrapper.find(".titlebar").attributes()).toHaveProperty("data-tauri-drag-region");
