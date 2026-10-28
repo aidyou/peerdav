@@ -13,7 +13,7 @@ import { buildBindOptions } from "../lib/bindScope";
 import { confirmAction } from "../lib/confirm";
 import { toUserMessage } from "../lib/invoke";
 import { locale, setLocale, localizeMessage, t } from "../lib/i18n";
-import { theme, setTheme } from "../lib/theme";
+import { theme, setTheme, SUPPORTED_THEMES } from "../lib/theme";
 import { accent, setAccent, SUPPORTED_ACCENTS } from "../lib/accent";
 import { generalSettings, saveGeneralSettings, shortcutFromEvent } from "../lib/general";
 import { accessRowState, findAccessRequest, findSavedPeer } from "../lib/access";
@@ -74,6 +74,13 @@ const trayIconOptions = [
   { value: "duo", label: "settings.trayIconDuo", preview: trayDuoPreview },
 ];
 
+/* 语言名固定用各自语言书写（简体中文 / English），不随当前界面语言翻译，
+   这是语言选择器的通用约定：切错语言后仍能认出自己的母语选项。 */
+const languageOptions = [
+  { value: "zh-CN", label: "language.zh" },
+  { value: "en", label: "language.en" },
+];
+
 async function loadServiceSettings() {
   try {
     const settings = await app.invoke("service_settings");
@@ -93,6 +100,28 @@ async function saveTcpSettings() {
       ...adminArgs(), settings: { enabled: tcpEnabled.value, networks: tcpNetworks.value },
     });
   });
+}
+
+/* 复制机器码是纯前端动作，没有后端因果链：可用性问题单独给提示，
+   真正的剪贴板拒绝则把原始 message 放进用户可见文案、完整信息进 detail。 */
+async function copyMachineId() {
+  const value = app.deviceFingerprint;
+  if (!value) return;
+  if (!navigator.clipboard?.writeText) {
+    app.setError("settings.clipboardUnavailable");
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(value);
+    app.setNotice("settings.machineIdCopied");
+  } catch (error) {
+    const reason = error?.message || String(error);
+    app.handleFailure({
+      code: "CLIPBOARD_WRITE_FAILED",
+      message: t("settings.copyMachineIdFailed", { reason }),
+      detail: error?.name ? `${error.name}: ${reason}` : reason,
+    });
+  }
 }
 
 async function loadTrayIconStyle() {
@@ -799,58 +828,126 @@ async function loadInitialData() {
       </button>
     </nav>
 
+      <!-- 通用面板按语义分四组：外观、系统集成、锁屏、会话。每组是「组标题 + 行式列表」，
+           行内标题在左、控件在右，一条设置项一行；服务、账户面板沿用同一套语法，
+           成组的数据录入也走行式列表，提交动作收在列表尾行。
+           面板级动作（立即锁屏、退出登录）挂在组标题右侧的小胶囊上，不占一行。 -->
       <section v-if="app.settingsTab === 'general'" id="pane-general" class="settings-pane" role="tabpanel" aria-labelledby="tab-general">
-        <h3>{{ t("settings.tabGeneral") }}</h3>
-        <div class="settings-toggle tray-icon-settings">
-          <div>
-            <strong>{{ t("settings.trayIcon") }}</strong>
-            <p class="hint">{{ t("settings.trayIconHint") }}</p>
+        <div class="settings-group">
+          <h3 class="group-title">{{ t("settings.groupAppearance") }}</h3>
+          <div class="settings-rows">
+            <div class="settings-row">
+              <span class="settings-row__label" id="general-language-label">{{ t("language.label") }}</span>
+              <div class="segmented-control" role="radiogroup" aria-labelledby="general-language-label">
+                <button v-for="option in languageOptions" :key="option.value" type="button" role="radio"
+                  class="segmented-control__option" :class="{ 'is-active': locale === option.value }"
+                  :aria-checked="locale === option.value" @click="setLocale(option.value)">
+                  {{ t(option.label) }}
+                </button>
+              </div>
+            </div>
+            <div class="settings-row">
+              <span class="settings-row__label" id="general-theme-label">{{ t("theme.label") }}</span>
+              <div class="segmented-control" role="radiogroup" aria-labelledby="general-theme-label">
+                <button v-for="value in SUPPORTED_THEMES" :key="value" type="button" role="radio"
+                  class="segmented-control__option" :class="{ 'is-active': theme === value }"
+                  :aria-checked="theme === value" @click="setTheme(value)">
+                  {{ t(`theme.${value}`) }}
+                </button>
+              </div>
+            </div>
+            <label class="settings-row">
+              <span class="settings-row__label">{{ t("accent.label") }}</span>
+              <el-select class="row-control" :model-value="accent" @update:model-value="setAccent">
+                <el-option v-for="value in SUPPORTED_ACCENTS" :key="value" :value="value" :label="t(`accent.${value}`)">
+                  <!-- 色点只做识别辅助，选项名仍是文字，不靠颜色单独表达。 -->
+                  <span class="accent-option"><i class="accent-dot" :style="{ background: `var(--accent-${value})` }" />{{ t(`accent.${value}`) }}</span>
+                </el-option>
+              </el-select>
+            </label>
           </div>
-          <div class="segmented-control" role="radiogroup" :aria-label="t('settings.trayIcon')" :aria-busy="trayIconBusy">
-            <button v-for="option in trayIconOptions" :key="option.value" type="button" role="radio"
-              class="segmented-control__option" :class="{ 'is-active': trayIconStyle === option.value }"
-              :aria-label="t(option.label)" :aria-checked="trayIconStyle === option.value"
-              :disabled="trayIconBusy" @click="changeTrayIconStyle(option.value)">
-              <img :src="option.preview" alt="" class="tray-icon-preview" :class="{ 'tray-icon-preview--mono': option.value === 'mono' }" />
-              {{ t(option.label) }}
-            </button>
+          <p class="settings-group__footnote">{{ t("settings.appearanceHint") }}</p>
+        </div>
+
+        <div class="settings-group">
+          <h3 class="group-title">{{ t("settings.groupIntegration") }}</h3>
+          <div class="settings-rows">
+            <div class="settings-row settings-row--stack tray-icon-settings">
+              <div class="settings-row__text">
+                <span class="settings-row__label" id="general-tray-icon-label">{{ t("settings.trayIcon") }}</span>
+                <p class="hint">{{ t("settings.trayIconHint") }}</p>
+              </div>
+              <div class="segmented-control" role="radiogroup" aria-labelledby="general-tray-icon-label" :aria-busy="trayIconBusy">
+                <button v-for="option in trayIconOptions" :key="option.value" type="button" role="radio"
+                  class="segmented-control__option" :class="{ 'is-active': trayIconStyle === option.value }"
+                  :aria-label="t(option.label)" :aria-checked="trayIconStyle === option.value"
+                  :disabled="trayIconBusy" @click="changeTrayIconStyle(option.value)">
+                  <img :src="option.preview" alt="" class="tray-icon-preview" :class="{ 'tray-icon-preview--mono': option.value === 'mono' }" />
+                  {{ t(option.label) }}
+                </button>
+              </div>
+            </div>
+            <div class="settings-row settings-row--stack">
+              <div class="settings-row__text">
+                <span class="settings-row__label" id="general-autostart-label">{{ t("settings.autostart") }}</span>
+                <p class="hint">{{ t("settings.autostartHint") }}</p>
+              </div>
+              <el-switch :model-value="autostartEnabled" :loading="autostartLoading" :disabled="autostartLoading"
+                aria-labelledby="general-autostart-label" @change="changeAutostart" />
+            </div>
           </div>
         </div>
-        <div class="grid pane-form-grid">
-          <label>{{ t("titlebar.language") }}
-            <el-select :model-value="locale" @update:model-value="setLocale">
-              <el-option value="zh-CN" :label="t('language.zh')" />
-              <el-option value="en" :label="t('language.en')" />
-            </el-select>
-          </label>
-          <label>{{ t("titlebar.theme") }}
-            <el-select :model-value="theme" @update:model-value="setTheme">
-              <el-option v-for="value in ['system', 'light', 'dark']" :key="value" :value="value" :label="t(`theme.${value}`)" />
-            </el-select>
-          </label>
-          <label>{{ t("titlebar.accent") }}
-            <el-select :model-value="accent" @update:model-value="setAccent">
-              <el-option v-for="value in SUPPORTED_ACCENTS" :key="value" :value="value" :label="t(`accent.${value}`)" />
-            </el-select>
-          </label>
-          <label>{{ t("lock.auto") }}<el-switch v-model="generalSettings.autoLock" @change="saveGeneralSettings" /></label>
-          <label>{{ t("lock.minutes") }}<el-input-number v-model="generalSettings.idleMinutes" :min="5" :step="5" step-strictly :max="1440" @change="saveGeneralSettings" /></label>
-          <label v-for="field in ['toggleShortcut', 'lockShortcut']" :key="field">
-            {{ t(field === 'toggleShortcut' ? 'lock.toggleShortcut' : 'lock.shortcut') }}
-            <el-input :model-value="capturingShortcut === field ? '' : generalSettings[field]" readonly
-              :aria-label="t(field === 'toggleShortcut' ? 'lock.toggleShortcut' : 'lock.shortcut')"
-              :placeholder="t(capturingShortcut === field ? 'lock.recordingShortcut' : 'lock.captureShortcut')"
-              @focus="capturingShortcut = field" @blur="capturingShortcut = null"
-              @keydown="captureShortcut($event, field)">
-              <template #append><el-button :aria-label="t('lock.clearShortcut')" @click="clearShortcut(field)">{{ t('lock.clearShortcut') }}</el-button></template>
-            </el-input>
-          </label>
+
+        <div class="settings-group">
+          <div class="settings-group__head">
+            <h3 class="group-title">{{ t("settings.groupLock") }}</h3>
+            <el-button class="list-pill group-action" round size="small" @click="app.lockInterface">{{ t("lock.now") }}</el-button>
+          </div>
+          <div class="settings-rows">
+            <div class="settings-row">
+              <span class="settings-row__label" id="general-auto-lock-label">{{ t("lock.auto") }}</span>
+              <el-switch v-model="generalSettings.autoLock" aria-labelledby="general-auto-lock-label" @change="saveGeneralSettings" />
+            </div>
+            <!-- 等待时长只在自动锁屏打开时生效：与其它行同列同字重，靠置灰表达依赖，不做缩进。 -->
+            <label class="settings-row settings-row--sub" :class="{ 'is-dependent': !generalSettings.autoLock }">
+              <span class="settings-row__label">{{ t("lock.minutes") }}</span>
+              <span class="settings-row__control">
+                <el-input-number v-model="generalSettings.idleMinutes" :min="5" :step="5" step-strictly :max="1440" :disabled="!generalSettings.autoLock" @change="saveGeneralSettings" />
+                <span class="settings-row__unit">{{ t("settings.unitMinutes") }}</span>
+              </span>
+            </label>
+            <div class="settings-row" v-for="field in ['toggleShortcut', 'lockShortcut']" :key="field">
+              <span class="settings-row__label">{{ t(field === 'toggleShortcut' ? 'lock.toggleShortcut' : 'lock.shortcut') }}</span>
+              <el-input class="row-control" :model-value="capturingShortcut === field ? '' : generalSettings[field]" readonly
+                :aria-label="t(field === 'toggleShortcut' ? 'lock.toggleShortcut' : 'lock.shortcut')"
+                :placeholder="t(capturingShortcut === field ? 'lock.recordingShortcut' : 'lock.captureShortcut')"
+                @focus="capturingShortcut = field" @blur="capturingShortcut = null"
+                @keydown="captureShortcut($event, field)">
+                <template #append><el-button :aria-label="t('lock.clearShortcut')" @click="clearShortcut(field)">{{ t('lock.clearShortcut') }}</el-button></template>
+              </el-input>
+            </div>
+          </div>
+          <p class="settings-group__footnote">{{ t("lock.passwordHint") }}</p>
         </div>
-        <p class="hint">{{ t("lock.passwordHint") }}</p>
-        <el-button @click="app.lockInterface">{{ t("lock.now") }}</el-button>
-        <el-button @click="app.logout">{{ t("login.logout") }}</el-button>
+
+        <div class="settings-group">
+          <div class="settings-group__head">
+            <h3 class="group-title">{{ t("settings.groupSession") }}</h3>
+            <el-button class="list-pill group-action" round size="small" @click="app.logout">{{ t("login.logout") }}</el-button>
+          </div>
+          <div class="settings-rows">
+            <div class="settings-row">
+              <span class="settings-row__label">{{ t("settings.currentAccount") }}</span>
+              <span class="settings-row__value">{{ app.adminUsername }}</span>
+            </div>
+          </div>
+        </div>
       </section>
 
+      <!-- 服务面板同样按语义分组，并沿用通用面板的行式列表：
+           「WebDAV 服务」放监听配置，「局域网发现」放主动探测，
+           「本机标识」只读展示机器码。启动/停止与保存探测设置都收进各自
+           列表的动作尾行并右对齐，让动作与它作用的字段看起来是同一张表单。 -->
       <section
         v-if="app.settingsTab === 'service'"
         id="pane-service"
@@ -858,35 +955,17 @@ async function loadInitialData() {
         role="tabpanel"
         aria-labelledby="tab-service"
       >
-        <div class="server-panel">
-          <h3>{{ t("server.title") }}</h3>
-          <p class="hint">{{ t("server.verifyHint") }}</p>
-          <p v-if="app.deviceFingerprint" class="hint">{{ t("auth.machineId") }}: {{ app.deviceFingerprint }}</p>
-          <!-- 两列固定配对：名称+绑定地址一行，HTTP 服务端口与 UDP 广播端口一行。 -->
-          <div class="grid pane-form-grid">
-            <label>
-              {{ t("server.name") }}
-              <el-input
-                v-model="serverName"
-                type="text"
-                placeholder="PeerDav"
-              />
+        <div class="settings-group">
+          <h3 class="group-title">{{ t("server.title") }}</h3>
+          <div class="settings-rows">
+            <label class="settings-row">
+              <span class="settings-row__label">{{ t("server.name") }}</span>
+              <el-input class="row-control" v-model="serverName" type="text" placeholder="PeerDav" />
             </label>
-            <label>
-              {{ t("server.bindAddress") }}
-              <el-select
-                v-model="serverBind"
-                class="bind-select"
-                filterable
-                allow-create
-                default-first-option
-              >
-                <el-option
-                  v-for="option in bindOptions"
-                  :key="option.value"
-                  :value="option.value"
-                  :label="option.text"
-                >
+            <label class="settings-row">
+              <span class="settings-row__label">{{ t("server.bindAddress") }}</span>
+              <el-select class="row-control bind-select" v-model="serverBind" filterable allow-create default-first-option>
+                <el-option v-for="option in bindOptions" :key="option.value" :value="option.value" :label="option.text">
                   <span class="bind-option">
                     <span>{{ option.scope }}</span>
                     <span class="bind-option__addr">{{ option.address }}</span>
@@ -894,57 +973,80 @@ async function loadInitialData() {
                 </el-option>
               </el-select>
             </label>
-            <label>
-              {{ t("server.port") }}
-              <el-input-number v-model="serverPort" :min="1" :max="65535" />
+            <label class="settings-row">
+              <span class="settings-row__label">{{ t("server.port") }}</span>
+              <el-input-number class="row-control" v-model="serverPort" :min="1" :max="65535" />
             </label>
-            <label>
-              {{ t("server.discoveryPort") }}
-              <el-input-number
-                v-model="serverDiscoveryPort"
-                :min="1"
-                :max="65535"
-              />
+            <label class="settings-row">
+              <span class="settings-row__label">{{ t("server.discoveryPort") }}</span>
+              <el-input-number class="row-control" v-model="serverDiscoveryPort" :min="1" :max="65535" />
             </label>
-          </div>
-          <div class="actions">
-            <el-button
-              type="primary"
-              :disabled="busy || app.serverStatus.running"
-              @click="startServer"
-            >
-              {{ t("server.startService") }}
-            </el-button>
-            <el-button
-              plain
-              :disabled="busy || !app.serverStatus.running"
-              @click="stopServer"
-            >
-              {{ t("server.stopService") }}
-            </el-button>
-          </div>
-          <div class="settings-toggle tcp-discovery-settings">
-            <div><strong>{{ t("server.tcpDiscovery") }}</strong><p class="hint">{{ t("server.tcpHint") }}</p></div>
-            <el-switch v-model="tcpEnabled" />
-          </div>
-          <label>
-            {{ t("server.tcpNetworks") }}
-            <el-select v-model="tcpNetworks" multiple filterable allow-create :disabled="!tcpEnabled">
-              <el-option v-for="network in tcpOptions" :key="network" :label="network" :value="network" />
-            </el-select>
-          </label>
-          <el-button :disabled="busy" @click="saveTcpSettings">{{ t("server.saveDiscovery") }}</el-button>
-          <div class="settings-toggle">
-            <div>
-              <strong>{{ t("settings.autostart") }}</strong>
-              <p class="hint">{{ t("settings.autostartHint") }}</p>
+            <!-- 主命令收进同一张列表的尾行并右对齐，让它读起来是这个表单的提交行，
+                 而不是浮在表单外的一排按钮。 -->
+            <div class="settings-row settings-row--actions">
+              <el-button
+                type="primary"
+                :disabled="busy || app.serverStatus.running"
+                @click="startServer"
+              >
+                {{ t("server.startService") }}
+              </el-button>
+              <el-button
+                plain
+                :disabled="busy || !app.serverStatus.running"
+                @click="stopServer"
+              >
+                {{ t("server.stopService") }}
+              </el-button>
             </div>
-            <el-switch
-              :model-value="autostartEnabled"
-              :loading="autostartLoading"
-              :disabled="autostartLoading"
-              @change="changeAutostart"
-            />
+          </div>
+          <p class="settings-group__footnote">{{ t("server.verifyHint") }}</p>
+        </div>
+
+        <div class="settings-group">
+          <h3 class="group-title">{{ t("settings.groupDiscovery") }}</h3>
+          <div class="settings-rows">
+            <div class="settings-row settings-row--stack tcp-discovery-settings">
+              <div class="settings-row__text">
+                <span class="settings-row__label" id="service-tcp-label">{{ t("server.tcpDiscovery") }}</span>
+                <p class="hint">{{ t("server.tcpHint") }}</p>
+              </div>
+              <el-switch v-model="tcpEnabled" aria-labelledby="service-tcp-label" />
+            </div>
+            <!-- 网段只在探测打开时生效：与其它行同列同字重，靠置灰表达依赖。 -->
+            <label class="settings-row" :class="{ 'is-dependent': !tcpEnabled }">
+              <span class="settings-row__label">{{ t("server.tcpNetworks") }}</span>
+              <el-select class="row-control" v-model="tcpNetworks" multiple filterable allow-create
+                :placeholder="t('server.tcpNetworksExample')" :disabled="!tcpEnabled">
+                <el-option v-for="network in tcpOptions" :key="network" :label="network" :value="network" />
+              </el-select>
+            </label>
+            <div class="settings-row settings-row--actions">
+              <el-button plain :disabled="busy" @click="saveTcpSettings">{{ t("server.saveDiscovery") }}</el-button>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-group" v-if="app.deviceFingerprint">
+          <h3 class="group-title">{{ t("settings.groupIdentity") }}</h3>
+          <div class="settings-rows">
+            <div class="settings-row">
+              <span class="settings-row__label">{{ t("auth.machineId") }}</span>
+              <!-- 机器码是 64 位十六进制，手抄不现实：整串做成可点击的文本按钮，
+                   悬停提示与无障碍名都用同一句 i18n，点击即复制并回报结果。 -->
+              <el-tooltip
+                :content="t('settings.copyMachineId')"
+                placement="top"
+                :show-after="200"
+                :hide-after="0"
+                :enterable="false"
+              >
+                <button type="button" class="settings-row__value settings-row__copy mono"
+                  :aria-label="t('settings.copyMachineId')" @click="copyMachineId">
+                  {{ app.deviceFingerprint }}
+                </button>
+              </el-tooltip>
+            </div>
           </div>
         </div>
       </section>
@@ -956,12 +1058,9 @@ async function loadInitialData() {
         role="tabpanel"
         aria-labelledby="tab-shares"
       >
-        <div class="server-panel">
-          <div class="pane-heading">
-            <div class="pane-heading__title">
-              <h3>{{ t("shares.title") }}</h3>
-              <span class="count-badge">{{ shares.length }}</span>
-            </div>
+        <div class="settings-group">
+          <div class="settings-group__head">
+            <h3 class="group-title">{{ t("shares.title") }}<span class="count-badge">{{ shares.length }}</span></h3>
             <el-button
               class="list-pill pane-cta"
               type="primary"
@@ -970,7 +1069,7 @@ async function loadInitialData() {
               :aria-label="t('shares.create')"
               @click="openNewShareForm"
             >
-              <svg viewBox="0 0 24 24" aria-hidden="true" class="pane-heading__add-icon">
+              <svg viewBox="0 0 24 24" aria-hidden="true" class="pane-cta__icon">
                 <path d="M12 5v14M5 12h14" />
               </svg>
             </el-button>
@@ -1210,15 +1309,11 @@ async function loadInitialData() {
                   <path d="M5 18h14" />
                 </svg>
               </span>
-              <div class="role-heading__text">
-                <h2>
-                  {{ t("clients.inboundTitle") }}
-                  <span v-if="inboundEntries.length" class="count-badge">{{
-                    inboundEntries.length
-                  }}</span>
-                </h2>
-                <p>{{ t("clients.inboundHint") }}</p>
-              </div>
+              <h3 class="group-title">
+                {{ t("clients.inboundTitle") }}<span v-if="inboundEntries.length" class="count-badge">{{
+                  inboundEntries.length
+                }}</span>
+              </h3>
             </header>
 
             <list-skeleton v-if="inboundLoading" :rows="3" />
@@ -1311,6 +1406,8 @@ async function loadInitialData() {
                 <p class="hint">{{ t("clients.inboundEmptyHint") }}</p>
               </div>
             </div>
+            <!-- 分区说明收在列表下方做脚注：标题行只留识别，说明与设置面板同一套斜体小字。 -->
+            <p class="settings-group__footnote">{{ t("clients.inboundHint") }}</p>
           </section>
 
           <section class="client-role">
@@ -1322,15 +1419,11 @@ async function loadInitialData() {
                   <path d="M5 20h14" />
                 </svg>
               </span>
-              <div class="role-heading__text">
-                <h2>
-                  {{ t("clients.outboundTitle") }}
-                  <span v-if="outboundEntries.length" class="count-badge">{{
-                    outboundEntries.length
-                  }}</span>
-                </h2>
-                <p>{{ t("clients.outboundHint") }}</p>
-              </div>
+              <h3 class="group-title">
+                {{ t("clients.outboundTitle") }}<span v-if="outboundEntries.length" class="count-badge">{{
+                  outboundEntries.length
+                }}</span>
+              </h3>
               <el-button
                 class="list-pill"
                 type="primary"
@@ -1558,6 +1651,7 @@ async function loadInitialData() {
                 <p class="hint">{{ t("clients.outboundEmptyHint") }}</p>
               </div>
             </div>
+            <p class="settings-group__footnote">{{ t("clients.outboundHint") }}</p>
           </section>
         </div>
       </section>
@@ -1569,85 +1663,53 @@ async function loadInitialData() {
         role="tabpanel"
         aria-labelledby="tab-account"
       >
-        <div class="server-panel">
-          <h3>{{ t("login.changeTitle") }}</h3>
-          <p class="hint">{{ t("login.changeAccountHint") }}</p>
-          <form class="stack" @submit.prevent="changeAdminPassword">
-            <!-- 两列配对：账号+当前密码一行，新密码+确认一行，避免单列拉成整屏长条。 -->
-            <div class="grid pane-form-grid">
-              <label>
-                {{ t("login.username") }}
-                <el-input
-                  :model-value="app.adminUsername"
-                  type="text"
-                  disabled
-                />
-              </label>
-              <label>
-                {{ t("login.currentPassword") }}
-                <el-input
-                  v-model="adminCurrentPassword"
-                  type="password"
-                  show-password
-                  autocomplete="current-password"
-                  required
-                />
-              </label>
-              <label>
-                {{ t("login.newPassword") }}
-                <el-input
-                  v-model="adminNewPassword"
-                  type="password"
-                  show-password
-                  minlength="6"
-                  autocomplete="new-password"
-                  required
-                />
-              </label>
-              <label>
-                {{ t("login.confirmNewPassword") }}
-                <el-input
-                  v-model="adminNewPasswordConfirm"
-                  type="password"
-                  show-password
-                  minlength="6"
-                  autocomplete="new-password"
-                  required
-                />
-              </label>
-            </div>
-            <div class="actions">
+        <form class="settings-group" @submit.prevent="changeAdminPassword">
+          <h3 class="group-title">{{ t("login.changeTitle") }}</h3>
+          <div class="settings-rows">
+            <label class="settings-row">
+              <span class="settings-row__label">{{ t("login.username") }}</span>
+              <el-input class="row-control" :model-value="app.adminUsername" type="text" disabled />
+            </label>
+            <label class="settings-row">
+              <span class="settings-row__label">{{ t("login.currentPassword") }}</span>
+              <el-input class="row-control" v-model="adminCurrentPassword" type="password"
+                show-password autocomplete="current-password" required />
+            </label>
+            <label class="settings-row">
+              <span class="settings-row__label">{{ t("login.newPassword") }}</span>
+              <el-input class="row-control" v-model="adminNewPassword" type="password" show-password
+                minlength="6" autocomplete="new-password" required />
+            </label>
+            <label class="settings-row">
+              <span class="settings-row__label">{{ t("login.confirmNewPassword") }}</span>
+              <el-input class="row-control" v-model="adminNewPasswordConfirm" type="password" show-password
+                minlength="6" autocomplete="new-password" required />
+            </label>
+            <div class="settings-row settings-row--actions">
               <el-button type="primary" native-type="submit" :disabled="busy">
                 {{ t("login.update") }}
               </el-button>
-              <el-button plain :disabled="busy" @click="app.logout">
-                {{ t("login.logout") }}
-              </el-button>
             </div>
-          </form>
-        </div>
+          </div>
+          <p class="settings-group__footnote">{{ t("login.changeAccountHint") }}</p>
+        </form>
 
-        <div class="server-panel">
-          <h3>{{ t("vault.keyFileTitle") }}</h3>
-          <p class="hint">{{ t("vault.keyFileHint") }}</p>
-          <!-- 用 .stack 包一层，label 才能拿到与其它面板一致的字段标题样式
-               （13px/600 + 6px 间距），裸 label 会继承 16px 正文且贴住输入框。 -->
-          <div class="stack">
-            <label>
-              {{ t("vault.keyFilePath") }}
-              <!-- 路径只读：换密钥只能通过选择文件完成，避免手输一个不存在的地址。 -->
-              <div class="input-with-button">
-                <el-input
-                  :model-value="app.status.keyFile ?? ''"
-                  type="text"
-                  readonly
-                />
+        <div class="settings-group">
+          <h3 class="group-title">{{ t("vault.keyFileTitle") }}</h3>
+          <div class="settings-rows">
+            <!-- 路径可能很长，这一行的取值吃掉剩余宽度，选择按钮仍贴右边界。 -->
+            <div class="settings-row settings-row--wide">
+              <span class="settings-row__label">{{ t("vault.keyFilePath") }}</span>
+              <div class="settings-row__control">
+                <!-- 路径只读：换密钥只能通过选择文件完成，避免手输一个不存在的地址。 -->
+                <el-input :model-value="app.status.keyFile ?? ''" type="text" readonly />
                 <el-button plain :disabled="busy" @click="chooseVaultKey">
                   {{ t("vault.chooseKeyFile") }}
                 </el-button>
               </div>
-            </label>
+            </div>
           </div>
+          <p class="settings-group__footnote">{{ t("vault.keyFileHint") }}</p>
         </div>
       </section>
   </div>
@@ -1711,24 +1773,7 @@ async function loadInitialData() {
   flex-direction: column;
 }
 
-.pane-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.pane-heading h3 {
-  margin: 0;
-}
-
-.pane-heading__title {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-}
-
-.pane-heading__add-icon {
+.pane-cta__icon {
   width: 15px;
   height: 15px;
   fill: none;
@@ -1737,15 +1782,187 @@ async function loadInitialData() {
   stroke-linecap: round;
 }
 
-/* 面板内表单固定两列，保证字段按语义成对换行；
-   全局 .grid 用 auto-fit，宽窗口下会排出三列把配对打散。 */
-.grid.pane-form-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+/* 通用、服务与账户面板共用的行式设置列表：组标题 + 一张描边列表 + 脚注/动作尾行。
+   每条设置项一行，标题在左、控件在右，行尾就是当前状态或取值。 */
+#pane-general,
+#pane-service,
+#pane-account {
+  gap: 26px;
 }
 
-/* EP 的 select 默认 240px 固定宽，与同排输入框对不齐。 */
-.bind-select {
-  width: 100%;
+.settings-rows {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--app-border);
+  border-radius: 10px;
+  background: var(--app-surface-3);
+  overflow: hidden;
+}
+
+/* 52px 行高容纳 segmented 控件（含 3px 内衬与描边）并留出点击余量。 */
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 52px;
+  padding: 10px 14px;
+}
+
+.settings-row + .settings-row {
+  border-top: 1px solid var(--app-border);
+}
+
+.settings-row__label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--app-text-strong);
+}
+
+/* 带说明的行：标题仍承担识别，说明只补充"开启后会怎样"，放在标题下方。 */
+.settings-row--stack {
+  align-items: flex-start;
+}
+
+.settings-row__text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* 依赖关系只靠置灰表达：不缩进、不降字重，跟其它行保持同一列起点。 */
+.settings-row.is-dependent .settings-row__label,
+.settings-row.is-dependent .settings-row__unit {
+  color: var(--app-text-muted);
+}
+
+.settings-row__unit,
+.settings-row__value {
+  font-size: 13px;
+  color: var(--app-text-secondary);
+}
+
+/* 动作尾行：不占标题列，控件右对齐，读起来是这张表单的提交行。 */
+.settings-row--actions {
+  justify-content: flex-end;
+}
+
+/* 机器码取值即按钮：去掉按钮外观，只保留文本的可点/可聚焦反馈，
+   长串允许折行，避免在窄窗口把行撑破。 */
+.settings-row__copy {
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  text-align: end;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.settings-row__copy:hover {
+  color: var(--el-color-primary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.settings-row__copy:focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+/* 右侧控件列统一 240px：数字框加单位合起来的宽度，与下面快捷键输入框
+   （含"清空"追加按钮）的总宽一致，两列右边界对齐。 */
+.settings-row .row-control,
+.settings-row .settings-row__control {
+  width: 240px;
+  max-width: 100%;
+}
+
+.settings-row__control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-row__control .el-input-number {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-row__control .el-input {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 长取值（如密钥文件路径）吃掉剩余宽度，按钮仍贴右边界；其余行保持 240px 定列。 */
+.settings-row--wide .settings-row__control {
+  width: auto;
+  flex: 1;
+}
+
+/* 注释性说明统一用斜体与小一号字，跟字段标题、取值区分开。 */
+.settings-group__footnote {
+  margin: 8px 2px 0;
+  font-size: 12px;
+  font-style: italic;
+  line-height: 1.5;
+  color: var(--app-text-secondary);
+}
+
+/* 组尾动作上提到组标题右侧（小胶囊）：列表里不夹按钮，视线先落在标题行。 */
+.settings-group__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+/* 头部自带 8px 下间距，标题在头部内不再叠加自己的 margin-bottom。 */
+.settings-group__head .group-title {
+  margin: 0;
+}
+
+/* 组标题右侧的动作胶囊默认就用主题色描边（与 hover 同色），让面板级动作在
+   标题行就看得出来。只覆盖这两颗：行内 .list-pill 仍是中性描边，
+   一屏几十颗强调色边框会把状态标签挤成噪音。 */
+:root .el-button.list-pill.group-action {
+  --el-button-border-color: color-mix(in oklab, var(--accent) 45%, var(--app-border));
+}
+
+.accent-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.accent-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  /* 浅色（黄）在白色下拉面板上会糊掉，描一圈内阴影保住轮廓；颜色只是辅助，选项名仍是文字。 */
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--app-text) 22%, transparent);
+}
+
+@media (max-width: 560px) {
+  /* 窄窗口下左右两栏会把控件挤扁，改为标题在上、控件在下并撑满行宽。 */
+  .settings-row {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .settings-row .row-control,
+  .settings-row .settings-row__control,
+  .settings-row .segmented-control {
+    width: 100%;
+  }
+
+  .settings-row .segmented-control__option {
+    flex: 1;
+  }
 }
 
 .bind-option {
@@ -1925,31 +2142,17 @@ async function loadInitialData() {
   min-width: 0;
 }
 
+/* 图标 + 组标题 + 可选动作，几何与设置面板的组标题一致（13px/700）。 */
 .role-heading {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
-  align-items: start;
+  align-items: center;
   gap: 11px;
-  margin-bottom: 12px;
-  padding: 0 2px;
+  margin-bottom: 10px;
 }
 
-.role-heading__text {
-  min-width: 0;
-}
-
-.role-heading h2 {
-  margin: 0 0 4px;
-  font-size: 16px;
-  line-height: 1.3;
-  color: var(--app-text);
-}
-
-.role-heading p {
+.role-heading .group-title {
   margin: 0;
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--app-text-muted);
 }
 
 .role-icon {
@@ -2286,31 +2489,6 @@ async function loadInitialData() {
 
 .rule-select {
   width: 100%;
-}
-
-.settings-toggle {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 12px;
-  border: 1px solid var(--app-border);
-  border-radius: 10px;
-  background: var(--app-surface-3);
-  /* 与上面的表单拉开一档：面板 gap 14px + 这里 26px = 40px，
-     开机启动是独立开关，不该看起来像表单里的一个字段。 */
-  margin-top: 26px;
-}
-
-.settings-toggle strong {
-  display: block;
-  margin-bottom: 4px;
-  font-size: 14px;
-  color: var(--app-text-strong);
-}
-
-.tray-icon-settings {
-  align-items: flex-start;
 }
 
 .tray-icon-settings .segmented-control {

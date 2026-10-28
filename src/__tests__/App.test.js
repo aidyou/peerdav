@@ -54,6 +54,7 @@ import App from "../App.vue";
 import { LOCALE_STORAGE_KEY, initLocale, setLocale } from "../lib/i18n";
 import { THEME_STORAGE_KEY, initTheme } from "../lib/theme";
 import { ACCENT_STORAGE_KEY, initAccent } from "../lib/accent";
+import { generalSettings } from "../lib/general";
 import { SETTINGS_SEEN_STORAGE_KEY } from "../lib/workspace";
 import { confirmAction } from "../lib/confirm";
 import { invoke } from "../lib/invoke";
@@ -1477,7 +1478,7 @@ describe("settings information architecture", () => {
       },
     });
     await signIn(wrapper, "secret", "general");
-    const group = wrapper.find('#pane-general [role="radiogroup"]');
+    const group = wrapper.find('#pane-general .tray-icon-settings [role="radiogroup"]');
     expect(group.findAll('[role="radio"]')).toHaveLength(3);
     expect(group.findAll('img')).toHaveLength(3);
     expect(group.find('[aria-label="蓝色"]').attributes("aria-checked")).toBe("true");
@@ -1505,6 +1506,152 @@ describe("settings information architecture", () => {
     await flushPromises();
     expect(JSON.parse(localStorage.getItem("peerdav.general")).toggleShortcut).toBe("");
     expect(invoke).toHaveBeenCalledWith("configure_shortcuts", expect.objectContaining({ toggle: "" }));
+    wrapper.unmount();
+  });
+
+  it("groups General settings by purpose and switches theme from its row", async () => {
+    const wrapper = await mountReady();
+    await signIn(wrapper, "secret", "general");
+
+    expect(
+      wrapper
+        .findAll("#pane-general .group-title")
+        .map((node) => node.text()),
+    ).toEqual(["外观", "系统集成", "锁屏", "会话"]);
+
+    const themeGroup = wrapper.find(
+      '#pane-general [aria-labelledby="general-theme-label"]',
+    );
+    const radios = themeGroup.findAll('[role="radio"]');
+    expect(radios).toHaveLength(3);
+    const dark = radios.find((radio) => radio.text() === "暗色");
+    await dark.trigger("click");
+    await flushPromises();
+    expect(dark.attributes("aria-checked")).toBe("true");
+    expect(localStorage.getItem(THEME_STORAGE_KEY)).toBe("dark");
+
+    // 会话组把当前登录账户作为只读值展示；组尾动作上提到标题右侧的小胶囊。
+    expect(wrapper.find("#pane-general .settings-row__value").text()).toBe("admin");
+    expect(
+      wrapper
+        .findAll("#pane-general .settings-group__head .list-pill")
+        .map((button) => button.text()),
+    ).toEqual(["立即锁屏", "退出登录"]);
+    wrapper.unmount();
+    localStorage.clear();
+    initTheme();
+  });
+
+  it("keeps the idle timeout disabled until auto-lock is turned on", async () => {
+    generalSettings.autoLock = false;
+    const wrapper = await mountReady();
+    await signIn(wrapper, "secret", "general");
+    const subRow = () => wrapper.find("#pane-general .settings-row--sub");
+    expect(subRow().classes()).toContain("is-dependent");
+    expect(subRow().find(".el-input-number").classes()).toContain("is-disabled");
+
+    // 面板里现在有两颗开关（开机启动 / 自动锁屏），按行标题定位到锁屏那颗。
+    await wrapper.find('#pane-general [aria-labelledby="general-auto-lock-label"]').trigger("click");
+    await flushPromises();
+    expect(JSON.parse(localStorage.getItem("peerdav.general")).autoLock).toBe(true);
+    expect(subRow().classes()).not.toContain("is-dependent");
+    expect(subRow().find(".el-input-number").classes()).not.toContain("is-disabled");
+
+    wrapper.unmount();
+    generalSettings.autoLock = false;
+  });
+
+  it("groups Service settings by purpose and keeps discovery networks tied to probing", async () => {
+    const wrapper = await mountReady({
+      service_settings: async () => ({
+        name: "开发主机", bindAddress: "0.0.0.0", port: 4918, discoveryPort: 4919,
+        tcp: { enabled: false, networks: [] },
+      }),
+    });
+    await signIn(wrapper, "secret", "general");
+    await clickButton(wrapper, "服务");
+
+    expect(
+      wrapper
+        .findAll("#pane-service .group-title")
+        .map((node) => node.text()),
+    ).toEqual(["WebDAV 服务", "局域网发现", "本机标识"]);
+
+    // 机器码是只读标识，不再挤在提示段落里。
+    expect(wrapper.find("#pane-service .settings-row__value").text()).toBe("a".repeat(64));
+
+    const networksRow = () =>
+      wrapper
+        .findAll("#pane-service .settings-row")
+        .find((row) => row.text().includes("探测网段"));
+    expect(networksRow().classes()).toContain("is-dependent");
+    await wrapper.find('#pane-service [aria-labelledby="service-tcp-label"]').trigger("click");
+    await flushPromises();
+    expect(networksRow().classes()).not.toContain("is-dependent");
+
+    wrapper.unmount();
+  });
+
+  it("copies the machine code from the Service pane and labels the control", async () => {
+    const previousClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    const writeText = vi.fn(async () => {});
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    const wrapper = await mountReady();
+    await signIn(wrapper);
+    await clickButton(wrapper, "服务");
+
+    const copy = wrapper.find("#pane-service .settings-row__copy");
+    expect(copy.attributes("aria-label")).toBe("点击复制机器码");
+    await copy.trigger("click");
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledWith("a".repeat(64));
+    const notices = document.querySelectorAll(".el-message--success .el-message__content");
+    expect(notices[notices.length - 1]?.textContent?.trim()).toBe("已复制机器码。");
+
+    wrapper.unmount();
+    if (previousClipboard) Object.defineProperty(navigator, "clipboard", previousClipboard);
+    else delete navigator.clipboard;
+  });
+
+  it("applies the group-title grammar to Shares, Clients and Account", async () => {
+    const wrapper = await mountReady();
+    await signIn(wrapper);
+
+    const sharesHead = wrapper.find("#pane-shares .settings-group__head");
+    expect(sharesHead.exists()).toBe(true);
+    expect(sharesHead.find(".group-title").text()).toContain("共享策略");
+    expect(sharesHead.find(".count-badge").exists()).toBe(true);
+    expect(sharesHead.find("button.pane-cta").exists()).toBe(true);
+
+    await wrapper.find("#tab-clients").trigger("click");
+    await flushPromises();
+    // 分区标题统一成组标题字号，旧的 h2 与标题旁的说明段落都不应再存在。
+    expect(wrapper.findAll("#pane-clients .role-heading h2")).toHaveLength(0);
+    expect(wrapper.findAll("#pane-clients .role-heading p")).toHaveLength(0);
+    const roleTitles = wrapper.findAll("#pane-clients .role-heading .group-title");
+    expect(roleTitles).toHaveLength(2);
+    expect(roleTitles[0].text()).toContain("其他设备访问此设备");
+    expect(roleTitles[1].text()).toContain("此设备访问其他设备");
+    const clientNotes = wrapper.findAll("#pane-clients .client-role > .settings-group__footnote");
+    expect(clientNotes).toHaveLength(2);
+    expect(clientNotes[0].text()).toContain("管理谁可以访问");
+    expect(clientNotes[1].text()).toContain("浏览其他设备的共享");
+
+    await wrapper.find("#tab-account").trigger("click");
+    await flushPromises();
+    expect(
+      wrapper.findAll("#pane-account .group-title").map((node) => node.text()),
+    ).toEqual(["修改管理员密码", "密钥文件"]);
+    // 4 个字段 + 动作尾行 + 密钥路径行；说明改为列表下方的脚注。
+    expect(wrapper.findAll("#pane-account .settings-row")).toHaveLength(6);
+    expect(wrapper.find("#pane-account .settings-row--actions button").text()).toBe("更新密码");
+    expect(wrapper.findAll("#pane-account .settings-group__footnote")).toHaveLength(2);
+    expect(wrapper.find("#pane-account .pane-form-grid").exists()).toBe(false);
+
     wrapper.unmount();
   });
 
@@ -1666,6 +1813,14 @@ describe("settings information architecture", () => {
       ],
     });
     await flushPromises();
+
+    // 分区标题与设置面板共用全局组标题几何，旧的 h2 不再出现。
+    const sectionHeadings = wrapper.findAll(".section-heading");
+    expect(wrapper.findAll(".section-heading h2")).toHaveLength(0);
+    expect(wrapper.findAll(".section-heading .group-title")).toHaveLength(sectionHeadings.length);
+    expect(
+      wrapper.findAll(".section-heading .group-title").map((node) => node.text()).join(" "),
+    ).toContain("已授权服务器");
 
     // 标题右侧是数量角标，不再是「共 N 台」的说明文字。
     expect(
@@ -2611,6 +2766,43 @@ describe("titlebar appearance controls", () => {
     invoke.mockReset();
   });
 
+  it.each([["zh-CN", "立即锁屏"], ["en", "Lock now"]])("locks from the titlebar before the language menu in %s", async (language, label) => {
+    setLocale(language);
+    const wrapper = await mountReady({
+      admin_session: async () => ({ username: "admin", mustChangePassword: false }),
+    });
+    const button = wrapper.find(".titlebar-lock");
+    expect(button.attributes("aria-label")).toBe(label);
+    expect(button.attributes("title")).toBe(label);
+    expect(button.element.nextElementSibling.dataset.menu).toBe("language");
+    await button.trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("lock_interface");
+    expect(wrapper.find(".interface-lock").exists()).toBe(true);
+    expect(wrapper.find("#titlebar-end").isVisible()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("hides the titlebar lock button before login", async () => {
+    const wrapper = await mountReady();
+    expect(wrapper.find(".titlebar-lock").exists()).toBe(false);
+    expect(invoke).not.toHaveBeenCalledWith("lock_interface");
+    wrapper.unmount();
+  });
+
+  it("keeps the workspace and reports a failed titlebar lock", async () => {
+    const wrapper = await mountReady({
+      admin_session: async () => ({ username: "admin", mustChangePassword: false }),
+      lock_interface: async () => { throw { code: "INTERNAL_ERROR", message: "Lock failed" }; },
+    });
+    await wrapper.find(".titlebar-lock").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".interface-lock").exists()).toBe(false);
+    expect(wrapper.find(".workspace").exists()).toBe(true);
+    expect(latestErrorMessage()).toBe("执行操作失败：Lock failed");
+    wrapper.unmount();
+  });
+
   it("renders localized labels in the titlebar menus", async () => {
     const wrapper = await mountReady(VAULT_NOT_INITIALIZED);
 
@@ -2726,15 +2918,18 @@ describe("startup launch", () => {
     enable.mockClear();
 
     const wrapper = await mountReady();
-    await signIn(wrapper);
-    await clickButton(wrapper, "服务");
+    await signIn(wrapper, "secret", "general");
 
     expect(isEnabled).toHaveBeenCalled();
 
-    await wrapper.find(".settings-toggle:not(.tcp-discovery-settings) .el-switch").trigger("click");
+    // 开机启动属于「通用 - 系统集成」，不再是服务面板的尾部卡片。
+    await wrapper.find('#pane-general [aria-labelledby="general-autostart-label"]').trigger("click");
     await flushPromises();
 
     expect(enable).toHaveBeenCalledTimes(1);
+
+    await clickButton(wrapper, "服务");
+    expect(wrapper.find("#pane-service").text()).not.toContain("开机启动");
 
     wrapper.unmount();
   });
@@ -2958,6 +3153,35 @@ describe("admin session restore", () => {
     wrapper.unmount();
   });
 
+  it.each(["", "#/settings/general", "#/peer/peer-1"])("restores a locked interface on reload without an error toast at %s", async (route) => {
+    window.history.replaceState(null, "", `${window.location.pathname}${route}`);
+    let resolveSession;
+    const pendingSession = new Promise((resolve) => { resolveSession = resolve; });
+    const lockedError = {
+      code: "AUTH_INTERFACE_LOCKED",
+      message: "界面已锁定，请输入登录密码解锁",
+    };
+    const wrapper = await mountReady({
+      configure_shortcuts: async () => { throw lockedError; },
+      admin_session: () => pendingSession,
+    });
+
+    // 初始化请求可能先于会话恢复被后端拒绝，不应短暂弹出锁屏错误。
+    expect(latestErrorMessage()).toBe("");
+    resolveSession({ username: "admin", mustChangePassword: false, interfaceLocked: true });
+    await flushPromises();
+    expect(wrapper.find(".interface-lock").exists()).toBe(true);
+    expect(latestErrorMessage()).toBe("");
+
+    eventHandlers.get("app://error")({ payload: lockedError });
+    await flushPromises();
+    expect(latestErrorMessage()).toBe("");
+    eventHandlers.get("app://error")({ payload: { code: "FS_PERMISSION_DENIED", message: "Permission denied" } });
+    await flushPromises();
+    expect(latestErrorMessage()).not.toBe("");
+    wrapper.unmount();
+  });
+
   it("restores a locked interface without covering window controls and verifies the unlock password", async () => {
     const wrapper = await mountReady({
       admin_session: async () => ({ username: "admin", mustChangePassword: false, interfaceLocked: true }),
@@ -2970,6 +3194,17 @@ describe("admin session restore", () => {
     expect(wrapper.find(".workspace").exists()).toBe(false);
     expect(wrapper.find(".traffic-lights").exists()).toBe(true);
     expect(wrapper.find("#titlebar-end").attributes("style")).toContain("display: none");
+    // 锁屏沿用闸门卡片几何，锁图形与标题同一行居中。
+    expect(wrapper.find(".interface-lock").classes()).toContain("card");
+    const lockHeading = wrapper.find(".interface-lock__heading");
+    expect(lockHeading.exists()).toBe(true);
+    expect(lockHeading.find(".interface-lock__icon").exists()).toBe(true);
+    expect(lockHeading.find("h1").text()).toBe("界面已锁定");
+    // 中间弹性槽不能被 v-show 掉：否则非 macOS 的窗口按钮会失去撑开的中间列而贴到左边。
+    expect(wrapper.find("#titlebar-center").attributes("style") ?? "").not.toContain("display: none");
+    // 锁屏是键盘界面：出现即聚焦密码框。
+    await flushPromises();
+    expect(document.activeElement?.getAttribute("type")).toBe("password");
     await wrapper.find('.interface-lock input').setValue("wrong");
     await wrapper.find('.interface-lock').trigger("submit");
     await flushPromises();
@@ -2979,6 +3214,8 @@ describe("admin session restore", () => {
     await flushPromises();
     expect(wrapper.find(".interface-lock").exists()).toBe(false);
     expect(wrapper.find(".workspace").exists()).toBe(true);
+    // 撤锁后焦点不留在已被替换掉的表单节点上。
+    expect(document.activeElement?.closest?.(".interface-lock") ?? null).toBeNull();
     wrapper.unmount();
   });
 

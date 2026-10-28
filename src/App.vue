@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, provide, reactive, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, provide, reactive, ref, watch } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ElMessage } from "element-plus";
@@ -93,6 +93,7 @@ let lastInterfaceActivity = Date.now();
 const interfaceLocked = ref(false);
 const unlockPassword = ref("");
 const unlockingInterface = ref(false);
+const unlockInput = ref(null);
 
 async function lockInterface() {
   if (!loggedIn.value || interfaceLocked.value) return;
@@ -117,6 +118,17 @@ async function unlockInterface() {
   finally { unlockPassword.value = ""; unlockingInterface.value = false; }
 }
 
+/* 锁屏是键盘界面：出现即聚焦密码框，不用先点一下输入框。
+   撤锁时表单整块被工作区替换，留在里面的焦点会落到已卸载的节点上，
+   因此交还给 document.body，让下一次 Tab 从内容区开始。 */
+watch(interfaceLocked, (locked) => {
+  if (locked) {
+    nextTick(() => unlockInput.value?.focus?.());
+  } else if (document.activeElement?.closest(".interface-lock")) {
+    document.activeElement.blur();
+  }
+});
+
 const settingsTab = ref("general");
 const transfers = ref({});
 
@@ -140,6 +152,11 @@ function setError(key, params) {
 }
 
 function setRawError(error) {
+  // 锁屏本身已提示解锁，包含刷新后尚未恢复会话状态的阶段。
+  if (errorStrategy(error) === "interface-lock") {
+    interfaceLocked.value = true;
+    return;
+  }
   showToast(toUserMessage(error), "error", 5000);
 }
 
@@ -959,16 +976,30 @@ provide(
         </div>
       </div>
 
+      <!-- 这个槽位是弹性占位：锁屏时不能 v-show 掉，否则非 macOS 的窗口按钮会因为
+           失去撑开的中间列而贴到左边（order 只在多个可见项之间起作用）。 -->
       <div
         :aria-hidden="interfaceLocked || undefined"
         :inert="interfaceLocked || undefined"
-        v-show="!interfaceLocked"
         id="titlebar-center"
         class="titlebar-slot titlebar-slot--center"
       ></div>
 
       <div v-show="!interfaceLocked" id="titlebar-end" class="titlebar-slot titlebar-slot--end">
         <div class="titlebar-actions">
+          <button
+            v-if="loggedIn"
+            type="button"
+            class="titlebar-lock"
+            :aria-label="t('lock.now')"
+            :title="t('lock.now')"
+            @click="lockInterface"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="5" y="10" width="14" height="11" rx="2" />
+              <path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3" />
+            </svg>
+          </button>
           <TitleBarMenu
             name="language"
             :aria-label="t('titlebar.language')"
@@ -1041,11 +1072,41 @@ provide(
     </header>
 
     <main class="shell" :class="{ 'shell--workspace': view === 'ready' || view === 'loading' }">
-      <form v-if="interfaceLocked" class="interface-lock" @submit.prevent="unlockInterface">
-        <h1>{{ t("lock.title") }}</h1>
+      <form
+        v-if="interfaceLocked"
+        class="interface-lock card"
+        @submit.prevent="unlockInterface"
+      >
+        <div class="interface-lock__heading">
+          <span class="interface-lock__icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <rect x="4.5" y="10.5" width="15" height="9.5" rx="2.5" />
+              <path d="M8 10.5V7.8a4 4 0 0 1 8 0v2.7" />
+              <circle cx="12" cy="15.2" r="1.4" />
+            </svg>
+          </span>
+          <h1>{{ t("lock.title") }}</h1>
+        </div>
         <p>{{ t("lock.hint") }}</p>
-        <el-input v-model="unlockPassword" type="password" show-password autocomplete="current-password" :placeholder="t('vault.adminPassword')" :disabled="unlockingInterface" />
-        <el-button type="primary" native-type="submit" :loading="unlockingInterface">{{ t("lock.unlock") }}</el-button>
+        <div class="stack">
+          <el-input
+            ref="unlockInput"
+            v-model="unlockPassword"
+            type="password"
+            show-password
+            autocomplete="current-password"
+            :placeholder="t('vault.adminPassword')"
+            :disabled="unlockingInterface"
+          />
+          <el-button
+            type="primary"
+            native-type="submit"
+            :loading="unlockingInterface"
+            :disabled="!unlockPassword"
+          >
+            {{ t("lock.unlock") }}
+          </el-button>
+        </div>
       </form>
       <AuthView v-else-if="view !== 'ready'" :view="view" />
 
@@ -1108,11 +1169,49 @@ provide(
 </template>
 
 <style scoped>
+/* 锁屏属于「闸门」界面，与登录/初始化共用 .card 的容器几何与字阶：
+   标题、说明、字段各自沿用卡片节奏，不再是一组浮在背景上的裸控件。 */
 .interface-lock {
   width: min(360px, 90%);
   margin: auto;
-  display: grid;
-  gap: 16px;
+}
+
+/* 锁图形与标题同一行并整体居中：这一屏只有“已锁定”一个主题，
+   图形是它的状态标记，不该单独占一行把标题推成第二段。 */
+.interface-lock__heading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-bottom: 50px;
+}
+
+/* 行与下方内容的间距由 heading 统一负责，标题不再自带卡片默认底部外边距。 */
+.interface-lock__heading h1 {
+  margin: 0;
+}
+
+/* 状态图形沿用其它面板的着色芯片写法（主色 + surface-2 底色），不引入新的强调层。 */
+.interface-lock__icon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 11px;
+  color: var(--el-color-primary);
+  background: color-mix(in oklab, var(--el-color-primary) 10%, var(--app-surface-2));
+}
+
+.interface-lock__icon svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 .window-frame {
   box-sizing: border-box;
@@ -1305,6 +1404,42 @@ provide(
   align-items: center;
   gap: 4px;
   -webkit-app-region: no-drag;
+}
+
+.titlebar-lock {
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 999px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--app-text-muted);
+  background: transparent;
+  -webkit-app-region: no-drag;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.titlebar-lock:hover {
+  color: var(--app-text);
+  background: var(--pill-bg);
+}
+
+.titlebar-lock:focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: 1px;
+}
+
+.titlebar-lock svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .titlebar-file-actions {
@@ -1705,6 +1840,9 @@ body,
   box-shadow: 0 14px 40px rgba(22, 32, 46, 0.06);
 }
 
+/* 闸门卡片的标题：锁屏用 h1（锁定期间它就是整页的唯一主题），
+   登录/初始化用 h2，两者字阶一致，不因标签不同而各写一份。 */
+.card h1,
 .card h2 {
   margin: 0 0 12px;
   font-size: 19px;
@@ -1727,8 +1865,17 @@ body,
   font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
 }
 
-/* 列表设计语言的全局件：标题数量角标、行内标签、行内动作按钮在首页/设置/文件页共用
-   一套几何，写在组件里会各写一份然后慢慢跑偏。 */
+/* 列表设计语言的全局件：分组标题、标题数量角标、行内标签、行内动作按钮在首页/设置/
+   文件页共用一套几何，写在组件里会各写一份然后慢慢跑偏。 */
+.group-title {
+  margin: 0 0 8px;
+  /* 标题比列表描边右移 2px：文字与卡片边框同一起点时，视觉上标题会显得偏左。 */
+  padding-left: 2px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--app-text);
+}
+
 .count-badge {
   display: inline-flex;
   align-items: center;
@@ -1826,27 +1973,6 @@ body,
   border-radius: 12px;
   background: var(--app-surface-2);
   border: 1px solid var(--app-border);
-}
-
-.server-panel {
-  margin-top: 26px;
-  padding-top: 22px;
-  border-top: 1px solid var(--app-border);
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.server-panel:first-child {
-  margin-top: 0;
-  padding-top: 0;
-  border-top: 0;
-}
-
-.server-panel h3 {
-  margin: 0;
-  font-size: 16px;
-  color: var(--app-text);
 }
 
 .hint {

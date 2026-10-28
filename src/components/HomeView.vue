@@ -189,14 +189,14 @@ async function forgetPeer(peer) {
     <!-- 没有待审批申请时整块隐藏：空态提示只会占位置，没有可操作的内容。 -->
     <section v-if="pendingApprovals.length" class="home-section">
       <header class="section-heading">
-        <h2>
+        <h3 class="group-title">
           {{ t("home.pendingTitle") }}
           <span
             class="count-badge"
             :title="t('home.pendingTotal', { count: pendingApprovals.length })"
             >{{ pendingApprovals.length }}</span
           >
-        </h2>
+        </h3>
       </header>
 
       <ul class="server-list">
@@ -242,7 +242,7 @@ async function forgetPeer(peer) {
 
     <section class="home-section">
       <header class="section-heading">
-        <h2>
+        <h3 class="group-title">
           {{ t("home.authorizedServers") }}
           <span
             v-if="hasPeers"
@@ -250,7 +250,7 @@ async function forgetPeer(peer) {
             :title="t('home.totalServers', { count: app.peers.length })"
             >{{ app.peers.length }}</span
           >
-        </h2>
+        </h3>
       </header>
 
       <list-skeleton v-if="peersLoading" variant="card" :rows="2" />
@@ -339,7 +339,7 @@ async function forgetPeer(peer) {
 
     <section class="home-section">
       <header class="section-heading">
-        <h2>
+        <h3 class="group-title">
           {{ t("home.discoveredServers") }}
           <span
             v-if="discovered.length"
@@ -347,7 +347,7 @@ async function forgetPeer(peer) {
             :title="t('home.totalServers', { count: discovered.length })"
             >{{ discovered.length }}</span
           >
-        </h2>
+        </h3>
         <el-tag
           class="row-tag"
           :type="discoveryRunning ? statusTagTone('online') : statusTagTone('unknown')"
@@ -498,12 +498,9 @@ async function forgetPeer(peer) {
   gap: 16px;
 }
 
-.section-heading h2 {
+/* 头部自带间距，标题在头部内不叠加自己的 margin-bottom。 */
+.section-heading .group-title {
   margin: 0;
-  font-size: 16px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-  color: var(--app-text);
 }
 
 .server-list {
