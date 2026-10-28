@@ -132,7 +132,8 @@ jobs:
           cache-on-failure: true
 
       - name: Test filesystem behavior on target platform
-        run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} --lib fs::
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml --target ${{ matrix.target }} --lib fs::
 
       - name: Build bundles
         uses: tauri-apps/tauri-action@v1

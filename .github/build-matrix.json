@@ -25,8 +25,8 @@
       "arch": "x86_64",
       "os": "ubuntu-22.04",
       "target": "x86_64-unknown-linux-gnu",
-      "bundles": "deb,rpm",
-      "artifact_paths": "src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb\nsrc-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm"
+      "bundles": "deb,rpm,appimage",
+      "artifact_paths": "src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb\nsrc-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm\nsrc-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage"
     },
     {
       "name": "linux-arm64",
@@ -34,8 +34,8 @@
       "arch": "arm64",
       "os": "ubuntu-22-04-arm",
       "target": "aarch64-unknown-linux-gnu",
-      "bundles": "deb,rpm",
-      "artifact_paths": "src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/deb/*.deb\nsrc-tauri/target/aarch64-unknown-linux-gnu/release/bundle/rpm/*.rpm"
+      "bundles": "deb,rpm,appimage",
+      "artifact_paths": "src-tauri/target/aarch64-unknown-linux-gnu/release/bundle/deb/*.deb\nsrc-tauri/target/aarch64-unknown-linux-gnu/release/bundle/rpm/*.rpm\nsrc-tauri/target/aarch64-unknown-linux-gnu/release/bundle/appimage/*.AppImage"
     },
     {
       "name": "macos-x86_64",
