@@ -23,8 +23,8 @@ use crate::types::{
     PENDING_REQUEST_EVENT, PeerHealth, PeerInfo, PeerListing, PeerRevocationInfo, PeerShare,
     PeerStatus, PendingRequestInfo, PreviewPayload, ResetVaultResult, SERVER_BIND_META,
     SERVER_DISCOVERY_PORT_META, SERVER_ENABLED_META, SERVER_NAME_META, SERVER_PORT_META,
-    ServerStatus, ShareInfo, SharePermissions, TRANSFER_PROGRESS_EVENT, TransferProgress,
-    TransferResult, UploadCandidate, VaultStatus,
+    ServerStatus, ShareInfo, SharePermissions, TRANSFER_PROGRESS_EVENT, TRAY_ICON_STYLE_META,
+    TransferProgress, TransferResult, TrayIconStyle, UploadCandidate, VaultStatus,
 };
 use crate::vault::Vault;
 
@@ -581,6 +581,31 @@ pub async fn set_tcp_discovery(
         source,
     })?;
     run_blocking(move || vault.set_setting(crate::types::TCP_DISCOVERY_META, &value)).await
+}
+
+#[tauri::command]
+pub async fn tray_icon_style(vault: State<'_, SharedVault>) -> Result<TrayIconStyle, AppError> {
+    let vault = Arc::clone(vault.inner());
+    let raw = run_blocking(move || vault.get_setting(TRAY_ICON_STYLE_META)).await?;
+    Ok(raw
+        .and_then(|value| serde_json::from_str::<TrayIconStyle>(&value).ok())
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+pub async fn set_tray_icon_style(
+    app: AppHandle,
+    vault: State<'_, SharedVault>,
+    style: TrayIconStyle,
+) -> Result<(), AppError> {
+    let vault = Arc::clone(vault.inner());
+    let value = serde_json::to_string(&style).map_err(|source| DomainError::Serialization {
+        operation: "save tray icon style",
+        source,
+    })?;
+    run_blocking(move || vault.set_setting(TRAY_ICON_STYLE_META, &value)).await?;
+    crate::apply_tray_icon_style(&app, style)?;
+    Ok(())
 }
 
 #[tauri::command]

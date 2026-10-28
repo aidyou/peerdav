@@ -253,6 +253,11 @@ export default {
   "settings.autostartHint": "系统启动后自动打开 PeerDav，并按上次状态恢复 WebDAV 服务，供已授权的局域网客户端访问。",
   "settings.autostartEnabled": "已开启开机启动。",
   "settings.autostartDisabled": "已关闭开机启动。",
+  "settings.trayIcon": "菜单栏图标",
+  "settings.trayIconHint": "选择系统菜单栏显示的图标样式。单色跟随系统深浅色自动切换，蓝色与双色为固定颜色。",
+  "settings.trayIconMono": "单色",
+  "settings.trayIconBlue": "蓝色",
+  "settings.trayIconDuo": "双色",
 
   "server.title": "WebDAV 服务",
   "server.verifyHint": "启用 WebDAV 服务后，局域网内的其他客户端才能按授权访问本机共享目录。",

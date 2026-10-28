@@ -39,6 +39,13 @@ const tcpEnabled = ref(false);
 const tcpNetworks = ref([]);
 const tcpOptions = computed(() => [...new Set([...defaultAllowRules.value, ...tcpNetworks.value])]);
 
+const trayIconStyle = ref("mono");
+const trayIconOptions = [
+  { value: "mono", label: "settings.trayIconMono" },
+  { value: "blue", label: "settings.trayIconBlue" },
+  { value: "duo", label: "settings.trayIconDuo" },
+];
+
 async function loadServiceSettings() {
   try {
     const settings = await app.invoke("service_settings");
@@ -58,6 +65,24 @@ async function saveTcpSettings() {
       ...adminArgs(), settings: { enabled: tcpEnabled.value, networks: tcpNetworks.value },
     });
   });
+}
+
+async function loadTrayIconStyle() {
+  try {
+    trayIconStyle.value = await app.invoke("tray_icon_style");
+  } catch (error) { app.handleFailure(error); }
+}
+
+async function changeTrayIconStyle(value) {
+  if (value === trayIconStyle.value) return;
+  const previous = trayIconStyle.value;
+  trayIconStyle.value = value;
+  try {
+    await app.invoke("set_tray_icon_style", { style: value });
+  } catch (error) {
+    trayIconStyle.value = previous;
+    app.handleFailure(error);
+  }
 }
 
 /* 绑定范围首选广域网/局域网/本机三项，其余本机网卡地址（VPN tun、多网卡）
@@ -703,6 +728,7 @@ onMounted(() => {
   void loadLocalNetworks();
   void loadLanAddress();
   void loadAutostart();
+  void loadTrayIconStyle();
   void loadInitialData();
 });
 
@@ -856,6 +882,26 @@ async function loadInitialData() {
               :disabled="autostartLoading"
               @change="changeAutostart"
             />
+          </div>
+          <div class="settings-toggle tray-icon-settings">
+            <div>
+              <strong>{{ t("settings.trayIcon") }}</strong>
+              <p class="hint">{{ t("settings.trayIconHint") }}</p>
+            </div>
+            <div class="segmented-control" role="radiogroup" :aria-label="t('settings.trayIcon')">
+              <button
+                v-for="option in trayIconOptions"
+                :key="option.value"
+                type="button"
+                role="radio"
+                class="segmented-control__option"
+                :class="{ 'is-active': trayIconStyle === option.value }"
+                :aria-checked="trayIconStyle === option.value"
+                @click="changeTrayIconStyle(option.value)"
+              >
+                {{ t(option.label) }}
+              </button>
+            </div>
           </div>
         </div>
       </section>
@@ -2199,6 +2245,49 @@ async function loadInitialData() {
   margin-bottom: 4px;
   font-size: 14px;
   color: var(--app-text-strong);
+}
+
+.tray-icon-settings {
+  align-items: flex-start;
+}
+
+.tray-icon-settings .segmented-control {
+  flex-shrink: 0;
+}
+
+.segmented-control {
+  display: flex;
+  padding: 3px;
+  border: 1px solid var(--app-border);
+  border-radius: 11px;
+  background: color-mix(in oklab, var(--app-surface-2) 74%, transparent);
+}
+
+.segmented-control__option {
+  border: 0;
+  border-radius: 8px;
+  padding: 6px 14px;
+  background: transparent;
+  color: var(--app-text-secondary);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.segmented-control__option:hover {
+  color: var(--app-text);
+  background: var(--app-surface-3);
+}
+
+.segmented-control__option.is-active {
+  color: #fff;
+  background: var(--el-color-primary);
+  box-shadow: 0 2px 8px color-mix(in oklab, var(--el-color-primary) 38%, transparent);
 }
 
 @media (max-width: 560px) {

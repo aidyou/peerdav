@@ -252,6 +252,11 @@ export default {
   "settings.autostartHint": "Opens PeerDav at system startup and resumes WebDAV from its last state, so authorized clients on your network can reach your shares.",
   "settings.autostartEnabled": "Launch at startup enabled.",
   "settings.autostartDisabled": "Launch at startup disabled.",
+  "settings.trayIcon": "Menu bar icon",
+  "settings.trayIconHint": "Choose the icon shown in the system menu bar. Mono follows the system light and dark appearance; Blue and Duo keep fixed colors.",
+  "settings.trayIconMono": "Mono",
+  "settings.trayIconBlue": "Blue",
+  "settings.trayIconDuo": "Duo",
 
   "server.title": "WebDAV server",
   "server.verifyHint": "Other clients on your network can reach your shared folders only while the WebDAV service is running, and only within their authorization.",

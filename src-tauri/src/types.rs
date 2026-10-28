@@ -220,6 +220,22 @@ pub const MAIN_WINDOW_LABEL: &str = "main";
 /// Tray menu identifiers.
 pub const TRAY_SHOW_MENU_ID: &str = "tray-show";
 pub const TRAY_QUIT_MENU_ID: &str = "tray-quit";
+/// Tray icon identifier, used to swap the icon at runtime.
+pub const TRAY_ID: &str = "main-tray";
+
+/// Tray icon style persisted in the metadata table. `mono` renders through the
+/// macOS template image so the system adapts it to light and dark menu bars;
+/// `blue` and `duo` keep fixed colors.
+pub const TRAY_ICON_STYLE_META: &str = "tray.iconStyle";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TrayIconStyle {
+    #[default]
+    Mono,
+    Blue,
+    Duo,
+}
 
 /// Read/write/delete permissions of one shared directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -782,4 +798,25 @@ pub(crate) struct PeerRecord {
 pub(crate) struct PeerSecret {
     pub url: String,
     pub code: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TrayIconStyle;
+
+    #[test]
+    fn tray_icon_style_round_trips_through_storage_format() {
+        for style in [TrayIconStyle::Mono, TrayIconStyle::Blue, TrayIconStyle::Duo] {
+            let raw = serde_json::to_string(&style).expect("serialize tray icon style");
+            let decoded: TrayIconStyle =
+                serde_json::from_str(&raw).expect("deserialize tray icon style");
+            assert_eq!(decoded, style);
+        }
+    }
+
+    #[test]
+    fn unknown_tray_icon_style_falls_back_to_mono() {
+        let decoded = serde_json::from_str::<TrayIconStyle>("\"neon\"").ok();
+        assert_eq!(decoded.unwrap_or_default(), TrayIconStyle::Mono);
+    }
 }
