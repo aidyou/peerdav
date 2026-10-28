@@ -272,7 +272,9 @@ fn split_components(relative: &Path) -> FsResult<Vec<std::ffi::OsString>> {
     for component in relative.components() {
         match component {
             Component::Normal(name) => {
-                if name.is_empty() {
+                if name.is_empty()
+                    || crate::ignore_rules::is_system_ignored(&name.to_string_lossy())
+                {
                     return Err(FsError::Forbidden);
                 }
                 components.push(name.to_owned());
@@ -621,7 +623,10 @@ fn read_entries(share: &ShareConfig, relative: &Path) -> FsResult<Vec<DirEntry>>
     for entry in directory {
         let entry = entry.map_err(errno)?;
         let name = entry.file_name().to_bytes();
-        if name == b"." || name == b".." {
+        if name == b"."
+            || name == b".."
+            || crate::ignore_rules::is_system_ignored(&String::from_utf8_lossy(name))
+        {
             continue;
         }
         if entry.file_type().is_symlink() {

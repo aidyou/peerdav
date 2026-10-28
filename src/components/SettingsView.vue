@@ -939,6 +939,22 @@ async function loadInitialData() {
           <p class="settings-group__footnote">{{ t("lock.passwordHint") }}</p>
         </div>
 
+        <div class="settings-group" data-testid="ignore-settings">
+          <h3 class="group-title">{{ t("ignore.title") }}</h3>
+          <div class="settings-rows">
+            <div class="settings-row">
+              <span class="settings-row__label" id="respect-gitignore-label">{{ t("ignore.gitignore") }}</span>
+              <el-switch v-model="generalSettings.respectGitignore" aria-labelledby="respect-gitignore-label" @change="saveGeneralSettings" />
+            </div>
+            <div class="settings-row settings-row--stack">
+              <span class="settings-row__label" id="ignore-patterns-label">{{ t("ignore.patterns") }}</span>
+              <el-input v-model="generalSettings.ignorePatterns" type="textarea" :autosize="{ minRows: 5, maxRows: 12 }"
+                aria-labelledby="ignore-patterns-label" @change="saveGeneralSettings" />
+            </div>
+          </div>
+          <p class="settings-group__footnote">{{ t("ignore.hint") }}</p>
+        </div>
+
         <div class="settings-group">
           <h3 class="group-title">{{ t("updates.title") }}</h3>
           <div class="settings-rows">

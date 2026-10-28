@@ -2,6 +2,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 beforeEach(() => { localStorage.clear(); vi.resetModules(); });
 describe("general preferences", () => {
+  it("defaults to gitignore and persists editable ignore rules including an empty list", async () => {
+    const initial = await import("../general");
+    expect(initial.generalSettings.respectGitignore).toBe(true);
+    expect(initial.generalSettings.ignorePatterns).toContain("node_modules/");
+    expect(initial.generalSettings.ignorePatterns.split("\n")).not.toContain(".git");
+    initial.generalSettings.respectGitignore = false;
+    initial.generalSettings.ignorePatterns = "";
+    initial.saveGeneralSettings();
+    vi.resetModules();
+    const restored = await import("../general");
+    expect(restored.generalSettings.respectGitignore).toBe(false);
+    expect(restored.generalSettings.ignorePatterns).toBe("");
+  });
   it("enables automatic updates by default and preserves an opt-out", async () => {
     const initial = await import("../general");
     expect(initial.generalSettings.autoUpdate).toBe(true);

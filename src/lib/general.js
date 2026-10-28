@@ -8,6 +8,8 @@ try {
 } catch { /* Use safe defaults when storage is unavailable. */ }
 export const generalSettings = reactive({
   autoUpdate: saved.autoUpdate !== false,
+  respectGitignore: saved.respectGitignore !== false,
+  ignorePatterns: typeof saved.ignorePatterns === "string" ? saved.ignorePatterns : "node_modules/\ntarget/\ndist/\n.idea/\n.vscode/",
   autoLock: saved.autoLock === true,
   idleMinutes: Number.isFinite(saved.idleMinutes) ? Math.min(1440, Math.max(5, Math.ceil(saved.idleMinutes / 5) * 5)) : defaults.idleMinutes,
   toggleShortcut: typeof saved.toggleShortcut === "string" ? saved.toggleShortcut : defaults.toggleShortcut,

@@ -1001,6 +1001,10 @@ async fn prepares_directory_downloads_with_gitignore_and_nested_paths() {
     let sub = harness.share_root.join("sub");
     std::fs::create_dir(sub.join("nested")).expect("nested dir");
     std::fs::create_dir(sub.join("__pycache__")).expect("cache dir");
+    std::fs::create_dir(sub.join(".git")).expect("git directory");
+    std::fs::write(sub.join(".git/HEAD"), b"ref: refs/heads/main").expect("git head");
+    std::fs::write(sub.join(".env"), b"EXAMPLE=1").expect("project config");
+    std::fs::write(sub.join(".DS_Store"), b"metadata").expect("system metadata");
     std::fs::write(sub.join(".gitignore"), "ignored.txt\n*.log\n!keep.log\n").expect("gitignore");
     std::fs::write(sub.join("ignored.txt"), b"ignored").expect("ignored file");
     std::fs::write(sub.join("drop.log"), b"drop").expect("dropped log");
@@ -1031,13 +1035,14 @@ async fn prepares_directory_downloads_with_gitignore_and_nested_paths() {
         Some("sub")
     );
     assert!(Path::new(&plan.local_root).join("nested").is_dir());
-    assert!(!Path::new(&plan.local_root).join("__pycache__").exists());
+    assert!(Path::new(&plan.local_root).join("__pycache__").is_dir());
     let relative: Vec<&str> = plan
         .files
         .iter()
         .map(|file| file.relative_path.as_str())
         .collect();
-    for expected in [".gitignore", "inner.txt", "keep.log", "nested/keep.txt"] {
+    for expected in [".gitignore", "inner.txt", "keep.log", "nested/keep.txt",
+        ".git/HEAD", ".env", "module.pyc", "__pycache__/x.pyc"] {
         assert!(
             relative.contains(&expected),
             "{expected} should be queued: {relative:?}"
@@ -1046,15 +1051,33 @@ async fn prepares_directory_downloads_with_gitignore_and_nested_paths() {
     for ignored in [
         "ignored.txt",
         "drop.log",
-        "module.pyc",
         "nested/drop.log",
-        "__pycache__/x.pyc",
+        ".DS_Store",
     ] {
         assert!(
             !relative.contains(&ignored),
             "{ignored} should be ignored: {relative:?}"
         );
     }
+
+    let unfiltered_downloads = tempfile::tempdir().expect("unfiltered downloads");
+    let options = peerdav_lib::IgnoreOptions {
+        respect_gitignore: false,
+        patterns: "__pycache__/\n*.log\n!keep.log\n".to_owned(),
+    };
+    let custom_plan = harness.peers.prepare_directory_download_with_options(
+        &peer_id, &share_id, "/sub", unfiltered_downloads.path().to_str().expect("utf8"),
+        ConflictPolicy::Fail, &options,
+    ).await.expect("custom plan");
+    let names: Vec<_> = custom_plan.files.iter().map(|file| file.relative_path.as_str()).collect();
+    assert!(names.contains(&"ignored.txt"));
+    assert!(names.contains(&"module.pyc"));
+    assert!(names.contains(&".git/HEAD"));
+    assert!(names.contains(&"keep.log"));
+    assert!(!names.contains(&"drop.log"));
+    assert!(!names.contains(&"nested/drop.log"));
+    assert!(!names.contains(&"__pycache__/x.pyc"));
+    assert!(!names.contains(&".DS_Store"));
 
     let inner = plan
         .files

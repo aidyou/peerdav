@@ -1953,6 +1953,22 @@ impl PeerManager {
         local_parent: &str,
         conflict: ConflictPolicy,
     ) -> Result<DirectoryDownloadPlan, DomainError> {
+        self.prepare_directory_download_with_options(
+            peer_id, share_id, remote_path, local_parent, conflict,
+            &crate::types::IgnoreOptions::default(),
+        ).await
+    }
+
+    pub async fn prepare_directory_download_with_options(
+        &self,
+        peer_id: &str,
+        share_id: &str,
+        remote_path: &str,
+        local_parent: &str,
+        conflict: ConflictPolicy,
+        options: &crate::types::IgnoreOptions,
+    ) -> Result<DirectoryDownloadPlan, DomainError> {
+        let custom_rules = build_gitignore(&options.patterns);
         let (display, _, folder_name) = remote_file_target(share_id, remote_path)?;
         let parent = canonical_local_dir(local_parent).await?;
         let target_root = parent.join(&folder_name);
@@ -1996,7 +2012,8 @@ impl PeerManager {
                     limit: MAX_DIRECTORY_DOWNLOAD_FILES,
                 });
             }
-            if let Some(ignore_entry) = listing
+            if options.respect_gitignore
+                && let Some(ignore_entry) = listing
                 .entries
                 .iter()
                 .find(|entry| !entry.is_dir && entry.name == ".gitignore")
@@ -2020,6 +2037,11 @@ impl PeerManager {
                 } else {
                     format!("{relative_parent}/{name}")
                 };
+                if custom_rules.as_ref().is_some_and(|matcher| {
+                    matcher.matched_path_or_any_parents(Path::new(&relative), entry.is_dir).is_ignore()
+                }) {
+                    continue;
+                }
                 if directories.len() + remote_files.len() >= MAX_DIRECTORY_DOWNLOAD_FILES {
                     return Err(DomainError::DownloadQueueTooLarge {
                         count: directories.len() + remote_files.len() + 1,

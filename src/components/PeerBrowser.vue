@@ -7,6 +7,7 @@ import { useAppContext } from "../lib/appContext";
 import { confirmAction } from "../lib/confirm";
 import { canPreview, fileKind, fileKindKey, isReadableText } from "../lib/fileKinds";
 import { t } from "../lib/i18n";
+import { generalSettings } from "../lib/general";
 import { normalizeAppError, toUserMessage } from "../lib/invoke";
 import { statusTagTone } from "../lib/tagTone";
 import {
@@ -672,6 +673,7 @@ async function downloadDirectory(entry) {
         shareId: activeShareId.value,
         remotePath: entry.path,
         localParent,
+        ignoreOptions: { respectGitignore: generalSettings.respectGitignore, patterns: generalSettings.ignorePatterns },
         conflict,
       });
 
@@ -762,7 +764,10 @@ async function chooseUploadFolder() {
 }
 
 async function prepareUploadQueue(paths) {
-  const candidates = await app.invoke("collect_upload_paths", { paths });
+  const candidates = await app.invoke("collect_upload_paths", {
+    paths,
+    ignoreOptions: { respectGitignore: generalSettings.respectGitignore, patterns: generalSettings.ignorePatterns },
+  });
   if (!candidates.length) {
     app.setNotice("peer.noUploadFiles");
     return;

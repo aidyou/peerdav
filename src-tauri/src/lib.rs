@@ -36,7 +36,7 @@ pub use types::{
     AccessRequestStatus, AccessRule, AccessStatusResponse, AdminLoginResult, ApprovePendingResult,
     AuthorizationBindingResponse, AuthorizationInfo, AuthorizationStatus,
     AuthorizationStatusResponse, ConflictPolicy, DiscoveredPeer, ExternalEditInfo,
-    InitializeVaultResult, MACHINE_ID_HEADER, MAX_ACCESS_GRANTS, MAX_ACCESS_REQUEST_ID_CHARS,
+    InitializeVaultResult, IgnoreOptions, MACHINE_ID_HEADER, MAX_ACCESS_GRANTS, MAX_ACCESS_REQUEST_ID_CHARS,
     MAX_PENDING_ATTEMPTS, MAX_PENDING_PATH_CHARS, MAX_PENDING_REQUESTS,
     MIN_ACCESS_REQUEST_ID_CHARS, OBSERVED_PEER_HEADER, OutboundAccessRequest, OutboundAccessStatus,
     PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT, PeerAccessRequest, PeerEntry, PeerHealth,

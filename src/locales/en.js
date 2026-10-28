@@ -1,5 +1,9 @@
 // English product copy. Keys must match src/locales/zh-CN.js exactly.
 export default {
+  "ignore.title": "Ignore rules",
+  "ignore.gitignore": "Respect .gitignore rules",
+  "ignore.patterns": "Default ignored files and directories",
+  "ignore.hint": "Applies to directory uploads and downloads. One pattern per line; wildcards supported. End directory patterns with / and use ! to include entries again. Project files are not forcibly excluded. Protected system entries and OS metadata are always ignored. Changes apply to new transfers.",
   "updates.title": "Software updates",
   "updates.current": "Current version {version}",
   "updates.auto": "Automatically check for and download updates",

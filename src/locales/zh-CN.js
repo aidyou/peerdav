@@ -1,6 +1,10 @@
 // Simplified Chinese product copy. Keep this catalogue strictly Chinese;
 // identifiers, algorithm names and user data are the only Latin text.
 export default {
+  "ignore.title": "忽略规则",
+  "ignore.gitignore": "遵循 .gitignore 规则",
+  "ignore.patterns": "默认忽略的文件和目录",
+  "ignore.hint": "用于目录上传和下载，每行一条规则，支持通配符；目录以 / 结尾，可用 ! 重新包含。项目文件不会被强制过滤，系统保护项和系统生成的元数据始终忽略。修改后对新建传输生效。",
   "updates.title": "软件更新",
   "updates.current": "当前版本 {version}",
   "updates.auto": "自动检查并下载更新",

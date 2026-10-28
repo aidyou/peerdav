@@ -13,6 +13,9 @@ fn components(relative: &Path) -> FsResult<PathBuf> {
     for component in relative.components() {
         match component {
             Component::Normal(name) => {
+                if crate::ignore_rules::is_system_ignored(&name.to_string_lossy()) {
+                    return Err(FsError::Forbidden);
+                }
                 #[cfg(windows)]
                 {
                     let value = name.to_str().ok_or(FsError::Forbidden)?;
@@ -172,6 +175,9 @@ pub(super) fn read_entries(share: &ShareConfig, relative: &Path) -> FsResult<Vec
     for entry in directory.read_dir(".").map_err(io_error)? {
         let entry = entry.map_err(io_error)?;
         let name = entry.file_name();
+        if crate::ignore_rules::is_system_ignored(&name.to_string_lossy()) {
+            continue;
+        }
         let metadata = match directory.symlink_metadata(&name) {
             Ok(metadata) if !metadata.file_type().is_symlink() => metadata,
             Ok(_) => continue,

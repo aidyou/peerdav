@@ -4,6 +4,50 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// Platform metadata and protected entries excluded from shares on every OS.
+pub(crate) const SYSTEM_IGNORED_NAMES: &[&str] = &[
+    "$recycle.bin",
+    "recycler",
+    "recycled",
+    "system volume information",
+    "pagefile.sys",
+    "swapfile.sys",
+    "hiberfil.sys",
+    ".thumb",
+    ".thumbs",
+    ".thumbnails",
+    "thumbs.db",
+    "ehthumbs.db",
+    "ehthumbs_vista.db",
+    "desktop.ini",
+    ".ds_store",
+    ".appledouble",
+    ".lsoverride",
+    ".spotlight-v100",
+    ".trashes",
+    ".trash",
+    ".fseventsd",
+    ".temporaryitems",
+    ".documentrevisions-v100",
+    ".volumeicon.icns",
+    ".com.apple.timemachine.donotpresent",
+    "__macosx",
+];
+
+/// Per-transfer preferences supplied by the local client's general settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct IgnoreOptions {
+    pub respect_gitignore: bool,
+    pub patterns: String,
+}
+
+impl Default for IgnoreOptions {
+    fn default() -> Self {
+        Self { respect_gitignore: true, patterns: String::new() }
+    }
+}
+
 /// Minimum accepted password length, in Unicode scalar values.
 pub const MIN_PASSWORD_CHARS: usize = 6;
 /// Upper bound to avoid unbounded password work from oversized IPC payloads.

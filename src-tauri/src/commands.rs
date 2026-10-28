@@ -1041,15 +1041,17 @@ pub async fn prepare_peer_directory_download(
     remote_path: String,
     local_parent: String,
     conflict: Option<ConflictPolicy>,
+    ignore_options: Option<crate::types::IgnoreOptions>,
 ) -> Result<DirectoryDownloadPlan, AppError> {
     let peers = Arc::clone(peers.inner());
     peers
-        .prepare_directory_download(
+        .prepare_directory_download_with_options(
             &peer_id,
             &share_id,
             &remote_path,
             &local_parent,
             conflict.unwrap_or_default(),
+            &ignore_options.unwrap_or_default(),
         )
         .await
         .map_err(AppError::from)
@@ -1116,11 +1118,22 @@ pub async fn download_peer_file_to(
 }
 
 #[tauri::command]
-pub async fn collect_upload_paths(paths: Vec<String>) -> Result<Vec<UploadCandidate>, AppError> {
-    run_blocking(move || collect_upload_candidates(&paths)).await
+pub async fn collect_upload_paths(
+    paths: Vec<String>,
+    ignore_options: Option<crate::types::IgnoreOptions>,
+) -> Result<Vec<UploadCandidate>, AppError> {
+    run_blocking(move || collect_upload_candidates_with_options(&paths, &ignore_options.unwrap_or_default())).await
 }
 
+#[cfg(test)]
 fn collect_upload_candidates(paths: &[String]) -> Result<Vec<UploadCandidate>, DomainError> {
+    collect_upload_candidates_with_options(paths, &crate::types::IgnoreOptions::default())
+}
+
+fn collect_upload_candidates_with_options(
+    paths: &[String],
+    options: &crate::types::IgnoreOptions,
+) -> Result<Vec<UploadCandidate>, DomainError> {
     let mut candidates = Vec::new();
     for raw in paths {
         let path = std::fs::canonicalize(raw)
@@ -1145,7 +1158,7 @@ fn collect_upload_candidates(paths: &[String]) -> Result<Vec<UploadCandidate>, D
                 .ok_or_else(|| DomainError::RemotePathInvalid {
                     detail: "the selected folder has no usable name".to_owned(),
                 })?;
-            walk_upload_dir(&path, Path::new(root), &mut candidates)?;
+            walk_upload_dir(&path, Path::new(root), &mut candidates, options)?;
         } else {
             return Err(DomainError::RemotePathInvalid {
                 detail: "only regular files and folders can be uploaded".to_owned(),
@@ -1166,20 +1179,29 @@ fn walk_upload_dir(
     directory: &Path,
     relative: &Path,
     candidates: &mut Vec<UploadCandidate>,
+    options: &crate::types::IgnoreOptions,
 ) -> Result<(), DomainError> {
+    let matcher = crate::ignore_rules::build_gitignore(&options.patterns);
+    let filter_root = directory.to_owned();
     let mut builder = WalkBuilder::new(directory);
     builder
         .hidden(false)
         .parents(false)
         .git_global(false)
         .git_exclude(false)
-        .git_ignore(true)
+        .git_ignore(options.respect_gitignore)
         .ignore(false)
         .require_git(false)
         .follow_links(false)
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
+            if entry.path() == filter_root { return true; }
             let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
             !is_builtin_ignored(&entry.file_name().to_string_lossy(), is_dir)
+                && !matcher.as_ref().is_some_and(|matcher| {
+                    entry.path().strip_prefix(&filter_root).ok().is_some_and(|relative| {
+                        matcher.matched_path_or_any_parents(relative, is_dir).is_ignore()
+                    })
+                })
         });
 
     for result in builder.build() {
@@ -1491,6 +1513,10 @@ mod tests {
         std::fs::create_dir_all(docs.join("sub")).expect("nested dir");
         std::fs::create_dir_all(docs.join("build")).expect("ignored dir");
         std::fs::create_dir_all(docs.join("__pycache__")).expect("cache dir");
+        std::fs::create_dir_all(docs.join(".git")).expect("git directory");
+        std::fs::write(docs.join(".git/HEAD"), b"ref: refs/heads/main").expect("git head");
+        std::fs::write(docs.join(".env"), b"EXAMPLE=1").expect("project config");
+        std::fs::write(docs.join(".DS_Store"), b"metadata").expect("system metadata");
         std::fs::write(docs.join(".gitignore"), b"*.log\nbuild/\n!keep.log\n").expect("gitignore");
         std::fs::write(docs.join("a.txt"), b"a").expect("root file");
         std::fs::write(docs.join("drop.log"), b"drop").expect("ignored log");
@@ -1512,6 +1538,10 @@ mod tests {
             "docs/a.txt",
             "docs/keep.log",
             "docs/sub/b.txt",
+            "docs/.git/HEAD",
+            "docs/.env",
+            "docs/module.pyc",
+            "docs/__pycache__/x.pyc",
         ] {
             assert!(
                 relative.contains(&expected),
@@ -1520,15 +1550,37 @@ mod tests {
         }
         for ignored in [
             "docs/drop.log",
-            "docs/module.pyc",
             "docs/build/generated.txt",
-            "docs/__pycache__/x.pyc",
+            "docs/.DS_Store",
         ] {
             assert!(
                 !relative.contains(&ignored),
                 "{ignored} should be ignored: {relative:?}"
             );
         }
+    }
+
+    #[test]
+    fn upload_ignore_options_disable_gitignore_and_apply_custom_patterns() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("cache")).expect("cache");
+        std::fs::write(root.join(".gitignore"), b"*.txt\n").expect("rules");
+        for name in ["keep.txt", "drop.log", "keep.log", ".DS_Store", "cache/item"] {
+            std::fs::write(root.join(name), b"fixture").expect("file");
+        }
+        let options = crate::types::IgnoreOptions {
+            respect_gitignore: false,
+            patterns: "cache/\n*.log\n!keep.log\n!.DS_Store\n".to_owned(),
+        };
+        let files = collect_upload_candidates_with_options(&[root.display().to_string()], &options).expect("queue");
+        let names: Vec<_> = files.iter().map(|file| file.relative_path.as_str()).collect();
+        assert!(names.contains(&"project/keep.txt"));
+        assert!(names.contains(&"project/keep.log"));
+        assert!(names.contains(&"project/.gitignore"));
+        assert!(!names.contains(&"project/drop.log"));
+        assert!(!names.contains(&"project/cache/item"));
+        assert!(!names.contains(&"project/.DS_Store"));
     }
 
     #[tokio::test]

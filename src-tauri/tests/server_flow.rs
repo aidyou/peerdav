@@ -174,6 +174,68 @@ impl Harness {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn system_entries_are_hidden_and_cannot_be_accessed_directly() {
+    let harness = Harness::new(
+        SharePermissions {
+            can_read: true,
+            can_write: true,
+            can_delete: true,
+        },
+        vec![loopback_rule()],
+    ).await;
+    let root = harness.share_root();
+    std::fs::create_dir(root.join("nested")).expect("nested directory");
+    for base in [&root, &root.join("nested")] {
+        for name in [".DS_Store", "Thumbs.db", "desktop.ini", "._photo.jpg", "pagefile.sys"] {
+            std::fs::write(base.join(name), b"protected").expect("system file");
+        }
+        for name in ["$RECYCLE.BIN", ".thumb", ".Spotlight-V100", ".Trash-1000"] {
+            std::fs::create_dir(base.join(name)).expect("system directory");
+            std::fs::write(base.join(name).join("secret.txt"), b"protected").expect("system child");
+        }
+        for name in ["notes.txt", ".env", ".gitignore", "Thumbs.db.backup"] {
+            std::fs::write(base.join(name), b"visible").expect("user file");
+        }
+    }
+    let token = harness.issue_code().await;
+    for prefix in ["", "nested/"] {
+        let listing = harness.request_with_headers(
+            Method::from_bytes(b"PROPFIND").expect("method"),
+            &harness.share_path(prefix), Some(&token), b"", &[("depth", "1".to_owned())],
+        ).await;
+        assert_eq!(listing.status, StatusCode::MULTI_STATUS);
+        let xml = String::from_utf8(listing.body).expect("listing XML");
+        for name in [".DS_Store", "Thumbs.db", "desktop.ini", "._photo.jpg", "pagefile.sys",
+            "$RECYCLE.BIN", ".thumb", ".Spotlight-V100", ".Trash-1000"] {
+            // The similarly named user backup remains visible.
+            assert!(!xml.contains(&format!("{name}</")), "{xml}");
+            assert!(!xml.contains(&format!("{name}/")), "{xml}");
+        }
+        for name in ["notes.txt", ".env", ".gitignore", "Thumbs.db.backup"] {
+            assert!(xml.contains(name), "{xml}");
+            let response = harness.request(Method::GET,
+                &harness.share_path(&format!("{prefix}{name}")), Some(&token), b"").await;
+            assert_eq!(response.status, StatusCode::OK);
+        }
+        for name in [".DS_Store", "%2eDS_Store", ".ds_store", "$RECYCLE.BIN/secret.txt",
+            ".thumb/secret.txt", ".Spotlight-V100/secret.txt", ".Trash-1000/secret.txt"] {
+            let path = harness.share_path(&format!("{prefix}{name}"));
+            for method in [Method::GET, Method::HEAD, Method::PUT, Method::DELETE] {
+                let body = if method == Method::PUT { b"changed".as_slice() } else { b"".as_slice() };
+                let response = harness.request(method.clone(), &path, Some(&token), body).await;
+                assert_eq!(response.status, StatusCode::FORBIDDEN, "{method} {path}");
+            }
+        }
+        assert_eq!(std::fs::read(root.join(prefix).join(".DS_Store")).expect("preserved"), b"protected");
+        let response = harness.request(Method::PUT,
+            &harness.share_path(&format!("{prefix}._new.txt")), Some(&token), b"new").await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert!(!root.join(prefix).join("._new.txt").exists());
+    }
+    harness.shutdown().await;
+}
+
 struct HttpResponse {
     status: StatusCode,
     headers: HeaderMap,

@@ -2,49 +2,13 @@
 //!
 //! Git ignore files are parsed with the same implementation used by ripgrep so
 //! negation, anchoring, `**`, and directory-only patterns keep their usual
-//! semantics. A small conservative set of temporary artifacts is always
-//! ignored, including when a project has no `.gitignore`.
+//! semantics. Only platform metadata and protected system entries are always
+//! ignored; project artifacts are controlled by the project's `.gitignore`.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-
-const BUILTIN_IGNORED_DIRS: &[&str] = &[
-    ".git",
-    ".hg",
-    ".svn",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".hypothesis",
-    ".tox",
-    ".nox",
-];
-
-const BUILTIN_IGNORED_FILES: &[&str] = &[
-    ".ds_store",
-    "thumbs.db",
-    "desktop.ini",
-    ".coverage",
-    ".coverage.xml",
-];
-
-const BUILTIN_IGNORED_SUFFIXES: &[&str] = &[
-    ".pyc",
-    ".pyo",
-    ".pyd",
-    ".class",
-    ".o",
-    ".obj",
-    ".swp",
-    ".swo",
-    ".tmp",
-    ".temp",
-    ".part",
-    ".crdownload",
-];
 
 /// One parsed `.gitignore` and the remote directory it applies to.
 #[derive(Clone)]
@@ -70,21 +34,16 @@ pub(crate) fn build_gitignore(content: &str) -> Option<Arc<Gitignore>> {
     }
 }
 
-pub(crate) fn is_builtin_ignored(name: &str, is_dir: bool) -> bool {
+/// Platform artifacts are blocked independently of file type or host OS.
+pub(crate) fn is_system_ignored(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    if is_dir && (BUILTIN_IGNORED_DIRS.contains(&lower.as_str()) || lower.ends_with(".egg-info")) {
-        return true;
-    }
-    if BUILTIN_IGNORED_FILES.contains(&lower.as_str()) {
-        return true;
-    }
-    if lower.starts_with(".coverage.") || name.ends_with('~') {
-        return true;
-    }
-    !is_dir
-        && BUILTIN_IGNORED_SUFFIXES
-            .iter()
-            .any(|suffix| lower.ends_with(suffix))
+    crate::types::SYSTEM_IGNORED_NAMES.contains(&lower.as_str())
+        || lower.starts_with("._")
+        || lower.starts_with(".trash-")
+}
+
+pub(crate) fn is_builtin_ignored(name: &str, _is_dir: bool) -> bool {
+    is_system_ignored(name)
 }
 
 /// Applies non-overridable built-in defaults, then every `.gitignore` from the
@@ -127,11 +86,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn system_rules_are_cross_platform_and_do_not_hide_user_dotfiles() {
+        for name in crate::types::SYSTEM_IGNORED_NAMES {
+            for variant in [name.to_string(), name.to_ascii_uppercase()] {
+                assert!(is_system_ignored(&variant), "{variant}");
+                assert!(is_builtin_ignored(&variant, false), "{variant}");
+                assert!(is_builtin_ignored(&variant, true), "{variant}");
+            }
+        }
+        for name in ["._photo.jpg", ".Trash-1000"] {
+            assert!(is_system_ignored(name), "{name}");
+        }
+        for name in [
+            ".env",
+            ".gitignore",
+            ".config",
+            ".git",
+            "photo.thumb",
+            "Thumbs.db.backup",
+            "my$RECYCLE.BIN",
+            "DS_Store",
+            "Trash",
+            "notes.txt",
+        ] {
+            assert!(!is_system_ignored(name), "{name}");
+        }
+        let layers = vec![IgnoreLayer {
+            base: "/project".to_owned(),
+            matcher: build_gitignore("!*\n").expect("rules"),
+        }];
+        assert!(is_path_ignored(
+            "/project/.DS_Store",
+            ".DS_Store",
+            false,
+            &layers
+        ));
+        assert!(is_path_ignored(
+            "/project/$RECYCLE.BIN",
+            "$RECYCLE.BIN",
+            true,
+            &layers
+        ));
+    }
+
+    #[test]
     fn builtin_rules_cover_common_temporary_artifacts() {
-        assert!(is_builtin_ignored("__pycache__", true));
-        assert!(is_builtin_ignored("module.pyc", false));
+        assert!(!is_builtin_ignored("__pycache__", true));
+        assert!(!is_builtin_ignored("module.pyc", false));
         assert!(is_builtin_ignored("Thumbs.db", false));
-        assert!(is_builtin_ignored("project.egg-info", true));
+        assert!(!is_builtin_ignored("project.egg-info", true));
+        for name in [".git", ".hg", ".svn", ".env", ".gitignore", ".config", ".coverage", "file.tmp", "file~"] {
+            assert!(!is_builtin_ignored(name, true), "{name}");
+            assert!(!is_builtin_ignored(name, false), "{name}");
+        }
         assert!(!is_builtin_ignored("notes.txt", false));
         assert!(!is_builtin_ignored("src", true));
     }
@@ -174,16 +181,16 @@ mod tests {
             &layers
         ));
         assert!(is_path_ignored("/project/build", "build", true, &layers));
-        assert!(is_builtin_ignored("module.pyc", false));
+        assert!(!is_builtin_ignored("module.pyc", false));
     }
 
     #[test]
-    fn builtin_temporary_rules_cannot_be_reincluded() {
+    fn project_artifacts_can_be_reincluded() {
         let layers = vec![IgnoreLayer {
             base: "/project".to_owned(),
             matcher: build_gitignore("!fixture.pyc\n").expect("rules"),
         }];
-        assert!(is_path_ignored(
+        assert!(!is_path_ignored(
             "/project/fixture.pyc",
             "fixture.pyc",
             false,

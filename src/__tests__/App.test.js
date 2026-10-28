@@ -1565,7 +1565,18 @@ describe("settings information architecture", () => {
       wrapper
         .findAll("#pane-general .group-title")
         .map((node) => node.text()),
-    ).toEqual(["外观", "系统集成", "锁屏", "软件更新", "会话"]);
+    ).toEqual(["外观", "系统集成", "锁屏", "忽略规则", "软件更新", "会话"]);
+    const ignoreGroup = wrapper.find('[data-testid="ignore-settings"]');
+    expect(ignoreGroup.find('[role="switch"]').attributes("aria-checked")).toBe("true");
+    await ignoreGroup.find('[role="switch"]').trigger("click");
+    const patterns = ignoreGroup.find("textarea");
+    await patterns.setValue("cache/\n*.bak");
+    await patterns.trigger("change");
+    expect(JSON.parse(localStorage.getItem("peerdav.general"))).toMatchObject({
+      respectGitignore: false, ignorePatterns: "cache/\n*.bak",
+    });
+    generalSettings.respectGitignore = true;
+    generalSettings.ignorePatterns = "node_modules/\ntarget/\ndist/\n.idea/\n.vscode/";
 
     const themeGroup = wrapper.find(
       '#pane-general [aria-labelledby="general-theme-label"]',
@@ -2579,6 +2590,7 @@ describe("Finder-style peer browser", () => {
       shareId: "share-1",
       remotePath: "/sub",
       localParent: "/tmp/peerdav-keys",
+      ignoreOptions: { respectGitignore: generalSettings.respectGitignore, patterns: generalSettings.ignorePatterns },
       conflict: "fail",
     });
     expect(wrapper.text()).toContain("下载队列");
@@ -2764,6 +2776,7 @@ describe("Finder-style peer browser", () => {
 
     expect(collectUploadPaths).toHaveBeenCalledWith({
       paths: ["/tmp/peerdav-keys"],
+      ignoreOptions: { respectGitignore: generalSettings.respectGitignore, patterns: generalSettings.ignorePatterns },
     });
     expect(uploadPeerFile).toHaveBeenCalledTimes(2);
     expect(uploadPeerFile.mock.calls[0][0].remoteDir).toBe("/docs");
