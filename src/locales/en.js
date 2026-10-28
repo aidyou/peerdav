@@ -461,6 +461,7 @@ export default {
   "peer.archive": "Archive",
   "peer.textFile": "Text",
   "peer.file": "File",
+  "peer.selectionHint": "Select a file or folder to see its actions.",
   "peer.selectPreview": "Select a file to preview",
   "peer.selectPreviewHint": "Use the thumbnails below to switch files.",
   "peer.open": "Open",

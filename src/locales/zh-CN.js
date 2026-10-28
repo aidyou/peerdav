@@ -462,6 +462,7 @@ export default {
   "peer.archive": "压缩包",
   "peer.textFile": "文本",
   "peer.file": "文件",
+  "peer.selectionHint": "选择一个文件或目录以查看操作。",
   "peer.selectPreview": "选择一个文件查看预览",
   "peer.selectPreviewHint": "使用下方缩略图切换文件。",
   "peer.open": "打开",

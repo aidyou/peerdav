@@ -2032,7 +2032,103 @@ describe("Finder-style peer browser", () => {
     await thumbs[1].trigger("click");
     await flushPromises();
     expect(wrapper.text()).toContain("hello peer");
+    const galleryCss = readFileSync("src/components/PeerBrowser.vue", "utf8")
+      .match(/<style scoped>([\s\S]*?)<\/style>/)[1];
+    expect(galleryCss).toContain(".browser-main > .file-view {\n  flex: 1;\n  min-height: 0;\n  overflow: hidden;\n}");
+    expect(galleryCss).toMatch(/\.gallery-stage \{[^}]*display: flex;[^}]*align-items: center;[^}]*justify-content: center;/);
+    expect(galleryCss).not.toMatch(/\.gallery-stage \{[^}]*display: grid;/);
+    expect(galleryCss).toContain(".selection-bar {\n  flex: none;\n  box-sizing: border-box;\n  min-height: 54px;\n  display: flex;");
+    expect(galleryCss).toContain(".gallery-image {\n  max-width: 100%;\n  max-height: 100%;\n  width: auto;\n  height: auto;\n  object-fit: contain;\n  border-radius: 8px;\n  box-shadow: 0 8px 28px rgba(22, 32, 46, 0.16);\n}");
+    expect(galleryCss).toContain(".selection-bar--reserved");
+    expect(galleryCss).toContain(".selection-bar__hint");
+    expect(galleryCss).toMatch(/\.selection-bar \{[^}]*min-height: 54px;/);
+    expect(galleryCss).toContain(".gallery-strip {\n  flex: none;");
+    expect(galleryCss).toContain(".gallery-video {\n  max-width: 100%;\n  max-height: 100%;\n  width: auto;\n  height: auto;\n  object-fit: contain;");
 
+
+    expect(galleryCss).not.toMatch(/\.gallery-(image|video|text) \{[^}]*max-height: 380px/);
+    wrapper.unmount();
+  });
+
+  it("keeps the gallery above the selection bar and centers preview media", async () => {
+    const browserListing = {
+      ...LISTING,
+      entries: [
+        {
+          path: "/photo.png", name: "photo.png", isDir: false,
+          size: 4, modified: 1700000000, contentType: "image/png",
+        },
+        ...LISTING.entries,
+      ],
+    };
+    const { wrapper } = await openBrowser({
+      list_peer_dir: async () => browserListing,
+      preview_peer_file: async () => ({
+        fileName: "photo.png",
+        mime: "image/png",
+        encoding: "base64",
+        data: "AAAA",
+        truncated: false,
+      }),
+    });
+    await wrapper.find('button[aria-label="画廊"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".selection-bar--reserved").exists()).toBe(true);
+    expect(wrapper.find(".selection-bar__hint").text()).toBe("选择一个文件或目录以查看操作。");
+    const main = wrapper.find(".browser-main");
+    const gallery = wrapper.find(".gallery-view");
+    const thumbs = wrapper.findAll(".gallery-thumb");
+    await thumbs[0].trigger("click");
+    await flushPromises();
+    expect(main.element.contains(gallery.element)).toBe(true);
+    expect(wrapper.find(".selection-bar").exists()).toBe(true);
+    expect(gallery.find(".selection-bar").exists()).toBe(false);
+    expect(wrapper.find(".gallery-image").exists()).toBe(true);
+    expect(wrapper.find(".preview-dialog").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("cycles selection with arrow keys: gallery horizontal, other views vertical", async () => {
+    const { wrapper } = await openBrowser();
+    const fileView = () => wrapper.find(".file-view");
+    const tile = () => wrapper.find(".file-tile.is-selected .file-tile__name").text();
+
+    await fileView().trigger("keydown", { key: "ArrowDown" });
+    await flushPromises();
+    expect(tile()).toBe("sub");
+    await fileView().trigger("keydown", { key: "ArrowDown" });
+    await flushPromises();
+    expect(tile()).toBe("notes.txt");
+    // Down on the last entry wraps to the first.
+    await fileView().trigger("keydown", { key: "ArrowDown" });
+    await flushPromises();
+    expect(tile()).toBe("sub");
+    // Up on the first entry wraps to the last.
+    await fileView().trigger("keydown", { key: "ArrowUp" });
+    await flushPromises();
+    expect(tile()).toBe("notes.txt");
+    // Horizontal keys do not move selection outside gallery mode.
+    await fileView().trigger("keydown", { key: "ArrowRight" });
+    await flushPromises();
+    expect(tile()).toBe("notes.txt");
+
+    await wrapper.find('button[aria-label="画廊"]').trigger("click");
+    await flushPromises();
+    const thumb = () => wrapper.find(".gallery-thumb.is-selected").text();
+    // Gallery ignores vertical keys.
+    await fileView().trigger("keydown", { key: "ArrowDown" });
+    await flushPromises();
+    expect(thumb()).toBe("notes.txt");
+    await fileView().trigger("keydown", { key: "ArrowRight" });
+    await flushPromises();
+    expect(thumb()).toBe("sub");
+    await fileView().trigger("keydown", { key: "ArrowRight" });
+    await flushPromises();
+    expect(thumb()).toBe("notes.txt");
+    // Left on the last entry wraps to the first.
+    await fileView().trigger("keydown", { key: "ArrowLeft" });
+    await flushPromises();
+    expect(thumb()).toBe("sub");
     wrapper.unmount();
   });
 

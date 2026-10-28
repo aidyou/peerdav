@@ -45,6 +45,7 @@ const peerNoticeState = ref(null);
 const viewMode = ref(readViewMode());
 const columnStack = ref([]);
 const columnViewEl = ref(null);
+const fileViewEl = ref(null);
 const selectedEntry = ref(null);
 const downloadOpen = ref(false);
 const downloadName = ref("");
@@ -520,6 +521,38 @@ function openEntry(entry) {
   } else if (canPreview(entry)) {
     void previewEntry(entry);
   }
+}
+
+// 画廊用左右方向键、其余视图用上下方向键在可见条目间移动选中项，并循环切换：
+// 首个按上/左跳到末尾，末尾按下/右跳到首个。
+function navigateSelection(delta) {
+  const entries = peerListing.value?.entries ?? [];
+  const length = entries.length;
+  if (!length) return;
+  const current = entries.findIndex((entry) => entry.path === selectedEntry.value?.path);
+  const index =
+    current === -1
+      ? delta > 0
+        ? 0
+        : length - 1
+      : (current + delta + length) % length;
+  selectEntry(entries[index]);
+  void nextTick(() => {
+    fileViewEl.value?.querySelector(".is-selected")?.focus?.();
+  });
+}
+
+function onFileViewKeydown(event) {
+  const gallery = viewMode.value === "gallery";
+  const forward = gallery ? "ArrowRight" : "ArrowDown";
+  const back = gallery ? "ArrowLeft" : "ArrowUp";
+  if (event.key !== forward && event.key !== back) return;
+  const target = event.target;
+  if (target?.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target?.tagName)) {
+    return;
+  }
+  event.preventDefault();
+  navigateSelection(event.key === forward ? 1 : -1);
 }
 
 async function loadColumn(entry, index) {
@@ -1286,7 +1319,13 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
         <p v-if="peerNotice" class="browser-notice">{{ peerNotice }}</p>
 
-        <div v-if="peerListing" class="file-view">
+        <div
+          v-if="peerListing"
+          ref="fileViewEl"
+          class="file-view"
+          tabindex="0"
+          @keydown="onFileViewKeydown"
+        >
           <div v-if="viewMode === 'icons'" class="icon-grid">
             <button
               v-for="entry in peerListing.entries"
@@ -1303,7 +1342,8 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
             </button>
           </div>
 
-          <table v-else-if="viewMode === 'list'" class="file-table">
+          <div v-else-if="viewMode === 'list'" class="file-table-wrap">
+            <table class="file-table">
             <thead>
               <tr>
                 <th scope="col">{{ t("peer.name") }}</th>
@@ -1333,7 +1373,8 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 <td>{{ formatModified(entry.modified) }}</td>
               </tr>
             </tbody>
-          </table>
+            </table>
+          </div>
 
           <div v-else-if="viewMode === 'columns'" class="column-view" ref="columnViewEl">
             <div
@@ -1360,7 +1401,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
             </div>
           </div>
 
-          <div v-else class="gallery-view">
+          <div v-else class="gallery-view" data-testid="gallery-view">
             <div class="gallery-stage">
               <template v-if="galleryFile">
                 <img
@@ -1433,8 +1474,8 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
           </p>
         </div>
 
-        <div v-if="selectedEntry" class="selection-bar">
-          <div class="selection-summary">
+        <div v-if="selectedEntry || viewMode === 'gallery'" class="selection-bar" :class="{ 'selection-bar--reserved': !selectedEntry }">
+          <div v-if="selectedEntry" class="selection-summary">
             <FileGlyph :entry="selectedEntry" />
             <div>
               <strong>{{ selectedEntry.name }}</strong>
@@ -1446,7 +1487,8 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
               </span>
             </div>
           </div>
-          <div class="selection-actions">
+          <p v-else class="selection-bar__hint">{{ t("peer.selectionHint") }}</p>
+          <div v-if="selectedEntry" class="selection-actions">
             <el-button
               v-if="selectedEntry.isDir"
               type="primary"
@@ -2099,14 +2141,29 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   font-size: 12.5px;
 }
 
-/* Keep the pathbar and selection bar fixed; only the file area scrolls. */
-.file-view {
+/* Keep the pathbar and selection bar fixed; each view owns its scrolling region. */
+.browser-main > .file-view {
   flex: 1;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
+}
+
+/* The region is only a keyboard-nav root; children carry their own focus ring. */
+.browser-main > .file-view:focus {
+  outline: none;
+}
+
+.browser-main > .file-view > .icon-grid,
+.browser-main > .file-view > .file-table-wrap,
+.browser-main > .file-view > .column-view,
+.browser-main > .file-view > .gallery-view {
+  height: 100%;
+  min-height: 0;
 }
 
 .icon-grid {
+  overflow: auto;
+  align-content: start;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
   gap: 10px;
@@ -2192,16 +2249,20 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   color: var(--app-text);
 }
 
+.file-table-wrap {
+  overflow: auto;
+}
+
 .column-view {
   display: flex;
   align-items: stretch;
-  min-height: 320px;
-  overflow-x: auto;
+  overflow: hidden;
 }
 
 .column {
   width: 240px;
   flex: none;
+  overflow-y: auto;
   overflow-y: auto;
   padding: 5px;
   border-right: 1px solid var(--app-border);
@@ -2256,14 +2317,19 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   color: var(--app-text-muted);
 }
 
+/* Keep the file list visible above the selection bar. */
 .gallery-view {
+  box-sizing: border-box;
+  height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
 
 .gallery-stage {
-  min-height: 300px;
+  flex: 1;
+  min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2284,9 +2350,18 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   background-size: 16px 16px;
 }
 
+.gallery-stage > * {
+  max-width: 100%;
+  max-height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
 .gallery-image {
   max-width: 100%;
-  max-height: 380px;
+  max-height: 100%;
+  width: auto;
+  height: auto;
   object-fit: contain;
   border-radius: 8px;
   box-shadow: 0 8px 28px rgba(22, 32, 46, 0.16);
@@ -2298,7 +2373,10 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
 .gallery-video {
   max-width: 100%;
-  max-height: 380px;
+  max-height: 100%;
+  width: auto;
+  height: auto;
+  object-fit: contain;
   border-radius: 8px;
   background: #000;
   box-shadow: 0 8px 28px rgba(22, 32, 46, 0.16);
@@ -2306,8 +2384,11 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
 .gallery-text {
   margin: 0;
+  box-sizing: border-box;
   width: 100%;
-  max-height: 380px;
+  height: 100%;
+  min-height: 0;
+  max-height: none;
   overflow: auto;
   padding: 16px;
   border-radius: 8px;
@@ -2338,6 +2419,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 }
 
 .gallery-strip {
+  flex: none;
   display: flex;
   gap: 8px;
   overflow-x: auto;
@@ -2386,6 +2468,9 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 }
 
 .selection-bar {
+  flex: none;
+  box-sizing: border-box;
+  min-height: 54px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2394,6 +2479,17 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   border: 1px solid var(--app-border);
   border-radius: 10px;
   background: var(--app-surface-2);
+}
+
+.selection-bar--reserved {
+  border-style: dashed;
+  background: transparent;
+}
+
+.selection-bar__hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--app-text-muted);
 }
 
 .selection-summary {
