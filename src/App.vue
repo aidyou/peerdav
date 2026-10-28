@@ -256,8 +256,14 @@ onMounted(async () => {
       if (payload.phase === "ready") setInfo("updates.readyNotice", { version: payload.version });
     }));
     applyUpdateStatus(await invoke("update_status"));
+    const updateAbort = new AbortController();
+    eventUnlisten.push(() => updateAbort.abort());
     const autoCheck = () => {
-      if (generalSettings.autoUpdate && updateState.configured) void checkForUpdates().catch(handleFailure);
+      if (generalSettings.autoUpdate && updateState.configured) void checkForUpdates({
+        automatic: true,
+        signal: updateAbort.signal,
+        enabled: () => generalSettings.autoUpdate,
+      });
     };
     autoCheck();
     const updateTimer = setInterval(autoCheck, 6 * 60 * 60 * 1000);

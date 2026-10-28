@@ -46,7 +46,7 @@ impl UpdateManager {
         }
     }
 
-    async fn check(&self, app: &AppHandle) -> Result<UpdateStatus, UpdateError> {
+    async fn check(&self, app: &AppHandle, automatic: bool) -> Result<UpdateStatus, UpdateError> {
         if !self.snapshot().configured {
             return Err(UpdateError::NotConfigured);
         }
@@ -95,7 +95,13 @@ impl UpdateManager {
         }
         .await;
         if result.is_err() {
-            self.change(app, |status| status.phase = UpdatePhase::Failed);
+            self.change(app, |status| {
+                status.phase = if automatic {
+                    UpdatePhase::Idle
+                } else {
+                    UpdatePhase::Failed
+                };
+            });
         }
         result?;
         Ok(self.snapshot())
@@ -139,8 +145,12 @@ pub(crate) fn update_status(manager: State<'_, UpdateManager>) -> Result<UpdateS
 pub(crate) async fn check_for_updates(
     app: AppHandle,
     manager: State<'_, UpdateManager>,
+    automatic: Option<bool>,
 ) -> Result<UpdateStatus, AppError> {
-    manager.check(&app).await.map_err(AppError::from)
+    manager
+        .check(&app, automatic.unwrap_or(false))
+        .await
+        .map_err(AppError::from)
 }
 
 #[tauri::command]

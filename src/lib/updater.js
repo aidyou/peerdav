@@ -11,10 +11,32 @@ export function applyUpdateStatus(status) {
   if (status && typeof status.phase === "string") Object.assign(updateState, status);
 }
 
-export async function checkForUpdates() {
+export async function checkForUpdates({ automatic = false, signal, enabled = () => true } = {}) {
   if (checking || updateBusy.value) return;
   checking = true;
-  try { applyUpdateStatus(await invoke("check_for_updates")); }
-  catch (error) { updateState.phase = "failed"; throw error; }
-  finally { checking = false; }
+  try {
+    for (let attempt = 0; attempt < (automatic ? 3 : 1); attempt += 1) {
+      if (signal?.aborted || (automatic && !enabled())) return;
+      try {
+        applyUpdateStatus(await (automatic
+          ? invoke("check_for_updates", { automatic: true })
+          : invoke("check_for_updates")));
+        return;
+      } catch (error) {
+        if (!automatic) { updateState.phase = "failed"; throw error; }
+        // The command boundary logs the original error and complete source chain.
+        if (attempt === 2) return;
+        await new Promise((resolve) => {
+          const finish = () => {
+            clearTimeout(timer);
+            signal?.removeEventListener("abort", finish);
+            resolve();
+          };
+          const timer = setTimeout(finish, 8000 * 2 ** attempt);
+          signal?.addEventListener("abort", finish, { once: true });
+          if (signal?.aborted) finish();
+        });
+      }
+    }
+  } finally { checking = false; }
 }

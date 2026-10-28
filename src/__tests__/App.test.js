@@ -1518,7 +1518,7 @@ describe("settings information architecture", () => {
       update_status: async () => ({ configured: true, phase: "idle", currentVersion: "0.1.0" }),
       check_for_updates: async () => ({ configured: true, phase: "ready", version: "0.2.0", notes: "Release notes" }),
     });
-    expect(invoke).toHaveBeenCalledWith("check_for_updates");
+    expect(invoke).toHaveBeenCalledWith("check_for_updates", { automatic: true });
     await signIn(wrapper, "secret", "general");
     expect(wrapper.text()).toContain("0.2.0 已下载，等待安装");
     const install = wrapper.findAll("button").find((button) => button.text() === "安装并重启");
@@ -1531,6 +1531,19 @@ describe("settings information architecture", () => {
     await flushPromises();
     expect(invoke).toHaveBeenCalledWith("install_update");
     wrapper.unmount();
+  });
+
+  it("keeps automatic update network failures silent while login remains available", async () => {
+    generalSettings.autoUpdate = true;
+    const wrapper = await mountReady({
+      update_status: async () => ({ configured: true, phase: "idle", currentVersion: "0.1.0" }),
+      check_for_updates: async () => { throw { code: "UPDATE_FAILED", message: "network unavailable" }; },
+    });
+    expect(invoke).toHaveBeenCalledWith("check_for_updates", { automatic: true });
+    expect(latestErrorMessage()).toBe("");
+    expect(wrapper.findComponent({ name: "AuthView" }).props("view")).toBe("login");
+    wrapper.unmount();
+    await flushPromises();
   });
 
   it("does not automatically check when disabled and displays missing configuration", async () => {
