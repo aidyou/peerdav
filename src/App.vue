@@ -23,7 +23,6 @@ import AuthView from "./components/AuthView.vue";
 import HomeView from "./components/HomeView.vue";
 import PeerBrowser from "./components/PeerBrowser.vue";
 import SettingsView from "./components/SettingsView.vue";
-import StartupSkeleton from "./components/StartupSkeleton.vue";
 import TitleBarMenu from "./components/TitleBarMenu.vue";
 
 const loading = ref(true);
@@ -192,12 +191,6 @@ const activePeer = computed(
       ? activePeerSnapshot.value
       : null),
 );
-
-/// 过渡屏要摆出哪一页的骨架。URL hash 在 webview 重载的第一帧就已经带回来了，
-/// 比等后端会话确认快得多，所以停在文件浏览页刷新不会先看到一份首页骨架。
-/// 这里一次性读取而不是 computed：过渡期不会有合法的路由写入（路由只在会话
-/// 确认后才落 hash），也不需要为一个不会变化的值维持响应式依赖。
-const startupRoute = readRoute();
 
 function setTransferProgress(payload, register = false) {
   if (!payload?.transferId) return;
@@ -1130,25 +1123,6 @@ provide(
           </el-button>
         </div>
       </form>
-      <!-- 过渡屏复用真实工作区的外壳：同一条侧栏、同一份内容区内边距，
-           里面只放骨架。会话确认后就地换成真实视图，边框与留白都不变，
-           用户看到的不是「换了一屏」，而是「同一屏填上了数据」。 -->
-      <div
-        v-else-if="view === 'loading'"
-        class="workspace startup-loading"
-        aria-busy="true"
-      >
-        <AppRail :peers="[]" :active-view="startupRoute.view" />
-        <div
-          class="workspace-content"
-          :class="{
-            'workspace-content--browser': startupRoute.view === 'peer',
-            'workspace-content--fluid': startupRoute.view === 'home',
-          }"
-        >
-          <StartupSkeleton :route="startupRoute" />
-        </div>
-      </div>
       <AuthView v-else-if="view !== 'ready'" :view="view" />
 
       <div v-else class="workspace">
@@ -1529,16 +1503,6 @@ provide(
   flex: 1;
   min-height: 0;
   display: flex;
-}
-
-/* 过渡屏与真实工作区共用同一副外壳，撤掉时只剩内部填充被替换。
-   这里不做整体淡入：曾经用 opacity 0 起始 + 120ms 延迟想藏掉快速恢复的闪烁，
-   结果是刷新时整屏先是一片纯背景，加载反馈反而消失了。骨架自身的脉冲动画
-   已经足够表达「正在读取」，外壳要保持立刻可见。 */
-
-/* 侧栏在过渡期只是几何占位：会话还没确认，导航点了也不该改状态或历史。 */
-.startup-loading .rail {
-  pointer-events: none;
 }
 
 .workspace-content {
