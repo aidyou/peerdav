@@ -37,9 +37,9 @@ describe("workspace routes", () => {
       peerId: "",
       settingsTab: "clients",
     });
-    expect(parseRoute("#/settings/unknown").settingsTab).toBe("shares");
+    expect(parseRoute("#/settings/unknown").settingsTab).toBe("general");
     expect(normalizeSettingsTab("account")).toBe("account");
-    expect(normalizeSettingsTab("")).toBe("shares");
+    expect(normalizeSettingsTab("")).toBe("general");
   });
 
   it("builds stable hashes for each page", () => {
@@ -50,7 +50,7 @@ describe("workspace routes", () => {
     expect(routeHash({ view: "settings", settingsTab: "service" })).toBe(
       "#/settings/service",
     );
-    expect(routeHash({ view: "settings" })).toBe("#/settings/shares");
+    expect(routeHash({ view: "settings" })).toBe("#/settings/general");
   });
 
   it("writes the route into the hash and reads it back", () => {

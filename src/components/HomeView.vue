@@ -93,7 +93,7 @@ async function scanTcp() {
     if (count > 0) {
       app.setNotice("home.scanTcpDone", { count });
     } else {
-      app.setError("home.scanTcpEmpty");
+      app.setInfo("home.scanTcpEmpty");
     }
   } catch (error) {
     app.handleFailure(error);
@@ -174,7 +174,7 @@ async function forgetPeer(peer) {
     if (!confirmed) return;
 
     await app.invoke("forget_peer", { peerId: peer.id });
-    await app.refreshPeers();
+    await Promise.all([app.refreshPeers(), app.refreshAdminData()]);
     app.setNotice("home.forgotten", { label: peer.label });
   } catch (error) {
     app.handleFailure(error);
@@ -311,6 +311,9 @@ async function forgetPeer(peer) {
               @click.stop="forgetPeer(peer)"
             >
               {{ t("home.forget") }}
+            </el-button>
+            <el-button class="list-pill" round size="small" :disabled="removingPeerId === peer.id" @click.stop="app.removeLocalPeer(peer)">
+              {{ t("client.removeLocal") }}
             </el-button>
             <span class="server-row__chevron" aria-hidden="true">
               <svg viewBox="0 0 24 24">

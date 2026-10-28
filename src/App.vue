@@ -1,10 +1,13 @@
 <script setup>
-import { computed, onMounted, onUnmounted, provide, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, provide, reactive, ref, watch } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ElMessage } from "element-plus";
 
 import { errorStrategy, invoke, normalizeAppError, toUserMessage } from "./lib/invoke";
+import { confirmAction } from "./lib/confirm";
+import { stableList } from "./lib/listOrder";
+import { generalSettings } from "./lib/general";
 import { locale, setLocale, t } from "./lib/i18n";
 import { resolvedTheme, setTheme, theme } from "./lib/theme";
 import { SUPPORTED_ACCENTS, accent, setAccent } from "./lib/accent";
@@ -86,7 +89,35 @@ const discoveredLoading = ref(true);
 const activePeerId = ref("");
 const activePeerSnapshot = ref(null);
 const workspaceView = ref("home");
-const settingsTab = ref("shares");
+let lastInterfaceActivity = Date.now();
+const interfaceLocked = ref(false);
+const unlockPassword = ref("");
+const unlockingInterface = ref(false);
+
+async function lockInterface() {
+  if (!loggedIn.value || interfaceLocked.value) return;
+  try {
+    await invoke("lock_interface");
+    interfaceLocked.value = true;
+    unlockPassword.value = "";
+  } catch (error) { handleFailure(error); }
+}
+
+async function unlockInterface() {
+  if (unlockingInterface.value || !unlockPassword.value) return;
+  unlockingInterface.value = true;
+  try {
+    await invoke("unlock_interface", { password: unlockPassword.value });
+    interfaceLocked.value = false;
+    lastInterfaceActivity = Date.now();
+    void refreshPeers();
+    void refreshConnections();
+    void invoke("refresh_tray_menu").catch(handleFailure);
+  } catch (error) { setRawError(error); }
+  finally { unlockPassword.value = ""; unlockingInterface.value = false; }
+}
+
+const settingsTab = ref("general");
 const transfers = ref({});
 
 let eventUnlisten = [];
@@ -110,6 +141,10 @@ function setError(key, params) {
 
 function setRawError(error) {
   showToast(toUserMessage(error), "error", 5000);
+}
+
+function setInfo(key, params) {
+  showToast(t(key, params), "info", 5000);
 }
 
 function setNotice(key, params) {
@@ -158,12 +193,45 @@ function clearTransfer(transferId) {
 }
 
 onMounted(async () => {
+  void bindWindowState();
+  const configureShortcuts = async () => {
+    if (interfaceLocked.value) return;
+    try {
+      await invoke("configure_shortcuts", { toggle: generalSettings.toggleShortcut, lock: generalSettings.lockShortcut });
+    } catch (error) { handleFailure(error); }
+  };
+  void configureShortcuts();
+  eventUnlisten.push(watch(() => [generalSettings.toggleShortcut, generalSettings.lockShortcut], configureShortcuts));
+  eventUnlisten.push(await listen("app://interface-locked", () => { if (loggedIn.value) interfaceLocked.value = true; }));
+  eventUnlisten.push(await listen("app://navigate", ({ payload }) => {
+    if (interfaceLocked.value) return;
+    if (payload === "home") openHome();
+    else if (payload === "settings") openSettings();
+    else if (typeof payload === "string" && payload.startsWith("peer/")) {
+      const peer = peers.value.find((entry) => entry.id === payload.slice(5));
+      if (peer) openPeer(peer);
+    }
+  }));
+  eventUnlisten.push(watch(() => peers.value.map(({ id, label }) => `${id}:${label}`).join("|"), async () => {
+    if (interfaceLocked.value) return;
+    try { await invoke("refresh_tray_menu"); } catch (error) { console.warn("tray menu refresh failed", error); }
+  }));
+  const recordActivity = (event) => { if (event.isTrusted) lastInterfaceActivity = Date.now(); };
+  for (const name of ["pointerdown", "keydown", "wheel", "touchstart"]) {
+    window.addEventListener(name, recordActivity, { passive: true });
+    eventUnlisten.push(() => window.removeEventListener(name, recordActivity));
+  }
+  const idleTimer = setInterval(() => {
+    if (!interfaceLocked.value && loggedIn.value && generalSettings.autoLock && Date.now() - lastInterfaceActivity >= generalSettings.idleMinutes * 60000) {
+      void lockInterface();
+    }
+  }, 1000);
+  eventUnlisten.push(() => clearInterval(idleTimer));
   window.addEventListener("hashchange", handleHashChange);
   eventUnlisten.push(() =>
     window.removeEventListener("hashchange", handleHashChange),
   );
   await bindServerEvents();
-  await bindWindowState();
   await refreshStatus();
   // 服务器列表与发现快照互相独立，也不该挡在管理员会话恢复前面：一次慢刷新只会
   // 让首屏多显示一会儿骨架屏，而不是把登录界面拖出来。两者内部都已捕获错误。
@@ -177,7 +245,7 @@ onMounted(async () => {
   if (status.value.unlocked) void resumeAccessRequests();
   void refreshConnections();
   const connectionTimer = setInterval(() => {
-    if (status.value.unlocked) void refreshConnections();
+    if (status.value.unlocked && !interfaceLocked.value) void refreshConnections();
   }, 3000);
   eventUnlisten.push(() => clearInterval(connectionTimer));
 });
@@ -254,13 +322,7 @@ async function bindServerEvents() {
       await listen("app://pending-request", (event) => {
         const request = event.payload;
         if (!request?.id) return;
-        if (!pendingRequests.value.some((item) => item.id === request.id)) {
-          pendingRequests.value = [...pendingRequests.value, request];
-        }
-        serverStatus.value = {
-          ...serverStatus.value,
-          pendingCount: pendingRequests.value.length,
-        };
+        void refreshPendingRequests();
         setNotice("pending.newRequest", { ip: request.peerIp });
       }),
     );
@@ -268,13 +330,7 @@ async function bindServerEvents() {
       await listen("app://pending-canceled", (event) => {
         const request = event.payload;
         if (!request?.id) return;
-        pendingRequests.value = pendingRequests.value.filter(
-          (item) => item.id !== request.id,
-        );
-        serverStatus.value = {
-          ...serverStatus.value,
-          pendingCount: pendingRequests.value.length,
-        };
+        void refreshPendingRequests();
         setNotice("pending.canceled", { ip: request.peerIp });
       }),
     );
@@ -307,7 +363,7 @@ async function bindServerEvents() {
     );
     eventUnlisten.push(
       await listen("app://discovered-peers", (event) => {
-        discovered.value = Array.isArray(event.payload) ? event.payload : [];
+        discovered.value = stableList(event.payload, (entry) => entry.serverId ?? entry.url);
       }),
     );
     eventUnlisten.push(
@@ -366,7 +422,7 @@ function applyRoute(route) {
     return;
   }
   activePeerId.value = "";
-  settingsTab.value = "shares";
+  settingsTab.value = "general";
   workspaceView.value = "home";
 }
 
@@ -394,6 +450,7 @@ async function restoreAdminSession() {
     const session = await invoke("admin_session");
     if (session?.username) {
       adminUsername.value = session.username;
+      interfaceLocked.value = Boolean(session.interfaceLocked);
       mustChangeAdminPassword.value = Boolean(session.mustChangePassword);
       loggedIn.value = !session.mustChangePassword;
       if (loggedIn.value) {
@@ -410,10 +467,13 @@ async function restoreAdminSession() {
 }
 
 function handleFailure(error) {
+  if (interfaceLocked.value && error?.code === "AUTH_INTERFACE_LOCKED") return;
   setRawError(error);
 
   const strategy = errorStrategy(error);
-  if (strategy === "unlock") {
+  if (strategy === "interface-lock") {
+    interfaceLocked.value = true;
+  } else if (strategy === "unlock") {
     status.value = { ...status.value, unlocked: false };
     resetAdminSession();
   } else if (strategy === "initialize") {
@@ -439,7 +499,7 @@ function landAfterLogin() {
   activePeerSnapshot.value = null;
   if (shouldOpenSettingsOnLogin()) {
     markSettingsSeen();
-    settingsTab.value = "shares";
+    settingsTab.value = "general";
     workspaceView.value = "settings";
     syncRoute();
   } else {
@@ -493,7 +553,7 @@ function resetAdminSession() {
   pendingRequests.value = [];
   activePeerId.value = "";
   activePeerSnapshot.value = null;
-  settingsTab.value = "shares";
+  settingsTab.value = "general";
   workspaceView.value = "home";
   syncRoute();
 }
@@ -508,13 +568,30 @@ async function refreshServerStatus() {
 
 /* 审批入站申请在首页控台与设置页「客户端」里是同一个动作：入口放在共享上下文，
    避免两处各自拼 admin 参数、各自刷新列表而出现短暂不一致。 */
+let adminRefreshVersion = 0;
+async function refreshAdminData() {
+  const version = ++adminRefreshVersion;
+  adminLoading.value = true;
+  try {
+    const args = { username: adminUsername.value, password: serverPassword.value };
+    const [shares, pending, authorizations] = await Promise.all([
+      invoke("list_shares", args),
+      invoke("list_pending_requests", args),
+      invoke("list_authorizations", args),
+    ]);
+    if (version !== adminRefreshVersion) return;
+    adminShares.value = stableList(shares, (entry) => entry.id);
+    pendingRequests.value = stableList(pending, (entry) => entry.machineId ?? entry.id);
+    adminAuthorizations.value = stableList(authorizations, (entry) => entry.machineId ?? entry.id);
+    await refreshServerStatus();
+  } finally {
+    if (version === adminRefreshVersion) adminLoading.value = false;
+  }
+}
+
 async function refreshPendingRequests() {
   try {
-    pendingRequests.value = await invoke("list_pending_requests", {
-      username: adminUsername.value,
-      password: serverPassword.value,
-    });
-    await refreshServerStatus();
+    await refreshAdminData();
   } catch (error) {
     handleFailure(error);
   }
@@ -588,8 +665,20 @@ async function beginPeerAccess(url, label = null, fingerprint = null) {
   await refreshAccessRequests();
   if (entry.status === "waiting") {
     trackPeerAccess(url, label);
+  } else if (entry.status === "accessible") {
+    await refreshPeers();
   }
   return entry;
+}
+
+async function removeLocalPeer(peer) {
+  if (!await confirmAction(t("client.removeLocalConfirm", { label: peer.label }), t("client.removeLocal"))) return;
+  try {
+    await invoke("remove_local_peer", { peerId: peer.id });
+    if (activePeerId.value === peer.id) closePeer();
+    await Promise.all([refreshPeers(), refreshAccessRequests()]);
+    setNotice("client.removedLocal");
+  } catch (error) { handleFailure(error); }
 }
 
 async function cancelPeerAccess(url) {
@@ -638,7 +727,7 @@ async function refreshConnections() {
 async function refreshPeers() {
   peersLoading.value = true;
   try {
-    peers.value = await invoke("list_peers");
+    peers.value = stableList(await invoke("list_peers"), (entry) => entry.fingerprint ?? entry.id);
   } catch (error) {
     const normalized = normalizeAppError(error);
     console.error(`[peerdav:${normalized.code}] saved peers refresh failed`, {
@@ -657,7 +746,7 @@ async function refreshDiscovered() {
   discoveredLoading.value = true;
   try {
     const peersOnLan = await invoke("discovered_peers");
-    discovered.value = Array.isArray(peersOnLan) ? peersOnLan : [];
+    discovered.value = stableList(peersOnLan, (entry) => entry.serverId ?? entry.url);
   } catch (error) {
     const normalized = normalizeAppError(error);
     console.error(
@@ -700,7 +789,7 @@ function closePeer() {
 function openHome() {
   activePeerId.value = "";
   activePeerSnapshot.value = null;
-  settingsTab.value = "shares";
+  settingsTab.value = "general";
   workspaceView.value = "home";
   syncRoute();
 }
@@ -709,7 +798,7 @@ function openSettings() {
   activePeerId.value = "";
   activePeerSnapshot.value = null;
   workspaceView.value = "settings";
-  settingsTab.value = "shares";
+  settingsTab.value = "general";
   syncRoute();
 }
 
@@ -745,6 +834,7 @@ provide(
     accessRequestFor,
     beginPeerAccess,
     cancelPeerAccess,
+    removeLocalPeer,
     resumeAccessRequests,
     refreshAccessRequests,
     adminShares,
@@ -763,6 +853,7 @@ provide(
     clearMessages,
     handleFailure,
     setError,
+    setInfo,
     setRawError,
     setNotice,
     setTransferProgress,
@@ -770,6 +861,7 @@ provide(
     refreshStatus,
     refreshServerStatus,
     refreshPendingRequests,
+    refreshAdminData,
     approvePendingRequest,
     refreshPeers,
     refreshDiscovered,
@@ -785,6 +877,8 @@ provide(
     openSettings,
     selectSettingsTab,
     logout,
+    lockInterface,
+    interfaceLocked,
   }),
 );
 </script>
@@ -866,11 +960,14 @@ provide(
       </div>
 
       <div
+        :aria-hidden="interfaceLocked || undefined"
+        :inert="interfaceLocked || undefined"
+        v-show="!interfaceLocked"
         id="titlebar-center"
         class="titlebar-slot titlebar-slot--center"
       ></div>
 
-      <div id="titlebar-end" class="titlebar-slot titlebar-slot--end">
+      <div v-show="!interfaceLocked" id="titlebar-end" class="titlebar-slot titlebar-slot--end">
         <div class="titlebar-actions">
           <TitleBarMenu
             name="language"
@@ -944,7 +1041,13 @@ provide(
     </header>
 
     <main class="shell" :class="{ 'shell--workspace': view === 'ready' || view === 'loading' }">
-      <AuthView v-if="view !== 'ready'" :view="view" />
+      <form v-if="interfaceLocked" class="interface-lock" @submit.prevent="unlockInterface">
+        <h1>{{ t("lock.title") }}</h1>
+        <p>{{ t("lock.hint") }}</p>
+        <el-input v-model="unlockPassword" type="password" show-password autocomplete="current-password" :placeholder="t('vault.adminPassword')" :disabled="unlockingInterface" />
+        <el-button type="primary" native-type="submit" :loading="unlockingInterface">{{ t("lock.unlock") }}</el-button>
+      </form>
+      <AuthView v-else-if="view !== 'ready'" :view="view" />
 
       <div v-else class="workspace">
         <AppRail
@@ -1005,6 +1108,12 @@ provide(
 </template>
 
 <style scoped>
+.interface-lock {
+  width: min(360px, 90%);
+  margin: auto;
+  display: grid;
+  gap: 16px;
+}
 .window-frame {
   box-sizing: border-box;
   height: 100vh;

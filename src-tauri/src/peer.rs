@@ -881,7 +881,18 @@ impl PeerManager {
             with_machine_id(
                 self.agent_for(&url)?
                     .get(endpoint)
-                    .header(ACCESS_REQUEST_HEADER, &request_id),
+                    .header(ACCESS_REQUEST_HEADER, &request_id)
+                    .header(
+                        "x-peerdav-device-name",
+                        percent_encoding::utf8_percent_encode(
+                            &self
+                                .vault
+                                .get_setting(crate::types::SERVER_NAME_META)?
+                                .unwrap_or_else(|| "PeerDav".into()),
+                            percent_encoding::NON_ALPHANUMERIC,
+                        )
+                        .to_string(),
+                    ),
             )
             .send(),
         )
@@ -1009,12 +1020,35 @@ impl PeerManager {
             return Ok(existing.request);
         }
 
+        let has_pin = self
+            .vault
+            .list_peer_records()?
+            .iter()
+            .any(|peer| peer.url == url && peer.machine_id.is_some())
+            || self
+                .pairing_pins
+                .lock()
+                .map_err(|_| DomainError::Internal {
+                    detail: "pairing registry lock poisoned".into(),
+                })?
+                .contains_key(&url)
+            || self.discovered_peers().iter().any(|peer| peer.url == url);
+        if !has_pin {
+            match crate::discovery::probe_url(&url, self.vault.identity()).await {
+                Ok(discovered) => self.set_pairing_fingerprint(&url, &discovered.server_id)?,
+                Err(error) => {
+                    let entry = settle_outbound_entry(url, label, access_failure(&error));
+                    self.store_outbound(&entry);
+                    return Ok(entry.request);
+                }
+            }
+        }
         if let Ok(expected) = self.expected_identity(&url)
             && !crate::tls::self_connection_allowed(self.vault.fingerprint(), &expected)
         {
             return Err(DomainError::SelfConnectionForbidden);
         }
-        let entry = match self.request_access(&url).await {
+        let mut entry = match self.request_access(&url).await {
             Ok(request) if !request.requested => OutboundAccess {
                 request: OutboundAccessRequest {
                     fingerprint: self.expected_identity(&url).ok(),
@@ -1048,6 +1082,29 @@ impl PeerManager {
             },
             Err(error) => settle_outbound_entry(url, label, access_failure(&error)),
         };
+        entry.request.fingerprint = self.expected_identity(&entry.request.url).ok();
+        if entry.request.status == OutboundAccessStatus::Accessible {
+            // The catalog accepted this mTLS identity using its existing active
+            // authorization. No authorization code is recoverable from storage;
+            // this non-secret placeholder never grants access without that identity.
+            match self
+                .connect(
+                    &entry.request.url,
+                    "mtls-identity",
+                    entry.request.label.as_deref(),
+                )
+                .await
+            {
+                Ok(_) => self.clear_outbound(&entry.request.url),
+                Err(error) => {
+                    entry = settle_outbound_entry(
+                        entry.request.url.clone(),
+                        entry.request.label.clone(),
+                        access_failure(&error),
+                    );
+                }
+            }
+        }
         self.store_outbound(&entry);
         Ok(entry.request.clone())
     }
@@ -1488,12 +1545,20 @@ impl PeerManager {
     /// Removes a peer only from this installation. This is used after the
     /// server has already revoked an authorization.
     pub async fn forget_local(&self, peer_id: &str) -> Result<(), DomainError> {
-        if self.vault.peer_record(peer_id)?.is_none() {
-            return Err(DomainError::PeerNotFound {
+        let record = self
+            .vault
+            .peer_record(peer_id)?
+            .ok_or_else(|| DomainError::PeerNotFound {
                 id: peer_id.to_owned(),
-            });
-        }
+            })?;
         self.vault.delete_peer_code(peer_id)?;
+        self.clear_outbound(&record.url);
+        self.pairing_pins
+            .lock()
+            .map_err(|_| DomainError::Internal {
+                detail: "pairing registry lock poisoned".into(),
+            })?
+            .remove(&record.url);
         self.vault.delete_peer_record(peer_id)?;
         if let Ok(mut map) = self.availability.lock() {
             map.remove(peer_id);

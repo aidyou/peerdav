@@ -69,6 +69,7 @@ pub fn run() {
     let application = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -142,72 +143,113 @@ pub fn run() {
                     api.prevent_close();
                     if let Err(error) = window.hide() {
                         log::warn!("failed to hide the main window: {error}");
+                    } else {
+                        if let Err(error) = window.set_skip_taskbar(true) {
+                            log::warn!("failed to hide taskbar entry: {error}");
+                        }
+                        #[cfg(target_os = "macos")]
+                        if let Err(error) = window
+                            .app_handle()
+                            .set_activation_policy(tauri::ActivationPolicy::Accessory)
+                        {
+                            log::warn!("failed to hide Dock icon: {error}");
+                        }
                     }
                 } else {
                     window.app_handle().exit(0);
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![
-            commands::vault_status,
-            commands::initialize_vault,
-            commands::reload_vault_key,
-            commands::reset_vault,
-            commands::lock_vault,
-            commands::quit_app,
-            commands::admin_login,
-            commands::admin_session,
-            commands::admin_logout,
-            commands::change_admin_password,
-            commands::server_status,
-            commands::start_server,
-            commands::stop_server,
-            commands::resume_server,
-            commands::list_shares,
-            commands::create_share,
-            commands::update_share_permissions,
-            commands::set_share_rules,
-            commands::delete_share,
-            commands::list_pending_requests,
-            commands::approve_pending_request,
-            commands::list_authorizations,
-            commands::revoke_authorization,
-            commands::scan_lan,
-            commands::scan_lan_tcp,
-            commands::service_settings,
-            commands::set_tcp_discovery,
-            commands::discovered_peers,
-            commands::local_networks,
-            commands::local_addresses,
-            commands::list_peers,
-            commands::request_peer_access,
-            commands::device_fingerprint,
-            commands::inbound_connections,
-            commands::outbound_connections,
-            commands::wait_for_peer_access,
-            commands::cancel_peer_access,
-            commands::access_requests,
-            commands::connect_peer,
-            commands::check_peer_health,
-            commands::forget_peer,
-            commands::sync_peers,
-            commands::list_peer_shares,
-            commands::list_peer_dir,
-            commands::delete_peer_entry,
-            commands::download_peer_file,
-            commands::download_peer_file_to,
-            commands::prepare_peer_directory_download,
-            commands::open_local_file,
-            commands::reveal_local_file,
-            commands::collect_upload_paths,
-            commands::begin_peer_upload,
-            commands::cancel_peer_upload,
-            commands::upload_peer_file,
-            commands::preview_peer_file,
-            commands::prepare_peer_external_edit,
-            commands::commit_peer_external_edit,
-            commands::discard_peer_external_edit,
-        ])
+        .invoke_handler(|invoke| {
+            let command = invoke.message.command();
+            let allowed_when_locked = matches!(
+                command,
+                "vault_status"
+                    | "admin_session"
+                    | "lock_interface"
+                    | "unlock_interface"
+                    | "quit_app"
+            );
+            if !allowed_when_locked {
+                let vault = invoke
+                    .message
+                    .webview()
+                    .state::<SharedVault>()
+                    .inner()
+                    .clone();
+                if let Err(error) = vault.require_interface_unlocked() {
+                    invoke.resolver.reject(AppError::from(error));
+                    return true;
+                }
+            }
+            let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool> =
+                Box::new(tauri::generate_handler![
+                    commands::vault_status,
+                    commands::initialize_vault,
+                    commands::reload_vault_key,
+                    commands::reset_vault,
+                    commands::lock_vault,
+                    commands::quit_app,
+                    commands::admin_login,
+                    commands::admin_session,
+                    commands::lock_interface,
+                    commands::configure_shortcuts,
+                    commands::refresh_tray_menu,
+                    commands::unlock_interface,
+                    commands::admin_logout,
+                    commands::change_admin_password,
+                    commands::server_status,
+                    commands::start_server,
+                    commands::stop_server,
+                    commands::resume_server,
+                    commands::list_shares,
+                    commands::create_share,
+                    commands::update_share_permissions,
+                    commands::set_share_rules,
+                    commands::delete_share,
+                    commands::list_pending_requests,
+                    commands::approve_pending_request,
+                    commands::list_authorizations,
+                    commands::revoke_authorization,
+                    commands::scan_lan,
+                    commands::scan_lan_tcp,
+                    commands::service_settings,
+                    commands::set_tcp_discovery,
+                    commands::discovered_peers,
+                    commands::local_networks,
+                    commands::local_addresses,
+                    commands::list_peers,
+                    commands::request_peer_access,
+                    commands::device_fingerprint,
+                    commands::inbound_connections,
+                    commands::outbound_connections,
+                    commands::wait_for_peer_access,
+                    commands::cancel_peer_access,
+                    commands::access_requests,
+                    commands::connect_peer,
+                    commands::check_peer_health,
+                    commands::forget_peer,
+                    commands::remove_local_peer,
+                    commands::sync_peers,
+                    commands::list_peer_shares,
+                    commands::list_peer_dir,
+                    commands::delete_peer_entry,
+                    commands::download_peer_file,
+                    commands::download_peer_file_to,
+                    commands::prepare_peer_directory_download,
+                    commands::open_local_file,
+                    commands::reveal_local_file,
+                    commands::collect_upload_paths,
+                    commands::begin_peer_upload,
+                    commands::cancel_peer_upload,
+                    commands::upload_peer_file,
+                    commands::preview_peer_file,
+                    commands::prepare_peer_external_edit,
+                    commands::commit_peer_external_edit,
+                    commands::discard_peer_external_edit,
+                ]);
+            handler(invoke)
+        })
         .build(tauri::generate_context!());
 
     match application {
@@ -249,13 +291,7 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error + Send +
     let icon = app
         .default_window_icon()
         .ok_or("default window icon is unavailable")?;
-    let show_item = MenuItem::with_id(
-        app,
-        TRAY_SHOW_MENU_ID,
-        "显示 PeerDav / Show PeerDav",
-        true,
-        None::<&str>,
-    )?;
+    let show_item = MenuItem::with_id(app, TRAY_SHOW_MENU_ID, "首页 / Home", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(
         app,
         TRAY_QUIT_MENU_ID,
@@ -263,23 +299,67 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error + Send +
         true,
         None::<&str>,
     )?;
-    let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+    let settings_item =
+        MenuItem::with_id(app, "tray-settings", "设置 / Settings", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_item, &settings_item, &quit_item])?;
 
-    TrayIconBuilder::with_id("main-tray")
+    let builder = TrayIconBuilder::with_id("main-tray")
         .icon(icon.clone())
-        .menu(&menu)
-        .show_menu_on_left_click(false)
+        .show_menu_on_left_click(false);
+    #[cfg(target_os = "linux")]
+    let builder = builder.menu(&menu);
+    #[cfg(not(target_os = "linux"))]
+    app.manage(std::sync::Mutex::new(menu));
+    builder
         .on_menu_event(|app, event| {
             let id = event.id.as_ref();
-            if id == TRAY_SHOW_MENU_ID {
+            if id == TRAY_SHOW_MENU_ID || id == "tray-settings" || id.starts_with("tray-peer-") {
                 show_main_window(app);
+                let route = if id == TRAY_SHOW_MENU_ID {
+                    "home".to_owned()
+                } else if id == "tray-settings" {
+                    "settings".to_owned()
+                } else {
+                    format!("peer/{}", id.trim_start_matches("tray-peer-"))
+                };
+                if let Some(vault) = app.try_state::<SharedVault>()
+                    && vault.require_interface_unlocked().is_err()
+                {
+                    return;
+                }
+                if let Err(error) = app.emit("app://navigate", route) {
+                    log::warn!("failed to navigate from tray: {error}");
+                }
             } else if id == TRAY_QUIT_MENU_ID {
                 request_quit(app);
             }
         })
         .on_tray_icon_event(|tray, event| {
+            #[cfg(not(target_os = "linux"))]
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                position,
+                ..
+            } = &event
+            {
+                if let Some(window) = tray.app_handle().get_webview_window(MAIN_WINDOW_LABEL)
+                    && let Some(menu) = tray
+                        .app_handle()
+                        .try_state::<std::sync::Mutex<Menu<tauri::Wry>>>()
+                {
+                    match menu.lock() {
+                        Ok(menu) => {
+                            if let Err(error) = window.popup_menu_at(&*menu, *position) {
+                                log::warn!("failed to show tray menu: {error}");
+                            }
+                        }
+                        Err(error) => log::error!("tray menu lock poisoned: {error}"),
+                    }
+                }
+            }
+            if let TrayIconEvent::Click {
+                button: MouseButton::Right,
                 button_state: MouseButtonState::Up,
                 ..
             } = event
@@ -292,7 +372,17 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error + Send +
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
+    #[cfg(target_os = "macos")]
+    if let Err(error) = app.set_activation_policy(tauri::ActivationPolicy::Regular) {
+        log::warn!("failed to restore Dock icon: {error}");
+    }
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        if let Err(error) = window.set_skip_taskbar(false) {
+            log::warn!("failed to restore taskbar entry: {error}");
+        }
+        if let Err(error) = window.unminimize() {
+            log::warn!("failed to restore the main window: {error}");
+        }
         if let Err(error) = window.show() {
             log::warn!("failed to show the main window: {error}");
         }

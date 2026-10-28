@@ -1032,14 +1032,69 @@ fn merge_scanned(found: Vec<(u8, DiscoveredPeer)>) -> Vec<DiscoveredPeer> {
     sorted_peers(unique.into_values().map(|(_, peer)| peer))
 }
 
+/// Probe one user-selected HTTPS endpoint. The fingerprint is TOFU discovery,
+/// not a replacement for a previously saved pin.
+pub(crate) async fn probe_url(
+    raw: &str,
+    identity: &crate::types::DeviceIdentity,
+) -> Result<DiscoveredPeer, DomainError> {
+    let url = url::Url::parse(raw).map_err(|source| DomainError::PeerProtocol {
+        detail: source.to_string(),
+    })?;
+    let host = url.host_str().ok_or_else(|| DomainError::PeerProtocol {
+        detail: "server URL has no host".into(),
+    })?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    let config = Arc::new(crate::tls::probe_client(identity)?);
+    let addresses = timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| DomainError::PeerProtocol {
+        detail: "server address lookup timed out".into(),
+    })?
+    .map_err(|source| DomainError::Io {
+        operation: "resolve server address",
+        path: None,
+        source,
+    })?;
+    for address in addresses.take(8) {
+        if let Some((_, mut peer)) =
+            probe_socket(address, 0, Duration::from_secs(3), Arc::clone(&config)).await
+        {
+            peer.url = raw.to_owned();
+            return Ok(peer);
+        }
+    }
+    Err(DomainError::PeerProtocol {
+        detail: "No PeerDav server responded at this address.".into(),
+    })
+}
+
 async fn probe_tcp(
     target: ScanTarget,
     port: u16,
     budget: Duration,
     config: Arc<rustls::ClientConfig>,
 ) -> Option<(u8, DiscoveredPeer)> {
-    let address = target.address;
-    let socket = SocketAddr::from((address, port));
+    probe_socket(
+        SocketAddr::from((target.address, port)),
+        target.priority,
+        budget,
+        config,
+    )
+    .await
+}
+
+async fn probe_socket(
+    socket: SocketAddr,
+    priority: u8,
+    budget: Duration,
+    config: Arc<rustls::ClientConfig>,
+) -> Option<(u8, DiscoveredPeer)> {
+    let address = socket.ip();
+    let port = socket.port();
     let stream = timeout(budget, TcpStream::connect(socket))
         .await
         .ok()?
@@ -1057,7 +1112,7 @@ async fn probe_tcp(
     // services would otherwise be reported as PeerDav. HEAD is routed to the
     // catalog handler before authentication and never records a pending
     // request; the Server header identifies the protocol implementation.
-    let host = format!("{address}:{port}");
+    let host = socket.to_string();
     let request = format!(
         "HEAD {CATALOG_PATH} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: PeerDav-discovery\r\nConnection: close\r\n\r\n"
     );
@@ -1085,7 +1140,7 @@ async fn probe_tcp(
     let host = address.to_string();
     let hosts = vec![host.clone()];
     Some((
-        target.priority,
+        priority,
         DiscoveredPeer {
             server_id,
             name: format!("PeerDav ({host})"),

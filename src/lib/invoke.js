@@ -26,6 +26,7 @@ const ERROR_STRATEGIES = Object.freeze({
   VAULT_SECRET_NOT_FOUND: "support",
   VAULT_RESERVED_SECRET_NAME: "support",
   VAULT_INVALID_SECRET_NAME: "support",
+  AUTH_INTERFACE_LOCKED: "interface-lock",
   AUTH_INVALID_CREDENTIALS: "retry",
   AUTH_PASSWORD_UNCHANGED: "edit",
   AUTH_PASSWORD_CHANGE_REQUIRED: "change-admin",

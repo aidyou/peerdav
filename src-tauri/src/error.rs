@@ -72,6 +72,9 @@ pub enum DomainError {
     #[error("the recovery code is invalid")]
     InvalidRecoveryCode,
 
+    #[error("the interface is locked")]
+    InterfaceLocked,
+
     #[error("invalid admin credentials")]
     InvalidAdminCredentials,
 
@@ -309,6 +312,7 @@ fn error_code(error: &DomainError) -> &'static str {
         DomainError::VaultMustBeLocked => "VAULT_MUST_BE_LOCKED",
         DomainError::RecoveryCodeNotConfigured => "VAULT_RECOVERY_CODE_NOT_CONFIGURED",
         DomainError::InvalidRecoveryCode => "VAULT_INVALID_RECOVERY_CODE",
+        DomainError::InterfaceLocked => "AUTH_INTERFACE_LOCKED",
         DomainError::InvalidAdminCredentials => "AUTH_INVALID_CREDENTIALS",
         DomainError::WeakPassword { .. } => "VALIDATION_WEAK_PASSWORD",
         DomainError::InvalidUsername { .. } => "VALIDATION_INVALID_USERNAME",
@@ -553,6 +557,7 @@ fn error_reason(error: &DomainError) -> String {
         DomainError::InvalidRecoveryCode => {
             "恢复码无效 / The recovery code is invalid.".to_owned()
         }
+        DomainError::InterfaceLocked => "界面已锁定，请输入登录密码解锁 / The interface is locked; enter your login password to unlock.".to_owned(),
         DomainError::InvalidAdminCredentials => {
             "管理员登录失败：用户名或密码错误 / Admin login failed: invalid username or password."
                 .to_owned()

@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 
 use crate::crypto;
 use crate::error::DomainError;
-use crate::types::{KEY_FILE_NAME, KEY_FILE_TYPE, KEY_FILE_VERSION, VAULT_KEY_LEN};
+use crate::types::{KEY_FILE_TYPE, KEY_FILE_VERSION, VAULT_KEY_LEN};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct KeyFile {
@@ -31,11 +31,11 @@ pub(crate) struct KeyMaterial {
     pub path: PathBuf,
 }
 
-/// Creates `<directory>/peerdav-vault.key` with a freshly generated key.
-///
-/// Existing files are never overwritten: the caller must choose another
-/// directory or restore the existing key file explicitly.
-pub(crate) fn generate_in_directory(directory: &str) -> Result<KeyMaterial, DomainError> {
+/// Creates a unique device-suffixed key file without overwriting any existing key.
+pub(crate) fn generate_in_directory(
+    directory: &str,
+    machine_id: &str,
+) -> Result<KeyMaterial, DomainError> {
     let directory = Path::new(directory);
     let metadata = fs::metadata(directory).map_err(|source| DomainError::Io {
         operation: "inspect key directory",
@@ -53,12 +53,11 @@ pub(crate) fn generate_in_directory(directory: &str) -> Result<KeyMaterial, Doma
         path: Some(directory.to_path_buf()),
         source,
     })?;
-    let path = canonical.join(KEY_FILE_NAME);
-    if path.exists() {
-        return Err(DomainError::KeyFileExists {
-            path: path.display().to_string(),
-        });
-    }
+    let machine_id = crate::tls::normalize_fingerprint(Some(machine_id)).ok_or_else(|| {
+        DomainError::InvalidKeyDirectory {
+            detail: "invalid device fingerprint".into(),
+        }
+    })?;
 
     let key = Zeroizing::new(crypto::random_bytes::<VAULT_KEY_LEN>());
     let id = key_id(&key);
@@ -81,11 +80,30 @@ pub(crate) fn generate_in_directory(directory: &str) -> Result<KeyMaterial, Doma
         options.mode(0o600);
     }
 
-    let mut file = options.open(&path).map_err(|source| DomainError::Io {
-        operation: "create key file",
-        path: Some(path.clone()),
-        source,
-    })?;
+    let mut suffix_length = 6;
+    let (path, mut file) = loop {
+        let suffix = if suffix_length <= machine_id.len() {
+            machine_id[machine_id.len() - suffix_length..].to_owned()
+        } else {
+            format!(
+                "{}-{}",
+                machine_id,
+                hex::encode(crypto::random_bytes::<8>())
+            )
+        };
+        let path = canonical.join(format!("peerdav-vault-{suffix}.key"));
+        match options.open(&path) {
+            Ok(file) => break (path, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => suffix_length += 1,
+            Err(source) => {
+                return Err(DomainError::Io {
+                    operation: "create key file",
+                    path: Some(path),
+                    source,
+                });
+            }
+        }
+    };
 
     if let Err(source) = file
         .write_all(&serialized)
@@ -178,4 +196,32 @@ pub(crate) fn read(path: &Path) -> Result<KeyMaterial, DomainError> {
 /// Stable, non-secret fingerprint of a key.
 fn key_id(key: &[u8; VAULT_KEY_LEN]) -> String {
     hex::encode(Sha256::digest(key))[..32].to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_suffix_extends_without_overwriting() {
+        let directory = tempfile::tempdir().expect("directory");
+        let machine = format!("{}abcdef", "0".repeat(58));
+        let first = generate_in_directory(directory.path().to_str().expect("path"), &machine)
+            .expect("first");
+        assert_eq!(
+            first.path.file_name().expect("name"),
+            "peerdav-vault-abcdef.key"
+        );
+        let original = fs::read(&first.path).expect("read");
+        let second = generate_in_directory(directory.path().to_str().expect("path"), &machine)
+            .expect("second");
+        assert_eq!(
+            second.path.file_name().expect("name"),
+            "peerdav-vault-0abcdef.key"
+        );
+        assert_eq!(fs::read(&first.path).expect("read"), original);
+        assert!(
+            generate_in_directory(directory.path().to_str().expect("path"), "../invalid").is_err()
+        );
+    }
 }

@@ -31,7 +31,6 @@ pub const META_RECOVERY_HASH: &str = "vault.recoveryHash";
 /// Key file format shared with the desktop UI.
 pub const KEY_FILE_TYPE: &str = "peerdav-vault";
 pub const KEY_FILE_VERSION: u32 = 1;
-pub const KEY_FILE_NAME: &str = "peerdav-vault.key";
 
 /// Persisted WebDAV server lifecycle and configuration. The server is restored
 /// on every app start when `SERVER_ENABLED_META` is `"1"`, including while the
@@ -119,6 +118,7 @@ pub struct AdminLoginResult {
 #[serde(rename_all = "camelCase")]
 pub struct AdminSessionInfo {
     pub username: String,
+    pub interface_locked: bool,
     pub must_change_password: bool,
 }
 
@@ -313,6 +313,7 @@ pub struct OutboundAccessRequest {
 #[serde(rename_all = "camelCase")]
 pub struct PendingRequestInfo {
     pub id: String,
+    pub device_name: Option<String>,
     pub share_id: String,
     pub share_name: String,
     /// 展示用地址：会随网络变化，因此不参与身份判定。

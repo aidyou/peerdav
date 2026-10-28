@@ -718,16 +718,10 @@ impl ServerController {
 
         let code = random_hex(32);
         let hash = hash_code(&code);
-        // 标签以机器码开头：IP 只是当时的地址，识别设备靠机器码。
-        let label = match request.machine_id.as_deref() {
-            Some(machine_id) => format!(
-                "{} · {} ({})",
-                crate::tls::short_fingerprint(machine_id),
-                request.peer_ip,
-                request.share_name
-            ),
-            None => format!("{} ({})", request.peer_ip, request.share_name),
-        };
+        let label = request
+            .device_name
+            .clone()
+            .unwrap_or_else(|| request.peer_ip.clone());
         let authorization_id = random_hex(8);
         let record = self.vault.add_authorization(
             &authorization_id,
@@ -1172,6 +1166,7 @@ async fn handle_request(
                 &requested_path,
                 client_request_id.as_deref(),
                 machine_id.as_deref(),
+                device_name_value(request.headers()),
             );
         }
         return auth_challenge();
@@ -1294,6 +1289,7 @@ async fn handle_catalog(
             "",
             client_request_id.as_deref(),
             machine_id.as_deref(),
+            device_name_value(request.headers()),
         );
         return auth_challenge();
     }
@@ -1865,6 +1861,21 @@ fn next_attempt_count(attempts: u32) -> u32 {
     attempts.saturating_add(1).min(MAX_PENDING_ATTEMPTS)
 }
 
+fn device_name_value(headers: &http::HeaderMap) -> Option<String> {
+    let encoded = headers.get("x-peerdav-device-name")?.to_str().ok()?;
+    if encoded.len() > 1536 {
+        return None;
+    }
+    let value = percent_encoding::percent_decode_str(encoded)
+        .decode_utf8()
+        .ok()?;
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > 128 || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
 fn record_pending(
     gate: &Gate,
     share: &ShareConfig,
@@ -1872,6 +1883,7 @@ fn record_pending(
     requested_path: &str,
     client_request_id: Option<&str>,
     machine_id: Option<&str>,
+    device_name: Option<String>,
 ) {
     let now = now_unix();
     let peer_ip = canonical_ip(peer.ip()).to_string();
@@ -1894,6 +1906,9 @@ fn record_pending(
         .find(|request| same_pending_entry(request, &share.id, machine_id, &peer_ip))
     {
         existing.last_seen = now;
+        if device_name.is_some() {
+            existing.device_name = device_name;
+        }
         existing.attempts = next_attempt_count(existing.attempts);
         existing.requested_path = requested_path.to_owned();
         // 同一台设备可能已经换到别的地址，展示用地址要跟着更新。
@@ -1914,6 +1929,7 @@ fn record_pending(
     }
 
     let request = PendingRequestInfo {
+        device_name,
         id: random_hex(8),
         share_id: share.id.clone(),
         share_name: share.name.clone(),
@@ -2216,6 +2232,7 @@ mod tests {
     #[test]
     fn pending_entries_merge_by_machine_code_and_fall_back_to_the_address() {
         let stored = |machine: Option<&str>, ip: &str| PendingRequestInfo {
+            device_name: None,
             id: "id".to_owned(),
             share_id: "share".to_owned(),
             share_name: "Docs".to_owned(),

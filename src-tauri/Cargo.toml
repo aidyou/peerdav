@@ -22,6 +22,7 @@ tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-autostart = "2"
+tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 argon2 = { version = "0.5", features = ["std"] }
@@ -57,6 +58,8 @@ url = "2"
 percent-encoding = "2"
 if-addrs = "0.15"
 socket2 = "0.6"
+cap-std = "4"
+cap-fs-ext = "4"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }

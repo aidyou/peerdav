@@ -128,6 +128,10 @@ function mockCommands(overrides = {}) {
     // 出站申请状态由后端保存；测试默认没有任何未完成的申请。
     access_requests: async () => [],
     inbound_connections: async () => [],
+    configure_shortcuts: async () => {},
+    refresh_tray_menu: async () => {},
+    lock_interface: async () => {},
+    unlock_interface: async () => {},
     outbound_connections: async () => [],
     device_fingerprint: async () => "a".repeat(64),
     request_peer_access: async ({ url, label }) => ({
@@ -186,11 +190,15 @@ const VAULT_NOT_INITIALIZED = {
   vault_status: async () => ({ initialized: false, unlocked: false }),
 };
 
-async function signIn(wrapper, password = "secret") {
+async function signIn(wrapper, password = "secret", tab = "shares") {
   await wrapper.find('input[autocomplete="username"]').setValue("admin");
   await wrapper.find('input[type="password"]').setValue(password);
   await wrapper.find("form").trigger("submit");
   await flushPromises();
+  if (tab === "shares" && wrapper.find("#tab-shares").exists()) {
+    await wrapper.find("#tab-shares").trigger("click");
+    await flushPromises();
+  }
 }
 
 function findButton(wrapper, label) {
@@ -983,6 +991,26 @@ describe("home workspace", () => {
     wrapper.unmount();
   });
 
+  it("removes a peer locally after remote unbinding fails without claiming revocation", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    let savedPeers = [PEER];
+    const removeLocal = vi.fn(async () => { savedPeers = []; });
+    const wrapper = await mountReady({
+      admin_session: async () => ({ username: "admin", mustChangePassword: false }),
+      list_peers: async () => savedPeers,
+      forget_peer: async () => { throw { code: "PEER_IDENTITY_MISMATCH", message: "fingerprint mismatch" }; },
+      remove_local_peer: removeLocal,
+    });
+    await flushPromises();
+    await clickButton(wrapper, "解绑");
+    expect(wrapper.text()).toContain("Office");
+    await clickButton(wrapper, "仅从本机移除");
+    expect(removeLocal).toHaveBeenCalledWith({ peerId: "peer-1" });
+    expect(wrapper.text()).not.toContain("Office");
+    expect(document.body.textContent).toContain("远端授权未撤销");
+    wrapper.unmount();
+  });
+
   it("unbinds an authorized server from the home list", async () => {
     localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
     let savedPeers = [PEER];
@@ -1199,6 +1227,8 @@ describe("home workspace", () => {
     await flushPromises();
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
     await flushPromises();
+    await wrapper.find("#tab-shares").trigger("click");
+    await flushPromises();
     await clickButton(wrapper, "客户端");
 
     await clickButton(wrapper, "手动输入");
@@ -1317,6 +1347,8 @@ describe("home workspace", () => {
     // 切到设置页再回到首页：视图重建不影响状态。
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
     await flushPromises();
+    await wrapper.find("#tab-shares").trigger("click");
+    await flushPromises();
     await wrapper.find(".rail-home").trigger("click");
     await flushPromises();
     expect(wrapper.text()).toContain("已发送申请，等待对方管理员批准…");
@@ -1355,11 +1387,15 @@ describe("home workspace", () => {
 
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
     await flushPromises();
+    await wrapper.find("#tab-shares").trigger("click");
+    await flushPromises();
     expect(wrapper.text()).toContain("Docs");
 
     await wrapper.find(".rail-home").trigger("click");
     await flushPromises();
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
+    await flushPromises();
+    await wrapper.find("#tab-shares").trigger("click");
     await flushPromises();
 
     // 数据已经缓存在共享上下文里：重新进入时直接渲染旧列表，不再闪骨架屏。
@@ -1402,15 +1438,31 @@ describe("settings information architecture", () => {
     invoke.mockReset();
   });
 
-  it("opens Shares first and orders the tabs by everyday priority", async () => {
+  it("records and clears shortcuts from General settings", async () => {
     const wrapper = await mountReady();
-    await signIn(wrapper);
+    await signIn(wrapper, "secret", "general");
+    const input = wrapper.find('input[aria-label="显示或隐藏窗口快捷键"]');
+    await input.trigger("focus");
+    await input.trigger("keydown", { key: "j", code: "KeyJ", ctrlKey: true, shiftKey: true });
+    await flushPromises();
+    expect(JSON.parse(localStorage.getItem("peerdav.general")).toggleShortcut).toBe("CommandOrControl+Shift+J");
+    expect(invoke).toHaveBeenCalledWith("configure_shortcuts", expect.objectContaining({ toggle: "CommandOrControl+Shift+J" }));
+    await wrapper.find('button[aria-label="清空"]').trigger("click");
+    await flushPromises();
+    expect(JSON.parse(localStorage.getItem("peerdav.general")).toggleShortcut).toBe("");
+    expect(invoke).toHaveBeenCalledWith("configure_shortcuts", expect.objectContaining({ toggle: "" }));
+    wrapper.unmount();
+  });
+
+  it("opens General first and retains the management tabs", async () => {
+    const wrapper = await mountReady();
+    await signIn(wrapper, "secret", "general");
 
     const labels = wrapper
       .findAll(".settings-tab")
       .map((tab) => tab.text());
-    expect(labels).toEqual(["共享", "客户端", "服务", "账户"]);
-    expect(wrapper.find("#pane-shares").exists()).toBe(true);
+    expect(labels).toEqual(["通用", "共享", "客户端", "服务", "账户"]);
+    expect(wrapper.find("#pane-general").exists()).toBe(true);
     expect(wrapper.find("#pane-clients").exists()).toBe(false);
 
     wrapper.unmount();
@@ -1427,19 +1479,24 @@ describe("settings information architecture", () => {
         attempts: 1,
       },
     ];
+    let authorized = [];
     const wrapper = await mountReady({
       admin_session: async () => ({
         username: "admin",
         mustChangePassword: false,
       }),
       list_pending_requests: async () => pending,
+      list_authorizations: async () => authorized,
       approve_pending_request: async () => {
         pending = [];
+        authorized = [{ id: "auth-new", label: "MacPro", machineId: "device-1", createdAt: 10 }];
         return { authorizationCode: "code", autoDelivery: true };
       },
     });
     await flushPromises();
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
+    await flushPromises();
+    await wrapper.find("#tab-shares").trigger("click");
     await flushPromises();
     await clickButton(wrapper, "客户端");
 
@@ -1462,6 +1519,11 @@ describe("settings information architecture", () => {
     await clickButton(wrapper, "审批");
     await flushPromises();
 
+    expect(wrapper.text()).toContain("MacPro");
+    expect(wrapper.find(".client-collapse .el-collapse-item__header").text()).toContain("已审批");
+    await wrapper.find(".client-collapse .el-collapse-item__header").trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("解绑");
     expect(wrapper.find(".code-box").exists()).toBe(false);
     expect(document.body.textContent).toContain(
       "已审批，客户端正在自动完成绑定。",
@@ -1499,6 +1561,8 @@ describe("settings information architecture", () => {
 
     // 设置页共享策略列表同样等待首屏数据。
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
+    await flushPromises();
+    await wrapper.find("#tab-shares").trigger("click");
     await flushPromises();
     expect(wrapper.findAll(".list-skeleton")).toHaveLength(1);
     expect(wrapper.find("#pane-shares .share-empty").exists()).toBe(false);
@@ -1564,6 +1628,8 @@ describe("settings information architecture", () => {
 
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
     await flushPromises();
+    await wrapper.find("#tab-shares").trigger("click");
+    await flushPromises();
     await clickButton(wrapper, "客户端");
 
     expect(
@@ -1574,13 +1640,13 @@ describe("settings information architecture", () => {
 
     const chips = wrapper.findAll(".client-item__status .el-tag");
     expect(chips.map((chip) => chip.text())).toEqual([
+      "已审批",
       "待审批",
       "已审批",
-      "已审批",
     ]);
-    // 待审批要用户动手，用琥珀色提醒；已审批是成功态，用绿色。
-    expect(chips[0].classes()).toContain("el-tag--warning");
-    expect(chips[1].classes()).toContain("el-tag--success");
+    // 状态不改变稳定身份排序，颜色仍表达各自语义。
+    expect(chips[0].classes()).toContain("el-tag--success");
+    expect(chips[1].classes()).toContain("el-tag--warning");
     expect(chips[2].classes()).toContain("el-tag--success");
 
     // 行内动作保留主类型按钮的语义，但配色降为中性描边（由 list-pill 覆盖），
@@ -2826,6 +2892,39 @@ describe("admin session restore", () => {
     }
     wrapper.unmount();
     warning.mockRestore();
+  });
+
+  it("routes tray settings actions to General", async () => {
+    const wrapper = await mountReady({ admin_session: async () => ({ username: "admin", mustChangePassword: false }) });
+    await flushPromises();
+    eventHandlers.get("app://navigate")({ payload: "settings" });
+    await flushPromises();
+    expect(wrapper.find("#pane-general").exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("restores a locked interface without covering window controls and verifies the unlock password", async () => {
+    const wrapper = await mountReady({
+      admin_session: async () => ({ username: "admin", mustChangePassword: false, interfaceLocked: true }),
+      unlock_interface: async ({ password }) => {
+        if (password !== "correct") throw { code: "AUTH_INVALID_CREDENTIALS", message: "wrong password" };
+      },
+    });
+    await flushPromises();
+    expect(wrapper.find(".interface-lock").exists()).toBe(true);
+    expect(wrapper.find(".workspace").exists()).toBe(false);
+    expect(wrapper.find(".traffic-lights").exists()).toBe(true);
+    expect(wrapper.find("#titlebar-end").attributes("style")).toContain("display: none");
+    await wrapper.find('.interface-lock input').setValue("wrong");
+    await wrapper.find('.interface-lock').trigger("submit");
+    await flushPromises();
+    expect(wrapper.find(".interface-lock").exists()).toBe(true);
+    await wrapper.find('.interface-lock input').setValue("correct");
+    await wrapper.find('.interface-lock').trigger("submit");
+    await flushPromises();
+    expect(wrapper.find(".interface-lock").exists()).toBe(false);
+    expect(wrapper.find(".workspace").exists()).toBe(true);
+    wrapper.unmount();
   });
 
   it("restores the signed-in admin after a reload", async () => {

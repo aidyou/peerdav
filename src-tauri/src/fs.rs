@@ -1,7 +1,11 @@
 //! Read-only-by-construction view of one share, enforced by the request gate
 //! and again by the filesystem layer.
 //!
-//! Path safety: every operation walks the share root file descriptor with
+//! Unix uses descriptor-relative `openat` operations. Other desktop platforms
+//! use directory capabilities with no-follow traversal (`cap-std`); neither
+//! backend reconstructs absolute paths from untrusted request components.
+//!
+//! Path safety on Unix: every operation walks the share root file descriptor with
 //! `openat(..., O_NOFOLLOW)` and never follows a symlink. Intermediate
 //! directories are opened with `O_DIRECTORY | O_NOFOLLOW`, and the final
 //! component with `O_NOFOLLOW` as well. A concurrent attacker who swaps a
@@ -16,7 +20,9 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
+#[cfg(unix)]
+use std::time::Duration;
+use std::time::SystemTime;
 
 use bytes::{Buf, Bytes};
 use dav_server::davpath::DavPath;
@@ -120,6 +126,8 @@ pub type ShareMap = HashMap<String, Arc<ShareConfig>>;
 #[derive(Debug)]
 pub struct ShareRoot {
     fd: std::os::fd::OwnedFd,
+    #[cfg(test)]
+    directory: cap_std::fs::Dir,
 }
 
 #[cfg(unix)]
@@ -155,27 +163,31 @@ impl ShareRoot {
             source: source.into(),
         })?;
 
-        Ok(Self { fd })
-    }
-}
-
-#[cfg(not(unix))]
-#[derive(Debug)]
-pub struct ShareRoot {
-    _private: (),
-}
-
-#[cfg(not(unix))]
-impl ShareRoot {
-    pub fn open(path: &Path) -> Result<Self, DomainError> {
-        Err(DomainError::InvalidShareConfig {
-            detail: format!(
-                "secure share filesystem is not implemented on this platform (`{}`)",
-                path.display()
-            ),
+        #[cfg(test)]
+        let directory =
+            cap_std::fs::Dir::from_std_file(File::from(fd.try_clone().map_err(|source| {
+                DomainError::Io {
+                    operation: "clone share root",
+                    path: None,
+                    source,
+                }
+            })?));
+        Ok(Self {
+            fd,
+            #[cfg(test)]
+            directory,
         })
     }
 }
+
+#[cfg(any(not(unix), test))]
+#[path = "fs/portable.rs"]
+mod portable;
+#[cfg(not(unix))]
+#[path = "fs/types.rs"]
+mod portable_types;
+#[cfg(not(unix))]
+pub use portable_types::ShareRoot;
 
 /// The guarded filesystem served by the WebDAV handler. It owns no mutable
 /// state; the share map is shared with the server controller.
@@ -366,7 +378,6 @@ fn stat_meta(stat: &rustix::fs::Stat) -> FsResult<Meta> {
     })
 }
 
-#[cfg(unix)]
 fn file_meta(metadata: &std::fs::Metadata) -> FsResult<Meta> {
     let file_type = metadata.file_type();
     if file_type.is_symlink() {
@@ -399,6 +410,11 @@ fn metadata_for(share: &ShareConfig, relative: &Path) -> FsResult<Meta> {
             stat_meta(&stat)
         }
     }
+}
+
+#[cfg(not(unix))]
+fn metadata_for(share: &ShareConfig, relative: &Path) -> FsResult<Meta> {
+    portable::metadata_for(share, relative)
 }
 
 #[cfg(unix)]
@@ -488,12 +504,12 @@ fn open_file(
 
 #[cfg(not(unix))]
 fn open_file(
-    _share: &ShareConfig,
-    _relative: &Path,
-    _options: OpenOptions,
-    _credentials: &RequestCredentials,
+    share: &ShareConfig,
+    relative: &Path,
+    options: OpenOptions,
+    credentials: &RequestCredentials,
 ) -> FsResult<Box<dyn DavFile>> {
-    Err(FsError::Forbidden)
+    portable::open_file(share, relative, options, credentials)
 }
 
 #[derive(Debug)]
@@ -635,8 +651,8 @@ fn read_entries(share: &ShareConfig, relative: &Path) -> FsResult<Vec<DirEntry>>
 }
 
 #[cfg(not(unix))]
-fn read_entries(_share: &ShareConfig, _relative: &Path) -> FsResult<Vec<DirEntry>> {
-    Err(FsError::Forbidden)
+fn read_entries(share: &ShareConfig, relative: &Path) -> FsResult<Vec<DirEntry>> {
+    portable::read_entries(share, relative)
 }
 
 impl GuardedFileSystem<RequestCredentials> for RestrictedFs {
@@ -802,8 +818,8 @@ fn create_dir_at(share: &ShareConfig, relative: &Path) -> FsResult<()> {
 }
 
 #[cfg(not(unix))]
-fn create_dir_at(_share: &ShareConfig, _relative: &Path) -> FsResult<()> {
-    Err(FsError::Forbidden)
+fn create_dir_at(share: &ShareConfig, relative: &Path) -> FsResult<()> {
+    portable::create_dir_at(share, relative)
 }
 
 #[cfg(unix)]
@@ -823,8 +839,8 @@ fn remove_at(share: &ShareConfig, relative: &Path, directory: bool) -> FsResult<
 }
 
 #[cfg(not(unix))]
-fn remove_at(_share: &ShareConfig, _relative: &Path, _directory: bool) -> FsResult<()> {
-    Err(FsError::Forbidden)
+fn remove_at(share: &ShareConfig, relative: &Path, directory: bool) -> FsResult<()> {
+    portable::remove_at(share, relative, directory)
 }
 
 #[cfg(unix)]
@@ -840,8 +856,8 @@ fn rename_at(share: &ShareConfig, from: &Path, to: &Path) -> FsResult<()> {
 }
 
 #[cfg(not(unix))]
-fn rename_at(_share: &ShareConfig, _from: &Path, _to: &Path) -> FsResult<()> {
-    Err(FsError::Forbidden)
+fn rename_at(share: &ShareConfig, from: &Path, to: &Path) -> FsResult<()> {
+    portable::rename_at(share, from, to)
 }
 
 /// Commit a verified upload through the same descriptor-relative path checks
@@ -929,16 +945,14 @@ pub(crate) fn commit_upload_parts(
 
 #[cfg(not(unix))]
 pub(crate) fn commit_upload_parts(
-    _share: &ShareConfig,
-    _relative: &Path,
-    _directory: &Path,
-    _size: u64,
-    _digest: &str,
-    _session: &crate::types::UploadSession,
+    share: &ShareConfig,
+    relative: &Path,
+    directory: &Path,
+    size: u64,
+    digest: &str,
+    session: &crate::types::UploadSession,
 ) -> Result<(), DomainError> {
-    Err(DomainError::InvalidShareConfig {
-        detail: "secure uploads are unavailable on this platform".into(),
-    })
+    portable::commit_upload_parts(share, relative, directory, size, digest, session)
 }
 
 #[cfg(unix)]
@@ -1063,8 +1077,72 @@ fn copy_at(share: &ShareConfig, from: &Path, to: &Path) -> FsResult<()> {
 }
 
 #[cfg(not(unix))]
-fn copy_at(_share: &ShareConfig, _from: &Path, _to: &Path) -> FsResult<()> {
-    Err(FsError::Forbidden)
+fn copy_at(share: &ShareConfig, from: &Path, to: &Path) -> FsResult<()> {
+    portable::copy_at(share, from, to)
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn file_metadata_preserves_size_time_and_type() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let path = directory.path().join("file");
+        std::fs::write(&path, b"metadata").expect("test file");
+        let metadata = std::fs::metadata(&path).expect("file metadata");
+        let meta = file_meta(&metadata).expect("converted metadata");
+        assert_eq!(meta.len(), 8);
+        assert_eq!(
+            meta.modified().expect("modified"),
+            metadata.modified().expect("source modified")
+        );
+        assert!(!meta.is_dir());
+
+        let metadata = std::fs::metadata(directory.path()).expect("directory metadata");
+        assert!(file_meta(&metadata).expect("converted directory").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_metadata_rejects_symlinks() {
+        let directory = tempfile::tempdir().expect("test directory");
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink("missing", &link).expect("symlink");
+        let metadata = std::fs::symlink_metadata(&link).expect("link metadata");
+        assert!(matches!(file_meta(&metadata), Err(FsError::Forbidden)));
+    }
+
+    #[test]
+    fn shared_metadata_and_traversal_rules() {
+        let directory = tempfile::tempdir().expect("test directory");
+        std::fs::write(directory.path().join("file"), b"data").expect("file");
+        let share = ShareConfig {
+            id: "test".into(),
+            name: "test".into(),
+            root_path: directory.path().to_path_buf(),
+            permissions: SharePermissions {
+                can_read: true,
+                can_write: true,
+                can_delete: true,
+            },
+            rules: Vec::new(),
+            display_rules: Vec::new(),
+            root: Arc::new(ShareRoot::open(directory.path()).expect("root")),
+        };
+        assert!(
+            metadata_for(&share, Path::new(""))
+                .expect("root metadata")
+                .is_dir()
+        );
+        assert_eq!(
+            metadata_for(&share, Path::new("file"))
+                .expect("metadata")
+                .len(),
+            4
+        );
+        assert!(metadata_for(&share, Path::new("../outside")).is_err());
+    }
 }
 
 #[cfg(all(test, unix))]

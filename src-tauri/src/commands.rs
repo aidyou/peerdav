@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use zeroize::Zeroizing;
 
@@ -190,6 +190,192 @@ pub async fn admin_session(
 ) -> Result<Option<AdminSessionInfo>, AppError> {
     let vault = Arc::clone(vault.inner());
     run_blocking(move || vault.admin_session()).await
+}
+
+#[tauri::command]
+pub async fn refresh_tray_menu(
+    app: AppHandle,
+    peers: State<'_, SharedPeers>,
+) -> Result<(), AppError> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+    let Some(tray) = app.tray_by_id("main-tray") else {
+        return Ok(());
+    };
+    let native = |error: tauri::Error| {
+        AppError::from(DomainError::Internal {
+            detail: error.to_string(),
+        })
+    };
+    let menu = Menu::new(&app).map_err(native)?;
+    menu.append(
+        &MenuItem::with_id(
+            &app,
+            crate::types::TRAY_SHOW_MENU_ID,
+            "首页 / Home",
+            true,
+            None::<&str>,
+        )
+        .map_err(native)?,
+    )
+    .map_err(native)?;
+    let mut servers = peers.list_peers().map_err(AppError::from)?;
+    servers.sort_by(|a, b| a.label.cmp(&b.label));
+    if !servers.is_empty() {
+        menu.append(&PredefinedMenuItem::separator(&app).map_err(native)?)
+            .map_err(native)?;
+        for peer in servers {
+            menu.append(
+                &MenuItem::with_id(
+                    &app,
+                    format!("tray-peer-{}", peer.id),
+                    &peer.label,
+                    true,
+                    None::<&str>,
+                )
+                .map_err(native)?,
+            )
+            .map_err(native)?;
+        }
+        menu.append(&PredefinedMenuItem::separator(&app).map_err(native)?)
+            .map_err(native)?;
+    }
+    menu.append(
+        &MenuItem::with_id(&app, "tray-settings", "设置 / Settings", true, None::<&str>)
+            .map_err(native)?,
+    )
+    .map_err(native)?;
+    menu.append(
+        &MenuItem::with_id(
+            &app,
+            crate::types::TRAY_QUIT_MENU_ID,
+            "退出 / Quit",
+            true,
+            None::<&str>,
+        )
+        .map_err(native)?,
+    )
+    .map_err(native)?;
+    #[cfg(target_os = "linux")]
+    {
+        tray.set_menu(Some(menu)).map_err(native)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = tray;
+        if let Some(stored) = app.try_state::<std::sync::Mutex<Menu<tauri::Wry>>>() {
+            *stored.lock().map_err(|error| {
+                AppError::from(DomainError::Internal {
+                    detail: error.to_string(),
+                })
+            })? = menu;
+        }
+        Ok(())
+    }
+}
+
+#[tauri::command]
+pub async fn configure_shortcuts(
+    app: AppHandle,
+    toggle: String,
+    lock: String,
+) -> Result<(), AppError> {
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+    let parse = |value: &str| -> Result<Option<Shortcut>, AppError> {
+        if value.trim().is_empty() {
+            return Ok(None);
+        }
+        value.parse().map(Some).map_err(|error| {
+            AppError::from(DomainError::Internal {
+                detail: format!("invalid shortcut: {error}"),
+            })
+        })
+    };
+    let toggle = parse(&toggle)?;
+    let lock = parse(&lock)?;
+    if toggle.is_some() && toggle == lock {
+        return Err(AppError::from(DomainError::Internal {
+            detail: "window and lock shortcuts must differ".into(),
+        }));
+    }
+    let shortcuts = app.global_shortcut();
+    shortcuts.unregister_all().map_err(|error| {
+        AppError::from(DomainError::Internal {
+            detail: error.to_string(),
+        })
+    })?;
+    if let Some(toggle) = toggle {
+        shortcuts
+            .on_shortcut(toggle, |app, _, event| {
+                if event.state != ShortcutState::Pressed {
+                    return;
+                }
+                let tray_available = app
+                    .try_state::<crate::TrayAvailable>()
+                    .is_some_and(|state| state.0);
+                if !tray_available {
+                    crate::show_main_window(app);
+                    return;
+                }
+                if let Some(window) = app.get_webview_window(crate::types::MAIN_WINDOW_LABEL) {
+                    match window.is_visible() {
+                        Ok(true) => {
+                            if let Err(error) = window.close() {
+                                log::warn!("failed to hide window from shortcut: {error}");
+                            }
+                        }
+                        Ok(false) => crate::show_main_window(app),
+                        Err(error) => log::warn!("failed to query window visibility: {error}"),
+                    }
+                }
+            })
+            .map_err(|error| {
+                AppError::from(DomainError::Internal {
+                    detail: error.to_string(),
+                })
+            })?;
+    }
+    if let Some(lock) = lock {
+        shortcuts
+            .on_shortcut(lock, |app, _, event| {
+                if event.state != ShortcutState::Pressed {
+                    return;
+                }
+                if let Some(vault) = app.try_state::<SharedVault>() {
+                    match vault.lock_interface() {
+                        Ok(()) => {
+                            if let Err(error) = app.emit("app://interface-locked", ()) {
+                                log::error!("failed to publish interface lock: {error}");
+                            }
+                        }
+                        Err(error) => log::error!(
+                            "failed to lock interface: {}",
+                            crate::error::error_chain(&error)
+                        ),
+                    }
+                }
+            })
+            .map_err(|error| {
+                AppError::from(DomainError::Internal {
+                    detail: error.to_string(),
+                })
+            })?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn lock_interface(vault: State<'_, SharedVault>) -> Result<(), AppError> {
+    vault.lock_interface().map_err(AppError::from)
+}
+
+#[tauri::command]
+pub async fn unlock_interface(
+    vault: State<'_, SharedVault>,
+    password: String,
+) -> Result<(), AppError> {
+    let vault = Arc::clone(vault.inner());
+    let password = Zeroizing::new(password);
+    run_blocking(move || vault.unlock_interface(password.as_str())).await
 }
 
 /// Clears the in-memory admin session without locking the vault.
@@ -733,6 +919,14 @@ pub async fn forget_peer(
         }
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_local_peer(
+    peers: State<'_, SharedPeers>,
+    peer_id: String,
+) -> Result<(), AppError> {
+    peers.forget_local(&peer_id).await.map_err(AppError::from)
 }
 
 #[tauri::command]

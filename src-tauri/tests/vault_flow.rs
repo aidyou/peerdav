@@ -57,7 +57,14 @@ fn first_run_creates_key_file_and_encrypted_vault() {
     let result = vault
         .initialize(&key_directory, "owner", ADMIN_PASSWORD)
         .expect("initialize");
-    let key_path = Path::new(&key_directory).join("peerdav-vault.key");
+    let key_path = PathBuf::from(result.vault_status.key_file.as_deref().expect("key path"));
+    assert!(
+        key_path
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .starts_with("peerdav-vault-")
+    );
     let canonical_key_path = fs::canonicalize(&key_path).expect("canonical key path");
     let key_file = canonical_key_path.display().to_string();
 
@@ -252,7 +259,13 @@ fn missing_or_wrong_key_file_requires_explicit_recovery() {
     other_vault
         .initialize(&other_key_directory, "owner", ADMIN_PASSWORD)
         .expect("other init");
-    let other_key = Path::new(&other_key_directory).join("peerdav-vault.key");
+    let other_key = PathBuf::from(
+        other_vault
+            .status()
+            .expect("status")
+            .key_file
+            .expect("key path"),
+    );
     let before = restarted.status().expect("status").key_file;
     assert!(matches!(
         restarted.reload_key(Some(other_key.to_str().expect("utf8 other key"))),
@@ -625,6 +638,38 @@ fn column_exists(connection: &Connection, table: &str, column: &str) -> bool {
 fn read_meta(path: &Path, key: &str) -> Option<String> {
     let connection = Connection::open(path).expect("open sqlite");
     read_meta_connection(&connection, key)
+}
+
+#[test]
+fn interface_lock_requires_password_without_locking_vault() {
+    let (directory, _, vault) = open_vault();
+    vault
+        .initialize(&key_dir(directory.path()), "owner", ADMIN_PASSWORD)
+        .expect("init");
+    vault.admin_login("owner", ADMIN_PASSWORD).expect("login");
+    vault.lock_interface().expect("lock interface");
+    assert!(vault.status().expect("status").unlocked);
+    assert!(
+        vault
+            .admin_session()
+            .expect("session")
+            .expect("admin")
+            .interface_locked
+    );
+    assert!(matches!(
+        vault.verify_admin("owner", ""),
+        Err(DomainError::InterfaceLocked)
+    ));
+    assert!(vault.unlock_interface("wrong").is_err());
+    assert!(
+        vault
+            .admin_session()
+            .expect("session")
+            .expect("admin")
+            .interface_locked
+    );
+    vault.unlock_interface(ADMIN_PASSWORD).expect("unlock");
+    vault.verify_admin("owner", "").expect("session restored");
 }
 
 fn read_meta_connection(connection: &Connection, key: &str) -> Option<String> {

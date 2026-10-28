@@ -37,6 +37,7 @@ struct Session {
     /// process memory so a webview reload keeps the user signed in; cleared on
     /// lock and logout.
     admin: Option<String>,
+    interface_locked: bool,
     /// Stable reason code when the configured key file could not be loaded at
     /// startup, so the UI can show a recovery path instead of a password form.
     key_error: Option<&'static str>,
@@ -148,7 +149,7 @@ impl Vault {
             }
         }
 
-        let material = keyfile::generate_in_directory(key_directory)?;
+        let material = keyfile::generate_in_directory(key_directory, self.fingerprint())?;
         let key_path = material.path.clone();
         let key = material.key;
         let recovery_code = generate_recovery_code();
@@ -188,6 +189,7 @@ impl Vault {
             let mut session = self.session()?;
             session.key = Some(key);
             session.admin = None;
+            session.interface_locked = false;
             session.key_error = None;
         }
 
@@ -226,7 +228,7 @@ impl Vault {
         }
 
         let archived = self.archive_database()?;
-        let material = keyfile::generate_in_directory(key_directory)?;
+        let material = keyfile::generate_in_directory(key_directory, self.fingerprint())?;
         let key_path = material.path.clone();
         let key = material.key;
         let next_recovery_code = generate_recovery_code();
@@ -265,6 +267,7 @@ impl Vault {
             let mut session = self.session()?;
             session.key = Some(key);
             session.admin = None;
+            session.interface_locked = false;
             session.key_error = None;
         }
 
@@ -314,6 +317,7 @@ impl Vault {
             let mut session = self.session()?;
             session.key = None;
             session.admin = None;
+            session.interface_locked = false;
             session.key_error = None;
         }
         self.status()
@@ -336,6 +340,7 @@ impl Vault {
         // Remember the signed-in admin for the lifetime of this unlock so a
         // webview reload does not force another login.
         session.admin = Some(record.username.clone());
+        session.interface_locked = false;
 
         Ok(AdminLoginResult {
             username: record.username,
@@ -371,6 +376,7 @@ impl Vault {
         db.put_secret(SECRET_ADMIN, &nonce, &ciphertext)?;
 
         session.admin = Some(record.username.clone());
+        session.interface_locked = false;
 
         Ok(AdminLoginResult {
             username: record.username,
@@ -411,6 +417,7 @@ impl Vault {
     /// admin session (established by login and kept until lock/logout) is
     /// accepted so a webview reload keeps the user signed in.
     pub fn verify_admin(&self, username: &str, password: &str) -> Result<(), DomainError> {
+        self.require_interface_unlocked()?;
         if password.is_empty() {
             let session = self.session()?;
             if session.admin.as_deref() == Some(username.trim()) {
@@ -437,15 +444,47 @@ impl Vault {
         let key = require_key(&session)?;
         let record = load_admin_record(&db, key)?;
         Ok(Some(AdminSessionInfo {
+            interface_locked: session.interface_locked,
             username,
             must_change_password: record.must_change_password,
         }))
+    }
+
+    pub fn lock_interface(&self) -> Result<(), DomainError> {
+        let mut session = self.session()?;
+        if session.admin.is_some() {
+            session.interface_locked = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn require_interface_unlocked(&self) -> Result<(), DomainError> {
+        if self.session()?.interface_locked {
+            return Err(DomainError::InterfaceLocked);
+        }
+        Ok(())
+    }
+
+    pub fn unlock_interface(&self, password: &str) -> Result<(), DomainError> {
+        let db = self.db()?;
+        let mut session = self.session()?;
+        let username = session
+            .admin
+            .as_deref()
+            .ok_or(DomainError::InvalidAdminCredentials)?;
+        let record = load_admin_record(&db, require_key(&session)?)?;
+        if !admin::authenticate(&record, username, password)? {
+            return Err(DomainError::InvalidAdminCredentials);
+        }
+        session.interface_locked = false;
+        Ok(())
     }
 
     /// Clears the in-memory admin session without locking the vault.
     pub fn admin_logout(&self) -> Result<(), DomainError> {
         let mut session = self.session()?;
         session.admin = None;
+        session.interface_locked = false;
         Ok(())
     }
 

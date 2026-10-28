@@ -7,11 +7,15 @@ import {
   isEnabled as isAutostartEnabled,
 } from "@tauri-apps/plugin-autostart";
 
+import { stableList } from "../lib/listOrder";
 import { useAppContext } from "../lib/appContext";
 import { buildBindOptions } from "../lib/bindScope";
 import { confirmAction } from "../lib/confirm";
 import { toUserMessage } from "../lib/invoke";
-import { localizeMessage, t } from "../lib/i18n";
+import { locale, setLocale, localizeMessage, t } from "../lib/i18n";
+import { theme, setTheme } from "../lib/theme";
+import { accent, setAccent, SUPPORTED_ACCENTS } from "../lib/accent";
+import { generalSettings, saveGeneralSettings, shortcutFromEvent } from "../lib/general";
 import { accessRowState, findAccessRequest, findSavedPeer } from "../lib/access";
 import { statusTagTone } from "../lib/tagTone";
 import { validatePassword } from "../lib/password";
@@ -21,7 +25,27 @@ import ListSkeleton from "./ListSkeleton.vue";
 const app = useAppContext();
 const { busy, run } = useAction();
 
+const capturingShortcut = ref(null);
+function captureShortcut(event, field) {
+  if (event.key === "Tab") return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (event.key === "Escape") { event.target.blur(); return; }
+  const shortcut = shortcutFromEvent(event);
+  if (!shortcut) return;
+  const other = field === "toggleShortcut" ? "lockShortcut" : "toggleShortcut";
+  if (generalSettings[other] === shortcut) { app.setError("lock.shortcutConflict"); return; }
+  generalSettings[field] = shortcut;
+  saveGeneralSettings();
+  event.target.blur();
+}
+function clearShortcut(field) {
+  generalSettings[field] = "";
+  saveGeneralSettings();
+}
+
 const settingsTabs = [
+  { name: "general", label: "settings.tabGeneral" },
   { name: "shares", label: "settings.tabShares" },
   { name: "clients", label: "settings.tabClients" },
   { name: "service", label: "settings.tabService" },
@@ -101,15 +125,7 @@ const lanServers = computed(() => app.discovered);
 const activeInboundIds = ref([]);
 const activeOutboundIds = ref([]);
 
-/* 入站与出站共用同一套审批状态：待申请 / 待审批 / 已审批。
-   排序把需要用户处理的放在前面，已完成配对放在最后。 */
-const CLIENT_STATUS_RANK = {
-  pending: 0,
-  error: 0,
-  canceled: 1,
-  unrequested: 1,
-  approved: 2,
-};
+// 状态只影响展示与操作，不参与排序，避免审批或连接后设备行跳动。
 const CLIENT_STATUS_LABEL = {
   pending: "clients.statusPending",
   error: "clients.statusFailed",
@@ -142,8 +158,8 @@ const inboundEntries = computed(() => {
     status: "pending",
     badgeKey: CLIENT_STATUS_LABEL.pending,
     action: "approve",
-    title: request.peerIp,
-    subtitle: request.shareName,
+    title: request.deviceName || request.peerIp,
+    subtitle: "",
     request,
     details: [
       // 机器码才是设备身份；IP 只是它这次拿到的地址，所以两行都列出但语义不同。
@@ -159,8 +175,7 @@ const inboundEntries = computed(() => {
       { label: t("pending.attemptCount"), value: String(request.attempts) },
     ],
   }));
-  const authorized = [...authorizations.value]
-    .sort((a, b) => b.createdAt - a.createdAt)
+  const authorized = authorizations.value
     .map((authorization) => ({
       key: `auth-${authorization.id}`,
       status: "approved",
@@ -185,7 +200,7 @@ const inboundEntries = computed(() => {
         },
       ],
     }));
-  return [...pending, ...authorized];
+  return stableList([...pending, ...authorized], (entry) => entry.request?.machineId ?? entry.authorization?.machineId ?? entry.key);
 });
 
 function buildOutboundEntry(server, peer, accessEntry) {
@@ -225,6 +240,7 @@ function buildOutboundEntry(server, peer, accessEntry) {
       : server
         ? `server-${server.serverId}`
         : `access-${accessEntry?.url ?? ""}`,
+    identity: fingerprint ?? (peer ? peer.url : (server?.url ?? accessEntry?.url ?? "")),
     status,
     badgeKey: CLIENT_STATUS_LABEL[status] ?? CLIENT_STATUS_LABEL.unrequested,
     action: peer
@@ -267,9 +283,7 @@ const outboundEntries = computed(() => {
     coveredAccess.add(entry.url);
     rows.push(buildOutboundEntry(null, null, entry));
   }
-  return rows.sort(
-    (a, b) => CLIENT_STATUS_RANK[a.status] - CLIENT_STATUS_RANK[b.status],
-  );
+  return stableList(rows, (entry) => entry.identity);
 });
 // 骨架屏仅用于「还没有任何数据」的首屏；已有数据时的刷新继续渲染旧行，避免整块闪烁。
 const sharesLoading = computed(
@@ -461,16 +475,7 @@ function describeRule(rule) {
 const activeShareIds = ref([]);
 
 async function loadAdminData() {
-  adminLoading.value = true;
-  try {
-    const args = adminArgs();
-    shares.value = await app.invoke("list_shares", args);
-    app.pendingRequests = await app.invoke("list_pending_requests", args);
-    authorizations.value = await app.invoke("list_authorizations", args);
-    await app.refreshServerStatus();
-  } finally {
-    adminLoading.value = false;
-  }
+  await app.refreshAdminData();
 }
 
 async function startServer() {
@@ -578,6 +583,8 @@ async function requestPeerAccess(url = peerUrl.value) {
   setPeerNotice(null);
   try {
     await app.beginPeerAccess(target, null, peerFingerprint.value.trim() || null);
+    const discovered = findAccessRequest(app.accessRequests, { url: target });
+    if (discovered?.fingerprint && !peerFingerprint.value.trim()) peerFingerprint.value = discovered.fingerprint;
   } catch (error) {
     app.handleFailure(error);
   } finally {
@@ -643,7 +650,7 @@ async function forgetPeer(peer) {
     if (app.activePeerId === peer.id) {
       app.closePeer();
     }
-    await app.refreshPeers();
+    await Promise.all([app.refreshPeers(), app.refreshAdminData()]);
     setPeerNotice("client.forgotten");
   });
 }
@@ -761,6 +768,43 @@ async function loadInitialData() {
         {{ t(tab.label) }}
       </button>
     </nav>
+
+      <section v-if="app.settingsTab === 'general'" id="pane-general" class="settings-pane" role="tabpanel" aria-labelledby="tab-general">
+        <h3>{{ t("settings.tabGeneral") }}</h3>
+        <div class="grid pane-form-grid">
+          <label>{{ t("titlebar.language") }}
+            <el-select :model-value="locale" @update:model-value="setLocale">
+              <el-option value="zh-CN" :label="t('language.zh')" />
+              <el-option value="en" :label="t('language.en')" />
+            </el-select>
+          </label>
+          <label>{{ t("titlebar.theme") }}
+            <el-select :model-value="theme" @update:model-value="setTheme">
+              <el-option v-for="value in ['system', 'light', 'dark']" :key="value" :value="value" :label="t(`theme.${value}`)" />
+            </el-select>
+          </label>
+          <label>{{ t("titlebar.accent") }}
+            <el-select :model-value="accent" @update:model-value="setAccent">
+              <el-option v-for="value in SUPPORTED_ACCENTS" :key="value" :value="value" :label="t(`accent.${value}`)" />
+            </el-select>
+          </label>
+          <label>{{ t("lock.auto") }}<el-switch v-model="generalSettings.autoLock" @change="saveGeneralSettings" /></label>
+          <label>{{ t("lock.minutes") }}<el-input-number v-model="generalSettings.idleMinutes" :min="5" :step="5" step-strictly :max="1440" @change="saveGeneralSettings" /></label>
+          <label v-for="field in ['toggleShortcut', 'lockShortcut']" :key="field">
+            {{ t(field === 'toggleShortcut' ? 'lock.toggleShortcut' : 'lock.shortcut') }}
+            <el-input :model-value="capturingShortcut === field ? '' : generalSettings[field]" readonly
+              :aria-label="t(field === 'toggleShortcut' ? 'lock.toggleShortcut' : 'lock.shortcut')"
+              :placeholder="t(capturingShortcut === field ? 'lock.recordingShortcut' : 'lock.captureShortcut')"
+              @focus="capturingShortcut = field" @blur="capturingShortcut = null"
+              @keydown="captureShortcut($event, field)">
+              <template #append><el-button :aria-label="t('lock.clearShortcut')" @click="clearShortcut(field)">{{ t('lock.clearShortcut') }}</el-button></template>
+            </el-input>
+          </label>
+        </div>
+        <p class="hint">{{ t("lock.passwordHint") }}</p>
+        <el-button @click="app.lockInterface">{{ t("lock.now") }}</el-button>
+        <el-button @click="app.logout">{{ t("login.logout") }}</el-button>
+      </section>
 
       <section
         v-if="app.settingsTab === 'service'"
@@ -1283,6 +1327,12 @@ async function loadInitialData() {
             <p v-if="manualOpen" class="hint manual-hint">
               {{ t("client.manualHint") }}
             </p>
+            <div v-if="manualOpen && defaultAllowRules.length" class="hint manual-hint">
+              {{ t("client.localNetworks") }}
+              <el-tag v-for="network in defaultAllowRules" :key="network" type="info">
+                {{ network }}
+              </el-tag>
+            </div>
 
             <!-- 只显示「正在发送」这种瞬时动作；申请结果来自后端状态，切换页面后仍在。 -->
             <div v-if="manualEntry?.status === 'waiting'" class="request-progress">
@@ -1392,6 +1442,9 @@ async function loadInitialData() {
                         @click="forgetPeer(entry.peer)"
                       >
                         {{ t("client.forget") }}
+                      </el-button>
+                      <el-button class="list-pill" type="primary" round size="small" :disabled="busy" @click="run(() => app.removeLocalPeer(entry.peer))">
+                        {{ t("client.removeLocal") }}
                       </el-button>
                     </template>
                   </div>

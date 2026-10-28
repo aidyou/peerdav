@@ -449,6 +449,46 @@ async fn canceling_after_approval_discards_the_queued_code_and_authorization() {
 }
 
 #[tokio::test]
+async fn local_removal_preserves_authorization_and_same_identity_reconnects_without_approval() {
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (info, _) = harness.connect().await;
+    harness
+        .peers
+        .forget_local(&info.id)
+        .await
+        .expect("local removal");
+    assert!(harness.peers.list_peers().expect("peers").is_empty());
+    assert_eq!(harness.controller.list_authorizations().len(), 1);
+    let access = harness
+        .peers
+        .begin_access(&harness.url, None)
+        .await
+        .expect("reuse identity");
+    assert_eq!(access.status, OutboundAccessStatus::Accessible);
+    assert_eq!(harness.peers.list_peers().expect("restored peers").len(), 1);
+    assert!(harness.controller.list_pending().is_empty());
+    let auth = harness.controller.list_authorizations()[0].id.clone();
+    harness
+        .controller
+        .revoke_authorization(&auth)
+        .expect("revoke");
+    let peer = harness.peers.list_peers().expect("peers")[0].id.clone();
+    harness
+        .peers
+        .forget_local(&peer)
+        .await
+        .expect("remove again");
+    let access = harness
+        .peers
+        .begin_access(&harness.url, None)
+        .await
+        .expect("request again");
+    assert_eq!(access.status, OutboundAccessStatus::Waiting);
+    assert!(harness.peers.list_peers().expect("peers").is_empty());
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
 async fn client_unbind_revokes_the_server_authorization() {
     let harness = Harness::new(vec![loopback_rule()], false).await;
     let (info, code) = harness.connect().await;
@@ -2185,6 +2225,45 @@ async fn connection_snapshots_keep_identity_across_approval_and_cancel() {
             .inbound_connections()
             .expect("revoked snapshot")[0]
             .authorized
+    );
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
+async fn manual_pairing_probes_fingerprint_and_never_replaces_an_existing_pin() {
+    let harness = Harness::new(Vec::new(), false).await;
+    let client_directory = dev_test_dir("manual_pairing");
+    let client_vault =
+        Arc::new(Vault::open(&client_directory.path().join("client.pd")).expect("client vault"));
+    client_vault
+        .initialize(&key_dir(client_directory.path()), "owner", ADMIN_PASSWORD)
+        .expect("init");
+    let peers = PeerManager::new(
+        Arc::clone(&client_vault),
+        client_directory.path().join("temp"),
+    )
+    .expect("peers");
+    let url = harness.url.replace("127.0.0.1", "localhost");
+    let request = peers
+        .begin_access(&url, None)
+        .await
+        .expect("probe and request");
+    assert_eq!(
+        request.fingerprint.as_deref(),
+        Some(harness.vault.fingerprint())
+    );
+    let pinned = PeerManager::new(client_vault, client_directory.path().join("pinned-temp"))
+        .expect("pinned peers");
+    pinned
+        .set_pairing_fingerprint(&url, &"a".repeat(64))
+        .expect("pin");
+    let request = pinned
+        .begin_access(&url, None)
+        .await
+        .expect("record failure");
+    assert_ne!(
+        request.fingerprint.as_deref(),
+        Some(harness.vault.fingerprint())
     );
     harness.controller.stop().await;
 }

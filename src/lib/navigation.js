@@ -1,7 +1,7 @@
-export const SETTINGS_TABS = ["shares", "clients", "service", "account"];
+export const SETTINGS_TABS = ["general", "shares", "clients", "service", "account"];
 
 export function normalizeSettingsTab(value) {
-  return SETTINGS_TABS.includes(value) ? value : "shares";
+  return SETTINGS_TABS.includes(value) ? value : "general";
 }
 
 /// Parses the workspace part of the URL hash. Unknown or malformed hashes fall

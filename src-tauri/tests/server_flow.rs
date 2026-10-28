@@ -536,6 +536,7 @@ async fn approval_identity_follows_the_machine_code() {
                 b"",
                 &[
                     (MACHINE_ID_HEADER, "forged-device-id".into()),
+                    ("x-peerdav-device-name", "MacPro".into()),
                     (ACCESS_REQUEST_HEADER, key),
                 ],
             )
@@ -559,6 +560,7 @@ async fn approval_identity_follows_the_machine_code() {
                 b"",
                 &[
                     (MACHINE_ID_HEADER, "forged-device-id".into()),
+                    ("x-peerdav-device-name", "MacPro".into()),
                     (ACCESS_REQUEST_HEADER, key),
                 ],
             )
@@ -601,12 +603,8 @@ async fn approval_identity_follows_the_machine_code() {
         approved.authorization.machine_id.as_deref(),
         Some(machine.as_str())
     );
-    // 标签以机器码开头，管理员能直接看出这是哪台设备。
-    assert!(
-        approved.authorization.label.starts_with(&machine[..8]),
-        "unexpected label {}",
-        approved.authorization.label
-    );
+    // Display names are independent of machine identity and authorized directories.
+    assert_eq!(approved.authorization.label, "MacPro");
 
     // 另一台设备用同一个 key 轮询：只能看到自己那条待审批，拿不到别人的授权码。
     let stolen = poll(other_machine.clone(), second_key.clone()).await;
