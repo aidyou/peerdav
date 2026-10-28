@@ -28,6 +28,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "PeerDav",
+    "license": "Proprietary",
+    "category": "Network",
+    "shortDescription": "LAN WebDAV file sharing tool",
+    "longDescription": "PeerDav is a desktop WebDAV server for local area networks. It shares selected folders over WebDAV, manages authorized users and access codes, filters clients by IP, subnet and MAC address, discovers peers with UDP broadcast, and keeps secret hashes encrypted in a Stronghold vault.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

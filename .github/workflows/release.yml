@@ -1,7 +1,9 @@
 name: Release
 
 # 推送以 v 开头的标签（例如 v0.1.0）时触发：
-# 校验版本号 -> 创建发布草稿 -> 并行构建六个平台并上传安装包。
+# 校验版本号 -> 创建发布草稿 -> 并行构建所有平台并上传安装包。
+# 平台集合来自 .github/build-matrix.json，与 build.yml（手动构建）完全一致，
+# 手动验证过的包可直接复用到发布；Linux 一次编译同时产出 deb（Debian 系）与 rpm（RedHat 系）。
 on:
   push:
     tags:
@@ -20,6 +22,29 @@ env:
   RUST_BACKTRACE: short
 
 jobs:
+  # 从 .github/build-matrix.json 解析完整平台矩阵，保证与手动构建的目标集合一致。
+  prepare:
+    name: Resolve build matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve build targets
+        id: resolve
+        run: |
+          set -euo pipefail
+          matrix=$(jq -c '[ .entries[] | with_entries(select(.key != "group")) ]' .github/build-matrix.json)
+          if [ "$matrix" = "[]" ]; then
+            echo "::error title=矩阵为空::.github/build-matrix.json 未定义任何构建目标"
+            exit 1
+          fi
+          echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
+          echo "构建目标：$(jq -r '[.[].name] | join(", ")' <<<"$matrix")"
+
   create_release:
     name: Create draft release
     runs-on: ubuntu-latest
@@ -75,41 +100,14 @@ jobs:
 
   build:
     name: ${{ matrix.name }}
-    needs: create_release
+    needs: [create_release, prepare]
+    if: needs.prepare.outputs.matrix != '[]'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      # ARM64 使用 GitHub 托管的 Arm64 runner；私有仓库需确认套餐支持。
       matrix:
-        include:
-          # Windows
-          - name: windows-x86_64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            bundles: nsis
-          - name: windows-arm64
-            os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            bundles: nsis
-          # Debian / Ubuntu（22.04 的 glibc 较旧，兼容 Debian 12+）
-          - name: linux-x86_64
-            os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            bundles: deb
-          - name: linux-arm64
-            os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            bundles: deb
-          # macOS
-          - name: macos-x86_64
-            os: macos-15-intel
-            target: x86_64-apple-darwin
-            bundles: dmg
-          - name: macos-arm64
-            os: macos-15
-            target: aarch64-apple-darwin
-            bundles: dmg
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5

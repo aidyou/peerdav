@@ -1,8 +1,29 @@
 name: Manual Build
 
 # 在 Actions 页面手动触发，只构建并上传工作流产物，不创建 Release。
+# 平台集合与 release.yml 共用 .github/build-matrix.json，手动验证过的包可直接复用到发布。
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: 构建平台
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - windows
+          - linux
+          - macos
+      arch:
+        description: 构建架构
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - x86_64
+          - arm64
 
 permissions:
   contents: read
@@ -17,48 +38,45 @@ env:
   RUST_BACKTRACE: short
 
 jobs:
+  # 从 .github/build-matrix.json 解析所选平台/架构，未选中的平台不会启动 runner。
+  prepare:
+    name: Resolve build matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve selected targets
+        id: resolve
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          ARCH: ${{ inputs.arch }}
+        run: |
+          set -euo pipefail
+          matrix=$(jq -c --arg p "$PLATFORM" --arg a "$ARCH" \
+            '[ .entries[]
+               | select(($p == "all" or .group == $p) and ($a == "all" or .arch == $a))
+               | with_entries(select(.key != "group")) ]' .github/build-matrix.json)
+          if [ "$matrix" = "[]" ]; then
+            echo "::error title=无匹配构建目标::未匹配到构建目标（platform=${PLATFORM} arch=${ARCH}）"
+            exit 1
+          fi
+          echo "matrix=$matrix" >>"$GITHUB_OUTPUT"
+          echo "已选择：$(jq -r '[.[].name] | join(", ")' <<<"$matrix")"
+
   build:
     name: ${{ matrix.name }}
+    needs: prepare
+    if: needs.prepare.outputs.matrix != '[]'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      # ARM64 使用 GitHub 托管的 Arm64 runner；私有仓库需确认套餐支持。
       matrix:
-        include:
-          # Windows
-          - name: windows-x86_64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            bundles: nsis
-            bundle_glob: nsis/*.exe
-          - name: windows-arm64
-            os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            bundles: nsis
-            bundle_glob: nsis/*.exe
-          # Debian / Ubuntu（22.04 的 glibc 较旧，兼容 Debian 12+）
-          - name: linux-x86_64
-            os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            bundles: deb
-            bundle_glob: deb/*.deb
-          - name: linux-arm64
-            os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            bundles: deb
-            bundle_glob: deb/*.deb
-          # macOS
-          - name: macos-x86_64
-            os: macos-15-intel
-            target: x86_64-apple-darwin
-            bundles: dmg
-            bundle_glob: dmg/*.dmg
-          - name: macos-arm64
-            os: macos-15
-            target: aarch64-apple-darwin
-            bundles: dmg
-            bundle_glob: dmg/*.dmg
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -125,7 +143,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: PeerDav-${{ matrix.name }}
-          path: src-tauri/target/${{ matrix.target }}/release/bundle/${{ matrix.bundle_glob }}
+          path: ${{ matrix.artifact_paths }}
           if-no-files-found: error
           overwrite: true
           retention-days: 7
