@@ -1,14 +1,73 @@
 import { describe, expect, it } from "vitest";
+import { mount } from "@vue/test-utils";
+import FileGlyph from "../../components/FileGlyph.vue";
 
 import {
   canPreview,
   fileExtension,
+  fileIconBadge,
   fileKind,
   fileKindKey,
   isReadableText,
 } from "../fileKinds";
 
 describe("fileKind", () => {
+  it.each([
+    ["image", "jpg jpeg png bmp gif svg webp avif heic tif tiff ico"],
+    ["audio", "mp3 wav ogg m4a aac flac opus wma"],
+    ["video", "mp4 mov mkv avi webm m4v wmv"],
+    ["word", "doc docx docm dot dotx odt rtf pages"],
+    ["spreadsheet", "xls xlsx xlsm xlsb csv tsv ods numbers"],
+    ["presentation", "ppt pptx pptm pps ppsx potx odp key"],
+    ["archive", "zip rar 7z tar gz tgz bz2 xz zst jar war"],
+    ["database", "db sqlite sqlite3 mdb accdb dbf"],
+    ["font", "ttf otf woff woff2 eot"],
+    ["package", "exe msi msix dmg pkg deb rpm apk appimage iso"],
+  ])("recognizes %s suffixes case-insensitively", (kind, suffixes) => {
+    for (const suffix of suffixes.split(" ")) {
+      expect(fileKind({ name: `sample.${suffix.toUpperCase()}` })).toBe(kind);
+      expect(fileKindKey(kind)).not.toBe("peer.file");
+    }
+  });
+
+  it.each([
+    ["go", "GO"], ["rs", "RS"], ["php", "PHP"], ["js", "JS"], ["ts", "TS"],
+    ["css", "CSS"], ["html", "HTML"], ["htm", "HTML"], ["shtml", "HTML"],
+    ["lua", "LUA"], ["java", "JAVA"], ["c", "C"], ["cpp", "C++"], ["c++", "C++"],
+    ["cs", "C#"], ["xml", "XML"], ["py", "PY"], ["rb", "RB"], ["vue", "VUE"],
+    ["mts", "TS"], ["cts", "TS"], ["h++", "C++"], ["php8", "PHP"],
+  ])("renders a distinct language badge for .%s", (suffix, label) => {
+    const entry = { name: `source.${suffix.toUpperCase()}` };
+    expect(fileKind(entry)).toBe("code");
+    expect(isReadableText(entry)).toBe(true);
+    expect(fileIconBadge(entry)?.label).toBe(label);
+    const wrapper = mount(FileGlyph, { props: { entry } });
+    expect(wrapper.find("svg text").text()).toBe(label);
+    expect(wrapper.attributes("aria-hidden")).toBe("true");
+    expect(wrapper.classes()).toContain(`file-glyph--${fileIconBadge(entry).tone}`);
+    wrapper.unmount();
+  });
+
+  it("keeps folders, unknown files and binary formats safe", async () => {
+    expect(fileIconBadge({ name: "folder.rs", isDir: true })).toBeNull();
+    expect(fileIconBadge({ name: "image.js", contentType: "image/png" })).toBeNull();
+    expect(fileIconBadge({ name: "unknown.xyz" })).toBeNull();
+    expect(fileKind({ name: "main.ts", contentType: "video/mp2t" })).toBe("code");
+    expect(fileKind({ name: "download", contentType: "APPLICATION/PDF; charset=binary" })).toBe("pdf");
+    for (const name of ["app.jar", "font.woff2", "db.sqlite", "installer.exe"]) {
+      expect(isReadableText({ name })).toBe(false);
+      expect(canPreview({ name })).toBe(false);
+    }
+    const wrapper = mount(FileGlyph, { props: { entry: { name: "main.go" }, size: "xl" } });
+    expect(wrapper.classes()).toContain("file-glyph--xl");
+    for (const [name, kind] of [["song.mp3", "audio"], ["clip.mp4", "video"], ["db.sqlite", "database"], ["font.ttf", "font"], ["app.deb", "package"], ["folder.ts", "folder"], ["unknown.xyz", "file"]]) {
+      await wrapper.setProps({ entry: { name, isDir: kind === "folder" } });
+      expect(wrapper.classes()).toContain(`file-glyph--${kind}`);
+      expect(wrapper.findAll("svg")).toHaveLength(1);
+      expect(wrapper.find("svg text").exists()).toBe(false);
+    }
+    wrapper.unmount();
+  });
   it("recognizes office, document and archive formats", () => {
     for (const name of ["a.doc", "a.docs", "a.docx", "a.odt"]) {
       expect(fileKind({ name })).toBe("word");

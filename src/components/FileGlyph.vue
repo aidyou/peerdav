@@ -1,7 +1,7 @@
 <script setup>
 import { computed } from "vue";
 
-import { fileKind } from "../lib/fileKinds";
+import { fileIconBadge, fileKind } from "../lib/fileKinds";
 
 const props = defineProps({
   entry: { type: Object, required: true },
@@ -9,14 +9,38 @@ const props = defineProps({
 });
 
 const kind = computed(() => fileKind(props.entry));
+const badge = computed(() => fileIconBadge(props.entry));
 </script>
 
 <template>
-  <span class="file-glyph" :class="[`file-glyph--${kind}`, `file-glyph--${size}`]">
+  <span class="file-glyph" :class="[`file-glyph--${kind}`, `file-glyph--${size}`, badge && `file-glyph--${badge.tone}`]" aria-hidden="true">
     <svg v-if="kind === 'folder'" viewBox="0 0 24 24" aria-hidden="true">
       <path
         d="M3.5 7.2c0-.9.7-1.6 1.6-1.6h4l1.8 2h8c.9 0 1.6.7 1.6 1.6v8.5c0 .9-.7 1.6-1.6 1.6H5.1c-.9 0-1.6-.7-1.6-1.6z"
       />
+    </svg>
+    <svg v-else-if="badge" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4 2.5h10l5 5v14H4zM14 2.5v5h5" />
+      <text x="11.5" y="16.5" text-anchor="middle" class="file-glyph__badge" :class="{ 'file-glyph__badge--long': badge.label.length > 3 }">{{ badge.label }}</text>
+    </svg>
+    <svg v-else-if="kind === 'audio'" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M10 17V6l10-2v11M10 9l10-2" />
+      <ellipse cx="6.5" cy="17.5" rx="3.5" ry="2.5" />
+      <ellipse cx="16.5" cy="15.5" rx="3.5" ry="2.5" />
+    </svg>
+    <svg v-else-if="kind === 'video'" viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="m10 8 6 4-6 4zM3 8h3M3 16h3M18 8h3M18 16h3" />
+    </svg>
+    <svg v-else-if="kind === 'database'" viewBox="0 0 24 24" aria-hidden="true">
+      <ellipse cx="12" cy="5.5" rx="8" ry="3" />
+      <path d="M4 5.5v12c0 4 16 4 16 0v-12M4 11.5c0 4 16 4 16 0" />
+    </svg>
+    <svg v-else-if="kind === 'font'" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3 19 9 4l6 15M5 14h8M2 19h4M12 19h4M16 11h6M19 11v9M17 20h4" />
+    </svg>
+    <svg v-else-if="kind === 'package'" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="m3 7 9-4 9 4v11l-9 4-9-4zM3 7l9 4 9-4M12 11v11M7.5 5l9 4v5" />
     </svg>
     <svg v-else-if="kind === 'image'" viewBox="0 0 24 24" aria-hidden="true">
       <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
@@ -87,6 +111,38 @@ const kind = computed(() => fileKind(props.entry));
   stroke-linejoin: round;
 }
 
+.file-glyph--code {
+  color: color-mix(in oklab, var(--accent-purple) 72%, var(--app-text));
+}
+
+.file-glyph--archive {
+  color: #9a7b42;
+}
+
+.file-glyph__badge {
+  fill: currentColor;
+  stroke: none;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 7px;
+  font-weight: 800;
+}
+
+.file-glyph__badge--long { font-size: 5.5px; }
+
+.file-glyph--go, .file-glyph--dart { color: #0891b2; }
+.file-glyph--rust, .file-glyph--html, .file-glyph--swift { color: #c66032; }
+.file-glyph--javascript, .file-glyph--json, .file-glyph--yaml { color: #a07812; }
+.file-glyph--typescript, .file-glyph--css, .file-glyph--c, .file-glyph--cpp, .file-glyph--python { color: #3f78c8; }
+.file-glyph--php, .file-glyph--lua, .file-glyph--csharp, .file-glyph--kotlin { color: #8b67bd; }
+.file-glyph--java, .file-glyph--ruby, .file-glyph--svelte { color: #c34d45; }
+.file-glyph--vue, .file-glyph--shell, .file-glyph--xml { color: #2f8f5b; }
+.file-glyph--sql, .file-glyph--toml { color: #9a7b42; }
+.file-glyph--audio { color: #a05bbe; }
+.file-glyph--video { color: #cc6a2f; }
+.file-glyph--database { color: #3f78c8; }
+.file-glyph--font { color: #8b67bd; }
+.file-glyph--package { color: #9a7b42; }
+
 .file-glyph--md {
   width: 24px;
   height: 24px;
@@ -124,14 +180,6 @@ const kind = computed(() => fileKind(props.entry));
 
 .file-glyph--presentation {
   color: #cc6a2f;
-}
-
-.file-glyph--code {
-  color: color-mix(in oklab, var(--accent-purple) 72%, var(--app-text));
-}
-
-.file-glyph--archive {
-  color: #9a7b42;
 }
 
 .file-glyph--text {
