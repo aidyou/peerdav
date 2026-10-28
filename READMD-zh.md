@@ -40,17 +40,19 @@ xattr -dr com.apple.quarantine "/Applications/PeerDav.app"
 pnpm tauri signer generate -w /安全且已存在的目录/peerdav-updater.key
 ```
 
-按提示设置密码，妥善离线备份私钥及密码，勿提交到仓库，也不要每次发布重新生成。命令同时生成 `.pub` 公钥文件。在 GitHub 仓库 **Settings → Secrets and variables → Actions** 配置：
+按提示设置密码，妥善离线备份私钥及密码，勿提交到仓库，也不要每次发布重新生成。命令同时生成 `.pub` 公钥文件。
 
-- **Variables**：`PEERDAV_UPDATER_PUBLIC_KEY`，值为 `.pub` 文件完整文本内容，不是文件路径。
+将 `.pub` 文件完整文本内容填写到 `src-tauri/tauri.conf.json` 的 `plugins.updater.pubkey`，不是文件路径。公钥可以提交到仓库；本地开发与正式构建共用这份配置，无需在每台机器设置公钥环境变量。`plugins.updater.endpoints` 配置更新元数据地址，当前使用本仓库公开稳定版的 `latest.json`；仅在确实发布对应元数据后才添加其他备用地址。Windows 安装模式配置为 `passive`，安装仍需用户确认。
+
+在 GitHub 仓库 **Settings → Secrets and variables → Actions → Secrets → Repository secrets** 配置：
 - **Secrets**：`TAURI_SIGNING_PRIVATE_KEY`，值为私钥文件完整文本内容，不是文件路径。
 - **Secrets**：`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，值为生成密钥时设置的密码；无密码则使用空值。
 
-更新包构建时公钥通过环境变量编译进程序，私钥只用于流水线签名。缺失签名配置会阻止正式发布构建；普通手动构建不生成更新签名包。未注入公钥的应用会显示更新不可用。
+公钥和更新地址随 Tauri 配置编译进程序，私钥只用于流水线签名。缺失公钥、更新地址或签名私钥会阻止正式发布构建；普通手动构建不生成更新签名包。未配置公钥或更新地址的应用会显示更新不可用。此前的 GitHub 公钥 Variable 已不再使用，可以删除。
 
 更新版本号并推送匹配的 `v版本号` 标签后，发布流水线生成所有平台安装包、签名及合并的 `latest.json`，上传至发布草稿。确认各平台资源完整后再公开发布草稿；客户端只读取公开的最新稳定版：`https://github.com/aidyou/peerdav/releases/latest/download/latest.json`。现有不包含更新功能的旧版本需要先手动安装一次新版本。
 
-本地构建正式包时也需设置以上三个环境变量。仅调试界面可使用 `pnpm tauri dev`；不带签名的本地打包可使用：
+本地构建正式签名包时需设置 `TAURI_SIGNING_PRIVATE_KEY` 和 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 两个环境变量。仅开发或检查更新可直接使用 `pnpm tauri dev`，无需设置密钥环境变量；不带签名的本地打包可使用：
 
 ```sh
 pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'

@@ -5,7 +5,7 @@ use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_updater::UpdaterExt;
 
 use super::error::UpdateError;
-use super::types::{ReadyUpdate, UPDATE_ENDPOINT, UpdatePhase, UpdateStatus};
+use super::types::{ReadyUpdate, UpdatePhase, UpdateStatus};
 use crate::AppError;
 
 pub(crate) struct UpdateManager {
@@ -14,10 +14,10 @@ pub(crate) struct UpdateManager {
 }
 
 impl UpdateManager {
-    pub(crate) fn new(version: String) -> Self {
+    pub(crate) fn new(version: String, config: Option<&serde_json::Value>) -> Self {
         Self {
             status: Mutex::new(UpdateStatus {
-                configured: public_key().is_some(),
+                configured: is_configured(config),
                 current_version: version,
                 ..UpdateStatus::default()
             }),
@@ -47,7 +47,9 @@ impl UpdateManager {
     }
 
     async fn check(&self, app: &AppHandle) -> Result<UpdateStatus, UpdateError> {
-        let key = public_key().ok_or(UpdateError::NotConfigured)?;
+        if !self.snapshot().configured {
+            return Err(UpdateError::NotConfigured);
+        }
         let Ok(mut ready) = self.operation.try_lock() else {
             return Ok(self.snapshot());
         };
@@ -64,12 +66,6 @@ impl UpdateManager {
         let result = async {
             let updater = app
                 .updater_builder()
-                .pubkey(key)
-                .endpoints(vec![
-                    UPDATE_ENDPOINT
-                        .parse()
-                        .map_err(tauri_plugin_updater::Error::from)?,
-                ])?
                 .timeout(Duration::from_secs(60))
                 .build()?;
             let Some(update) = updater.check().await? else {
@@ -117,10 +113,11 @@ impl UpdateManager {
     }
 }
 
-fn public_key() -> Option<&'static str> {
-    option_env!("PEERDAV_UPDATER_PUBLIC_KEY")
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
+fn is_configured(config: Option<&serde_json::Value>) -> bool {
+    config
+        .cloned()
+        .and_then(|value| serde_json::from_value::<tauri_plugin_updater::Config>(value).ok())
+        .is_some_and(|config| !config.pubkey.trim().is_empty() && !config.endpoints.is_empty())
 }
 
 fn report(app: &AppHandle, error: UpdateError) {
@@ -160,7 +157,7 @@ mod tests {
 
     #[test]
     fn initial_status_has_no_pending_install_or_progress() {
-        let manager = UpdateManager::new("0.1.0".into());
+        let manager = UpdateManager::new("0.1.0".into(), None);
         let status = manager.snapshot();
         assert_eq!(status.phase, UpdatePhase::Idle);
         assert_eq!(status.current_version, "0.1.0");
@@ -174,14 +171,41 @@ mod tests {
     fn updater_plugin_configuration_deserializes_at_startup() -> Result<(), serde_json::Error> {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../../tauri.conf.json"))?;
-        let _: tauri_plugin_updater::Config =
+        let updater_config: tauri_plugin_updater::Config =
             serde_json::from_value(config["plugins"]["updater"].clone())?;
+        assert!(!updater_config.pubkey.trim().is_empty());
+        assert_eq!(updater_config.endpoints.len(), 1);
+        assert_eq!(
+            updater_config.endpoints[0].as_str(),
+            "https://github.com/aidyou/peerdav/releases/latest/download/latest.json"
+        );
+        let manager = UpdateManager::new("0.1.0".into(), Some(&config["plugins"]["updater"]));
+        assert!(manager.snapshot().configured);
         Ok(())
     }
 
     #[test]
+    fn missing_or_incomplete_configuration_disables_updates() {
+        use serde_json::json;
+        assert!(!is_configured(None));
+        for config in [
+            json!(null),
+            json!({"pubkey": ""}),
+            json!({"pubkey": "key", "endpoints": []}),
+            json!({"pubkey": "  ", "endpoints": ["https://example.com/latest.json"]}),
+            json!({"pubkey": "key", "endpoints": ["not a URL"]}),
+        ] {
+            assert!(!is_configured(Some(&config)));
+        }
+        assert!(is_configured(Some(&json!({
+            "pubkey": "configured-key",
+            "endpoints": ["https://example.com/latest.json"]
+        }))));
+    }
+
+    #[test]
     fn serializes_frontend_contract() -> Result<(), serde_json::Error> {
-        let manager = UpdateManager::new("0.1.0".into());
+        let manager = UpdateManager::new("0.1.0".into(), None);
         let value = serde_json::to_value(manager.snapshot())?;
         assert_eq!(value["phase"], "idle");
         assert_eq!(value["currentVersion"], "0.1.0");

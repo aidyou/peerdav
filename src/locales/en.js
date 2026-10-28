@@ -306,7 +306,7 @@ export default {
   "settings.autostartEnabled": "Launch at startup enabled.",
   "settings.autostartDisabled": "Launch at startup disabled.",
   "settings.trayIcon": "Menu bar icon",
-  "settings.trayIconHint": "Mono follows the system light and dark appearance; Blue and Duo keep fixed colors.",
+  "settings.trayIconHint": "Mono adapts to the system appearance only on macOS and stays black on other platforms. Blue and Duo keep fixed colors; Duo is the default.",
   "settings.trayIconMono": "Mono",
   "settings.trayIconBlue": "Blue",
   "settings.trayIconDuo": "Duo",

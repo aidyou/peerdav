@@ -231,9 +231,9 @@ pub const TRAY_ICON_STYLE_META: &str = "tray.iconStyle";
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TrayIconStyle {
-    #[default]
     Mono,
     Blue,
+    #[default]
     Duo,
 }
 
@@ -816,8 +816,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tray_icon_style_falls_back_to_mono() {
+    fn unknown_tray_icon_style_falls_back_to_duo() {
         let decoded = serde_json::from_str::<TrayIconStyle>("\"neon\"").ok();
-        assert_eq!(decoded.unwrap_or_default(), TrayIconStyle::Mono);
+        assert_eq!(decoded.unwrap_or_default(), TrayIconStyle::Duo);
+        assert_eq!(TrayIconStyle::default(), TrayIconStyle::Duo);
     }
 }

@@ -75,7 +75,7 @@ const tcpEnabled = ref(false);
 const tcpNetworks = ref([]);
 const tcpOptions = computed(() => [...new Set([...defaultAllowRules.value, ...tcpNetworks.value])]);
 
-const trayIconStyle = ref("mono");
+const trayIconStyle = ref("duo");
 const trayIconBusy = ref(true);
 const trayIconOptions = [
   { value: "mono", label: "settings.trayIconMono", preview: trayMonoPreview },

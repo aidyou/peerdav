@@ -123,6 +123,7 @@ pub fn run() {
             app.manage(peers as SharedPeers);
             app.manage(updater::UpdateManager::new(
                 app.package_info().version.to_string(),
+                app.config().plugins.0.get("updater"),
             ));
             setup_tray(app);
             Ok(())

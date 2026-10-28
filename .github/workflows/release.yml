@@ -165,11 +165,11 @@ jobs:
       - name: Validate updater signing configuration
         shell: bash
         env:
-          PEERDAV_UPDATER_PUBLIC_KEY: ${{ vars.PEERDAV_UPDATER_PUBLIC_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
-          if [[ -z "$PEERDAV_UPDATER_PUBLIC_KEY" || -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
-            echo "::error::Configure PEERDAV_UPDATER_PUBLIC_KEY variable and TAURI_SIGNING_PRIVATE_KEY secret before releasing"
+          node -e 'const c = require("./src-tauri/tauri.conf.json").plugins?.updater; if (!c?.pubkey?.trim() || !Array.isArray(c.endpoints) || !c.endpoints.length) { console.error("Configure plugins.updater.pubkey and endpoints in src-tauri/tauri.conf.json"); process.exit(1); }'
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo "::error::Configure TAURI_SIGNING_PRIVATE_KEY secret before releasing"
             exit 1
           fi
 
@@ -177,7 +177,6 @@ jobs:
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PEERDAV_UPDATER_PUBLIC_KEY: ${{ vars.PEERDAV_UPDATER_PUBLIC_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:

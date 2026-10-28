@@ -1,9 +1,6 @@
 use serde::Serialize;
 use tauri_plugin_updater::Update;
 
-pub(super) const UPDATE_ENDPOINT: &str =
-    "https://github.com/aidyou/peerdav/releases/latest/download/latest.json";
-
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UpdateStatus {

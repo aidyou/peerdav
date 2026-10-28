@@ -307,7 +307,7 @@ export default {
   "settings.autostartEnabled": "已开启开机启动。",
   "settings.autostartDisabled": "已关闭开机启动。",
   "settings.trayIcon": "菜单栏图标",
-  "settings.trayIconHint": "单色跟随系统深浅色自动切换，蓝色与双色为固定颜色。",
+  "settings.trayIconHint": "单色仅在 macOS 上自动适配系统深浅色，其他平台固定为黑色；蓝色与双色为固定颜色，默认使用双色。",
   "settings.trayIconMono": "单色",
   "settings.trayIconBlue": "蓝色",
   "settings.trayIconDuo": "双色",

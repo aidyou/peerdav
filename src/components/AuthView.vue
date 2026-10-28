@@ -7,8 +7,18 @@ import { t } from "../lib/i18n";
 import { validatePassword } from "../lib/password";
 import { useAction } from "../composables/useAction";
 
+/**
+ * 这里只负责认证相关的界面。重载过渡屏不属于它：过渡屏要在会话确认前摆出
+ * 工作区的几何，塞进认证视图就会先长出一张居中卡片、再换成侧栏布局，
+ * 正是原先刷新跳一下的来源。
+ */
 defineProps({
-  view: { type: String, required: true },
+  view: {
+    type: String,
+    required: true,
+    validator: (value) =>
+      ["initialize", "unlock", "login", "change-admin"].includes(value),
+  },
 });
 
 const app = useAppContext();
@@ -251,11 +261,7 @@ function backToLogin() {
 </script>
 
 <template>
-  <section v-if="view === 'loading'" class="startup-loading" role="status" aria-live="polite" aria-busy="true">
-    <p>{{ t("common.loading") }}</p>
-  </section>
-
-  <section v-else-if="view === 'initialize'" class="card">
+  <section v-if="view === 'initialize'" class="card">
     <h2>{{ t("vault.initializeTitle") }}</h2>
     <p>{{ t("vault.initializeBody") }}</p>
     <form class="stack" @submit.prevent="initializeVault">
@@ -559,20 +565,6 @@ function backToLogin() {
 </template>
 
 <style scoped>
-/* Keep the window background stable; fast restores show no interim card. */
-.startup-loading {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--app-text-muted);
-  font-size: 13px;
-}
-
-.startup-loading p {
-  margin: 0;
-}
-
 .path-picker {
   display: flex;
   align-items: center;

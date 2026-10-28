@@ -3077,6 +3077,8 @@ describe("admin session restore", () => {
     expect(html).toMatch(/html\[data-theme="dark"\] #app:empty\s*\{[^}]*background-color: #14181f;/);
     const authSource = readFileSync("src/components/AuthView.vue", "utf8");
     expect(authSource).not.toContain("startup-hint");
+    // 过渡屏归工作区外壳管，不能再回流到认证视图里当一张居中卡片。
+    expect(authSource).not.toContain("startup-loading");
   });
 
   it("uses compatible selection colors in every file browser layout", () => {
@@ -3154,11 +3156,22 @@ describe("admin session restore", () => {
 
     const waiting = wrapper.find(".startup-loading");
     expect(waiting.exists()).toBe(true);
-    expect(waiting.attributes("role")).toBe("status");
+    // 过渡屏与真实工作区共用同一副外壳：侧栏与内容留白先摆好，撤掉时只换填充，
+    // 右键刷新才不会先看到空屏上一行提示、再整屏换成侧栏布局。
+    expect(waiting.classes()).toContain("workspace");
+    expect(waiting.attributes("aria-busy")).toBe("true");
+    expect(waiting.find(".rail").exists()).toBe(true);
+    expect(waiting.find(".workspace-content--fluid").exists()).toBe(true);
+    expect(waiting.find('[role="status"]').exists()).toBe(true);
+    // 过渡期必须看得见反馈：只留一副外壳或一片纯背景，都等于没有过渡屏。
+    expect(waiting.text()).toContain("正在加载…");
+    // 防回归：外壳不能再用整体透明度动画把自己藏起来，那会让刷新先闪一屏纯背景。
+    expect(readFileSync("src/App.vue", "utf8")).not.toContain("startup-skeleton-fade");
     expect(waiting.classes()).not.toContain("card");
     expect(wrapper.find(".footer").exists()).toBe(false);
     expect(wrapper.find("form").exists()).toBe(false);
-    expect(wrapper.findComponent({ name: "AuthView" }).props("view")).toBe("loading");
+    // 过渡屏不属于认证视图：会话没确认前不能把登录表单挂上来。
+    expect(wrapper.findComponent({ name: "AuthView" }).exists()).toBe(false);
 
     if (scenario === "failed") {
       rejectSession(new Error("session unavailable"));
@@ -3170,11 +3183,38 @@ describe("admin session restore", () => {
     expect(wrapper.find(".startup-loading").exists()).toBe(false);
     if (expectedView === "ready") {
       expect(wrapper.find(".workspace").exists()).toBe(true);
+      expect(wrapper.find(".rail").exists()).toBe(true);
       expect(wrapper.text()).not.toContain("管理员登录");
     } else {
       expect(wrapper.findComponent({ name: "AuthView" }).props("view")).toBe(expectedView);
       expect(wrapper.find("form").exists()).toBe(true);
     }
+    wrapper.unmount();
+    warning.mockRestore();
+  });
+
+  it.each([
+    ["#/settings/general", false],
+    ["#/peer/peer-1", true],
+  ])("lays the reload skeleton out for %s before the session is confirmed", async (route, isBrowser) => {
+    window.history.replaceState(null, "", `${window.location.pathname}${route}`);
+    let resolveSession;
+    const pendingSession = new Promise((resolve) => {
+      resolveSession = resolve;
+    });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const wrapper = await mountReady({ admin_session: () => pendingSession });
+
+    // URL hash 在重载第一帧就跟着回来了，比等后端会话快；骨架要直接摆成那一页，
+    // 不能先摆一份首页再换成文件浏览页。
+    const waiting = wrapper.find(".startup-loading");
+    expect(waiting.exists()).toBe(true);
+    expect(waiting.find(".workspace-content--browser").exists()).toBe(isBrowser);
+    expect(waiting.find(".workspace-content--fluid").exists()).toBe(false);
+    expect(waiting.findAll(".startup-section")).toHaveLength(1);
+
+    resolveSession(null);
+    await flushPromises();
     wrapper.unmount();
     warning.mockRestore();
   });
