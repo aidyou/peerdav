@@ -1,0 +1,131 @@
+name: Manual Build
+
+# 在 Actions 页面手动触发，只构建并上传工作流产物，不创建 Release。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manual-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      # ARM64 使用 GitHub 托管的 Arm64 runner；私有仓库需确认套餐支持。
+      matrix:
+        include:
+          # Windows
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+            bundle_glob: nsis/*.exe
+          - name: windows-arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bundles: nsis
+            bundle_glob: nsis/*.exe
+          # Debian / Ubuntu（22.04 的 glibc 较旧，兼容 Debian 12+）
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb
+            bundle_glob: deb/*.deb
+          - name: linux-arm64
+            os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundles: deb
+            bundle_glob: deb/*.deb
+          # macOS
+          - name: macos-x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: dmg
+            bundle_glob: dmg/*.dmg
+          - name: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            bundles: dmg
+            bundle_glob: dmg/*.dmg
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            cmake \
+            xdg-utils
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Use static CRT on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "RUSTFLAGS=-Ctarget-feature=+crt-static"
+
+      - name: Use prebuilt NASM objects on Windows x64
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "AWS_LC_SYS_PREBUILT_NASM=1"
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+          shared-key: ${{ matrix.target }}
+          cache-targets: false
+          cache-on-failure: true
+
+      - name: Build bundles
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+          uploadUpdaterJson: false
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: PeerDav-${{ matrix.name }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/${{ matrix.bundle_glob }}
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
