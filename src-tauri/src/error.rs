@@ -368,7 +368,7 @@ fn error_code(error: &DomainError) -> &'static str {
 
 /// Remove only known transport wrappers, never split an arbitrary cause on a
 /// colon: the original reason may itself contain colons or structured values.
-fn visible_reason(detail: &str) -> String {
+pub(crate) fn visible_reason(detail: &str) -> String {
     let mut reason = detail.trim();
     loop {
         let previous = reason;

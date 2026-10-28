@@ -20,6 +20,7 @@ import { accessRowState, findAccessRequest, findSavedPeer } from "../lib/access"
 import { statusTagTone } from "../lib/tagTone";
 import { validatePassword } from "../lib/password";
 import { useAction } from "../composables/useAction";
+import { updateState, updateBusy, updateProgress, checkForUpdates } from "../lib/updater";
 import trayMonoPreview from "../../design/icon/peerdav-tray-icon.svg";
 import trayBluePreview from "../../design/icon/peerdav-tray-icon-blue.svg";
 import trayDuoPreview from "../../design/icon/peerdav-tray-icon-duo.svg";
@@ -27,6 +28,14 @@ import ListSkeleton from "./ListSkeleton.vue";
 
 const app = useAppContext();
 const { busy, run } = useAction();
+
+async function checkUpdates() {
+  try { await checkForUpdates(); } catch (error) { app.handleFailure(error); }
+}
+async function installUpdate() {
+  if (!await confirmAction(t("updates.confirm"), t("updates.install"), { confirmText: t("updates.install") })) return;
+  try { await app.invoke("install_update"); } catch (error) { app.handleFailure(error); }
+}
 
 const capturingShortcut = ref(null);
 function captureShortcut(event, field) {
@@ -931,6 +940,26 @@ async function loadInitialData() {
         </div>
 
         <div class="settings-group">
+          <h3 class="group-title">{{ t("updates.title") }}</h3>
+          <div class="settings-rows">
+            <div class="settings-row">
+              <span class="settings-row__label">{{ t("updates.current", { version: updateState.currentVersion }) }}</span>
+              <el-button :loading="updateBusy" :disabled="updateBusy || !updateState.configured || updateState.phase === 'ready'" @click="checkUpdates">{{ t("updates.check") }}</el-button>
+            </div>
+            <div class="settings-row">
+              <span class="settings-row__label" id="auto-update-label">{{ t("updates.auto") }}</span>
+              <el-switch v-model="generalSettings.autoUpdate" aria-labelledby="auto-update-label" @change="saveGeneralSettings" />
+            </div>
+            <div class="settings-row" role="status" aria-live="polite">
+              <span>{{ t(updateState.configured ? `updates.${updateState.phase}` : 'updates.unconfigured', { version: updateState.version, progress: updateProgress }) }}</span>
+              <el-button v-if="updateState.phase === 'ready'" type="primary" @click="installUpdate">{{ t("updates.install") }}</el-button>
+            </div>
+          </div>
+          <p class="settings-group__footnote">{{ t("updates.hint") }}</p>
+          <p v-if="updateState.notes" class="settings-group__footnote" style="white-space: pre-wrap">{{ updateState.notes }}</p>
+        </div>
+
+        <div class="settings-group">
           <div class="settings-group__head">
             <h3 class="group-title">{{ t("settings.groupSession") }}</h3>
             <el-button class="list-pill group-action" round size="small" @click="app.logout">{{ t("login.logout") }}</el-button>
@@ -1723,7 +1752,7 @@ async function loadInitialData() {
   vertical-align: middle;
   margin-inline-end: 6px;
 }
-:global(html[data-theme="dark"]) .tray-icon-preview--mono {
+html[data-theme="dark"] .tray-icon-preview--mono {
   filter: invert(1);
 }
 .settings-view {

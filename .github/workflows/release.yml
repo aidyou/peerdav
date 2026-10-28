@@ -162,12 +162,26 @@ jobs:
           cache-targets: false
           cache-on-failure: true
 
+      - name: Validate updater signing configuration
+        shell: bash
+        env:
+          PEERDAV_UPDATER_PUBLIC_KEY: ${{ vars.PEERDAV_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$PEERDAV_UPDATER_PUBLIC_KEY" || -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo "::error::Configure PEERDAV_UPDATER_PUBLIC_KEY variable and TAURI_SIGNING_PRIVATE_KEY secret before releasing"
+            exit 1
+          fi
+
       - name: Build and upload to draft release
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PEERDAV_UPDATER_PUBLIC_KEY: ${{ vars.PEERDAV_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           releaseId: ${{ needs.create_release.outputs.release_id }}
           tagName: ${{ github.ref_name }}
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
-          uploadUpdaterJson: false
+          uploadUpdaterJson: true

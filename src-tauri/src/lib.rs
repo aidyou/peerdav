@@ -21,6 +21,7 @@ mod tls;
 mod traits;
 mod transfer;
 mod types;
+mod updater;
 mod upload;
 mod vault;
 mod window;
@@ -69,6 +70,7 @@ pub fn run() {
 
     let application = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
@@ -119,6 +121,9 @@ pub fn run() {
             app.manage(Arc::clone(&vault) as SharedVault);
             app.manage(server as SharedServer);
             app.manage(peers as SharedPeers);
+            app.manage(updater::UpdateManager::new(
+                app.package_info().version.to_string(),
+            ));
             setup_tray(app);
             Ok(())
         })
@@ -170,6 +175,8 @@ pub fn run() {
                     | "lock_interface"
                     | "unlock_interface"
                     | "quit_app"
+                    | "update_status"
+                    | "check_for_updates"
             );
             if !allowed_when_locked {
                 let vault = invoke
@@ -185,6 +192,9 @@ pub fn run() {
             }
             let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool> =
                 Box::new(tauri::generate_handler![
+                    updater::manager::update_status,
+                    updater::manager::check_for_updates,
+                    updater::manager::install_update,
                     commands::vault_status,
                     commands::initialize_vault,
                     commands::reload_vault_key,

@@ -2,6 +2,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 beforeEach(() => { localStorage.clear(); vi.resetModules(); });
 describe("general preferences", () => {
+  it("enables automatic updates by default and preserves an opt-out", async () => {
+    const initial = await import("../general");
+    expect(initial.generalSettings.autoUpdate).toBe(true);
+    initial.generalSettings.autoUpdate = false;
+    initial.saveGeneralSettings();
+    vi.resetModules();
+    const restored = await import("../general");
+    expect(restored.generalSettings.autoUpdate).toBe(false);
+  });
   it("persists lock preferences and clamps idle time", async () => {
     const { generalSettings, saveGeneralSettings } = await import("../general");
     generalSettings.autoLock = true;

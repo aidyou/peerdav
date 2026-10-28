@@ -157,6 +157,9 @@ function mockCommands(overrides = {}) {
       username: "admin",
       mustChangePassword: false,
     }),
+    update_status: async () => ({ configured: false, phase: "idle", currentVersion: "0.1.0", version: null, notes: null, downloaded: 0, total: null }),
+    check_for_updates: async () => ({ configured: true, phase: "upToDate" }),
+    install_update: async () => {},
     admin_session: async () => null,
     list_shares: async () => [],
     list_pending_requests: async () => [],
@@ -1509,6 +1512,38 @@ describe("settings information architecture", () => {
     wrapper.unmount();
   });
 
+  it("checks on startup and requires confirmation before installing a ready update", async () => {
+    generalSettings.autoUpdate = true;
+    const wrapper = await mountReady({
+      update_status: async () => ({ configured: true, phase: "idle", currentVersion: "0.1.0" }),
+      check_for_updates: async () => ({ configured: true, phase: "ready", version: "0.2.0", notes: "Release notes" }),
+    });
+    expect(invoke).toHaveBeenCalledWith("check_for_updates");
+    await signIn(wrapper, "secret", "general");
+    expect(wrapper.text()).toContain("0.2.0 已下载，等待安装");
+    const install = wrapper.findAll("button").find((button) => button.text() === "安装并重启");
+    confirmAction.mockResolvedValueOnce(false);
+    await install.trigger("click");
+    await flushPromises();
+    expect(invoke).not.toHaveBeenCalledWith("install_update");
+    confirmAction.mockResolvedValueOnce(true);
+    await install.trigger("click");
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith("install_update");
+    wrapper.unmount();
+  });
+
+  it("does not automatically check when disabled and displays missing configuration", async () => {
+    generalSettings.autoUpdate = false;
+    const wrapper = await mountReady();
+    await signIn(wrapper, "secret", "general");
+    expect(invoke).not.toHaveBeenCalledWith("check_for_updates");
+    expect(wrapper.text()).toContain("此构建未配置更新签名公钥");
+    expect(wrapper.findAll("button").find((button) => button.text() === "检查更新").attributes("disabled")).toBeDefined();
+    wrapper.unmount();
+    generalSettings.autoUpdate = true;
+  });
+
   it("groups General settings by purpose and switches theme from its row", async () => {
     const wrapper = await mountReady();
     await signIn(wrapper, "secret", "general");
@@ -1517,7 +1552,7 @@ describe("settings information architecture", () => {
       wrapper
         .findAll("#pane-general .group-title")
         .map((node) => node.text()),
-    ).toEqual(["外观", "系统集成", "锁屏", "会话"]);
+    ).toEqual(["外观", "系统集成", "锁屏", "软件更新", "会话"]);
 
     const themeGroup = wrapper.find(
       '#pane-general [aria-labelledby="general-theme-label"]',

@@ -7,6 +7,7 @@ try {
   saved = value && typeof value === "object" && !Array.isArray(value) ? value : {};
 } catch { /* Use safe defaults when storage is unavailable. */ }
 export const generalSettings = reactive({
+  autoUpdate: saved.autoUpdate !== false,
   autoLock: saved.autoLock === true,
   idleMinutes: Number.isFinite(saved.idleMinutes) ? Math.min(1440, Math.max(5, Math.ceil(saved.idleMinutes / 5) * 5)) : defaults.idleMinutes,
   toggleShortcut: typeof saved.toggleShortcut === "string" ? saved.toggleShortcut : defaults.toggleShortcut,

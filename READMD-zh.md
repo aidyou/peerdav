@@ -30,6 +30,32 @@ xattr -dr com.apple.quarantine "/Applications/PeerDav.app"
 
 如果公司或学校的安全策略阻止安装，请联系管理员处理。如果杀毒软件明确报毒，请停止安装并核实文件，不要关闭防护。如果 Windows 防火墙询问是否允许网络访问，只对你准备用于共享的可信网络类型放行。
 
+## 自动更新与发布签名配置
+
+正式发布版默认在启动时及每 6 小时检查 GitHub 最新稳定版，后台下载并验证签名。进入「设置 → 通用 → 软件更新」可关闭自动检查、手动检查或确认安装并重启。安装会中断共享和传输，请先完成当前任务。Linux 应用内更新面向 AppImage；deb/rpm 请通过系统包管理方式升级。下载仅保存在当前进程内存中，退出后需要重新下载。
+
+维护者首次发布前需要生成独立的更新签名密钥（不同于系统代码签名证书）：
+
+```sh
+pnpm tauri signer generate -w /安全且已存在的目录/peerdav-updater.key
+```
+
+按提示设置密码，妥善离线备份私钥及密码，勿提交到仓库，也不要每次发布重新生成。命令同时生成 `.pub` 公钥文件。在 GitHub 仓库 **Settings → Secrets and variables → Actions** 配置：
+
+- **Variables**：`PEERDAV_UPDATER_PUBLIC_KEY`，值为 `.pub` 文件完整文本内容，不是文件路径。
+- **Secrets**：`TAURI_SIGNING_PRIVATE_KEY`，值为私钥文件完整文本内容，不是文件路径。
+- **Secrets**：`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，值为生成密钥时设置的密码；无密码则使用空值。
+
+更新包构建时公钥通过环境变量编译进程序，私钥只用于流水线签名。缺失签名配置会阻止正式发布构建；普通手动构建不生成更新签名包。未注入公钥的应用会显示更新不可用。
+
+更新版本号并推送匹配的 `v版本号` 标签后，发布流水线生成所有平台安装包、签名及合并的 `latest.json`，上传至发布草稿。确认各平台资源完整后再公开发布草稿；客户端只读取公开的最新稳定版：`https://github.com/aidyou/peerdav/releases/latest/download/latest.json`。现有不包含更新功能的旧版本需要先手动安装一次新版本。
+
+本地构建正式包时也需设置以上三个环境变量。仅调试界面可使用 `pnpm tauri dev`；不带签名的本地打包可使用：
+
+```sh
+pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+```
+
 ## 分享哪些目录，允许谁访问，由你决定
 
 选择要分享的本机目录，分别设置读取、写入和删除权限。其他电脑先申请访问，经你批准后才能使用共享。每个共享还可以按 IP、网段或 MAC 地址设置允许和拒绝规则，拒绝规则优先。

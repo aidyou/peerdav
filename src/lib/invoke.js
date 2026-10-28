@@ -7,6 +7,11 @@ import { localizeMessage, t } from "./i18n.js";
  * never on the localized `message` text.
  */
 const ERROR_STRATEGIES = Object.freeze({
+  UPDATE_NOT_CONFIGURED: "show",
+  UPDATE_NOT_READY: "show",
+  UPDATE_BUSY: "show",
+  UPDATE_FAILED: "retry",
+  UPDATE_EVENT_FAILED: "support",
   VAULT_NOT_INITIALIZED: "initialize",
   VAULT_ALREADY_INITIALIZED: "refresh",
   VAULT_LOCKED: "unlock",

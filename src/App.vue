@@ -8,6 +8,7 @@ import { errorStrategy, invoke, normalizeAppError, toUserMessage } from "./lib/i
 import { confirmAction } from "./lib/confirm";
 import { stableList } from "./lib/listOrder";
 import { generalSettings } from "./lib/general";
+import { applyUpdateStatus, checkForUpdates, updateState } from "./lib/updater";
 import { locale, setLocale, t } from "./lib/i18n";
 import { resolvedTheme, setTheme, theme } from "./lib/theme";
 import { SUPPORTED_ACCENTS, accent, setAccent } from "./lib/accent";
@@ -249,6 +250,20 @@ onMounted(async () => {
     window.removeEventListener("hashchange", handleHashChange),
   );
   await bindServerEvents();
+  try {
+    eventUnlisten.push(await listen("update://status", ({ payload }) => {
+      applyUpdateStatus(payload);
+      if (payload.phase === "ready") setInfo("updates.readyNotice", { version: payload.version });
+    }));
+    applyUpdateStatus(await invoke("update_status"));
+    const autoCheck = () => {
+      if (generalSettings.autoUpdate && updateState.configured) void checkForUpdates().catch(handleFailure);
+    };
+    autoCheck();
+    const updateTimer = setInterval(autoCheck, 6 * 60 * 60 * 1000);
+    eventUnlisten.push(() => clearInterval(updateTimer));
+    eventUnlisten.push(watch(() => generalSettings.autoUpdate, (enabled) => { if (enabled) autoCheck(); }));
+  } catch (error) { handleFailure(error); }
   await refreshStatus();
   // 服务器列表与发现快照互相独立，也不该挡在管理员会话恢复前面：一次慢刷新只会
   // 让首屏多显示一会儿骨架屏，而不是把登录界面拖出来。两者内部都已捕获错误。
