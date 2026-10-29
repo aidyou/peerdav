@@ -66,7 +66,6 @@ const downloadOpen = ref(false);
 const downloadName = ref("");
 const downloadTransferId = ref("");
 const downloadDialogOpen = ref(false);
-const downloadDirectoryName = ref("");
 const downloadRoot = ref("");
 const downloadQueue = ref([]);
 const downloadRunning = ref(false);
@@ -476,7 +475,6 @@ function reset() {
   downloadOpen.value = false;
   downloadTransferId.value = "";
   downloadDialogOpen.value = false;
-  downloadDirectoryName.value = "";
   downloadRoot.value = "";
   downloadQueue.value = [];
   downloadRunning.value = false;
@@ -1154,7 +1152,6 @@ async function downloadDirectory(entry) {
       return;
     }
 
-    downloadDirectoryName.value = entry.name;
     downloadRoot.value = plan.localRoot;
     downloadQueue.value = plan.files.map((file) => ({
       ...file,
@@ -1249,7 +1246,6 @@ async function downloadBatch(entries) {
       app.setNotice("peer.downloadEmptySelection", {});
       return;
     }
-    downloadDirectoryName.value = t("peer.selectedCount", { count: entries.length });
     downloadRoot.value = localParent;
     downloadQueue.value = items;
     downloadCanceled.value = false;
@@ -2200,13 +2196,12 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
       v-model="downloadDialogOpen"
       :title="t('peer.downloadQueue')"
       width="560"
+      align-center
       :show-close="!downloadRunning"
       :close-on-click-modal="false"
       :close-on-press-escape="false"
     >
       <div class="transfer-dialog">
-        <p class="transfer-dialog__name">{{ downloadDirectoryName }}</p>
-        <p class="saved-path">{{ downloadRoot }}</p>
         <p class="hint">{{ downloadSummary }}</p>
         <el-progress :percentage="downloadQueuePercent" :stroke-width="8" />
         <p v-if="downloadTotalBytes" class="hint">
@@ -2285,6 +2280,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
       v-model="uploadDialogOpen"
       :title="t('peer.uploadQueue')"
       width="560"
+      align-center
       :show-close="!uploadRunning"
       :close-on-click-modal="false"
       :close-on-press-escape="false"
@@ -3824,8 +3820,10 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
 .transfer-queue {
   list-style: none;
-  max-height: 320px;
+  /* 队列长度不可控（整目录展开可达数百项），必须按视口收口，否则对话框会顶出屏幕。 */
+  max-height: min(320px, 34vh);
   overflow-y: auto;
+  overscroll-behavior: contain;
   margin: 0;
   padding: 0;
   border: 1px solid var(--app-border);

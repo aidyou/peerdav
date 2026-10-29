@@ -3186,6 +3186,21 @@ describe("Finder-style peer browser", () => {
     });
     expect(wrapper.text()).toContain("下载队列");
     expect(wrapper.text()).toContain("inner.txt");
+
+    // 对话框必须保持紧凑并垂直居中，否则多选深目录时会顶出屏幕无法操作。
+    const dialogBody = wrapper.find(".transfer-dialog");
+    expect(dialogBody.exists()).toBe(true);
+    expect(dialogBody.find(".transfer-dialog__name").exists()).toBe(false);
+    expect(dialogBody.find(".saved-path").exists()).toBe(false);
+    expect(dialogBody.text()).not.toContain("已选");
+    expect(dialogBody.text()).not.toContain("/tmp/peerdav-keys");
+    const dialogSource = readFileSync("src/components/PeerBrowser.vue", "utf8");
+    expect(
+      dialogSource.match(/<el-dialog[^>]*v-model="downloadDialogOpen"[^>]*>/)[0],
+    ).toContain("align-center");
+    const queueCss = dialogSource.match(/<style scoped>([\s\S]*?)<\/style>/)[1];
+    // 队列长度不可控，列表高度必须随视口收口。
+    expect(queueCss).toMatch(/\.transfer-queue \{[^}]*max-height: min\(320px, 34vh\)/);
     wrapper.unmount();
   });
 
@@ -3242,7 +3257,8 @@ describe("Finder-style peer browser", () => {
       conflict: "fail",
     });
     expect(wrapper.text()).toContain("下载队列");
-    expect(wrapper.text()).toContain("/tmp/downloads/sub");
+    // 本机保存目录不再展示：长路径会撑高对话框，落盘位置改由「打开所在目录」按钮承担。
+    expect(wrapper.text()).not.toContain("/tmp/downloads/sub");
     expect(wrapper.text()).toContain("inner.txt");
     expect(downloadTo).toHaveBeenCalledTimes(1);
 
