@@ -44,6 +44,8 @@ const peerEdit = ref(null);
 const peerNoticeState = ref(null);
 const viewMode = ref(readViewMode());
 const columnStack = ref([]);
+// 分栏模式下正在取子目录的那一列：点击后必须有即时反馈，否则深层目录看起来像没响应。
+const loadingColumn = ref(-1);
 const columnViewEl = ref(null);
 const fileViewEl = ref(null);
 const selectedEntry = ref(null);
@@ -108,6 +110,8 @@ onBeforeUnmount(() => {
   window.removeEventListener("keydown", onModifierKeydown, true);
   window.removeEventListener("keyup", onModifierKeyup, true);
   window.removeEventListener("blur", resetHeldModifiers);
+  window.removeEventListener("mousedown", onShortcutsOutsideMousedown, true);
+  window.removeEventListener("keydown", onShortcutsKeydown, true);
   if (uploadTransferId.value && uploadRunning.value) {
     void app.invoke("cancel_peer_upload", {
       transferId: uploadTransferId.value,
@@ -821,6 +825,70 @@ function goUpLevel() {
   void browse(crumbs[crumbs.length - 2].path);
 }
 
+// 快捷键说明面板：只列本视图真实实现的行为。修饰键标签按平台精确列出，
+// 跳跃多选接受 Ctrl / ⌘ / Alt，返回上一级只接受 Alt + ↑（macOS 额外支持 ⌘ + ↑）。
+// 面板自己渲染并 Teleport 到 body：titlebar 里的锚点用库的 popper 定位不可控，
+// 且需要点击外部/Esc 立即收起，直接受控更可靠。
+const shortcutsOpen = ref(false);
+const shortcutsTriggerEl = ref(null);
+const shortcutsPanelEl = ref(null);
+const shortcutsPanelStyle = ref({});
+const isMacPlatform = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || "");
+const shortcutRows = computed(() => {
+  const selectMods = isMacPlatform ? "⌘ / Ctrl / Alt" : "Ctrl / Alt";
+  const upMods = isMacPlatform ? "Alt / ⌘" : "Alt";
+  return [
+    { id: "add", keys: t("peer.shortcutAddKeys", { mods: selectMods }), desc: t("peer.shortcutAddDesc") },
+    { id: "range", keys: t("peer.shortcutRangeKeys"), desc: t("peer.shortcutRangeDesc") },
+    { id: "marquee", keys: t("peer.shortcutMarqueeKeys"), desc: t("peer.shortcutMarqueeDesc") },
+    { id: "open", keys: t("peer.shortcutOpenKeys"), desc: t("peer.shortcutOpenDesc") },
+    { id: "enter", keys: t("peer.shortcutEnterKeys"), desc: t("peer.shortcutEnterDesc") },
+    { id: "step", keys: t("peer.shortcutStepKeys"), desc: t("peer.shortcutStepDesc") },
+    { id: "up", keys: t("peer.shortcutUpKeys", { mods: upMods }), desc: t("peer.shortcutUpDesc") },
+    { id: "esc", keys: t("peer.shortcutEscKeys"), desc: t("peer.shortcutEscDesc") },
+  ];
+});
+
+// 面板贴在按钮正下方、右对齐；jsdom 等拿不到尺寸的环境跳过定位，不影响内容渲染。
+function positionShortcutsPanel() {
+  const rect = shortcutsTriggerEl.value?.getBoundingClientRect?.();
+  if (!rect || !rect.width) return;
+  shortcutsPanelStyle.value = {
+    position: "fixed",
+    top: `${Math.round(rect.bottom + 6)}px`,
+    right: `${Math.round(Math.max(8, window.innerWidth - rect.right))}px`,
+  };
+}
+
+function closeShortcutsPanel() {
+  shortcutsOpen.value = false;
+}
+
+function toggleShortcutsPanel() {
+  if (shortcutsOpen.value) {
+    closeShortcutsPanel();
+    return;
+  }
+  shortcutsOpen.value = true;
+  void nextTick(positionShortcutsPanel);
+}
+
+function onShortcutsOutsideMousedown(event) {
+  if (!shortcutsOpen.value) return;
+  const target = event.target;
+  if (shortcutsPanelEl.value?.contains?.(target) || shortcutsTriggerEl.value?.contains?.(target)) {
+    return;
+  }
+  closeShortcutsPanel();
+}
+
+function onShortcutsKeydown(event) {
+  if (event.key === "Escape" && shortcutsOpen.value) closeShortcutsPanel();
+}
+
+window.addEventListener("mousedown", onShortcutsOutsideMousedown, true);
+window.addEventListener("keydown", onShortcutsKeydown, true);
+
 function onFileViewKeydown(event) {
   if (event.key === "ArrowUp" && (event.altKey || event.metaKey)) {
     const target = event.target;
@@ -849,14 +917,20 @@ async function loadColumn(entry, index) {
     return;
   }
   if (busy.value) return;
-  await run(async () => {
-    const listing = await fetchListing(entry.path);
-    peerListing.value = listing;
-    peerPath.value = listing.path;
-    clearPreview();
-    setSelection([entry]);
-    columnStack.value = [...columnStack.value.slice(0, index + 1), listing];
-  });
+  loadingColumn.value = index;
+  try {
+    await run(async () => {
+      const listing = await fetchListing(entry.path);
+      peerListing.value = listing;
+      peerPath.value = listing.path;
+      clearPreview();
+      setSelection([entry]);
+      columnStack.value = [...columnStack.value.slice(0, index + 1), listing];
+    });
+  } finally {
+    // 失败时 run 会吞掉异常并走 handleFailure，这里保证指示器一定会撤掉。
+    if (loadingColumn.value === index) loadingColumn.value = -1;
+  }
 }
 
 function newTransferId() {
@@ -1755,6 +1829,40 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                   </svg>
                 </button>
               </el-tooltip>
+              <button
+                ref="shortcutsTriggerEl"
+                type="button"
+                class="view-switch__button shortcuts-trigger"
+                :aria-label="t('peer.shortcuts')"
+                :aria-expanded="shortcutsOpen ? 'true' : 'false'"
+                @click="toggleShortcutsPanel"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="2.5" y="6.5" width="19" height="11" rx="2" />
+                  <path d="M6 10h1.5M9.5 10h1.5M13 10h1.5M16.5 10h1.5" />
+                  <path d="M6 13h1.5M9.5 13h1.5M13 13h1.5M16.5 13h1.5" />
+                  <path d="M8.5 15.5h7" />
+                </svg>
+              </button>
+              <Teleport to="body">
+                <div
+                  v-if="shortcutsOpen"
+                  ref="shortcutsPanelEl"
+                  class="shortcuts-panel"
+                  :style="shortcutsPanelStyle"
+                  role="dialog"
+                  :aria-label="t('peer.shortcutsTitle')"
+                >
+                  <h4 class="shortcuts-panel__title">{{ t("peer.shortcutsTitle") }}</h4>
+                  <dl class="shortcuts-panel__list">
+                    <div v-for="row in shortcutRows" :key="row.id" class="shortcuts-panel__row">
+                      <dt class="shortcuts-panel__keys"><kbd>{{ row.keys }}</kbd></dt>
+                      <dd class="shortcuts-panel__desc">{{ row.desc }}</dd>
+                    </div>
+                  </dl>
+                  <p class="shortcuts-panel__note">{{ t("peer.shortcutsFootnote") }}</p>
+                </div>
+              </Teleport>
             </div>
           </div>
         </Teleport>
@@ -1782,8 +1890,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
               @dblclick="openEntry(entry)"
             >
               <FileGlyph :entry="entry" size="lg" />
-              <span class="file-tile__name">{{ entry.name }}</span>
-              <span class="file-tile__meta">{{ entryKind(entry) }}</span>
+              <span class="file-tile__name" :title="entry.name">{{ entry.name }}</span>
             </button>
           </div>
 
@@ -1822,7 +1929,12 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
             </table>
           </div>
 
-          <div v-else-if="viewMode === 'columns'" class="column-view" ref="columnViewEl">
+          <div
+            v-else-if="viewMode === 'columns'"
+            class="column-view"
+            ref="columnViewEl"
+            :aria-busy="loadingColumn !== -1 ? 'true' : 'false'"
+          >
             <div
               v-for="(column, index) in columnStack"
               :key="column.path"
@@ -1845,6 +1957,18 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
               <p v-if="!column.entries.length" class="column-empty">
                 {{ t("peer.emptyDir") }}
               </p>
+              <div v-if="loadingColumn === index" class="column-loading" role="status">
+                <svg
+                  class="file-loading__spinner"
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                  focusable="false"
+                >
+                  <circle class="file-loading__track" cx="12" cy="12" r="9" />
+                  <path class="file-loading__arc" d="M21 12a9 9 0 0 0-9-9" />
+                </svg>
+                <span>{{ t("peer.loading") }}</span>
+              </div>
             </div>
           </div>
 
@@ -2462,6 +2586,78 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   stroke-linejoin: round;
 }
 
+/* 快捷键入口是说明类图标，描边略细一点，避免和上传操作抢视觉权重。 */
+.shortcuts-trigger svg {
+  stroke-width: 1.4;
+}
+
+.shortcuts-panel {
+  /* 定位由内联 style 提供（fixed + top/right），这里只负责外观与层叠。 */
+  z-index: 1500;
+  display: grid;
+  gap: 8px;
+  width: 300px;
+  max-height: min(60vh, 420px);
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--app-border);
+  border-radius: 12px;
+  background: var(--app-surface);
+  box-shadow: 0 12px 28px rgba(22, 32, 46, 0.16);
+  color: var(--app-text);
+}
+
+.shortcuts-panel__title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--app-text-muted);
+}
+
+.shortcuts-panel__list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.shortcuts-panel__row {
+  display: grid;
+  grid-template-columns: minmax(104px, auto) 1fr;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.shortcuts-panel__keys {
+  margin: 0;
+}
+
+.shortcuts-panel__keys kbd {
+  padding: 2px 6px;
+  border: 1px solid var(--app-border);
+  border-radius: 6px;
+  background: var(--app-surface-2);
+  color: var(--app-text);
+  font-family: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.shortcuts-panel__desc {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--app-text-muted);
+}
+
+.shortcuts-panel__note {
+  margin: 0;
+  padding-top: 6px;
+  border-top: 1px solid color-mix(in oklab, var(--app-border) 55%, transparent);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--app-text-muted);
+}
+
 .browser-body {
   flex: 1;
   min-height: 0;
@@ -2690,18 +2886,19 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   background: var(--selection-bg);
 }
 
+/* 图标视图优先保证名称可读：允许折两行，超出才省略；类型标签不再占用行高。 */
 .file-tile__name {
+  display: -webkit-box;
   max-width: 100%;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow-wrap: break-word;
+  text-align: center;
   font-size: 12.5px;
   font-weight: 500;
-}
-
-.file-tile__meta {
-  font-size: 11px;
-  color: var(--app-text-muted);
+  line-height: 1.35;
 }
 
 .file-table {
@@ -2830,6 +3027,16 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   margin: 8px;
   font-size: 12px;
   color: var(--app-text-muted);
+}
+
+/* 正在加载的列尾部给出与文件区一致的 loading 反馈。 */
+.column-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 8px;
+  color: var(--app-text-muted);
+  font-size: 12px;
 }
 
 /* Keep the file list visible above the selection bar. */

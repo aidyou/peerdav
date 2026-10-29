@@ -2253,6 +2253,71 @@ describe("Finder-style peer browser", () => {
     wrapper.unmount();
   });
 
+  it("shows a loading row in the column being fetched when entering a folder", async () => {
+    const subListing = {
+      ...LISTING,
+      path: "/sub",
+      entries: [
+        {
+          ...LISTING.entries[1],
+          path: "/sub/inner.txt",
+          name: "inner.txt",
+        },
+      ],
+    };
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const { wrapper } = await openBrowser({
+      list_peer_dir: async ({ path }) => {
+        if (path !== "/sub") return LISTING;
+        await gate;
+        return subListing;
+      },
+    });
+
+    await wrapper.find('button[aria-label="分栏"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".column-loading")).toHaveLength(0);
+    expect(wrapper.find(".column-view").attributes("aria-busy")).toBe("false");
+
+    await wrapper.findAll(".column-row")[0].trigger("click");
+    await flushPromises();
+    // 请求未返回前，正在加载的列尾部必须有 spinner 与文案，否则深层目录像没响应。
+    const loading = wrapper.find(".column-loading");
+    expect(loading.exists()).toBe(true);
+    expect(loading.text()).toContain("正在加载…");
+    expect(loading.find("svg.file-loading__spinner").exists()).toBe(true);
+    expect(wrapper.find(".column-view").attributes("aria-busy")).toBe("true");
+
+    release();
+    await flushPromises();
+    expect(wrapper.findAll(".column-loading")).toHaveLength(0);
+    expect(wrapper.find(".column-view").attributes("aria-busy")).toBe("false");
+    expect(wrapper.findAll(".column")).toHaveLength(2);
+
+    wrapper.unmount();
+  });
+
+  it("renders icon tiles with the full name and no kind label", async () => {
+    const { wrapper } = await openBrowser();
+    const tile = wrapper.find(".file-tile");
+    expect(tile.find(".file-tile__meta").exists()).toBe(false);
+    expect(tile.find(".file-tile__name").text()).toBe(LISTING.entries[0].name);
+    // 超长名称折两行后仍被截断时，title 提供完整名称。
+    expect(tile.find(".file-tile__name").attributes("title")).toBe(LISTING.entries[0].name);
+
+    const css = readFileSync("src/components/PeerBrowser.vue", "utf8");
+    expect(css).not.toContain('class="file-tile__meta"');
+    expect(css).not.toContain(".file-tile__meta {");
+    expect(css).toMatch(/\.file-tile__name \{[^}]*-webkit-line-clamp: 2;/);
+    expect(css).toMatch(/\.file-tile__name \{[^}]*overflow-wrap: break-word;/);
+    expect(css).not.toMatch(/\.file-tile__name \{[^}]*white-space: nowrap;/);
+
+    wrapper.unmount();
+  });
+
   it("renders audio and video previews with playable elements", async () => {
     const mediaEntries = [
       {
@@ -3296,13 +3361,66 @@ describe("Finder-style peer browser", () => {
     wrapper.unmount();
   });
 
+  it("lists every file-browser shortcut from the titlebar help button", async () => {
+    const { wrapper } = await openBrowser();
+
+    const trigger = wrapper.find(".shortcuts-trigger");
+    expect(trigger.exists()).toBe(true);
+    expect(trigger.attributes("aria-label")).toBe("快捷键说明");
+    // 面板按需渲染：未展开时 body 里没有面板节点。
+    expect(document.querySelector(".shortcuts-panel")).toBeNull();
+    expect(trigger.attributes("aria-expanded")).toBe("false");
+
+    // 图标位置：紧随"上传文件夹"之后，只在文件管理器打开时出现。
+    const labels = wrapper
+      .findAll("#titlebar-file-actions .view-switch__button")
+      .map((button) => button.attributes("aria-label"));
+    expect(labels.indexOf("上传文件夹") + 1).toBe(labels.indexOf("快捷键说明"));
+
+    await trigger.trigger("click");
+    await flushPromises();
+    const panel = document.querySelector(".shortcuts-panel");
+    expect(panel).not.toBeNull();
+    expect(wrapper.find(".shortcuts-trigger").attributes("aria-expanded")).toBe("true");
+    const text = panel.textContent;
+    expect(text).toContain("文件浏览快捷键");
+    // 非 macOS 宿主只标注真实可用的修饰键，避免写出 Ctrl + ↑ 这种无效组合。
+    expect(text).toContain("Ctrl / Alt + 点击");
+    expect(text).toContain("Shift + 点击");
+    expect(text).toContain("按住左键拖动");
+    expect(text).toContain("双击");
+    expect(text).toContain("Enter");
+    expect(text).toContain("↑ ↓ / ← →");
+    expect(text).toContain("Alt + ↑");
+    expect(text).toContain("返回上一级");
+    expect(text).toContain("Esc");
+    expect(text).toContain("关闭文件预览");
+    expect(text).toContain("键盘操作需先点击文件区域取得焦点");
+
+    // 点击面板外部立即收起，不会挡住文件区。
+    document.body.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    await flushPromises();
+    expect(document.querySelector(".shortcuts-panel")).toBeNull();
+
+    // Esc 同样收起。
+    await wrapper.find(".shortcuts-trigger").trigger("click");
+    await flushPromises();
+    expect(document.querySelector(".shortcuts-panel")).not.toBeNull();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await flushPromises();
+    expect(document.querySelector(".shortcuts-panel")).toBeNull();
+
+    wrapper.unmount();
+  });
+
   it("shows the file actions in the titlebar only while the browser is open", async () => {
     const { wrapper } = await openBrowser();
 
     const slot = wrapper.find("#titlebar-file-actions");
     expect(slot.exists()).toBe(true);
     expect(slot.findAll(".view-switch")).toHaveLength(2);
-    expect(slot.findAll(".view-switch__button")).toHaveLength(7);
+    // 第 8 个是快捷键说明入口，紧随上传文件夹之后。
+    expect(slot.findAll(".view-switch__button")).toHaveLength(8);
     expect(slot.findAll(".titlebar-divider")).toHaveLength(1);
     expect(slot.find(".pathbar-actions").classes()).not.toContain(
       "titlebar-pill",
