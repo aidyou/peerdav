@@ -105,6 +105,9 @@ onBeforeUnmount(() => {
   browserDisposed = true;
   uploadCanceled.value = true;
   clearInterval(uploadClockTimer);
+  window.removeEventListener("keydown", onModifierKeydown, true);
+  window.removeEventListener("keyup", onModifierKeyup, true);
+  window.removeEventListener("blur", resetHeldModifiers);
   if (uploadTransferId.value && uploadRunning.value) {
     void app.invoke("cancel_peer_upload", {
       transferId: uploadTransferId.value,
@@ -610,10 +613,74 @@ const selectionGlyph = computed(() =>
     : selectedEntry.value,
 );
 
+// 修饰键判定不能只依赖 click 事件：部分 WebKit 环境（Tauri 在 Linux 用的 WebKitGTK）
+// 在 mousedown 被 preventDefault 后不会把 Ctrl/Cmd/Alt/Shift 带进 click，
+// 真机上表现为 ctrl+点击退化成单选。这里同时采信 mousedown 的修饰键和键盘实时状态，
+// 任一来源为真即按多选处理；键盘导航等内部调用走 selectSingle，不受修饰键影响。
+// 附加选择键：Ctrl / Cmd / Alt 三者等价；Shift 仍只做范围选择。
+const pointerModifiers = { ctrl: false, meta: false, alt: false, shift: false };
+const heldModifiers = { ctrl: false, meta: false, alt: false, shift: false };
+
+function markModifierFlag(target, event, active) {
+  if (event.key === "Control" || event.code === "ControlLeft" || event.code === "ControlRight") {
+    target.ctrl = active;
+  } else if (event.key === "Meta" || event.code === "MetaLeft" || event.code === "MetaRight") {
+    target.meta = active;
+  } else if (event.key === "Alt" || event.code === "AltLeft" || event.code === "AltRight") {
+    target.alt = active;
+  } else if (event.key === "Shift" || event.code === "ShiftLeft" || event.code === "ShiftRight") {
+    target.shift = active;
+  }
+}
+
+function onModifierKeydown(event) {
+  markModifierFlag(heldModifiers, event, true);
+}
+
+function onModifierKeyup(event) {
+  markModifierFlag(heldModifiers, event, false);
+}
+
+function resetHeldModifiers() {
+  heldModifiers.ctrl = false;
+  heldModifiers.meta = false;
+  heldModifiers.alt = false;
+  heldModifiers.shift = false;
+}
+
+window.addEventListener("keydown", onModifierKeydown, true);
+window.addEventListener("keyup", onModifierKeyup, true);
+window.addEventListener("blur", resetHeldModifiers);
+
+function selectSingle(entry) {
+  selectionAnchor.value = entry.path;
+  setSelection([entry]);
+  if (viewMode.value === "gallery" && !entry.isDir && canPreview(entry)) {
+    void previewEntry(entry);
+  }
+}
+
 function selectEntry(entry, event) {
   if (suppressClick) return;
+  const additive = Boolean(
+    event?.ctrlKey ||
+      event?.metaKey ||
+      event?.altKey ||
+      pointerModifiers.ctrl ||
+      pointerModifiers.meta ||
+      pointerModifiers.alt ||
+      heldModifiers.ctrl ||
+      heldModifiers.meta ||
+      heldModifiers.alt,
+  );
+  const ranged = Boolean(event?.shiftKey || pointerModifiers.shift || heldModifiers.shift);
+  // 指针修饰键只对本次点击有效，避免残留影响后续键盘触发的选择。
+  pointerModifiers.ctrl = false;
+  pointerModifiers.meta = false;
+  pointerModifiers.alt = false;
+  pointerModifiers.shift = false;
   const listing = peerListing.value?.entries ?? [];
-  if (event?.shiftKey && selectionAnchor.value) {
+  if (ranged && selectionAnchor.value) {
     const from = listing.findIndex((item) => item.path === selectionAnchor.value);
     const to = listing.findIndex((item) => item.path === entry.path);
     if (from !== -1 && to !== -1) {
@@ -622,25 +689,26 @@ function selectEntry(entry, event) {
       return;
     }
   }
-  if (event?.ctrlKey || event?.metaKey) {
+  if (additive) {
     const added = !isSelected(entry);
     const next = added
       ? [...selectedEntries.value, entry]
       : selectedEntries.value.filter((item) => item.path !== entry.path);
-    setSelection(listing.filter((item) => next.some((entry2) => entry2.path === item.path)));
+    setSelection(listing.filter((item) => next.some((other) => other.path === item.path)));
     if (added) selectionAnchor.value = entry.path;
     return;
   }
-  selectionAnchor.value = entry.path;
-  setSelection([entry]);
-  if (viewMode.value === "gallery" && !entry.isDir && canPreview(entry)) {
-    void previewEntry(entry);
-  }
+  selectSingle(entry);
 }
 
 // 任意位置按下并拖动都能框选（包括从文件上起拉），轻点空白处清空选择。
 // preventDefault 关闭原生拖动：避免文字选择和"从下往上拉时区域自动向下滚动"。
 function onFileViewMousedown(event) {
+  // 先记下按下时的修饰键，click 事件万一丢掉修饰位还能靠它判定多选。
+  pointerModifiers.ctrl = Boolean(event.ctrlKey);
+  pointerModifiers.meta = Boolean(event.metaKey);
+  pointerModifiers.alt = Boolean(event.altKey);
+  pointerModifiers.shift = Boolean(event.shiftKey);
   if (event.button !== 0 || viewMode.value === "columns") return;
   // 按住 Ctrl/Cmd/Shift/Alt 时不能启动框选：框选会覆盖当前选择并抑制随后的 click，
   // 真机上表现为 ctrl/cmd 跳跃多选完全失效。这类按下交给 click 逻辑处理。
@@ -738,8 +806,7 @@ function navigateSelection(delta) {
         ? 0
         : length - 1
       : (current + delta + length) % length;
-  selectEntry(entries[index]);
-  selectionAnchor.value = entries[index].path;
+  selectSingle(entries[index]);
   void nextTick(() => {
     fileViewEl.value?.querySelector(".is-selected")?.focus?.();
   });
@@ -778,7 +845,7 @@ function onFileViewKeydown(event) {
 
 async function loadColumn(entry, index) {
   if (!entry.isDir) {
-    selectEntry(entry);
+    selectSingle(entry);
     return;
   }
   if (busy.value) return;

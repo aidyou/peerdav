@@ -2762,6 +2762,12 @@ describe("Finder-style peer browser", () => {
     expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(2);
     expect(wrapper.find(".selection-bar").text()).toContain("已选 2 项");
 
+    // Alt 与 Ctrl/Cmd 等价，也作为附加选择键。
+    await tiles[3].trigger("click", { altKey: true });
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(3);
+    expect(wrapper.find(".selection-bar").text()).toContain("已选 3 项");
+
     // 清除选择回到空态（画廊外不显示底栏）。
     await wrapper.find(".selection-clear").trigger("click");
     await flushPromises();
@@ -2828,6 +2834,57 @@ describe("Finder-style peer browser", () => {
     await tiles[3].trigger("click", { shiftKey: true });
     await flushPromises();
     expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(3);
+    wrapper.unmount();
+  });
+
+  it("falls back to mousedown and keyboard modifier state when the click event loses them", async () => {
+    const listing = {
+      ...LISTING,
+      entries: [
+        LISTING.entries[0],
+        { ...LISTING.entries[1], path: "/a.txt", name: "a.txt" },
+        { ...LISTING.entries[1], path: "/b.txt", name: "b.txt" },
+        { ...LISTING.entries[1], path: "/c.txt", name: "c.txt" },
+      ],
+    };
+    const { wrapper } = await openBrowser({ list_peer_dir: async () => listing });
+    const tiles = wrapper.findAll(".file-tile");
+
+    await tiles[1].trigger("click");
+    await flushPromises();
+
+    // WebKitGTK 可能不把 Ctrl 带进 click：按下有修饰键、点击没有，仍应多选。
+    await tiles[3].trigger("mousedown", { button: 0, ctrlKey: true, clientX: 5, clientY: 5 });
+    window.dispatchEvent(new MouseEvent("mouseup"));
+    await tiles[3].trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(2);
+
+    // 按下与点击都没有修饰位时，采信键盘上 Ctrl 的实时状态。
+    // mouseup 派发在条目上：真机落点就是条目，不会触发"点空白清空选择"。
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Control", code: "ControlLeft" }));
+    await tiles[2].trigger("mousedown", { button: 0, clientX: 5, clientY: 5 });
+    await tiles[2].trigger("mouseup");
+    await tiles[2].trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(3);
+
+    // 松开 Ctrl 后普通点击恢复单选语义。
+    window.dispatchEvent(new KeyboardEvent("keyup", { key: "Control", code: "ControlLeft" }));
+    await tiles[1].trigger("mousedown", { button: 0, clientX: 5, clientY: 5 });
+    await tiles[1].trigger("mouseup");
+    await tiles[1].trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(1);
+
+    // 窗口失焦会清掉残留的按键状态，避免卡住的多选位影响后续点击。
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Control", code: "ControlLeft" }));
+    window.dispatchEvent(new Event("blur"));
+    await tiles[2].trigger("mousedown", { button: 0, clientX: 5, clientY: 5 });
+    await tiles[2].trigger("mouseup");
+    await tiles[2].trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(1);
     wrapper.unmount();
   });
 
