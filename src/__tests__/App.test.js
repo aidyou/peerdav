@@ -2330,6 +2330,50 @@ describe("Finder-style peer browser", () => {
     wrapper.unmount();
   });
 
+  it("scrolls columns horizontally with the mouse wheel so deep folders stay reachable", async () => {
+    const source = readFileSync("src/components/PeerBrowser.vue", "utf8");
+    // 溢出必须是横向可滚，不能退回 overflow: hidden，否则左侧列会被彻底裁掉。
+    expect(source).toMatch(/\.column-view\s*\{[^}]*overflow-x:\s*auto/);
+
+    const listingFor = (path) => ({
+      ...LISTING,
+      path,
+      entries: [
+        { ...LISTING.entries[0], path: `${path === "/" ? "" : path}/next`, name: "next" },
+        { ...LISTING.entries[1], path: `${path}/file.txt`, name: "file.txt" },
+      ],
+    });
+    const { wrapper } = await openBrowser({
+      list_peer_dir: async ({ path }) => listingFor(path),
+    });
+    await wrapper.find('button[aria-label="分栏"]').trigger("click");
+    await flushPromises();
+
+    // 连续展开形成多列，模拟深层目录宽度超出可视区域。
+    for (let depth = 0; depth < 3; depth += 1) {
+      const columns = wrapper.findAll(".column");
+      await columns[columns.length - 1].findAll(".column-row")[0].trigger("click");
+      await flushPromises();
+    }
+    expect(wrapper.findAll(".column")).toHaveLength(4);
+
+    const columnView = wrapper.find(".column-view").element;
+    Object.defineProperty(columnView, "scrollWidth", { configurable: true, value: 960 });
+    Object.defineProperty(columnView, "clientWidth", { configurable: true, value: 300 });
+    columnView.scrollLeft = 0;
+
+    // 鼠标滚轮只有纵向增量，必须换算成横向滚动。
+    await wrapper.find(".column-view").trigger("wheel", { deltaY: 120, deltaX: 0 });
+    expect(columnView.scrollLeft).toBe(120);
+
+    // 触控板横向手势交给浏览器原生滚动，不叠加偏移。
+    columnView.scrollLeft = 0;
+    await wrapper.find(".column-view").trigger("wheel", { deltaY: 10, deltaX: 80 });
+    expect(columnView.scrollLeft).toBe(0);
+
+    wrapper.unmount();
+  });
+
   it("renders icon tiles with the full name and no kind label", async () => {
     const { wrapper } = await openBrowser();
     const tile = wrapper.find(".file-tile");

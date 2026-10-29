@@ -269,6 +269,16 @@ function scrollBreadcrumbs(event) {
   element.scrollLeft += event.deltaY;
 }
 
+// 分栏是横向排布的，鼠标滚轮只给纵向增量，必须转成横向滚动，否则目录一深左侧列就无法查看；
+// 触控板的横向手势（deltaX）交给浏览器原生滚动，不拦截。
+function scrollColumnView(event) {
+  const element = event.currentTarget;
+  if (!element || element.scrollWidth <= element.clientWidth) return;
+  if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+  event.preventDefault();
+  element.scrollLeft += event.deltaY;
+}
+
 // 新列或 loading 占位列出现时滚到最右，保证反馈落在视野内而不是屏幕外。
 watch(
   [columnStack, loadingColumn],
@@ -1941,6 +1951,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
             class="column-view"
             ref="columnViewEl"
             :aria-busy="loadingColumn !== -1 ? 'true' : 'false'"
+            @wheel="scrollColumnView"
           >
             <div
               v-for="(column, index) in visibleColumns"
@@ -2975,13 +2986,14 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 .column-view {
   display: flex;
   align-items: stretch;
-  overflow: hidden;
+  /* 横向必须可滚：目录一深就会被裁掉，程序滚到最右后用户要能滚回左侧列。 */
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .column {
   width: 240px;
   flex: none;
-  overflow-y: auto;
   overflow-y: auto;
   padding: 5px;
   border-right: 1px solid var(--app-border);
