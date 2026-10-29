@@ -1,0 +1,31 @@
+{
+  "version": "0.1.5",
+  "notes": "",
+  "pub_date": "2026-10-29T13:17:24Z",
+  "platforms": {
+    "windows-aarch64-nsis": {
+      "url": "https://github.com/aidyou/peerdav/releases/download/v0.1.5/peerdav_0.1.5_arm64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSV2szQ0ViVVVzL0I3T1EwRmIrb3BySkJIaFRkZWJCZ0prd2RmUlM5Q0dtRWxnMkZKOWEyYjJpaWFwYWRWZTdsWFhlc0NGOXBzMThWNkRTb2ErSllVMXFGVEZUNGxKd2dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjc5Mzc5CWZpbGU6cGVlcmRhdl8wLjEuNV9hcm02NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuNQpCVWVUeGZNL2pYeXlrM1B5eEFjOXhpNUZha0pMNmlveVZVdjY1Yk1Nd1gvVGNxd1VCMFpBb0FOSjc0NjFaN3FqcngwMWQvSnF2d2hlZkFTTHF6VnlEZz09Cg=="
+    },
+    "windows-x86_64-nsis": {
+      "url": "https://github.com/aidyou/peerdav/releases/download/v0.1.5/peerdav_0.1.5_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSV2szQ0ViVVVzL0tFVnUyeHhBbFhzeEI3UGtYZ1cvZ3hwT0p6eFg4SU9ZZE94eXh3d0U5OGtmMFlHUUdEajNyWmE5Q2NTMVNLYW9GV0JtdHpqWGhnSFV5RStReTFTbFE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjc5NDMzCWZpbGU6cGVlcmRhdl8wLjEuNV94NjQtc2V0dXAuZXhlCXZlcnNpb246MC4xLjUKQ01ld0w3bmhmMGFMME5VVU9oYWk0Nm1XUU1IM3ZSRG84Y2xpc0xDa3U5SUJFdE9TZGo3bWNhSEZnaHFsK25hQVZnYWpQdmFnYThxOEs2UGsraDBQQlE9PQo="
+    },
+    "darwin-aarch64-app": {
+      "url": "https://github.com/aidyou/peerdav/releases/download/v0.1.5/peerdav.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSV2szQ0ViVVVzL0hoaSthVGRYUkpyK3dpcmU2N1VGc1RHT0RZZVhJVmRZSjBEMU56c3ZpQ1BtMUtMaGdzT1R0cDRxbVNHMXM0SDlaRzk2THBCTi96RSt5MUh1dEl2TXdJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjc5MjI5CWZpbGU6cGVlcmRhdi5hcHAudGFyLmd6CXZlcnNpb246MC4xLjUKN3dDa25ZWkl1Vkc0ZUQzaWlKQ2JBZ2t3YWkzMlVYYnkzT0x1ZmhBOWx4dDZmQUR0RkgwbTRtQlo2RnY3QVpRUllPZHR4K3FFZ1lkN2UrWStQWnhSQUE9PQo="
+    },
+    "darwin-x86_64-app": {
+      "url": "https://github.com/aidyou/peerdav/releases/download/v0.1.5/peerdav.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSV2szQ0ViVVVzL1BleTljazQ2djljbktteVdwT1cyektYRDFReEs0V3BjRFplUm9lcjdqSzlBd3FwMjFxRWsyWlpJdWtOclZ6akREcTdxd0l6cXpobVVqWnVLaW1wL3dRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjc5ODM5CWZpbGU6cGVlcmRhdi5hcHAudGFyLmd6CXZlcnNpb246MC4xLjUKVW5tL2IvQlV5dC9PNzFRSGE2V2NrbHpibGtRdG5sbHhZWVJpdHRzSUFnTFR5cm4yQ2pDWVhUN29UbXBpcTdvNVQxQlRvNWNkRVg4dGhKT05reGFzRGc9PQo="
+    },
+    "linux-aarch64-deb": {
+      "url": "https://github.com/aidyou/peerdav/releases/download/v0.1.5/peerdav_0.1.5_arm64.deb",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSV2szQ0ViVVVzL05rcU9pSDdhenJHOEEycHVNbDdMM2o3cDNPR3lielg1d3lMazFVaWVkSGFQVXJmUStoTGtHZVdreHd1WWZnbDg3dUNkbWx2WDk4WjhFVTdqNThEMXdvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjc5MjIzCWZpbGU6cGVlcmRhdl8wLjEuNV9hcm02NC5kZWIJdmVyc2lvbjowLjEuNQoxWGtEZDBwTUVVS2JnKzRsdDk5WSs0ZlJFdW9vcldGZ0xqTTR1YmZGcGlhYmYrYkZ6TU9vNmI2cU5MeW5HR0N5N3I5OTlHRlRKVTBqNzdDNUJKeTBEZz09Cg=="
+    },
+    "linux-x86_64-deb": {
+      "url": "https://github.com/aidyou/peerdav/releases/download/v0.1.5/peerdav_0.1.5_amd64.deb",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSV2szQ0ViVVVzL0xwVFRuYWNIZ0FKbmNEMU9JRUZodFhFYWJzZG9NK1dtd1QwQnl5S01iWFpRbzFIdGR4RzFHMWpDZnQ5ck0zdkF2Uy9TaVRmay8rYW5NRlE0TmxTTVF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjc5MTA3CWZpbGU6cGVlcmRhdl8wLjEuNV9hbWQ2NC5kZWIJdmVyc2lvbjowLjEuNQpMZWtDbEd2QkRoS21KWnBNU09uc215eGEyZkNuOE5YT2dzMVRGbGFwZnJZbXp1eENsUDRTejhOTzcxdTg4T0NYbjdqb2JVNUZPZ05QVDdERkh6KzVEZz09Cg=="
+    }
+  }
+}

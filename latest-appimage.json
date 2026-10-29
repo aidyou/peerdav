@@ -1,0 +1,15 @@
+{
+  "version": "0.1.5",
+  "notes": "",
+  "pub_date": "2026-10-29T13:07:11Z",
+  "platforms": {
+    "linux-aarch64-appimage": {
+      "url": "https://github.com/aidyou/peerdav/releases/download/v0.1.5/peerdav_0.1.5_aarch64.AppImage",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSV2szQ0ViVVVzL0FMek12SW4rRzVId0pBbVBtYkUvTTdLUnp4b1RKaVFqOW9RZzlmSC9xS1lLVmxkWElYdEExQi8yRlM3ZjBCSDVaWWxqTzB3elE0THJtcnFTZ01KS3cwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjc5MjIzCWZpbGU6cGVlcmRhdl8wLjEuNV9hYXJjaDY0LkFwcEltYWdlCXZlcnNpb246MC4xLjUKQXBsSmRRVXJsRXVyNVhwTk5UUnY0SllYOGZDQUhKMURXNjBjRjF4dEdxcER3V3RobXFzMWNhKzZIQk1YZGFMaHA3SkhKMU1qZjVyM0ZqZFQrMThtRGc9PQo="
+    },
+    "linux-x86_64-appimage": {
+      "url": "https://github.com/aidyou/peerdav/releases/download/v0.1.5/peerdav_0.1.5_amd64.AppImage",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSV2szQ0ViVVVzL05sTzRpV0V2TnZQREFwYkZBU3BQd1RCREdNc1E4UzNncXV1UGxzZ3JFYzZMWHFFUU5Zbk1paDdkS3J3bG1talJMVVpvbEdKRDgyUGw0TWV6RFJHclFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjc5MTA3CWZpbGU6cGVlcmRhdl8wLjEuNV9hbWQ2NC5BcHBJbWFnZQl2ZXJzaW9uOjAuMS41ClJkMUVIWlhtV0w0bjlJelU5YllzNVJ2ZnVTQWw2NHR4ckZNZ1lMUXlYbDd5ZXZpMTdHOU9GcXRUbmErVS9KeXFCWjgxU3RTci9vTlFsTUhKYW1rSUNRPT0K"
+    }
+  }
+}

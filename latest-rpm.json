@@ -1,0 +1,15 @@
+{
+  "version": "0.1.5",
+  "notes": "",
+  "pub_date": "2026-10-29T13:07:11Z",
+  "platforms": {
+    "linux-aarch64-rpm": {
+      "url": "https://github.com/aidyou/peerdav/releases/download/v0.1.5/peerdav-0.1.5-1.aarch64.rpm",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSV2szQ0ViVVVzL0xxVVpGWUljQUZ5cFhTeDBWR1FYUjQ2dmFpYjhJYmJvR2ZpTk8wSnhaMS9OdUtXZ2FwdUdiRzI2Ulo2Vm05aVZLSlcvN3V2dWw3bEx6bG5mSnRNTFFVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjc5MjIzCWZpbGU6cGVlcmRhdi0wLjEuNS0xLmFhcmNoNjQucnBtCXZlcnNpb246MC4xLjUKcnNMZGZsQWM0VTZTSGl4Rnc2cHZiL3RFSnpob1h3MFMrMkdZYnBDclE1TTBVS1I2UWdoc3R1RlhhcTV4QWtNNll1MzhxR29rU3BqdjB6NG9jRmU2Q0E9PQo="
+    },
+    "linux-x86_64-rpm": {
+      "url": "https://github.com/aidyou/peerdav/releases/download/v0.1.5/peerdav-0.1.5-1.x86_64.rpm",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSV2szQ0ViVVVzL0lMaE9XMVZNTG5SVEdLOVZmWXgxa2N5QUtyKzRPdDZrTFRvMDkxUS9NV2RJYTBuNTc2QWIrV3RpM3JKbk81TGNPcmR3OER1ZjVmQTF4NnhBcHFHZ1FVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjc5MTA3CWZpbGU6cGVlcmRhdi0wLjEuNS0xLng4Nl82NC5ycG0JdmVyc2lvbjowLjEuNQpLbDVLSllwYllaZXQrWTFmQjdacEtRUFRGUkpYY3dTc3FldVdqNmc1cjFSZHAybE95blh6V01zWWcwdkUzWkVOSkVWYnlMSjNqakZKSXBxMWE1T3JDUT09Cg=="
+    }
+  }
+}

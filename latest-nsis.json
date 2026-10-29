@@ -1,0 +1,15 @@
+{
+  "version": "0.1.5",
+  "notes": "",
+  "pub_date": "2026-10-29T13:10:36Z",
+  "platforms": {
+    "windows-aarch64-nsis": {
+      "url": "https://github.com/aidyou/peerdav/releases/download/v0.1.5/peerdav_0.1.5_arm64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSV2szQ0ViVVVzL0I3T1EwRmIrb3BySkJIaFRkZWJCZ0prd2RmUlM5Q0dtRWxnMkZKOWEyYjJpaWFwYWRWZTdsWFhlc0NGOXBzMThWNkRTb2ErSllVMXFGVEZUNGxKd2dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjc5Mzc5CWZpbGU6cGVlcmRhdl8wLjEuNV9hcm02NC1zZXR1cC5leGUJdmVyc2lvbjowLjEuNQpCVWVUeGZNL2pYeXlrM1B5eEFjOXhpNUZha0pMNmlveVZVdjY1Yk1Nd1gvVGNxd1VCMFpBb0FOSjc0NjFaN3FqcngwMWQvSnF2d2hlZkFTTHF6VnlEZz09Cg=="
+    },
+    "windows-x86_64-nsis": {
+      "url": "https://github.com/aidyou/peerdav/releases/download/v0.1.5/peerdav_0.1.5_x64-setup.exe",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSV2szQ0ViVVVzL0tFVnUyeHhBbFhzeEI3UGtYZ1cvZ3hwT0p6eFg4SU9ZZE94eXh3d0U5OGtmMFlHUUdEajNyWmE5Q2NTMVNLYW9GV0JtdHpqWGhnSFV5RStReTFTbFE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjc5NDMzCWZpbGU6cGVlcmRhdl8wLjEuNV94NjQtc2V0dXAuZXhlCXZlcnNpb246MC4xLjUKQ01ld0w3bmhmMGFMME5VVU9oYWk0Nm1XUU1IM3ZSRG84Y2xpc0xDa3U5SUJFdE9TZGo3bWNhSEZnaHFsK25hQVZnYWpQdmFnYThxOEs2UGsraDBQQlE9PQo="
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "version": "0.1.5",
+  "notes": "",
+  "pub_date": "2026-10-29T13:17:24Z",
+  "platforms": {
+    "darwin-aarch64-app": {
+      "url": "https://github.com/aidyou/peerdav/releases/download/v0.1.5/peerdav.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSV2szQ0ViVVVzL0hoaSthVGRYUkpyK3dpcmU2N1VGc1RHT0RZZVhJVmRZSjBEMU56c3ZpQ1BtMUtMaGdzT1R0cDRxbVNHMXM0SDlaRzk2THBCTi96RSt5MUh1dEl2TXdJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjc5MjI5CWZpbGU6cGVlcmRhdi5hcHAudGFyLmd6CXZlcnNpb246MC4xLjUKN3dDa25ZWkl1Vkc0ZUQzaWlKQ2JBZ2t3YWkzMlVYYnkzT0x1ZmhBOWx4dDZmQUR0RkgwbTRtQlo2RnY3QVpRUllPZHR4K3FFZ1lkN2UrWStQWnhSQUE9PQo="
+    },
+    "darwin-x86_64-app": {
+      "url": "https://github.com/aidyou/peerdav/releases/download/v0.1.5/peerdav.app.tar.gz",
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSV2szQ0ViVVVzL1BleTljazQ2djljbktteVdwT1cyektYRDFReEs0V3BjRFplUm9lcjdqSzlBd3FwMjFxRWsyWlpJdWtOclZ6akREcTdxd0l6cXpobVVqWnVLaW1wL3dRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkzMjc5ODM5CWZpbGU6cGVlcmRhdi5hcHAudGFyLmd6CXZlcnNpb246MC4xLjUKVW5tL2IvQlV5dC9PNzFRSGE2V2NrbHpibGtRdG5sbHhZWVJpdHRzSUFnTFR5cm4yQ2pDWVhUN29UbXBpcTdvNVQxQlRvNWNkRVg4dGhKT05reGFzRGc9PQo="
+    }
+  }
+}
