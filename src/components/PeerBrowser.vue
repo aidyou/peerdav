@@ -642,6 +642,9 @@ function selectEntry(entry, event) {
 // preventDefault 关闭原生拖动：避免文字选择和"从下往上拉时区域自动向下滚动"。
 function onFileViewMousedown(event) {
   if (event.button !== 0 || viewMode.value === "columns") return;
+  // 按住 Ctrl/Cmd/Shift/Alt 时不能启动框选：框选会覆盖当前选择并抑制随后的 click，
+  // 真机上表现为 ctrl/cmd 跳跃多选完全失效。这类按下交给 click 逻辑处理。
+  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
   if (event.target?.closest?.("a, input, textarea, select, [contenteditable], pre, video, audio")) {
     return;
   }
@@ -1855,7 +1858,15 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
         <!-- 加载中先清空旧内容并给出即时反馈；失败时提示可点击地址栏重试。 -->
         <div v-else class="file-view file-view--placeholder" :aria-busy="navigating">
           <div v-if="navigating" class="file-loading">
-            <span class="file-loading__spinner" aria-hidden="true"></span>
+            <svg
+              class="file-loading__spinner"
+              viewBox="0 0 24 24"
+              aria-hidden="true"
+              focusable="false"
+            >
+              <circle class="file-loading__track" cx="12" cy="12" r="9" />
+              <path class="file-loading__arc" d="M21 12a9 9 0 0 0-9-9" />
+            </svg>
             <span>{{ t("peer.loading") }}</span>
           </div>
           <p v-else class="file-empty">{{ t("peer.loadFailed") }}</p>
@@ -2647,11 +2658,14 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
 .file-table td {
   padding: 7px 9px;
-  /* 行分隔线用文字色按比例调出，亮色和暗色下都比 --app-border 更清晰，
-     多选行的背景之上也能保持可辨。 */
-  border-bottom: 1px solid color-mix(in oklab, var(--app-text) 20%, var(--app-surface));
+  /* 普通行分隔线保持很浅，最后一行不画线；选中行的边线单独定义。 */
+  border-bottom: 1px solid color-mix(in oklab, var(--app-border) 55%, transparent);
   color: var(--app-text-secondary);
   white-space: nowrap;
+}
+
+.file-table tbody tr:last-child td {
+  border-bottom: none;
 }
 
 .file-table tbody tr {
@@ -2664,6 +2678,16 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
 .file-table tbody tr.is-selected {
   background: var(--selection-bg);
+}
+
+/* 选中行在浅色底上仍能分辨行界：用主色淡边线独立定义，
+   不去加深普通行的浅色分隔线。 */
+.file-table tbody tr.is-selected td {
+  border-bottom-color: color-mix(in oklab, var(--selection-border) 40%, transparent);
+}
+
+.file-table tbody tr.is-selected:last-child td {
+  border-bottom: none;
 }
 
 .table-name {
@@ -2906,13 +2930,23 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 }
 
 .file-loading__spinner {
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
   flex: none;
-  border: 2px solid var(--app-border);
-  border-top-color: var(--el-color-primary);
-  border-radius: 50%;
-  animation: file-loading-spin 0.8s linear infinite;
+  animation: file-loading-spin 0.9s linear infinite;
+}
+
+.file-loading__track {
+  fill: none;
+  stroke: color-mix(in oklab, var(--app-border) 85%, transparent);
+  stroke-width: 2.5;
+}
+
+.file-loading__arc {
+  fill: none;
+  stroke: var(--el-color-primary, var(--app-text-secondary));
+  stroke-width: 2.5;
+  stroke-linecap: round;
 }
 
 @keyframes file-loading-spin {
@@ -2921,9 +2955,10 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   }
 }
 
+/* 加载指示的旋转本身就是信息，减弱动效时放慢而不是静止。 */
 @media (prefers-reduced-motion: reduce) {
   .file-loading__spinner {
-    animation: none;
+    animation-duration: 2.4s;
   }
 }
 

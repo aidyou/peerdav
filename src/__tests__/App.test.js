@@ -2156,6 +2156,9 @@ describe("Finder-style peer browser", () => {
     expect(wrapper.find(".breadcrumb.is-current").text()).toBe("sub");
     expect(wrapper.find(".file-loading").exists()).toBe(true);
     expect(wrapper.find(".file-loading").text()).toContain("正在加载");
+    // 加载指示必须是可识别的旋转图标（SVG 弧线），不是静态圆点。
+    expect(wrapper.find("svg.file-loading__spinner").exists()).toBe(true);
+    expect(wrapper.find(".file-loading__arc").exists()).toBe(true);
     expect(wrapper.find(".icon-grid").exists()).toBe(false);
 
     // 用户在慢目录返回前从地址栏返回上一级。
@@ -2765,6 +2768,85 @@ describe("Finder-style peer browser", () => {
     expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(0);
     expect(wrapper.find(".selection-bar").exists()).toBe(false);
     wrapper.unmount();
+  });
+
+  it("keeps ctrl/cmd multi-select working through the real pointer sequence", async () => {
+    const listing = {
+      ...LISTING,
+      entries: [
+        LISTING.entries[0],
+        { ...LISTING.entries[1], path: "/a.txt", name: "a.txt" },
+        { ...LISTING.entries[1], path: "/b.txt", name: "b.txt" },
+        { ...LISTING.entries[1], path: "/c.txt", name: "c.txt" },
+      ],
+    };
+    const { wrapper } = await openBrowser({ list_peer_dir: async () => listing });
+    const tiles = wrapper.findAll(".file-tile");
+
+    await tiles[1].trigger("click");
+    await flushPromises();
+
+    // 真机上 ctrl+点击必然伴随 mousedown/mousemove/mouseup，鼠标抖动会超过框选阈值；
+    // 修饰键按下时不能进入框选，否则已有选择被覆盖且随后的 click 会被抑制。
+    await tiles[3].trigger("mousedown", {
+      button: 0,
+      ctrlKey: true,
+      clientX: 10,
+      clientY: 10,
+    });
+    window.dispatchEvent(new MouseEvent("mousemove", { clientX: 46, clientY: 38 }));
+    window.dispatchEvent(new MouseEvent("mouseup"));
+    await tiles[3].trigger("click", { ctrlKey: true });
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(2);
+    expect(wrapper.find(".marquee").exists()).toBe(false);
+
+    // Cmd（macOS）同样成立。
+    await tiles[2].trigger("mousedown", {
+      button: 0,
+      metaKey: true,
+      clientX: 10,
+      clientY: 10,
+    });
+    window.dispatchEvent(new MouseEvent("mousemove", { clientX: 52, clientY: 44 }));
+    window.dispatchEvent(new MouseEvent("mouseup"));
+    await tiles[2].trigger("click", { metaKey: true });
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(3);
+
+    // Shift+点击做范围选择也不应被框选打断。
+    await tiles[1].trigger("click");
+    await flushPromises();
+    await tiles[3].trigger("mousedown", {
+      button: 0,
+      shiftKey: true,
+      clientX: 10,
+      clientY: 10,
+    });
+    window.dispatchEvent(new MouseEvent("mousemove", { clientX: 40, clientY: 30 }));
+    window.dispatchEvent(new MouseEvent("mouseup"));
+    await tiles[3].trigger("click", { shiftKey: true });
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(3);
+    wrapper.unmount();
+  });
+
+  it("keeps list row dividers light, drops the last one and styles selected rows separately", () => {
+    const tableCss = readFileSync("src/components/PeerBrowser.vue", "utf8");
+    // 普通行分隔线用浅边框色淡入，不用文字色加深。
+    expect(tableCss).toMatch(
+      /\.file-table td \{[^}]*border-bottom: 1px solid color-mix\(in oklab, var\(--app-border\) 55%, transparent\);/
+    );
+    expect(tableCss).not.toMatch(/\.file-table td \{[^}]*var\(--app-text\)/);
+    // 最后一行不画分隔线。
+    expect(tableCss).toMatch(/\.file-table tbody tr:last-child td \{\n  border-bottom: none;\n\}/);
+    // 选中行的边线独立定义，使用主色淡边而不是复用浅色分隔线。
+    expect(tableCss).toMatch(
+      /\.file-table tbody tr\.is-selected td \{[^}]*border-bottom-color: color-mix\(in oklab, var\(--selection-border\) 40%, transparent\);/
+    );
+    expect(tableCss).toMatch(
+      /\.file-table tbody tr\.is-selected:last-child td \{\n  border-bottom: none;\n\}/
+    );
   });
 
   it("drag on the empty file area starts a marquee and a tiny drag clears selection", async () => {
