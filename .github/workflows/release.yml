@@ -211,7 +211,7 @@ jobs:
           IFS=',' read -ra bundle_types <<< "${{ matrix.bundles }}"
           for bundle_type in "${bundle_types[@]}"; do
             case "$bundle_type" in
-              nsis) artifact=$(find "$bundle_dir/nsis" -maxdepth 1 -type f -name '*.nsis.zip' -print -quit) ;;
+              nsis) artifact=$(find "$bundle_dir/nsis" -maxdepth 1 -type f -name '*.exe' ! -name '*.sig' -print -quit) ;;
               app) artifact=$(find "$bundle_dir/macos" -maxdepth 1 -type f -name '*.app.tar.gz' -print -quit) ;;
               deb) artifact=$(find "$bundle_dir/deb" -maxdepth 1 -type f -name '*.deb' -print -quit) ;;
               rpm) artifact=$(find "$bundle_dir/rpm" -maxdepth 1 -type f -name '*.rpm' -print -quit) ;;
