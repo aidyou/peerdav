@@ -47,6 +47,13 @@ const columnStack = ref([]);
 const columnViewEl = ref(null);
 const fileViewEl = ref(null);
 const selectedEntry = ref(null);
+const selectedEntries = ref([]);
+const selectionAnchor = ref(null);
+const marquee = ref(null);
+const batchConflict = ref("fail");
+let batchConflictResolved = false;
+let marqueeStart = null;
+let suppressClick = false;
 const downloadOpen = ref(false);
 const downloadName = ref("");
 const downloadTransferId = ref("");
@@ -258,6 +265,31 @@ watch(
   { flush: "post" },
 );
 
+// 进入目录后自动聚焦文件区域，方向键无需先点击空白处即可使用；
+// 焦点已在区域内或弹窗/输入框上时不抢焦点。
+watch(peerListing, () => {
+  void nextTick(() => {
+    const view = fileViewEl.value;
+    if (!view) return;
+    const active = document.activeElement;
+    if (active && view.contains(active)) return;
+    if (
+      active?.closest?.(
+        ".el-overlay, .el-dialog, .el-message-box, .preview-dialog, .edit-panel",
+      )
+    ) {
+      return;
+    }
+    if (
+      active?.isContentEditable ||
+      ["INPUT", "TEXTAREA", "SELECT"].includes(active?.tagName)
+    ) {
+      return;
+    }
+    view.focus();
+  });
+});
+
 const activePreview = computed(() =>
   peerPreview.value && peerPreviewPath.value === selectedEntry.value?.path
     ? peerPreview.value
@@ -412,7 +444,7 @@ function reset() {
   peerEdit.value = null;
   peerNoticeState.value = null;
   columnStack.value = [];
-  selectedEntry.value = null;
+  clearSelection();
   downloadOpen.value = false;
   downloadTransferId.value = "";
   downloadDialogOpen.value = false;
@@ -432,7 +464,7 @@ function reset() {
 function applyListing(listing) {
   peerListing.value = listing;
   peerPath.value = listing.path;
-  selectedEntry.value = null;
+  clearSelection();
   clearPreview();
   if (viewMode.value === "columns") {
     columnStack.value = [listing];
@@ -494,7 +526,7 @@ async function loadPeer() {
 async function openShare(shareId) {
   if (busy.value) return;
   activeShareId.value = shareId;
-  selectedEntry.value = null;
+  clearSelection();
   await run(() => loadPath("/"));
 }
 
@@ -508,12 +540,152 @@ async function refreshListing() {
   await run(() => loadPath(peerPath.value));
 }
 
-function selectEntry(entry) {
-  selectedEntry.value = entry;
+function isSelected(entry) {
+  return selectedEntries.value.some((item) => item.path === entry?.path);
+}
+
+function setSelection(entries) {
+  const list = entries.filter(Boolean);
+  selectedEntries.value = list;
+  selectedEntry.value = list.length ? list[list.length - 1] : null;
+}
+
+function clearSelection() {
+  selectionAnchor.value = null;
+  setSelection([]);
+}
+
+const selectionFileCount = computed(
+  () => selectedEntries.value.filter((entry) => !entry.isDir).length,
+);
+const selectionDirCount = computed(
+  () => selectedEntries.value.length - selectionFileCount.value,
+);
+const selectionTitle = computed(() =>
+  selectedEntries.value.length > 1
+    ? t("peer.selectedCount", { count: selectedEntries.value.length })
+    : selectedEntry.value?.name ?? "",
+);
+const selectionSubtitle = computed(() => {
+  if (selectedEntries.value.length > 1) {
+    return t("peer.selectedSummary", {
+      files: selectionFileCount.value,
+      dirs: selectionDirCount.value,
+    });
+  }
+  if (!selectedEntry.value) return "";
+  return entryKind(selectedEntry.value) +
+    (selectedEntry.value.isDir ? "" : ` · ${formatSize(selectedEntry.value)}`);
+});
+const selectionGlyph = computed(() =>
+  selectedEntries.value.length > 1
+    ? { isDir: true, name: "", contentType: null }
+    : selectedEntry.value,
+);
+
+function selectEntry(entry, event) {
+  if (suppressClick) return;
+  const listing = peerListing.value?.entries ?? [];
+  if (event?.shiftKey && selectionAnchor.value) {
+    const from = listing.findIndex((item) => item.path === selectionAnchor.value);
+    const to = listing.findIndex((item) => item.path === entry.path);
+    if (from !== -1 && to !== -1) {
+      const [start, end] = from < to ? [from, to] : [to, from];
+      setSelection(listing.slice(start, end + 1));
+      return;
+    }
+  }
+  if (event?.ctrlKey || event?.metaKey) {
+    const added = !isSelected(entry);
+    const next = added
+      ? [...selectedEntries.value, entry]
+      : selectedEntries.value.filter((item) => item.path !== entry.path);
+    setSelection(listing.filter((item) => next.some((entry2) => entry2.path === item.path)));
+    if (added) selectionAnchor.value = entry.path;
+    return;
+  }
+  selectionAnchor.value = entry.path;
+  setSelection([entry]);
   if (viewMode.value === "gallery" && !entry.isDir && canPreview(entry)) {
     void previewEntry(entry);
   }
 }
+
+// 任意位置按下并拖动都能框选（包括从文件上起拉），轻点空白处清空选择。
+// preventDefault 关闭原生拖动：避免文字选择和"从下往上拉时区域自动向下滚动"。
+function onFileViewMousedown(event) {
+  if (event.button !== 0 || viewMode.value === "columns") return;
+  if (event.target?.closest?.("a, input, textarea, select, [contenteditable], pre, video, audio")) {
+    return;
+  }
+  event.preventDefault();
+  fileViewEl.value?.focus();
+  marqueeStart = { clientX: event.clientX, clientY: event.clientY };
+  marquee.value = { left: event.clientX, top: event.clientY, width: 0, height: 0 };
+  window.addEventListener("mousemove", onMarqueeMove);
+  window.addEventListener("mouseup", onMarqueeUp);
+}
+
+function onMarqueeMove(event) {
+  if (!marqueeStart) return;
+  const width = Math.abs(event.clientX - marqueeStart.clientX);
+  const height = Math.abs(event.clientY - marqueeStart.clientY);
+  // 微小抖动仍视为点击，不进入框选。
+  if (width <= 3 && height <= 3) return;
+  marquee.value = {
+    left: Math.min(marqueeStart.clientX, event.clientX),
+    top: Math.min(marqueeStart.clientY, event.clientY),
+    width,
+    height,
+  };
+  const band = marquee.value;
+  const hits = [];
+  for (const element of fileViewEl.value?.querySelectorAll("[data-path]") ?? []) {
+    const rect = element.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    if (
+      rect.left < band.left + band.width &&
+      rect.right > band.left &&
+      rect.top < band.top + band.height &&
+      rect.bottom > band.top
+    ) {
+      hits.push(element.getAttribute("data-path"));
+    }
+  }
+  const listing = peerListing.value?.entries ?? [];
+  setSelection(listing.filter((entry) => hits.includes(entry.path)));
+}
+
+function onMarqueeUp(event) {
+  window.removeEventListener("mousemove", onMarqueeMove);
+  window.removeEventListener("mouseup", onMarqueeUp);
+  const band = marquee.value;
+  const dragged = Boolean(band) && (band.width > 3 || band.height > 3);
+  if (dragged) {
+    // 拖动后的 click 会落在起点条目上，必须忽略，否则多选会被折叠成单选。
+    suppressClick = true;
+    setTimeout(() => {
+      suppressClick = false;
+    }, 0);
+  } else if (!event.target?.closest?.("[data-path]")) {
+    clearSelection();
+  }
+  marquee.value = null;
+  marqueeStart = null;
+}
+
+const marqueeStyle = computed(() => {
+  const band = marquee.value;
+  const view = fileViewEl.value;
+  if (!band || !view) return {};
+  const rect = view.getBoundingClientRect();
+  return {
+    left: `${band.left - rect.left}px`,
+    top: `${band.top - rect.top}px`,
+    width: `${band.width}px`,
+    height: `${band.height}px`,
+  };
+});
 
 function openEntry(entry) {
   if (entry.isDir) {
@@ -537,6 +709,7 @@ function navigateSelection(delta) {
         : length - 1
       : (current + delta + length) % length;
   selectEntry(entries[index]);
+  selectionAnchor.value = entries[index].path;
   void nextTick(() => {
     fileViewEl.value?.querySelector(".is-selected")?.focus?.();
   });
@@ -584,7 +757,7 @@ async function loadColumn(entry, index) {
     peerListing.value = listing;
     peerPath.value = listing.path;
     clearPreview();
-    selectedEntry.value = entry;
+    setSelection([entry]);
     columnStack.value = [...columnStack.value.slice(0, index + 1), listing];
   });
 }
@@ -672,17 +845,53 @@ async function processDownloadQueue() {
     downloadTransferId.value = transferId;
     app.clearTransfer(transferId);
     try {
-      const result = await app.invoke("download_peer_file_to", {
-        peerId: props.peer.id,
-        shareId: activeShareId.value,
-        remotePath: item.remotePath,
-        localPath: item.localPath,
-        transferId,
-      });
+      const result = item.localDir
+        ? await app.invoke("download_peer_file", {
+            peerId: props.peer.id,
+            shareId: activeShareId.value,
+            remotePath: item.remotePath,
+            localDir: item.localDir,
+            conflict: batchConflict.value,
+          })
+        : await app.invoke("download_peer_file_to", {
+            peerId: props.peer.id,
+            shareId: activeShareId.value,
+            remotePath: item.remotePath,
+            localPath: item.localPath,
+            transferId,
+          });
       item.status = "done";
       item.bytes = result.bytes;
       completed += 1;
     } catch (error) {
+      const conflict = item.localDir && normalizeAppError(error).code === "TRANSFER_CONFLICT";
+      if (conflict) {
+        const policy = await ensureBatchConflictPolicy(baseName(item.relativePath));
+        if (policy) {
+          try {
+            const result = await app.invoke("download_peer_file", {
+              peerId: props.peer.id,
+              shareId: activeShareId.value,
+              remotePath: item.remotePath,
+              localDir: item.localDir,
+              conflict: policy,
+            });
+            item.status = "done";
+            item.bytes = result.bytes;
+            completed += 1;
+            continue;
+          } catch (retryError) {
+            item.status = "error";
+            item.error = toUserMessage(retryError);
+            markRemainingDownloadCanceled();
+            app.handleFailure(retryError);
+            break;
+          }
+        }
+        item.status = "canceled";
+        markRemainingDownloadCanceled();
+        break;
+      }
       item.status = "error";
       item.error = toUserMessage(error);
       markRemainingDownloadCanceled();
@@ -768,11 +977,122 @@ async function downloadDirectory(entry) {
   });
 }
 
+// 批量下载同时包含文件与目录：目录用 prepare 展开成文件清单，单个文件直接
+// 下载到同一目标目录。后端没有混合批量的单一命令，这里在前端编排成一个队列。
+async function ensureBatchConflictPolicy(name) {
+  if (batchConflictResolved) return batchConflict.value === "overwrite" ? "overwrite" : null;
+  const overwrite = await confirmAction(
+    t("peer.overwriteBatchConfirm", { name }),
+    t("peer.overwrite"),
+    { confirmText: t("peer.overwrite"), cancelText: t("confirm.cancel") },
+  );
+  batchConflict.value = overwrite ? "overwrite" : "fail";
+  batchConflictResolved = true;
+  return overwrite ? "overwrite" : null;
+}
+
+function buildPrepareRequest(entry, localParent, conflict) {
+  return app.invoke("prepare_peer_directory_download", {
+    peerId: props.peer.id,
+    shareId: activeShareId.value,
+    remotePath: entry.path,
+    localParent,
+    ignoreOptions: {
+      respectGitignore: generalSettings.respectGitignore,
+      patterns: generalSettings.ignorePatterns,
+    },
+    conflict,
+  });
+}
+
+async function downloadBatch(entries) {
+  if (!entries.length || busy.value) return;
+  await run(async () => {
+    const selected = await openDialog({
+      title: t("peer.pickDownloadFolder"),
+      multiple: false,
+      directory: true,
+    });
+    const localParent = typeof selected === "string" ? selected : "";
+    if (!localParent) return;
+
+    batchConflict.value = "fail";
+    batchConflictResolved = false;
+    const items = [];
+    let aborted = false;
+    for (const entry of entries) {
+      if (entry.isDir) {
+        let plan;
+        try {
+          plan = await buildPrepareRequest(entry, localParent, batchConflict.value);
+        } catch (error) {
+          if (normalizeAppError(error).code !== "TRANSFER_CONFLICT") throw error;
+          const policy = await ensureBatchConflictPolicy(entry.name);
+          if (!policy) {
+            aborted = true;
+            break;
+          }
+          plan = await buildPrepareRequest(entry, localParent, policy);
+        }
+        items.push(
+          ...plan.files.map((file) => ({ ...file, status: "pending", error: "", bytes: null })),
+        );
+      } else {
+        items.push({
+          remotePath: entry.path,
+          localDir: localParent,
+          relativePath: entry.name,
+          size: entry.size,
+          status: "pending",
+          error: "",
+          bytes: null,
+        });
+      }
+    }
+
+    if (aborted) return;
+    if (!items.length) {
+      app.setNotice("peer.downloadEmptySelection", {});
+      return;
+    }
+    downloadDirectoryName.value = t("peer.selectedCount", { count: entries.length });
+    downloadRoot.value = localParent;
+    downloadQueue.value = items;
+    downloadCanceled.value = false;
+    downloadRunning.value = true;
+    downloadDialogOpen.value = true;
+    await processDownloadQueue();
+  });
+}
+
+function downloadSelected() {
+  const entries = selectedEntries.value;
+  if (!entries.length || busy.value) return;
+  if (entries.length === 1) {
+    const entry = entries[0];
+    if (entry.isDir) void downloadDirectory(entry);
+    else void downloadEntry(entry);
+    return;
+  }
+  void downloadBatch(entries);
+}
+
 async function revealSavedFile() {
   if (!savedPath.value) return;
   try {
     await app.invoke("reveal_local_file", { path: savedPath.value });
     savedOpen.value = false;
+  } catch (error) {
+    app.handleFailure(error);
+  }
+}
+
+// 批量/目录下载完成后打开本地根目录，与单文件下载的入口保持一致。
+async function revealDownloadRoot() {
+  if (!downloadRoot.value) return;
+  try {
+    await app.invoke("reveal_local_file", { path: downloadRoot.value });
+    downloadDialogOpen.value = false;
   } catch (error) {
     app.handleFailure(error);
   }
@@ -1005,7 +1325,7 @@ function closePreview() {
 async function previewEntry(entry) {
   if (!entry || entry.isDir || busy.value || !canPreview(entry)) return;
   clearPreview();
-  selectedEntry.value = entry;
+  setSelection([entry]);
 
   if (Number(entry.size) > MAX_PREVIEW_BYTES) {
     peerPreviewPath.value = entry.path;
@@ -1343,15 +1663,18 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
           class="file-view"
           tabindex="0"
           @keydown="onFileViewKeydown"
+          @mousedown="onFileViewMousedown"
         >
+          <div v-if="marquee" class="marquee" :style="marqueeStyle"></div>
           <div v-if="viewMode === 'icons'" class="icon-grid">
             <button
               v-for="entry in peerListing.entries"
               :key="entry.path"
               type="button"
               class="file-tile"
-              :class="{ 'is-selected': selectedEntry?.path === entry.path }"
-              @click="selectEntry(entry)"
+              :data-path="entry.path"
+              :class="{ 'is-selected': isSelected(entry) }"
+              @click="selectEntry(entry, $event)"
               @dblclick="openEntry(entry)"
             >
               <FileGlyph :entry="entry" size="lg" />
@@ -1375,8 +1698,9 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 v-for="entry in peerListing.entries"
                 :key="entry.path"
                 tabindex="0"
-                :class="{ 'is-selected': selectedEntry?.path === entry.path }"
-                @click="selectEntry(entry)"
+                :data-path="entry.path"
+                :class="{ 'is-selected': isSelected(entry) }"
+                @click="selectEntry(entry, $event)"
                 @dblclick="openEntry(entry)"
                 @keydown.enter="openEntry(entry)"
               >
@@ -1405,7 +1729,8 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 :key="entry.path"
                 type="button"
                 class="column-row"
-                :class="{ 'is-selected': selectedEntry?.path === entry.path }"
+                :data-path="entry.path"
+                :class="{ 'is-selected': isSelected(entry) }"
                 @click="loadColumn(entry, index)"
                 @dblclick="previewEntry(entry)"
               >
@@ -1477,8 +1802,9 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 :key="entry.path"
                 type="button"
                 class="gallery-thumb"
-                :class="{ 'is-selected': selectedEntry?.path === entry.path }"
-                @click="selectEntry(entry)"
+                :data-path="entry.path"
+                :class="{ 'is-selected': isSelected(entry) }"
+                @click="selectEntry(entry, $event)"
                 @dblclick="openEntry(entry)"
               >
                 <FileGlyph :entry="entry" />
@@ -1492,47 +1818,46 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
           </p>
         </div>
 
-        <div v-if="selectedEntry || viewMode === 'gallery'" class="selection-bar" :class="{ 'selection-bar--reserved': !selectedEntry }">
-          <div v-if="selectedEntry" class="selection-summary">
-            <FileGlyph :entry="selectedEntry" />
+        <div
+          v-if="selectedEntries.length || viewMode === 'gallery'"
+          class="selection-bar"
+          :class="{
+            'selection-bar--reserved': !selectedEntries.length,
+            'selection-bar--multi': selectedEntries.length > 1,
+          }"
+        >
+          <div v-if="selectedEntries.length" class="selection-summary">
+            <FileGlyph :entry="selectionGlyph" />
             <div>
-              <strong>{{ selectedEntry.name }}</strong>
-              <span>
-                {{ entryKind(selectedEntry) }}
-                <template v-if="!selectedEntry.isDir">
-                  · {{ formatSize(selectedEntry) }}
-                </template>
-              </span>
+              <strong>{{ selectionTitle }}</strong>
+              <span>{{ selectionSubtitle }}</span>
             </div>
-          </div>
-          <p v-else class="selection-bar__hint">{{ t("peer.selectionHint") }}</p>
-          <div v-if="selectedEntry" class="selection-actions">
             <el-button
-              v-if="selectedEntry.isDir"
+              v-if="selectedEntries.length > 1"
+              class="selection-clear"
+              link
               type="primary"
               :disabled="busy"
-              @click="browse(selectedEntry.path)"
+              @click="clearSelection"
             >
-              {{ t("peer.open") }}
+              {{ t("peer.clearSelection") }}
             </el-button>
-            <el-button
-              v-if="selectedEntry.isDir"
-              plain
-              :disabled="busy"
-              @click="downloadDirectory(selectedEntry)"
-            >
-              {{ t("peer.download") }}
-            </el-button>
-            <template v-else>
+          </div>
+          <p v-else class="selection-bar__hint">{{ t("peer.selectionHint") }}</p>
+          <div v-if="selectedEntries.length" class="selection-actions">
+            <template v-if="selectedEntries.length === 1 && selectedEntry.isDir">
               <el-button
-                v-if="canPreview(selectedEntry)"
                 type="primary"
-                plain
                 :disabled="busy"
-                @click="previewEntry(selectedEntry)"
+                @click="browse(selectedEntry.path)"
               >
-                {{ t("peer.preview") }}
+                {{ t("peer.open") }}
               </el-button>
+              <el-button plain :disabled="busy" @click="downloadDirectory(selectedEntry)">
+                {{ t("peer.download") }}
+              </el-button>
+            </template>
+            <template v-else-if="selectedEntries.length === 1">
               <el-button plain :disabled="busy" @click="downloadEntry(selectedEntry)">
                 {{ t("peer.download") }}
               </el-button>
@@ -1545,8 +1870,11 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 {{ t("peer.edit") }}
               </el-button>
             </template>
+            <el-button v-else type="primary" plain :disabled="busy" @click="downloadSelected">
+              {{ t("peer.download") }}
+            </el-button>
             <el-button
-              v-if="canDeleteEntries"
+              v-if="canDeleteEntries && selectedEntries.length === 1"
               type="danger"
               plain
               :disabled="busy"
@@ -1662,9 +1990,14 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
         >
           {{ downloadCanceled ? t("peer.cancelingDownload") : t("peer.cancelDownload") }}
         </el-button>
-        <el-button v-else type="primary" @click="downloadDialogOpen = false">
-          {{ t("common.close") }}
-        </el-button>
+        <template v-else>
+          <el-button v-if="downloadRoot" plain @click="revealDownloadRoot">
+            {{ t("peer.revealInFolder") }}
+          </el-button>
+          <el-button type="primary" @click="downloadDialogOpen = false">
+            {{ t("common.close") }}
+          </el-button>
+        </template>
       </template>
     </el-dialog>
 
@@ -2171,6 +2504,30 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   outline: none;
 }
 
+/* Drag selection owns the pointer in this region; text stays selectable where
+   editing or reading it is the point (code preview, inputs). */
+.browser-main > .file-view {
+  position: relative;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.browser-main > .file-view pre,
+.browser-main > .file-view input,
+.browser-main > .file-view textarea {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.marquee {
+  position: absolute;
+  z-index: 5;
+  pointer-events: none;
+  border: 1px solid var(--el-color-primary);
+  border-radius: 4px;
+  background: color-mix(in oklab, var(--el-color-primary) 14%, transparent);
+}
+
 .browser-main > .file-view > .icon-grid,
 .browser-main > .file-view > .file-table-wrap,
 .browser-main > .file-view > .column-view,
@@ -2233,8 +2590,12 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 }
 
 .file-table th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
   padding: 7px 9px;
   border-bottom: 1px solid var(--app-border);
+  background: var(--app-surface);
   color: var(--app-text-muted);
   font-size: 11.5px;
   font-weight: 600;
@@ -2502,6 +2863,18 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 .selection-bar--reserved {
   border-style: dashed;
   background: transparent;
+}
+
+.selection-bar--multi {
+  align-items: center;
+}
+
+.selection-clear {
+  flex: none;
+  margin-left: auto;
+  padding: 0;
+  height: auto;
+  min-height: 0;
 }
 
 .selection-bar__hint {

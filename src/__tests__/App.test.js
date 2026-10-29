@@ -2248,15 +2248,15 @@ describe("Finder-style peer browser", () => {
             },
     });
 
-    await wrapper.findAll(".file-tile")[1].trigger("click");
-    await clickButton(wrapper, "预览");
+    await wrapper.findAll(".file-tile")[1].trigger("dblclick");
+    await flushPromises();
     expect(wrapper.find(".preview-dialog audio").attributes("src")).toBe(
       "data:audio/mpeg;base64,SUQz",
     );
 
     await clickButton(wrapper, "关闭");
-    await wrapper.findAll(".file-tile")[2].trigger("click");
-    await clickButton(wrapper, "预览");
+    await wrapper.findAll(".file-tile")[2].trigger("dblclick");
+    await flushPromises();
     expect(wrapper.find(".preview-dialog video").attributes("src")).toBe(
       "data:video/mp4;base64,AAAA",
     );
@@ -2376,8 +2376,8 @@ describe("Finder-style peer browser", () => {
 
   it("opens text previews in a full-browser dialog", async () => {
     const { wrapper } = await openBrowser();
-    await wrapper.findAll(".file-tile")[1].trigger("click");
-    await clickButton(wrapper, "预览");
+    await wrapper.findAll(".file-tile")[1].trigger("dblclick");
+    await flushPromises();
 
     expect(wrapper.find(".preview-dialog").exists()).toBe(true);
     expect(wrapper.find(".preview-panel").exists()).toBe(false);
@@ -2406,8 +2406,8 @@ describe("Finder-style peer browser", () => {
         size: 28,
       }),
     });
-    await wrapper.findAll(".file-tile")[1].trigger("click");
-    await clickButton(wrapper, "预览");
+    await wrapper.findAll(".file-tile")[1].trigger("dblclick");
+    await flushPromises();
 
     await vi.waitFor(() => {
       expect(wrapper.find(".markdown-body h1").exists()).toBe(true);
@@ -2439,8 +2439,8 @@ describe("Finder-style peer browser", () => {
         size: 24,
       }),
     });
-    await wrapper.findAll(".file-tile")[1].trigger("click");
-    await clickButton(wrapper, "预览");
+    await wrapper.findAll(".file-tile")[1].trigger("dblclick");
+    await flushPromises();
 
     const headers = wrapper
       .findAll(".preview-table thead th")
@@ -2472,8 +2472,8 @@ describe("Finder-style peer browser", () => {
         size: 13,
       }),
     });
-    await wrapper.findAll(".file-tile")[1].trigger("click");
-    await clickButton(wrapper, "预览");
+    await wrapper.findAll(".file-tile")[1].trigger("dblclick");
+    await flushPromises();
 
     await vi.waitFor(() => {
       expect(wrapper.find(".preview-code .hljs-keyword").exists()).toBe(true);
@@ -2524,8 +2524,8 @@ describe("Finder-style peer browser", () => {
         entries: [LISTING.entries[0], largeEntry],
       }),
     });
-    await wrapper.findAll(".file-tile")[1].trigger("click");
-    await clickButton(wrapper, "预览");
+    await wrapper.findAll(".file-tile")[1].trigger("dblclick");
+    await flushPromises();
 
     expect(
       invoke.mock.calls.some(([command]) => command === "preview_peer_file"),
@@ -2547,8 +2547,8 @@ describe("Finder-style peer browser", () => {
         };
       },
     });
-    await wrapper.findAll(".file-tile")[1].trigger("click");
-    await clickButton(wrapper, "预览");
+    await wrapper.findAll(".file-tile")[1].trigger("dblclick");
+    await flushPromises();
 
     expect(wrapper.find(".preview-unavailable").text()).toContain("5001");
     expect(wrapper.find(".preview-unavailable").text()).toContain("5000");
@@ -2664,12 +2664,202 @@ describe("Finder-style peer browser", () => {
     await flushPromises();
 
     savedPeers = [];
-    await clickButton(wrapper, "预览");
+    await wrapper.findAll(".file-tile")[1].trigger("dblclick");
     await flushPromises();
 
     expect(wrapper.find(".peer-browser").exists()).toBe(true);
     expect(wrapper.find(".icon-grid").exists()).toBe(true);
 
+    wrapper.unmount();
+  });
+
+  it("selects multiple entries with ctrl/shift and shows only counts in the bar", async () => {
+    const listing = {
+      ...LISTING,
+      entries: [
+        LISTING.entries[0],
+        { ...LISTING.entries[1], path: "/a.txt", name: "a.txt" },
+        { ...LISTING.entries[1], path: "/b.txt", name: "b.txt" },
+        { ...LISTING.entries[1], path: "/c.txt", name: "c.txt" },
+      ],
+    };
+    const { wrapper } = await openBrowser({ list_peer_dir: async () => listing });
+    const tiles = wrapper.findAll(".file-tile");
+
+    await tiles[1].trigger("click", { ctrlKey: true });
+    await flushPromises();
+    await tiles[3].trigger("click", { ctrlKey: true });
+    await flushPromises();
+    const bar = wrapper.find(".selection-bar");
+    expect(bar.classes()).toContain("selection-bar--multi");
+    expect(bar.text()).toContain("已选 2 项");
+    expect(bar.text()).toContain("2 个文件 · 0 个目录");
+    expect(bar.find(".selection-tree").exists()).toBe(false);
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(2);
+
+    // Plain click replaces the whole selection.
+    await tiles[0].trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(1);
+    expect(wrapper.find(".selection-bar").text()).toContain("sub");
+
+    // Shift+click selects the inclusive range from the anchor.
+    await tiles[1].trigger("click");
+    await flushPromises();
+    await tiles[3].trigger("click", { shiftKey: true });
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(3);
+    expect(wrapper.find(".selection-bar").text()).toContain("已选 3 项");
+
+    // 清除选择回到空态（画廊外不显示底栏）。
+    await wrapper.find(".selection-clear").trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(0);
+    expect(wrapper.find(".selection-bar").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("drag on the empty file area starts a marquee and a tiny drag clears selection", async () => {
+    const { wrapper } = await openBrowser();
+    const fileView = wrapper.find(".file-view");
+    await fileView.trigger("mousedown", { button: 0, clientX: 10, clientY: 10 });
+    window.dispatchEvent(new MouseEvent("mousemove", { clientX: 120, clientY: 90 }));
+    window.dispatchEvent(new MouseEvent("mouseup"));
+    await flushPromises();
+    // jsdom 报告零尺寸，框选不会命中条目；这里只保证流程不报错且不残留框选层。
+    expect(wrapper.find(".marquee").exists()).toBe(false);
+
+    await wrapper.findAll(".file-tile")[1].trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(1);
+    await fileView.trigger("mousedown", { button: 0, clientX: 10, clientY: 10 });
+    window.dispatchEvent(new MouseEvent("mouseup"));
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(0);
+    wrapper.unmount();
+  });
+
+  it("dragging from a tile suppresses the following click so multi-selection survives", async () => {
+    const { wrapper } = await openBrowser();
+    const tile = wrapper.findAll(".file-tile")[1];
+    await tile.trigger("mousedown", { button: 0, clientX: 10, clientY: 10 });
+    window.dispatchEvent(new MouseEvent("mousemove", { clientX: 120, clientY: 90 }));
+    window.dispatchEvent(new MouseEvent("mouseup"));
+    // 浏览器里 click 紧随 mouseup 同步派发，因此这里不等待就直接触发。
+    await tile.trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(0);
+    // 抑制只对一次点击生效，之后的普通点击恢复正常选择。
+    await tile.trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(1);
+    wrapper.unmount();
+  });
+
+  it("shows a reveal-in-folder action after a batch download and keeps the list header sticky", async () => {
+    const listing = {
+      ...LISTING,
+      entries: [
+        LISTING.entries[0],
+        { ...LISTING.entries[1], path: "/a.txt", name: "a.txt" },
+        { ...LISTING.entries[1], path: "/b.txt", name: "b.txt" },
+      ],
+    };
+    const prepare = vi.fn(async () => ({
+      localRoot: "/tmp/peerdav-keys/sub",
+      directoryCount: 1,
+      files: [
+        { remotePath: "/sub/inner.txt", relativePath: "inner.txt", localPath: "/tmp/peerdav-keys/sub/inner.txt", size: 4 },
+      ],
+    }));
+    const downloadFile = vi.fn(async () => ({
+      transferred: true, remotePath: "/a.txt", localPath: "/tmp/peerdav-keys/a.txt", bytes: 2, skippedReason: null,
+    }));
+    const revealLocal = vi.fn(async () => {});
+    const { wrapper } = await openBrowser({
+      list_peer_dir: async () => listing,
+      prepare_peer_directory_download: prepare,
+      download_peer_file: downloadFile,
+      reveal_local_file: revealLocal,
+    });
+
+    const tiles = wrapper.findAll(".file-tile");
+    await tiles[0].trigger("click", { ctrlKey: true });
+    await flushPromises();
+    await tiles[1].trigger("click", { ctrlKey: true });
+    await flushPromises();
+    await clickButton(wrapper, "下载");
+    await flushPromises();
+
+    const reveal = wrapper.findAll("button").find((button) => button.text() === "打开所在目录");
+    expect(reveal?.exists()).toBe(true);
+    await reveal.trigger("click");
+    await flushPromises();
+    expect(revealLocal).toHaveBeenCalledWith({ path: "/tmp/peerdav-keys" });
+
+    // 列表模式表头固定，长列表滚动时表头不掉出视野。
+    await wrapper.find('button[aria-label="列表"]').trigger("click");
+    await flushPromises();
+    const source = readFileSync("src/components/PeerBrowser.vue", "utf8");
+    const tableCss = source.match(/<style scoped>([\s\S]*?)<\/style>/)[1];
+    expect(tableCss).toContain(".file-table th {\n  position: sticky;\n  top: 0;\n  z-index: 2;");
+    wrapper.unmount();
+  });
+
+  it("batch downloads mixed files and directories into one folder", async () => {
+    const listing = {
+      ...LISTING,
+      entries: [
+        LISTING.entries[0],
+        { ...LISTING.entries[1], path: "/a.txt", name: "a.txt" },
+        { ...LISTING.entries[1], path: "/b.txt", name: "b.txt" },
+      ],
+    };
+    const prepare = vi.fn(async () => ({
+      localRoot: "/tmp/peerdav-keys/sub",
+      directoryCount: 1,
+      files: [
+        { remotePath: "/sub/inner.txt", relativePath: "inner.txt", localPath: "/tmp/peerdav-keys/sub/inner.txt", size: 4 },
+      ],
+    }));
+    const downloadFile = vi.fn(async () => ({
+      transferred: true, remotePath: "/a.txt", localPath: "/tmp/peerdav-keys/a.txt", bytes: 2, skippedReason: null,
+    }));
+    const { wrapper } = await openBrowser({
+      list_peer_dir: async () => listing,
+      prepare_peer_directory_download: prepare,
+      download_peer_file: downloadFile,
+    });
+
+    const tiles = wrapper.findAll(".file-tile");
+    await tiles[0].trigger("click", { ctrlKey: true });
+    await flushPromises();
+    await tiles[1].trigger("click", { ctrlKey: true });
+    await flushPromises();
+    await tiles[2].trigger("click", { ctrlKey: true });
+    await flushPromises();
+    expect(wrapper.find(".selection-bar").text()).toContain("已选 3 项");
+
+    await clickButton(wrapper, "下载");
+    await flushPromises();
+
+    expect(prepare).toHaveBeenCalledWith({
+      peerId: "peer-1",
+      shareId: "share-1",
+      remotePath: "/sub",
+      localParent: "/tmp/peerdav-keys",
+      ignoreOptions: { respectGitignore: generalSettings.respectGitignore, patterns: generalSettings.ignorePatterns },
+      conflict: "fail",
+    });
+    expect(downloadFile).toHaveBeenCalledTimes(2);
+    expect(downloadFile).toHaveBeenNthCalledWith(1, {
+      peerId: "peer-1", shareId: "share-1", remotePath: "/a.txt", localDir: "/tmp/peerdav-keys", conflict: "fail",
+    });
+    expect(downloadFile).toHaveBeenNthCalledWith(2, {
+      peerId: "peer-1", shareId: "share-1", remotePath: "/b.txt", localDir: "/tmp/peerdav-keys", conflict: "fail",
+    });
+    expect(wrapper.text()).toContain("下载队列");
+    expect(wrapper.text()).toContain("inner.txt");
     wrapper.unmount();
   });
 
@@ -3278,11 +3468,16 @@ describe("admin session restore", () => {
     expect(source).toContain("clip-path: inset(0 round var(--overlay-radius))");
     expect(source).toMatch(/\.titlebar\s*\{\s*position: relative;\s*z-index: 999999;/);
     expect(source).toMatch(/\.el-overlay-dialog\s*\{\s*position: absolute;\s*inset: 0;/);
+    // 只触发本次挂载注册的 resize 处理器，避免其它用例残留的处理器先消耗一次性 mock。
+    const staleHandlers = new Set(resizeHandlers);
     const wrapper = await mountReady();
     expect(wrapper.find(".titlebar").attributes()).toHaveProperty("data-tauri-drag-region");
     expect(wrapper.find(".window-frame").attributes("style")).toContain("--window-overlay-inset: 1px");
     windowMock.isMaximized.mockResolvedValueOnce(true);
-    for (const handler of resizeHandlers) handler();
+    for (const handler of resizeHandlers) {
+      if (staleHandlers.has(handler)) continue;
+      handler();
+    }
     await flushPromises();
     expect(wrapper.find(".window-frame").attributes("style")).toContain("--window-overlay-radius: 0px");
     wrapper.unmount();
