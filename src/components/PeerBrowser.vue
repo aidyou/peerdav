@@ -46,6 +46,12 @@ const viewMode = ref(readViewMode());
 const columnStack = ref([]);
 // 分栏模式下正在取子目录的那一列：点击后必须有即时反馈，否则深层目录看起来像没响应。
 const loadingColumn = ref(-1);
+// 加载中只显示到被点击的那一列，右侧空位留给即将展开的新列（loading 占位在那里）。
+const visibleColumns = computed(() =>
+  loadingColumn.value === -1
+    ? columnStack.value
+    : columnStack.value.slice(0, loadingColumn.value + 1),
+);
 const columnViewEl = ref(null);
 const fileViewEl = ref(null);
 const selectedEntry = ref(null);
@@ -263,8 +269,9 @@ function scrollBreadcrumbs(event) {
   element.scrollLeft += event.deltaY;
 }
 
+// 新列或 loading 占位列出现时滚到最右，保证反馈落在视野内而不是屏幕外。
 watch(
-  columnStack,
+  [columnStack, loadingColumn],
   () => {
     const element = columnViewEl.value;
     if (element) element.scrollLeft = element.scrollWidth;
@@ -1936,7 +1943,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
             :aria-busy="loadingColumn !== -1 ? 'true' : 'false'"
           >
             <div
-              v-for="(column, index) in columnStack"
+              v-for="(column, index) in visibleColumns"
               :key="column.path"
               class="column"
             >
@@ -1957,18 +1964,18 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
               <p v-if="!column.entries.length" class="column-empty">
                 {{ t("peer.emptyDir") }}
               </p>
-              <div v-if="loadingColumn === index" class="column-loading" role="status">
-                <svg
-                  class="file-loading__spinner"
-                  viewBox="0 0 24 24"
-                  aria-hidden="true"
-                  focusable="false"
-                >
-                  <circle class="file-loading__track" cx="12" cy="12" r="9" />
-                  <path class="file-loading__arc" d="M21 12a9 9 0 0 0-9-9" />
-                </svg>
-                <span>{{ t("peer.loading") }}</span>
-              </div>
+            </div>
+            <div v-if="loadingColumn !== -1" class="column column-loading" role="status">
+              <svg
+                class="file-loading__spinner"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+                focusable="false"
+              >
+                <circle class="file-loading__track" cx="12" cy="12" r="9" />
+                <path class="file-loading__arc" d="M21 12a9 9 0 0 0-9-9" />
+              </svg>
+              <span>{{ t("peer.loading") }}</span>
             </div>
           </div>
 
@@ -3029,12 +3036,12 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   color: var(--app-text-muted);
 }
 
-/* 正在加载的列尾部给出与文件区一致的 loading 反馈。 */
+/* loading 占位出现在右侧即将展开的新列位置，宽度沿用 .column。 */
 .column-loading {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 8px;
-  padding: 10px 8px;
   color: var(--app-text-muted);
   font-size: 12px;
 }

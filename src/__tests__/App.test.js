@@ -2253,49 +2253,79 @@ describe("Finder-style peer browser", () => {
     wrapper.unmount();
   });
 
-  it("shows a loading row in the column being fetched when entering a folder", async () => {
+  it("shows the loading placeholder in the column that will open on the right", async () => {
     const subListing = {
       ...LISTING,
       path: "/sub",
       entries: [
-        {
-          ...LISTING.entries[1],
-          path: "/sub/inner.txt",
-          name: "inner.txt",
-        },
+        { ...LISTING.entries[0], path: "/sub/deep", name: "deep" },
+        { ...LISTING.entries[1], path: "/sub/inner.txt", name: "inner.txt" },
+      ],
+    };
+    const deepListing = {
+      ...LISTING,
+      path: "/sub/deep",
+      entries: [
+        { ...LISTING.entries[1], path: "/sub/deep/deep.txt", name: "deep.txt" },
       ],
     };
     let release;
-    const gate = new Promise((resolve) => {
-      release = resolve;
-    });
+    const gate = () =>
+      new Promise((resolve) => {
+        release = resolve;
+      });
+    let pending = gate();
     const { wrapper } = await openBrowser({
       list_peer_dir: async ({ path }) => {
-        if (path !== "/sub") return LISTING;
-        await gate;
-        return subListing;
+        if (path === "/sub") {
+          await pending;
+          return subListing;
+        }
+        if (path === "/sub/deep") return deepListing;
+        return LISTING;
       },
     });
 
     await wrapper.find('button[aria-label="分栏"]').trigger("click");
     await flushPromises();
-    expect(wrapper.findAll(".column-loading")).toHaveLength(0);
+    expect(wrapper.findAll(".column")).toHaveLength(1);
     expect(wrapper.find(".column-view").attributes("aria-busy")).toBe("false");
 
-    await wrapper.findAll(".column-row")[0].trigger("click");
+    // 点击目录：loading 出现在右侧即将展开的新列位置，而不是当前列尾部。
+    await wrapper.findAll(".column")[0].findAll(".column-row")[0].trigger("click");
     await flushPromises();
-    // 请求未返回前，正在加载的列尾部必须有 spinner 与文案，否则深层目录像没响应。
-    const loading = wrapper.find(".column-loading");
-    expect(loading.exists()).toBe(true);
-    expect(loading.text()).toContain("正在加载…");
-    expect(loading.find("svg.file-loading__spinner").exists()).toBe(true);
+    let columns = wrapper.findAll(".column");
+    expect(columns).toHaveLength(2);
+    expect(columns[0].find(".column-loading").exists()).toBe(false);
+    expect(columns[1].classes()).toContain("column-loading");
+    expect(columns[1].text()).toContain("正在加载…");
+    expect(columns[1].find("svg.file-loading__spinner").exists()).toBe(true);
     expect(wrapper.find(".column-view").attributes("aria-busy")).toBe("true");
 
     release();
     await flushPromises();
     expect(wrapper.findAll(".column-loading")).toHaveLength(0);
+    columns = wrapper.findAll(".column");
+    expect(columns).toHaveLength(2);
+    expect(columns[1].text()).toContain("deep");
+
+    // 展开第二列的子目录，得到 3 列，用于验证旧列会被收起让位。
+    await columns[1].findAll(".column-row")[0].trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".column")).toHaveLength(3);
+
+    // 已有右侧旧列时再次点击第一列：旧列先收起，位置让给即将展开的新列。
+    pending = gate();
+    await wrapper.findAll(".column")[0].findAll(".column-row")[0].trigger("click");
+    await flushPromises();
+    columns = wrapper.findAll(".column");
+    expect(columns).toHaveLength(2);
+    expect(columns[1].classes()).toContain("column-loading");
+
+    release();
+    await flushPromises();
+    expect(wrapper.findAll(".column-loading")).toHaveLength(0);
     expect(wrapper.find(".column-view").attributes("aria-busy")).toBe("false");
-    expect(wrapper.findAll(".column")).toHaveLength(2);
 
     wrapper.unmount();
   });
