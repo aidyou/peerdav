@@ -308,21 +308,25 @@ pub(crate) async fn upload(
         .map_err(|e| io(local, e))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
-    while !streaming {
-        if *cancel.borrow() {
-            return Err(DomainError::TransferCanceled);
+    // 流式（协议 v2）由服务端边传边校验，本机不再整体哈希；
+    // 旧版对端才需要先把全文哈希出来作为 content hash。
+    if !streaming {
+        loop {
+            if *cancel.borrow() {
+                return Err(DomainError::TransferCanceled);
+            }
+            let len = tokio::select! {
+                biased;
+                _ = cancel.changed() => return Err(DomainError::TransferCanceled),
+                result = input.read(&mut buffer) => result.map_err(|e| io(local, e))?,
+            };
+            if len == 0 {
+                break;
+            }
+            hasher.update(&buffer[..len]);
+            hashed += len as u64;
+            report(UploadPhase::Hashing, hashed, 0);
         }
-        let len = tokio::select! {
-            biased;
-            _ = cancel.changed() => return Err(DomainError::TransferCanceled),
-            result = input.read(&mut buffer) => result.map_err(|e| io(local, e))?,
-        };
-        if len == 0 {
-            break;
-        }
-        hasher.update(&buffer[..len]);
-        hashed += len as u64;
-        report(UploadPhase::Hashing, hashed, 0);
     }
     let digest = if streaming {
         // A stable resume key is not a content guarantee: every reused part is
