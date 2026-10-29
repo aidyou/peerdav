@@ -49,7 +49,7 @@ pub use vault::Vault;
 use std::sync::Arc;
 
 use tauri::menu::{Menu, MenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, WindowEvent};
 
 use crate::commands::{AppEvents, SharedPeers, SharedServer, SharedVault};
@@ -327,72 +327,38 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error + Send +
     let settings_item = MenuItem::with_id(app, "tray-settings", settings, true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show_item, &settings_item, &quit_item])?;
 
+    // The menu belongs to the tray icon: the platform anchors it to the icon, which is what makes
+    // it open next to the macOS menu bar item instead of at the app's dock position. Popping a
+    // window menu up manually cannot reproduce that anchor.
     let builder = TrayIconBuilder::with_id(TRAY_ID)
         .title(tray_display_name(&language))
         .tooltip(tray_display_name(&language))
         .icon(icon.clone())
-        .show_menu_on_left_click(false);
-    #[cfg(target_os = "linux")]
-    let builder = builder.menu(&menu);
-    #[cfg(not(target_os = "linux"))]
-    app.manage(std::sync::Mutex::new(menu));
-    let tray = builder
-        .on_menu_event(|app, event| {
-            let id = event.id.as_ref();
-            if id == TRAY_SHOW_MENU_ID || id == "tray-settings" || id.starts_with("tray-peer-") {
-                show_main_window(app);
-                let route = if id == TRAY_SHOW_MENU_ID {
-                    "home".to_owned()
-                } else if id == "tray-settings" {
-                    "settings".to_owned()
-                } else {
-                    format!("peer/{}", id.trim_start_matches("tray-peer-"))
-                };
-                if let Some(vault) = app.try_state::<SharedVault>()
-                    && vault.require_interface_unlocked().is_err()
-                {
-                    return;
-                }
-                if let Err(error) = app.emit("app://navigate", route) {
-                    log::warn!("failed to navigate from tray: {error}");
-                }
-            } else if id == TRAY_QUIT_MENU_ID {
-                request_quit(app);
-            }
-        })
-        .on_tray_icon_event(|tray, event| {
-            #[cfg(not(target_os = "linux"))]
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                position,
-                ..
-            } = &event
+        .menu(&menu)
+        .show_menu_on_left_click(true);
+    let tray = builder.on_menu_event(|app, event| {
+        let id = event.id.as_ref();
+        if id == TRAY_SHOW_MENU_ID || id == "tray-settings" || id.starts_with("tray-peer-") {
+            show_main_window(app);
+            let route = if id == TRAY_SHOW_MENU_ID {
+                "home".to_owned()
+            } else if id == "tray-settings" {
+                "settings".to_owned()
+            } else {
+                format!("peer/{}", id.trim_start_matches("tray-peer-"))
+            };
+            if let Some(vault) = app.try_state::<SharedVault>()
+                && vault.require_interface_unlocked().is_err()
             {
-                if let Some(window) = tray.app_handle().get_webview_window(MAIN_WINDOW_LABEL)
-                    && let Some(menu) = tray
-                        .app_handle()
-                        .try_state::<std::sync::Mutex<Menu<tauri::Wry>>>()
-                {
-                    match menu.lock() {
-                        Ok(menu) => {
-                            if let Err(error) = window.popup_menu_at(&*menu, *position) {
-                                log::warn!("failed to show tray menu: {error}");
-                            }
-                        }
-                        Err(error) => log::error!("tray menu lock poisoned: {error}"),
-                    }
-                }
+                return;
             }
-            if let TrayIconEvent::Click {
-                button: MouseButton::Right,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                show_main_window(tray.app_handle());
+            if let Err(error) = app.emit("app://navigate", route) {
+                log::warn!("failed to navigate from tray: {error}");
             }
-        });
+        } else if id == TRAY_QUIT_MENU_ID {
+            request_quit(app);
+        }
+    });
 
     // 单色样式走 macOS 模板图标，系统按 alpha 形状适配深浅色外观；
     // 蓝色与双色是固定颜色，不参与模板反色。
@@ -466,6 +432,21 @@ fn show_main_window(app: &tauri::AppHandle) {
 
 #[cfg(test)]
 mod tray_tests {
+    /// Tauri turns `productName` into a kebab-case package name for deb/rpm, so `PeerDav` used to
+    /// install as `peer-dav`, which does not match the binary, the desktop entry, or the docs.
+    #[test]
+    fn product_name_matches_the_package_identifier() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("valid tauri config");
+        assert_eq!(config["productName"], "peerdav");
+        assert_eq!(config["identifier"], "ai.aidyou.peerdav");
+
+        // The Tauri config schema accepts the file as written.
+        let parsed: tauri::utils::config::Config =
+            serde_json::from_value(config).expect("tauri config schema");
+        assert_eq!(parsed.product_name.as_deref(), Some("peerdav"));
+    }
+
     #[test]
     fn menu_labels_use_one_language() {
         assert_eq!(super::tray_display_name("zh-CN"), "邻盘");

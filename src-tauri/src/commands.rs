@@ -274,22 +274,7 @@ pub async fn refresh_tray_menu(
         .map_err(native)?,
     )
     .map_err(native)?;
-    #[cfg(target_os = "linux")]
-    {
-        tray.set_menu(Some(menu)).map_err(native)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = tray;
-        if let Some(stored) = app.try_state::<std::sync::Mutex<Menu<tauri::Wry>>>() {
-            *stored.lock().map_err(|error| {
-                AppError::from(DomainError::Internal {
-                    detail: error.to_string(),
-                })
-            })? = menu;
-        }
-        Ok(())
-    }
+    tray.set_menu(Some(menu)).map_err(native)
 }
 
 #[tauri::command]

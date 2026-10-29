@@ -19,7 +19,7 @@ Open the release page and choose the package for your operating system and proce
 Install PeerDav in **Applications**. If macOS blocks it with a message such as “developer cannot be verified” or “app is damaged,” first check that the download is complete and comes from the release page above. For a trusted copy, open Terminal and remove the quarantine attribute from this app only:
 
 ```sh
-xattr -dr com.apple.quarantine "/Applications/PeerDav.app"
+xattr -dr com.apple.quarantine "/Applications/peerdav.app"
 ```
 
 Then open PeerDav again. Adjust the path if you installed it elsewhere. This command removes the downloaded-file quarantine flag; it does not repair a damaged download. If macOS reports malware, do not bypass that warning. Do not disable Gatekeeper system-wide.

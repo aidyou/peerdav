@@ -184,3 +184,51 @@ jobs:
           tagName: ${{ github.ref_name }}
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
           uploadUpdaterJson: true
+
+  # 客户端按 {{bundle_type}} 请求 latest-deb.json / latest-rpm.json 等，
+  # 而 tauri-action 只在合并后的 latest.json 里写入 linux-x86_64-deb 这类目标。
+  # 这里把合并后的清单按包类型拆分上传，两种读取方式都能拿到可安装的包。
+  finalize_updater_manifests:
+    name: Finalize updater manifests
+    needs: [create_release, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download the merged manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p updater-manifests
+          gh release download "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'latest.json' \
+            --dir updater-manifests \
+            --clobber
+          if [ "$(jq -r '.platforms | length' updater-manifests/latest.json)" -eq 0 ]; then
+            echo "::error title=清单为空::latest.json 没有 platforms 条目，无法生成分包清单"
+            exit 1
+          fi
+
+      - name: Split the manifest per bundle type
+        run: |
+          set -euo pipefail
+          for bundle in nsis app deb rpm appimage; do
+            jq --arg suffix "-$bundle" '
+              .platforms |= with_entries(select(.key | endswith($suffix)))
+            ' updater-manifests/latest.json > "updater-manifests/latest-$bundle.json"
+            count=$(jq -r '.platforms | length' "updater-manifests/latest-$bundle.json")
+            if [ "$count" -eq 0 ]; then
+              echo "::error title=缺少 $bundle 更新目标::latest.json 中没有 *-$bundle 平台"
+              exit 1
+            fi
+            echo "latest-$bundle.json: $count 个平台"
+          done
+
+      - name: Upload per-bundle manifests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" updater-manifests/latest-*.json \
+            --repo "${{ github.repository }}" \
+            --clobber

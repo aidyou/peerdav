@@ -1,11 +1,14 @@
 use std::sync::Mutex;
-use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_updater::UpdaterExt;
 
 use super::error::UpdateError;
-use super::types::{ReadyUpdate, UpdatePhase, UpdateStatus};
+use super::proxy;
+use super::types::{
+    CHECK_TIMEOUT, CONNECT_TIMEOUT, ProxyChoice, READ_TIMEOUT, ReadyUpdate, UpdatePhase,
+    UpdateStatus,
+};
 use crate::AppError;
 
 pub(crate) struct UpdateManager {
@@ -64,10 +67,22 @@ impl UpdateManager {
             status.total = None;
         });
         let result = async {
-            let updater = app
+            let mut builder = app
                 .updater_builder()
-                .timeout(Duration::from_secs(60))
-                .build()?;
+                .timeout(CHECK_TIMEOUT)
+                .configure_client(|client| {
+                    client
+                        .connect_timeout(CONNECT_TIMEOUT)
+                        .read_timeout(READ_TIMEOUT)
+                });
+            match proxy::resolve().await {
+                ProxyChoice::Url(proxy) => builder = builder.proxy(proxy),
+                // A configured proxy that is not running must not swallow every request: the
+                // client would otherwise keep reading the same stale variable from the environment.
+                ProxyChoice::Direct => builder = builder.no_proxy(),
+                ProxyChoice::Platform => {}
+            }
+            let updater = builder.build()?;
             let Some(update) = updater.check().await? else {
                 self.change(app, |status| status.phase = UpdatePhase::UpToDate);
                 return Ok::<(), UpdateError>(());
@@ -184,10 +199,21 @@ mod tests {
         let updater_config: tauri_plugin_updater::Config =
             serde_json::from_value(config["plugins"]["updater"].clone())?;
         assert!(!updater_config.pubkey.trim().is_empty());
-        assert_eq!(updater_config.endpoints.len(), 1);
+        // The per-bundle manifest must come first: it is the only way a deb/rpm install gets the
+        // package it can actually install, and the generic manifest stays as the last resort.
+        let endpoints: Vec<_> = updater_config
+            .endpoints
+            .iter()
+            .map(|url| url.as_str())
+            .collect();
         assert_eq!(
-            updater_config.endpoints[0].as_str(),
-            "https://github.com/aidyou/peerdav/releases/latest/download/latest.json"
+            endpoints,
+            [
+                "https://github.com/aidyou/peerdav/releases/latest/download/latest-%7B%7Bbundle_type%7D%7D.json",
+                "https://github.com/aidyou/peerdav/releases/latest/download/latest.json",
+                "https://cdn.jsdelivr.net/gh/aidyou/peerdav@updater-meta/latest-%7B%7Bbundle_type%7D%7D.json",
+                "https://cdn.jsdelivr.net/gh/aidyou/peerdav@updater-meta/latest.json",
+            ]
         );
         let manager = UpdateManager::new("0.1.0".into(), Some(&config["plugins"]["updater"]));
         assert!(manager.snapshot().configured);

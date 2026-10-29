@@ -1,0 +1,54 @@
+name: Publish Updater Metadata
+
+# 发布正式版本后，把 latest.json 与 latest-{nsis,app,deb,rpm,appimage}.json
+# 推送到 updater-meta 分支，供客户端在 GitHub 不可达时通过 jsDelivr 获取：
+# https://cdn.jsdelivr.net/gh/aidyou/peerdav@updater-meta/latest-deb.json
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-updater-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish updater metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download updater manifests from the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p updater-dist
+          gh release download "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'latest*.json' \
+            --dir updater-dist \
+            --clobber
+          for bundle in nsis app deb rpm appimage; do
+            if [ ! -f "updater-dist/latest-$bundle.json" ]; then
+              echo "::error title=缺少 latest-$bundle.json::发布 ${{ github.event.release.tag_name }} 前请确认 release.yml 的 finalize_updater_manifests 已执行"
+              exit 1
+            fi
+          done
+          ls -l updater-dist
+
+      - name: Deploy to updater-meta branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./updater-dist
+          publish_branch: updater-meta
+          keep_files: false
+          user_name: 'github-actions[bot]'
+          user_email: 'github-actions[bot]@users.noreply.github.com'
+          commit_message: 'Publish updater manifests for ${{ github.event.release.tag_name }}'
