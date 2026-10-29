@@ -478,6 +478,8 @@ export default {
   "peer.noUploadFiles": "No files to upload after applying .gitignore and built-in temporary-file rules.",
   "peer.pickDownloadFolder": "Choose where to save (the selected folder will be created inside)",
   "peer.emptyDir": "This folder is empty.",
+  "peer.loading": "Loading…",
+  "peer.loadFailed": "Loading failed. Click the path bar to retry.",
   "peer.truncated": "The listing was truncated.",
   "peer.upload": "Upload",
   "peer.uploadFiles": "Upload files",

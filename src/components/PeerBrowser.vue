@@ -445,6 +445,10 @@ function reset() {
   peerNoticeState.value = null;
   columnStack.value = [];
   clearSelection();
+  // 切换对端时作废仍在飞行的目录请求，避免旧结果落到新对端上。
+  navigationToken += 1;
+  navigating.value = false;
+  loadFailed.value = false;
   downloadOpen.value = false;
   downloadTransferId.value = "";
   downloadDialogOpen.value = false;
@@ -460,6 +464,10 @@ function reset() {
   uploadRunning.value = false;
   uploadCanceled.value = false;
 }
+
+const navigating = ref(false);
+const loadFailed = ref(false);
+let navigationToken = 0;
 
 function applyListing(listing) {
   peerListing.value = listing;
@@ -502,11 +510,29 @@ async function rebuildColumnStack() {
   columnStack.value = listings;
 }
 
+// 进入目录时先更新地址栏并清空文件区放上 loading，让"已进入"立刻可见；
+// 令牌保证用户中途再导航时，旧请求返回的内容不会覆盖新目录。
 async function loadPath(path) {
-  const listing = await fetchListing(path);
-  applyListing(listing);
-  if (viewMode.value === "columns") {
-    await rebuildColumnStack();
+  const token = ++navigationToken;
+  peerPath.value = path;
+  peerListing.value = null;
+  loadFailed.value = false;
+  clearSelection();
+  clearPreview();
+  navigating.value = true;
+  try {
+    const listing = await fetchListing(path);
+    if (token !== navigationToken) return;
+    applyListing(listing);
+    if (viewMode.value === "columns") {
+      await rebuildColumnStack();
+    }
+  } catch (error) {
+    if (token !== navigationToken) return;
+    loadFailed.value = true;
+    app.handleFailure(error);
+  } finally {
+    if (token === navigationToken) navigating.value = false;
   }
 }
 
@@ -524,20 +550,21 @@ async function loadPeer() {
 }
 
 async function openShare(shareId) {
-  if (busy.value) return;
+  if (!props.peer.id) return;
   activeShareId.value = shareId;
-  clearSelection();
-  await run(() => loadPath("/"));
+  void loadPath("/");
 }
 
+// 导航不再被 busy 阻塞：用户可以在下载等操作进行中继续切换目录，
+// 竞态由 loadPath 内的令牌保证。
 async function browse(path) {
-  if (!props.peer.id || !activeShareId.value || busy.value) return;
-  await run(() => loadPath(path));
+  if (!props.peer.id || !activeShareId.value) return;
+  void loadPath(path);
 }
 
 async function refreshListing() {
-  if (!activeShareId.value || busy.value) return;
-  await run(() => loadPath(peerPath.value));
+  if (!activeShareId.value) return;
+  void loadPath(peerPath.value);
 }
 
 function isSelected(entry) {
@@ -787,6 +814,8 @@ async function downloadEntry(entry) {
       defaultPath: entry.name,
     });
     if (!target) return;
+    // 下载已开始，选中状态不应残留在已下载的条目上。
+    clearSelection();
 
     const transferId = newTransferId();
     downloadTransferId.value = transferId;
@@ -926,6 +955,8 @@ async function downloadDirectory(entry) {
     });
     const localParent = typeof selected === "string" ? selected : "";
     if (!localParent) return;
+    // 下载已开始，选中状态不应残留在已下载的条目上。
+    clearSelection();
 
     const request = (conflict) =>
       app.invoke("prepare_peer_directory_download", {
@@ -1015,6 +1046,8 @@ async function downloadBatch(entries) {
     });
     const localParent = typeof selected === "string" ? selected : "";
     if (!localParent) return;
+    // 下载已开始，选中状态不应残留在已下载的条目上。
+    clearSelection();
 
     batchConflict.value = "fail";
     batchConflictResolved = false;
@@ -1088,10 +1121,11 @@ async function revealSavedFile() {
 }
 
 // 批量/目录下载完成后打开本地根目录，与单文件下载的入口保持一致。
+// 根目录是文件夹，reveal_local_file 只接受普通文件，因此用目录版命令。
 async function revealDownloadRoot() {
   if (!downloadRoot.value) return;
   try {
-    await app.invoke("reveal_local_file", { path: downloadRoot.value });
+    await app.invoke("reveal_local_directory", { path: downloadRoot.value });
     downloadDialogOpen.value = false;
   } catch (error) {
     app.handleFailure(error);
@@ -1816,6 +1850,15 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
           <p v-if="!peerListing.entries.length" class="file-empty">
             {{ t("peer.emptyDir") }}
           </p>
+        </div>
+
+        <!-- 加载中先清空旧内容并给出即时反馈；失败时提示可点击地址栏重试。 -->
+        <div v-else class="file-view file-view--placeholder" :aria-busy="navigating">
+          <div v-if="navigating" class="file-loading">
+            <span class="file-loading__spinner" aria-hidden="true"></span>
+            <span>{{ t("peer.loading") }}</span>
+          </div>
+          <p v-else class="file-empty">{{ t("peer.loadFailed") }}</p>
         </div>
 
         <div
@@ -2604,7 +2647,9 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
 .file-table td {
   padding: 7px 9px;
-  border-bottom: 1px solid color-mix(in oklab, var(--app-border) 70%, transparent);
+  /* 行分隔线用文字色按比例调出，亮色和暗色下都比 --app-border 更清晰，
+     多选行的背景之上也能保持可辨。 */
+  border-bottom: 1px solid color-mix(in oklab, var(--app-text) 20%, var(--app-surface));
   color: var(--app-text-secondary);
   white-space: nowrap;
 }
@@ -2844,6 +2889,42 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   text-align: center;
   font-size: 13px;
   color: var(--app-text-muted);
+}
+
+.file-view--placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.file-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--app-text-muted);
+  font-size: 13px;
+}
+
+.file-loading__spinner {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border: 2px solid var(--app-border);
+  border-top-color: var(--el-color-primary);
+  border-radius: 50%;
+  animation: file-loading-spin 0.8s linear infinite;
+}
+
+@keyframes file-loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .file-loading__spinner {
+    animation: none;
+  }
 }
 
 .selection-bar {

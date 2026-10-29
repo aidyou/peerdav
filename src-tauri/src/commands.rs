@@ -1290,6 +1290,19 @@ pub async fn reveal_local_file(app: AppHandle, path: String) -> Result<(), AppEr
     })
 }
 
+/// Opens the downloaded folder itself in the platform file manager. Batch and
+/// directory downloads hand back a folder, which `reveal_local_file` rejects.
+#[tauri::command]
+pub async fn reveal_local_directory(app: AppHandle, path: String) -> Result<(), AppError> {
+    ensure_local_directory(&path).await?;
+    app.opener().open_path(&path, None::<&str>).map_err(|error| {
+        AppError::from(DomainError::ExternalReveal {
+            path: path.clone(),
+            detail: error.to_string(),
+        })
+    })
+}
+
 async fn ensure_downloaded_file(path: &str) -> Result<(), AppError> {
     let target = Path::new(path);
     if path.trim().is_empty() {
@@ -1313,6 +1326,40 @@ async fn ensure_downloaded_file(path: &str) -> Result<(), AppError> {
             source: std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "the path is not a regular file",
+            ),
+        }));
+    }
+    Ok(())
+}
+
+/// Mirrors `ensure_downloaded_file` for folders opened from the transfer
+/// dialogs. Symlinks stay rejected so a link never silently opens elsewhere.
+async fn ensure_local_directory(path: &str) -> Result<(), AppError> {
+    let target = Path::new(path);
+    if path.trim().is_empty() {
+        return Err(AppError::from(DomainError::Io {
+            operation: "inspect downloaded folder",
+            path: None,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the folder path is empty",
+            ),
+        }));
+    }
+    let metadata = tokio::fs::symlink_metadata(target).await.map_err(|error| {
+        AppError::from(DomainError::Io {
+            operation: "inspect downloaded folder",
+            path: Some(target.to_path_buf()),
+            source: error,
+        })
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AppError::from(DomainError::Io {
+            operation: "inspect downloaded folder",
+            path: Some(target.to_path_buf()),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the path is not a directory",
             ),
         }));
     }
@@ -1596,6 +1643,35 @@ mod tests {
         let error = ensure_downloaded_file(missing.to_str().expect("utf8"))
             .await
             .expect_err("missing file");
+        assert_eq!(error.code, "IO_FAILED");
+    }
+
+    #[tokio::test]
+    async fn downloaded_folder_actions_only_accept_directories() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let folder = temp.path().join("downloads");
+        std::fs::create_dir(&folder).expect("download folder");
+        ensure_local_directory(folder.to_str().expect("utf8"))
+            .await
+            .expect("directory");
+
+        // 普通文件不能当作目录打开，提示必须贴近真相。
+        let file = temp.path().join("saved.txt");
+        std::fs::write(&file, b"saved").expect("saved file");
+        let error = ensure_local_directory(file.to_str().expect("utf8"))
+            .await
+            .expect_err("regular file");
+        assert_eq!(error.code, "IO_FAILED");
+        assert_eq!(error.message, "文件操作失败：the path is not a directory");
+        assert_eq!(
+            error.detail,
+            Some("I/O operation `inspect downloaded folder` failed: the path is not a directory".to_owned())
+        );
+
+        let missing = temp.path().join("missing");
+        let error = ensure_local_directory(missing.to_str().expect("utf8"))
+            .await
+            .expect_err("missing folder");
         assert_eq!(error.code, "IO_FAILED");
     }
 }

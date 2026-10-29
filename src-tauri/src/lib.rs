@@ -253,6 +253,7 @@ pub fn run() {
                     commands::prepare_peer_directory_download,
                     commands::open_local_file,
                     commands::reveal_local_file,
+                    commands::reveal_local_directory,
                     commands::collect_upload_paths,
                     commands::begin_peer_upload,
                     commands::cancel_peer_upload,

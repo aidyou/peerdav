@@ -478,6 +478,8 @@ export default {
   "peer.noUploadFiles": "没有可上传的文件（已按 .gitignore 和内置临时文件规则忽略）。",
   "peer.pickDownloadFolder": "选择下载位置（将在其中创建所选文件夹）",
   "peer.emptyDir": "这个文件夹是空的。",
+  "peer.loading": "正在加载…",
+  "peer.loadFailed": "加载失败，请点击地址栏重试。",
   "peer.truncated": "列表已截断。",
   "peer.upload": "上传",
   "peer.uploadFiles": "上传文件",

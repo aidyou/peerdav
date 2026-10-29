@@ -2132,6 +2132,46 @@ describe("Finder-style peer browser", () => {
     wrapper.unmount();
   });
 
+  it("clears the file area with loading while entering and drops stale listings", async () => {
+    let resolveSub;
+    const subListing = {
+      ...LISTING,
+      path: "/sub",
+      entries: [{ ...LISTING.entries[1], path: "/sub/inner.txt", name: "inner.txt" }],
+    };
+    const { wrapper } = await openBrowser({
+      list_peer_dir: async ({ path }) => {
+        if (path === "/sub") {
+          return new Promise((resolve) => {
+            resolveSub = resolve;
+          });
+        }
+        return LISTING;
+      },
+    });
+
+    // 双击进入：地址栏立即变化，文件区清空并显示 loading。
+    await wrapper.find(".file-tile").trigger("dblclick");
+    await flushPromises();
+    expect(wrapper.find(".breadcrumb.is-current").text()).toBe("sub");
+    expect(wrapper.find(".file-loading").exists()).toBe(true);
+    expect(wrapper.find(".file-loading").text()).toContain("正在加载");
+    expect(wrapper.find(".icon-grid").exists()).toBe(false);
+
+    // 用户在慢目录返回前从地址栏返回上一级。
+    await wrapper.find(".breadcrumb").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".icon-grid").exists()).toBe(true);
+    expect(wrapper.find(".file-loading").exists()).toBe(false);
+
+    // 旧目录的迟到的结果必须不能覆盖当前根目录视图。
+    resolveSub(subListing);
+    await flushPromises();
+    expect(wrapper.find(".breadcrumb.is-current").text()).toBe("Docs");
+    expect(wrapper.findAll(".file-tile")).toHaveLength(2);
+    wrapper.unmount();
+  });
+
   it("goes up one level with Alt+ArrowUp and selects first or last after entering", async () => {
     const subListing = {
       ...LISTING,
@@ -2711,6 +2751,14 @@ describe("Finder-style peer browser", () => {
     expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(3);
     expect(wrapper.find(".selection-bar").text()).toContain("已选 3 项");
 
+    // macOS 习惯用 Cmd（metaKey）做跳跃多选，与 Ctrl 等价。
+    await tiles[0].trigger("click");
+    await flushPromises();
+    await tiles[2].trigger("click", { metaKey: true });
+    await flushPromises();
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(2);
+    expect(wrapper.find(".selection-bar").text()).toContain("已选 2 项");
+
     // 清除选择回到空态（画廊外不显示底栏）。
     await wrapper.find(".selection-clear").trigger("click");
     await flushPromises();
@@ -2780,7 +2828,7 @@ describe("Finder-style peer browser", () => {
       list_peer_dir: async () => listing,
       prepare_peer_directory_download: prepare,
       download_peer_file: downloadFile,
-      reveal_local_file: revealLocal,
+      reveal_local_directory: revealLocal,
     });
 
     const tiles = wrapper.findAll(".file-tile");
