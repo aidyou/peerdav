@@ -235,7 +235,7 @@ jobs:
               --arg pub_date "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
               --arg url "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$filename" \
               --arg signature "$(cat "$artifact.sig")" \
-              --arg platform "$platform" \
+              --arg platform "${platform}-${bundle_type}" \
               '{version: $version, notes: "", pub_date: $pub_date, platforms: {($platform): {url: $url, signature: $signature}}}' \
               > "$manifest"
           done
