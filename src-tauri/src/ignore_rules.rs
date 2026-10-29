@@ -135,7 +135,17 @@ mod tests {
         assert!(!is_builtin_ignored("module.pyc", false));
         assert!(is_builtin_ignored("Thumbs.db", false));
         assert!(!is_builtin_ignored("project.egg-info", true));
-        for name in [".git", ".hg", ".svn", ".env", ".gitignore", ".config", ".coverage", "file.tmp", "file~"] {
+        for name in [
+            ".git",
+            ".hg",
+            ".svn",
+            ".env",
+            ".gitignore",
+            ".config",
+            ".coverage",
+            "file.tmp",
+            "file~",
+        ] {
             assert!(!is_builtin_ignored(name, true), "{name}");
             assert!(!is_builtin_ignored(name, false), "{name}");
         }

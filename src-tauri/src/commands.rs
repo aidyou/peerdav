@@ -1122,7 +1122,10 @@ pub async fn collect_upload_paths(
     paths: Vec<String>,
     ignore_options: Option<crate::types::IgnoreOptions>,
 ) -> Result<Vec<UploadCandidate>, AppError> {
-    run_blocking(move || collect_upload_candidates_with_options(&paths, &ignore_options.unwrap_or_default())).await
+    run_blocking(move || {
+        collect_upload_candidates_with_options(&paths, &ignore_options.unwrap_or_default())
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1194,13 +1197,21 @@ fn walk_upload_dir(
         .require_git(false)
         .follow_links(false)
         .filter_entry(move |entry| {
-            if entry.path() == filter_root { return true; }
+            if entry.path() == filter_root {
+                return true;
+            }
             let is_dir = entry.file_type().is_some_and(|kind| kind.is_dir());
             !is_builtin_ignored(&entry.file_name().to_string_lossy(), is_dir)
                 && !matcher.as_ref().is_some_and(|matcher| {
-                    entry.path().strip_prefix(&filter_root).ok().is_some_and(|relative| {
-                        matcher.matched_path_or_any_parents(relative, is_dir).is_ignore()
-                    })
+                    entry
+                        .path()
+                        .strip_prefix(&filter_root)
+                        .ok()
+                        .is_some_and(|relative| {
+                            matcher
+                                .matched_path_or_any_parents(relative, is_dir)
+                                .is_ignore()
+                        })
                 })
         });
 
@@ -1295,12 +1306,14 @@ pub async fn reveal_local_file(app: AppHandle, path: String) -> Result<(), AppEr
 #[tauri::command]
 pub async fn reveal_local_directory(app: AppHandle, path: String) -> Result<(), AppError> {
     ensure_local_directory(&path).await?;
-    app.opener().open_path(&path, None::<&str>).map_err(|error| {
-        AppError::from(DomainError::ExternalReveal {
-            path: path.clone(),
-            detail: error.to_string(),
+    app.opener()
+        .open_path(&path, None::<&str>)
+        .map_err(|error| {
+            AppError::from(DomainError::ExternalReveal {
+                path: path.clone(),
+                detail: error.to_string(),
+            })
         })
-    })
 }
 
 async fn ensure_downloaded_file(path: &str) -> Result<(), AppError> {
@@ -1613,15 +1626,25 @@ mod tests {
         let root = temp.path().join("project");
         std::fs::create_dir_all(root.join("cache")).expect("cache");
         std::fs::write(root.join(".gitignore"), b"*.txt\n").expect("rules");
-        for name in ["keep.txt", "drop.log", "keep.log", ".DS_Store", "cache/item"] {
+        for name in [
+            "keep.txt",
+            "drop.log",
+            "keep.log",
+            ".DS_Store",
+            "cache/item",
+        ] {
             std::fs::write(root.join(name), b"fixture").expect("file");
         }
         let options = crate::types::IgnoreOptions {
             respect_gitignore: false,
             patterns: "cache/\n*.log\n!keep.log\n!.DS_Store\n".to_owned(),
         };
-        let files = collect_upload_candidates_with_options(&[root.display().to_string()], &options).expect("queue");
-        let names: Vec<_> = files.iter().map(|file| file.relative_path.as_str()).collect();
+        let files = collect_upload_candidates_with_options(&[root.display().to_string()], &options)
+            .expect("queue");
+        let names: Vec<_> = files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect();
         assert!(names.contains(&"project/keep.txt"));
         assert!(names.contains(&"project/keep.log"));
         assert!(names.contains(&"project/.gitignore"));
@@ -1665,7 +1688,10 @@ mod tests {
         assert_eq!(error.message, "文件操作失败：the path is not a directory");
         assert_eq!(
             error.detail,
-            Some("I/O operation `inspect downloaded folder` failed: the path is not a directory".to_owned())
+            Some(
+                "I/O operation `inspect downloaded folder` failed: the path is not a directory"
+                    .to_owned()
+            )
         );
 
         let missing = temp.path().join("missing");

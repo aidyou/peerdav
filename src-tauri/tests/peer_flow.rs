@@ -1041,19 +1041,22 @@ async fn prepares_directory_downloads_with_gitignore_and_nested_paths() {
         .iter()
         .map(|file| file.relative_path.as_str())
         .collect();
-    for expected in [".gitignore", "inner.txt", "keep.log", "nested/keep.txt",
-        ".git/HEAD", ".env", "module.pyc", "__pycache__/x.pyc"] {
+    for expected in [
+        ".gitignore",
+        "inner.txt",
+        "keep.log",
+        "nested/keep.txt",
+        ".git/HEAD",
+        ".env",
+        "module.pyc",
+        "__pycache__/x.pyc",
+    ] {
         assert!(
             relative.contains(&expected),
             "{expected} should be queued: {relative:?}"
         );
     }
-    for ignored in [
-        "ignored.txt",
-        "drop.log",
-        "nested/drop.log",
-        ".DS_Store",
-    ] {
+    for ignored in ["ignored.txt", "drop.log", "nested/drop.log", ".DS_Store"] {
         assert!(
             !relative.contains(&ignored),
             "{ignored} should be ignored: {relative:?}"
@@ -1065,11 +1068,23 @@ async fn prepares_directory_downloads_with_gitignore_and_nested_paths() {
         respect_gitignore: false,
         patterns: "__pycache__/\n*.log\n!keep.log\n".to_owned(),
     };
-    let custom_plan = harness.peers.prepare_directory_download_with_options(
-        &peer_id, &share_id, "/sub", unfiltered_downloads.path().to_str().expect("utf8"),
-        ConflictPolicy::Fail, &options,
-    ).await.expect("custom plan");
-    let names: Vec<_> = custom_plan.files.iter().map(|file| file.relative_path.as_str()).collect();
+    let custom_plan = harness
+        .peers
+        .prepare_directory_download_with_options(
+            &peer_id,
+            &share_id,
+            "/sub",
+            unfiltered_downloads.path().to_str().expect("utf8"),
+            ConflictPolicy::Fail,
+            &options,
+        )
+        .await
+        .expect("custom plan");
+    let names: Vec<_> = custom_plan
+        .files
+        .iter()
+        .map(|file| file.relative_path.as_str())
+        .collect();
     assert!(names.contains(&"ignored.txt"));
     assert!(names.contains(&"module.pyc"));
     assert!(names.contains(&".git/HEAD"));

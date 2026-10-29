@@ -487,11 +487,10 @@ impl PeerManager {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
                     _ = tcp.tick() => {
-                        if manager.vault.is_unlocked() {
-                            if let Err(error) = manager.scan_lan_tcp().await {
+                        if manager.vault.is_unlocked()
+                            && let Err(error) = manager.scan_lan_tcp().await {
                                 manager.events.error(&AppError::from_ref(&error));
                             }
-                        }
                     }
                     _ = presence.tick() => {
                         manager.reconcile_announced_peers();
@@ -1954,9 +1953,14 @@ impl PeerManager {
         conflict: ConflictPolicy,
     ) -> Result<DirectoryDownloadPlan, DomainError> {
         self.prepare_directory_download_with_options(
-            peer_id, share_id, remote_path, local_parent, conflict,
+            peer_id,
+            share_id,
+            remote_path,
+            local_parent,
+            conflict,
             &crate::types::IgnoreOptions::default(),
-        ).await
+        )
+        .await
     }
 
     pub async fn prepare_directory_download_with_options(
@@ -2014,9 +2018,9 @@ impl PeerManager {
             }
             if options.respect_gitignore
                 && let Some(ignore_entry) = listing
-                .entries
-                .iter()
-                .find(|entry| !entry.is_dir && entry.name == ".gitignore")
+                    .entries
+                    .iter()
+                    .find(|entry| !entry.is_dir && entry.name == ".gitignore")
                 && let Some(content) = self
                     .read_remote_ignore_file(peer_id, share_id, &ignore_entry.path)
                     .await?
@@ -2038,7 +2042,9 @@ impl PeerManager {
                     format!("{relative_parent}/{name}")
                 };
                 if custom_rules.as_ref().is_some_and(|matcher| {
-                    matcher.matched_path_or_any_parents(Path::new(&relative), entry.is_dir).is_ignore()
+                    matcher
+                        .matched_path_or_any_parents(Path::new(&relative), entry.is_dir)
+                        .is_ignore()
                 }) {
                     continue;
                 }

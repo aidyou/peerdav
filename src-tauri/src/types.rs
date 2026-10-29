@@ -44,7 +44,10 @@ pub struct IgnoreOptions {
 
 impl Default for IgnoreOptions {
     fn default() -> Self {
-        Self { respect_gitignore: true, patterns: String::new() }
+        Self {
+            respect_gitignore: true,
+            patterns: String::new(),
+        }
     }
 }
 

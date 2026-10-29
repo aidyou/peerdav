@@ -372,10 +372,10 @@ pub(crate) fn visible_reason(detail: &str) -> String {
     let mut reason = detail.trim();
     loop {
         let previous = reason;
-        if reason.starts_with("error sending request for url (") {
-            if let Some((_, rest)) = reason.split_once("): ") {
-                reason = rest;
-            }
+        if reason.starts_with("error sending request for url (")
+            && let Some((_, rest)) = reason.split_once("): ")
+        {
+            reason = rest;
         }
         for prefix in [
             "client error (Connect): ",

@@ -454,10 +454,10 @@ fn upsert_live(
         let previous = record.peer.clone();
         update_discovered_peer(&mut record.peer, &announcement);
         if let Some(url) = &record.verified_url {
-            if let Ok(parsed) = url::Url::parse(url) {
-                if let Some(host) = parsed.host_str() {
-                    push_host(&mut record.peer.hosts, host.to_owned());
-                }
+            if let Ok(parsed) = url::Url::parse(url)
+                && let Some(host) = parsed.host_str()
+            {
+                push_host(&mut record.peer.hosts, host.to_owned());
             }
             record.peer.url = url.clone();
         }
