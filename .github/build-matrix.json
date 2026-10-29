@@ -43,7 +43,7 @@
       "arch": "x86_64",
       "os": "macos-15-intel",
       "target": "x86_64-apple-darwin",
-      "bundles": "dmg",
+      "bundles": "app,dmg",
       "artifact_paths": "src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg"
     },
     {
@@ -52,7 +52,7 @@
       "arch": "arm64",
       "os": "macos-15",
       "target": "aarch64-apple-darwin",
-      "bundles": "dmg",
+      "bundles": "app,dmg",
       "artifact_paths": "src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg"
     }
   ]

@@ -188,6 +188,8 @@ jobs:
   # 客户端按 {{bundle_type}} 请求 latest-deb.json / latest-rpm.json 等，
   # 而 tauri-action 只在合并后的 latest.json 里写入 linux-x86_64-deb 这类目标。
   # 这里把合并后的清单按包类型拆分上传，两种读取方式都能拿到可安装的包。
+  # 注意：macOS 的更新包是 .app.tar.gz，必须同时构建 app 包才会产生 darwin-*-app 目标，
+  # 因此 build-matrix.json 中的 macOS 目标使用 app,dmg，只构建 dmg 会让这里缺少 app 目标。
   finalize_updater_manifests:
     name: Finalize updater manifests
     needs: [create_release, build]
