@@ -1,4 +1,4 @@
-export const SETTINGS_TABS = ["general", "shares", "clients", "service", "account"];
+export const SETTINGS_TABS = ["general", "shares", "clients", "service", "account", "cloud"];
 
 export function normalizeSettingsTab(value) {
   return SETTINGS_TABS.includes(value) ? value : "general";

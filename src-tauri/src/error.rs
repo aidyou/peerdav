@@ -225,6 +225,14 @@ pub enum DomainError {
         detail: String,
     },
 
+    #[error("cloud operation failed: {user_reason}")]
+    Cloud {
+        code: &'static str,
+        user_reason: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[error("internal error: {detail}")]
     Internal { detail: String },
 }
@@ -255,7 +263,10 @@ impl AppError {
     pub fn from_ref(error: &DomainError) -> Self {
         let code = error_code(error).to_owned();
         let message = user_message(error);
-        let detail = Some(error_chain(error));
+        let detail = match &error {
+            DomainError::Cloud { .. } => Some(safe_cloud_chain(error)),
+            _ => Some(error_chain(error)),
+        };
         let mut context = error_context(error).unwrap_or_else(|| json!({}));
         if let Some(reason) = frontend_reason(error) {
             context["reason"] = json!(visible_reason(&reason));
@@ -362,7 +373,141 @@ fn error_code(error: &DomainError) -> &'static str {
         DomainError::UploadQueueTooLarge { .. } => "UPLOAD_QUEUE_TOO_LARGE",
         DomainError::DownloadQueueTooLarge { .. } => "DOWNLOAD_QUEUE_TOO_LARGE",
         DomainError::Discovery { .. } => "DISCOVERY_FAILED",
+        DomainError::Cloud { code, .. } => code,
         DomainError::Internal { .. } => "INTERNAL_ERROR",
+    }
+}
+
+/// Redacts cloud diagnostics before they cross the IPC boundary or enter logs.
+/// Provider errors frequently include signed URLs and proxy credentials.
+fn safe_cloud_chain(error: &DomainError) -> String {
+    redact_cloud_diagnostic(&error_chain(error))
+}
+
+fn safe_cloud_reason(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut deepest = error;
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if !cause.to_string().trim().is_empty() {
+            deepest = cause;
+        }
+        source = cause.source();
+    }
+    redact_cloud_diagnostic(&deepest.to_string())
+}
+
+fn redact_cloud_diagnostic(value: &str) -> String {
+    let mut pending_credential = false;
+    let mut lines = Vec::new();
+    for line in value.lines() {
+        if pending_credential {
+            lines.push("[凭据]".to_owned());
+            pending_credential = false;
+            continue;
+        }
+        let (safe, pending) = redact_cloud_line(line);
+        lines.push(safe);
+        pending_credential = pending;
+    }
+    lines.join("\n")
+}
+
+fn redact_cloud_line(line: &str) -> (String, bool) {
+    let lower = line.to_ascii_lowercase();
+    let labels = [
+        "authorization:",
+        "authorization=",
+        "proxy-authorization:",
+        "proxy-authorization=",
+        "\"secretkey\":",
+        "\"secretkey\"=",
+        "secretkey:",
+        "secretkey=",
+        "secret_key:",
+        "secret_key=",
+        "\"accesskey\":",
+        "\"accesskey\"=",
+        "accesskey:",
+        "accesskey=",
+        "access_key:",
+        "access_key=",
+        "\"awsaccesskeyid\":",
+        "\"awsaccesskeyid\"=",
+        "awsaccesskeyid:",
+        "awsaccesskeyid=",
+        "aws_access_key_id:",
+        "aws_access_key_id=",
+        "aws_secret_access_key:",
+        "aws_secret_access_key=",
+        "\"aws_secret_access_key\":",
+        "sessiontoken:",
+        "sessiontoken=",
+        "\"session_token\":",
+        "session_token:",
+        "session_token=",
+        "password:",
+        "password=",
+        "\"password\":",
+        "proxypassword:",
+        "proxypassword=",
+        "\"proxypassword\":",
+        "token:",
+        "token=",
+        "\"token\":",
+    ];
+    if let Some((index, label)) = labels
+        .iter()
+        .filter_map(|label| lower.find(label).map(|index| (index, *label)))
+        .min_by_key(|(index, _)| *index)
+    {
+        let prefix = &line[..index];
+        // Keep a structured HTTP status/request id prefix, but never any text
+        // following a credential assignment or authorization header.
+        let remainder = &line[index + label.len()..];
+        return (
+            format!("{}[凭据]", prefix.trim_end()),
+            remainder.trim().is_empty() || (remainder.contains('"') && !remainder.contains('}')),
+        );
+    }
+
+    let mut output = String::with_capacity(line.len());
+    for word in line.split_whitespace() {
+        let redacted = if word.contains("://") {
+            "[地址]"
+        } else if word.to_ascii_lowercase().contains("signature")
+            || word.to_ascii_lowercase().contains("x-amz-")
+        {
+            "[凭据]"
+        } else {
+            word
+        };
+        if !output.is_empty() {
+            output.push(' ');
+        }
+        output.push_str(redacted);
+    }
+    (output, false)
+}
+
+impl From<crate::cloud::types::CloudError> for DomainError {
+    fn from(source: crate::cloud::types::CloudError) -> Self {
+        use crate::cloud::types::CloudError;
+        let (code, user_reason): (&'static str, &'static str) = match &source {
+            CloudError::InvalidConfig(_) => ("CLOUD_CONFIG_INVALID", "云存储配置无效"),
+            CloudError::Precondition => ("CLOUD_PRECONDITION", "云端对象前置条件未满足"),
+            CloudError::NotFound => ("CLOUD_NOT_FOUND", "云端对象不存在"),
+            CloudError::Unsupported => ("CLOUD_UNSUPPORTED", "云服务不支持所需操作"),
+            CloudError::PayloadTooLarge => ("CLOUD_PRECONDITION", "云端对象超过大小限制"),
+            CloudError::PrefixViolation => ("CLOUD_CONFIG_INVALID", "云端对象路径不在配置范围内"),
+            CloudError::Random { .. } => ("CLOUD_CONFIG_INVALID", "云存储安全随机数生成失败"),
+            CloudError::Transport { .. } => ("CLOUD_TRANSPORT", "云存储传输失败"),
+            CloudError::Storage { .. } => ("CLOUD_STORAGE", "云存储操作失败"),
+        };
+        DomainError::Cloud {
+            code,
+            user_reason,
+            source: Box::new(source),
+        }
     }
 }
 
@@ -678,6 +823,10 @@ fn error_reason(error: &DomainError) -> String {
             )
         }
         DomainError::Discovery { detail, .. } => failure("探测设备失败", "Device discovery failed", detail),
+        DomainError::Cloud { source, .. } => {
+            let reason = safe_cloud_reason(source.as_ref());
+            failure("云存储操作失败", "Cloud storage operation failed", &reason)
+        }
         DomainError::Internal { detail } => failure("执行操作失败", "Operation failed", detail),
     }
 }

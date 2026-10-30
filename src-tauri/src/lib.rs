@@ -2,6 +2,7 @@
 //! UDP discovery, and the PeerDav client with loopback (self-connect) support.
 
 mod admin;
+pub mod cloud;
 mod commands;
 mod crypto;
 mod db;
@@ -17,6 +18,7 @@ pub mod paths;
 mod peer;
 mod policy;
 mod server;
+pub mod sync;
 mod tls;
 mod traits;
 mod transfer;
@@ -98,6 +100,22 @@ pub fn run() {
                 app.handle().clone(),
                 vault.fingerprint().to_owned(),
             ));
+            let cloud = cloud::runtime::CloudRuntime::new(
+                Arc::clone(&vault),
+                Arc::clone(&events) as Arc<dyn crate::sync::traits::SyncEvents>,
+                data_dir.clone(),
+            );
+            if vault.status()?.unlocked {
+                cloud.resume().map_err(|error| DomainError::Internal {
+                    detail: error.message,
+                })?;
+                tauri::async_runtime::block_on(cloud.refresh_schedules()).map_err(|error| {
+                    DomainError::Internal {
+                        detail: error.message,
+                    }
+                })?;
+            }
+
             let server_events: Arc<dyn ServerEvents> = Arc::clone(&events) as Arc<dyn ServerEvents>;
             let peer_events: Arc<dyn PeerEvents> = Arc::clone(&events) as Arc<dyn PeerEvents>;
             let server = Arc::new(ServerController::new(Arc::clone(&vault), server_events)?);
@@ -118,6 +136,7 @@ pub fn run() {
             if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                 window::restore(&window, &vault)?;
             }
+            app.manage(cloud::runtime_types::SharedCloud(cloud));
             app.manage(Arc::clone(&vault) as SharedVault);
             app.manage(server as SharedServer);
             app.manage(peers as SharedPeers);
@@ -262,13 +281,87 @@ pub fn run() {
                     commands::prepare_peer_external_edit,
                     commands::commit_peer_external_edit,
                     commands::discard_peer_external_edit,
+                    cloud::cloud_commands::cloud_list,
+                    cloud::cloud_commands::cloud_test_connection,
+                    cloud::cloud_commands::cloud_recovery_records,
+                    cloud::cloud_commands::cloud_restore,
+                    cloud::cloud_commands::cloud_save_connection,
+                    cloud::cloud_commands::cloud_delete_connection,
+                    cloud::cloud_commands::cloud_create_repository,
+                    cloud::cloud_commands::cloud_join_repository,
+                    cloud::cloud_commands::cloud_save_mapping,
+                    cloud::cloud_commands::cloud_delete_mapping,
+                    cloud::cloud_commands::cloud_status,
+                    cloud::cloud_commands::cloud_cancel,
+                    cloud::cloud_commands::cloud_preview,
+                    cloud::cloud_commands::cloud_sync,
                 ]);
             handler(invoke)
         })
         .build(tauri::generate_context!());
 
+    let exit_state = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let exit_task = Arc::new(std::sync::Mutex::new(
+        None::<tauri::async_runtime::JoinHandle<()>>,
+    ));
     match application {
-        Ok(app) => app.run(|app_handle, event| {
+        Ok(app) => app.run(move |app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = &event {
+                use std::sync::atomic::Ordering;
+                if exit_state.load(Ordering::Acquire) != 2 {
+                    api.prevent_exit();
+                    if exit_state
+                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        let app = app_handle.clone();
+                        let state = Arc::clone(&exit_state);
+                        let cloud = app_handle
+                            .state::<cloud::runtime_types::SharedCloud>()
+                            .0
+                            .clone();
+                        let task = tauri::async_runtime::spawn(async move {
+                            use futures_util::FutureExt;
+                            let stopped = std::panic::AssertUnwindSafe(cloud.stop_and_clear())
+                                .catch_unwind()
+                                .await;
+                            match stopped {
+                                Ok(Ok(())) => {
+                                    state.store(2, Ordering::Release);
+                                    app.exit(0);
+                                }
+                                Ok(Err(error)) => {
+                                    log::error!("cloud shutdown failed: code={}", error.code);
+                                    if let Err(emit_error) = app.emit(types::ERROR_EVENT, &error) {
+                                        log::error!("shutdown error event failed: {emit_error}");
+                                    }
+                                    state.store(0, Ordering::Release);
+                                }
+                                Err(_) => {
+                                    log::error!("cloud shutdown task panicked; exit cancelled");
+                                    let error = AppError::from(DomainError::Internal {
+                                        detail: "cloud shutdown task panicked".into(),
+                                    });
+                                    if let Err(emit_error) = app.emit(types::ERROR_EVENT, &error) {
+                                        log::error!("shutdown panic event failed: {emit_error}");
+                                    }
+                                    state.store(0, Ordering::Release);
+                                }
+                            }
+                        });
+                        match exit_task.lock() {
+                            Ok(mut slot) => {
+                                *slot = Some(task);
+                            }
+                            Err(poison) => {
+                                log::error!("shutdown task holder was poisoned");
+                                *poison.into_inner() = Some(task);
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
             if matches!(event, tauri::RunEvent::Exit) {
                 if let Some(server) = app_handle.try_state::<SharedServer>() {
                     server.request_shutdown();

@@ -14,6 +14,8 @@ use crate::error::{AppError, DomainError};
 use crate::ignore_rules::is_builtin_ignored;
 use crate::peer::{PeerManager, TransferProgressCallback};
 use crate::server::{ServerConfig, ServerController};
+use crate::sync::manager_types::SyncStatus;
+use crate::sync::traits::{BoxError, SyncEvents};
 use crate::traits::{PeerEvents, ServerEvents};
 use crate::types::{
     AccessRule, AdminLoginResult, AdminSessionInfo, ApprovePendingResult, AuthorizationInfo,
@@ -31,6 +33,7 @@ use crate::vault::Vault;
 pub type SharedVault = Arc<Vault>;
 pub type SharedServer = Arc<ServerController>;
 pub type SharedPeers = Arc<PeerManager>;
+pub type SharedCloud = crate::cloud::runtime_types::SharedCloud;
 
 const MAX_UPLOAD_FILES: usize = 10_000;
 
@@ -67,6 +70,22 @@ impl ServerEvents for AppEvents {
         if let Err(emit_error) = self.app.emit(PENDING_CANCELED_EVENT, request) {
             log::error!("failed to emit {PENDING_CANCELED_EVENT}: {emit_error}");
         }
+    }
+}
+
+impl SyncEvents for AppEvents {
+    fn progress(&self, status: SyncStatus) -> Result<(), BoxError> {
+        if let Err(error) = self.app.emit("app://cloud-progress", status) {
+            log::error!("failed to emit app://cloud-progress: {error}");
+        }
+        Ok(())
+    }
+
+    fn error(&self, error: AppError) -> Result<(), BoxError> {
+        if let Err(emit_error) = self.app.emit(ERROR_EVENT, error) {
+            log::error!("failed to emit {ERROR_EVENT}: {emit_error}");
+        }
+        Ok(())
     }
 }
 
@@ -112,14 +131,20 @@ pub async fn vault_status(vault: State<'_, SharedVault>) -> Result<VaultStatus, 
 #[tauri::command]
 pub async fn initialize_vault(
     vault: State<'_, SharedVault>,
+    cloud: State<'_, SharedCloud>,
     key_directory: String,
     admin_username: String,
     admin_password: String,
 ) -> Result<InitializeVaultResult, AppError> {
     let vault = Arc::clone(vault.inner());
     let admin_password = Zeroizing::new(admin_password);
-    run_blocking(move || vault.initialize(&key_directory, &admin_username, admin_password.as_str()))
-        .await
+    let result = run_blocking(move || {
+        vault.initialize(&key_directory, &admin_username, admin_password.as_str())
+    })
+    .await?;
+    cloud.0.resume()?;
+    cloud.0.refresh_schedules().await?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -130,24 +155,32 @@ pub fn quit_app(app: tauri::AppHandle) {
 #[tauri::command]
 pub async fn reload_vault_key(
     vault: State<'_, SharedVault>,
+    cloud: State<'_, SharedCloud>,
     path: Option<String>,
 ) -> Result<VaultStatus, AppError> {
     let vault = Arc::clone(vault.inner());
-    run_blocking(move || vault.reload_key(path.as_deref())).await
+    let status = run_blocking(move || vault.reload_key(path.as_deref())).await?;
+    if status.unlocked {
+        cloud.0.resume()?;
+        cloud.0.refresh_schedules().await?;
+    }
+    Ok(status)
 }
 
 #[tauri::command]
 pub async fn reset_vault(
     vault: State<'_, SharedVault>,
+    cloud: State<'_, SharedCloud>,
     recovery_code: String,
     key_directory: String,
     admin_username: String,
     admin_password: String,
 ) -> Result<ResetVaultResult, AppError> {
+    cloud.0.stop_and_clear().await?;
     let vault = Arc::clone(vault.inner());
     let recovery_code = Zeroizing::new(recovery_code);
     let admin_password = Zeroizing::new(admin_password);
-    run_blocking(move || {
+    let result = run_blocking(move || {
         vault.reset_lost_key(
             recovery_code.as_str(),
             &key_directory,
@@ -155,14 +188,19 @@ pub async fn reset_vault(
             admin_password.as_str(),
         )
     })
-    .await
+    .await?;
+    cloud.0.resume()?;
+    cloud.0.refresh_schedules().await?;
+    Ok(result)
 }
 
 #[tauri::command]
 pub async fn lock_vault(
     vault: State<'_, SharedVault>,
+    cloud: State<'_, SharedCloud>,
     peers: State<'_, SharedPeers>,
 ) -> Result<VaultStatus, AppError> {
+    cloud.0.stop_and_clear().await?;
     let vault = Arc::clone(vault.inner());
     let status = run_blocking(move || vault.lock()).await?;
     // Client codes left in memory and external-edit copies are dropped with

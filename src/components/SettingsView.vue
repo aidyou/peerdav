@@ -1,5 +1,6 @@
 <script setup>
-import { computed, onMounted, ref, toRef } from "vue";
+import { computed, onMounted, onBeforeUnmount, ref, toRef } from "vue";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   disable as disableAutostart,
@@ -20,11 +21,13 @@ import { accessRowState, findAccessRequest, findSavedPeer } from "../lib/access"
 import { statusTagTone } from "../lib/tagTone";
 import { validatePassword } from "../lib/password";
 import { useAction } from "../composables/useAction";
+import { cloud, blankConnection, blankMapping } from "../lib/cloud";
 import { updateState, updateBusy, updateProgress, checkForUpdates } from "../lib/updater";
 import trayMonoPreview from "../../design/icon/peerdav-tray-icon.svg";
 import trayBluePreview from "../../design/icon/peerdav-tray-icon-blue.svg";
 import trayDuoPreview from "../../design/icon/peerdav-tray-icon-duo.svg";
 import ListSkeleton from "./ListSkeleton.vue";
+import CloudSettings from "./CloudSettings.vue";
 
 const app = useAppContext();
 const { busy, run } = useAction();
@@ -62,7 +65,46 @@ const settingsTabs = [
   { name: "clients", label: "settings.tabClients" },
   { name: "service", label: "settings.tabService" },
   { name: "account", label: "settings.tabAccount" },
+  { name: "cloud", label: "settings.tabCloud" },
 ];
+
+const cloudData = ref({ connections: [], repositories: [], mappings: [], statuses: [], capabilities: { safeApply: false } });
+const cloudConnection = ref(blankConnection());
+const cloudMapping = ref(blankMapping());
+const cloudPassword = ref("");
+const cloudPasswordConfirmation = ref("");
+const cloudLoading = ref(false);
+const cloudPreview = ref(null);
+const cloudProgress = ref(null);
+const cloudRecovery = ref([]);
+let cloudUnlisten = null;
+let cloudPoll = null;
+
+function cloudFailure(error) { app.handleFailure(error); }
+async function loadCloud() {
+  cloudLoading.value = true;
+  try { cloudData.value = await cloud.list(); } catch (error) { cloudFailure(error); }
+  finally { cloudLoading.value = false; }
+}
+async function saveCloudConnection() {
+  try { await cloud.saveConnection(cloudConnection.value); cloudConnection.value = blankConnection(); await loadCloud(); app.setNotice("cloud.saved"); } catch (error) { cloudFailure(error); }
+}
+async function chooseCloudRoot() {
+  const selected = await openDialog({ directory: true, multiple: false });
+  if (typeof selected === "string") cloudMapping.value.localRoot = selected;
+}
+async function previewCloud(mapping) {
+  try { cloudPreview.value = await cloud.preview(mapping.id); } catch (error) { cloudFailure(error); }
+}
+async function syncCloud(mapping) {
+  if (!cloudPreview.value?.previewId) return;
+  try { await cloud.sync(mapping.id, cloudPreview.value.previewId); cloudPreview.value = null; await loadCloud(); } catch (error) { cloudFailure(error); }
+}
+async function cancelCloud(mapping) { try { await cloud.cancel(mapping.id); await loadCloud(); } catch (error) { cloudFailure(error); } }
+async function saveCloudMapping() {
+  try { await cloud.saveMapping(null, cloudMapping.value); cloudMapping.value = blankMapping(); await loadCloud(); } catch (error) { cloudFailure(error); }
+}
+async function loadCloudRecovery(mapping) { try { cloudRecovery.value = await cloud.recoveryRecords(mapping.id); } catch (error) { cloudFailure(error); } }
 
 const autostartEnabled = ref(false);
 const autostartLoading = ref(true);
@@ -779,6 +821,14 @@ onMounted(() => {
   void loadAutostart();
   void loadTrayIconStyle();
   void loadInitialData();
+  void loadCloud();
+  cloudPoll = setInterval(() => { if (app.settingsTab === "cloud") void loadCloud(); }, 15000);
+  void listen("app://cloud-progress", (event) => { cloudProgress.value = event.payload; }).then((unlisten) => { cloudUnlisten = unlisten; }).catch((error) => console.error("cloud progress listener", error));
+});
+
+onBeforeUnmount(() => {
+  if (cloudPoll) clearInterval(cloudPoll);
+  if (cloudUnlisten) cloudUnlisten();
 });
 
 async function loadAutostart() {
@@ -1701,6 +1751,10 @@ async function loadInitialData() {
         </div>
       </section>
 
+      <section v-if="app.settingsTab === 'cloud'" id="pane-cloud" class="settings-pane cloud-pane" role="tabpanel" aria-labelledby="tab-cloud">
+        <CloudSettings />
+      </section>
+
       <section
         v-if="app.settingsTab === 'account'"
         id="pane-account"
@@ -1831,9 +1885,16 @@ html[data-theme="dark"] .tray-icon-preview--mono {
    每条设置项一行，标题在左、控件在右，行尾就是当前状态或取值。 */
 #pane-general,
 #pane-service,
-#pane-account {
+#pane-account,
+#pane-cloud {
   gap: 26px;
 }
+
+.cloud-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px; border-bottom: 1px solid var(--app-border); flex-wrap: wrap; }
+.cloud-item--actions { justify-content: flex-end; }
+.cloud-preview { margin-top: 12px; padding: 12px; border: 1px solid var(--app-border); border-radius: 10px; }
+.cloud-preview pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+
 
 .settings-rows {
   display: flex;

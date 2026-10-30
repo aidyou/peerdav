@@ -1,0 +1,135 @@
+use super::config_types::{
+    AddMappingInput, CloudMapping, ConnectionRedacted, RepositoryRedacted, SaveS3Input,
+};
+use super::runtime::CloudRuntime;
+use super::runtime_types::*;
+use crate::AppError;
+use std::sync::Arc;
+
+#[tauri::command]
+pub async fn cloud_test_connection(
+    connection_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<serde_json::Value, AppError> {
+    Ok(serde_json::json!({ "verified": cloud.0.test_connection(&connection_id).await? }))
+}
+
+#[tauri::command]
+pub async fn cloud_recovery_records(
+    mapping_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<Vec<RecoveryRecord>, AppError> {
+    cloud.0.recovery_records(&mapping_id).await
+}
+
+#[tauri::command]
+pub async fn cloud_restore(
+    mapping_id: String,
+    record_id: String,
+    destination: std::path::PathBuf,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<(), AppError> {
+    cloud.0.restore(&mapping_id, &record_id, destination).await
+}
+#[tauri::command]
+pub fn cloud_list(cloud: tauri::State<'_, SharedCloud>) -> Result<CloudRuntimeSnapshot, AppError> {
+    cloud.0.snapshot()
+}
+#[tauri::command]
+pub async fn cloud_save_connection(
+    input: SaveS3Input,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<ConnectionRedacted, AppError> {
+    cloud.0.update_connection(input).await
+}
+#[tauri::command]
+pub async fn cloud_delete_connection(
+    connection_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<(), AppError> {
+    cloud.0.delete_connection(&connection_id).await?;
+    cloud.0.refresh_schedules().await
+}
+#[tauri::command]
+pub async fn cloud_create_repository(
+    connection_id: String,
+    encrypted: bool,
+    password: String,
+    password_confirmation: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<RepositoryRedacted, AppError> {
+    cloud
+        .0
+        .create_repository(CreateRepositoryInput {
+            connection_id,
+            repository_id: None,
+            encrypted,
+            password,
+            password_confirmation,
+        })
+        .await
+}
+#[tauri::command]
+pub async fn cloud_join_repository(
+    connection_id: String,
+    password: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<RepositoryRedacted, AppError> {
+    cloud
+        .0
+        .join_repository(JoinRepositoryInput {
+            connection_id,
+            password,
+        })
+        .await
+}
+#[tauri::command]
+pub async fn cloud_save_mapping(
+    mapping_id: Option<String>,
+    input: AddMappingInput,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<CloudMapping, AppError> {
+    let mapping = cloud.0.save_mapping(mapping_id.as_deref(), input).await?;
+    cloud.0.refresh_schedules().await?;
+    Ok(mapping)
+}
+#[tauri::command]
+pub async fn cloud_delete_mapping(
+    mapping_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<(), AppError> {
+    cloud.0.delete_mapping(&mapping_id).await?;
+    cloud.0.refresh_schedules().await
+}
+#[tauri::command]
+pub fn cloud_status(
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<Vec<crate::sync::manager_types::SyncStatus>, AppError> {
+    Ok(cloud.0.manager.snapshots())
+}
+#[tauri::command]
+pub async fn cloud_cancel(
+    mapping_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<(), AppError> {
+    cloud.0.manager.stop_mapping(&mapping_id).await
+}
+#[tauri::command]
+pub async fn cloud_preview(
+    mapping_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<CloudPreview, AppError> {
+    cloud.0.preview(&mapping_id).await
+}
+#[tauri::command]
+pub async fn cloud_sync(
+    mapping_id: String,
+    preview_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<CloudSyncResult, AppError> {
+    cloud.0.manual_sync(&mapping_id, &preview_id).await
+}
+
+pub fn shared(runtime: Arc<CloudRuntime>) -> SharedCloud {
+    SharedCloud(runtime)
+}

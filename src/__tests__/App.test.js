@@ -1721,7 +1721,7 @@ describe("settings information architecture", () => {
     const labels = wrapper
       .findAll(".settings-tab")
       .map((tab) => tab.text());
-    expect(labels).toEqual(["通用", "共享", "客户端", "服务", "账户"]);
+    expect(labels).toEqual(["通用", "共享", "客户端", "服务", "账户", "网盘"]);
     expect(wrapper.find("#pane-general").exists()).toBe(true);
     expect(wrapper.find("#pane-clients").exists()).toBe(false);
 
