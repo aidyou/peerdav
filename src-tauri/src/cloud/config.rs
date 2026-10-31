@@ -34,7 +34,13 @@ impl CloudConfigStore {
 
     fn load_locked(&self) -> Result<CloudConfigSnapshot, ConfigError> {
         match self.vault.load_secret(SECRET_NAME) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => {
+                let snapshot: CloudConfigSnapshot = serde_json::from_slice(&bytes)?;
+                for mapping in &snapshot.mappings {
+                    validate_mapping_protocol(mapping)?;
+                }
+                Ok(snapshot)
+            }
             Err(crate::DomainError::SecretNotFound { .. }) => Ok(CloudConfigSnapshot::default()),
             Err(error) => Err(error.into()),
         }
@@ -184,6 +190,9 @@ impl CloudConfigStore {
         snapshot.connections.retain(|c| c.id != id);
         snapshot.mappings.retain(|m| m.connection_id != id);
         snapshot.repositories.retain(|r| r.connection_id != id);
+        snapshot
+            .append_repositories
+            .retain(|r| r.connection_id != id);
         self.save_locked(&snapshot)
     }
 
@@ -192,7 +201,7 @@ impl CloudConfigStore {
         input: AddMappingInput,
         protected: &[&Path],
     ) -> Result<CloudMapping, ConfigError> {
-        self.save_mapping(None, input, protected)
+        self.save_mapping(None, input, protected, None)
     }
 
     pub fn edit_mapping(
@@ -201,7 +210,17 @@ impl CloudConfigStore {
         input: EditMappingInput,
         protected: &[&Path],
     ) -> Result<CloudMapping, ConfigError> {
-        self.save_mapping(Some(id), input, protected)
+        self.save_mapping(Some(id), input, protected, None)
+    }
+
+    pub fn save_append_mapping(
+        &self,
+        id: Option<&str>,
+        input: AddMappingInput,
+        protected: &[&Path],
+        binding: AppendRepositoryBinding,
+    ) -> Result<CloudMapping, ConfigError> {
+        self.save_mapping(id, input, protected, Some(binding))
     }
 
     fn save_mapping(
@@ -209,6 +228,7 @@ impl CloudConfigStore {
         id: Option<&str>,
         input: AddMappingInput,
         protected: &[&Path],
+        append: Option<AppendRepositoryBinding>,
     ) -> Result<CloudMapping, ConfigError> {
         let _guard = self.guard()?;
         let mut snapshot = self.load_locked()?;
@@ -241,7 +261,25 @@ impl CloudConfigStore {
                 "mapping overlaps an existing mapping".into(),
             ));
         }
+        let existing = snapshot.mappings.iter().find(|m| Some(m.id.as_str()) == id);
+        if let Some(mapping) = existing {
+            if mapping.protocol == StorageProtocol::AppendV2
+                && (mapping.connection_id != input.connection_id
+                    || mapping.repository_id != input.repository_id)
+            {
+                return Err(ConfigError::Validation(
+                    "append binding must be removed before changing its connection or repository"
+                        .into(),
+                ));
+            }
+        }
         let mapping = CloudMapping {
+            protocol: if append.is_some() {
+                StorageProtocol::AppendV2
+            } else {
+                existing.map(|m| m.protocol).unwrap_or_default()
+            },
+            append_binding: append.or_else(|| existing.and_then(|m| m.append_binding.clone())),
             id: id.map(str::to_owned).unwrap_or(random_id()?),
             connection_id: input.connection_id,
             repository_id: input.repository_id,
@@ -249,6 +287,7 @@ impl CloudConfigStore {
             logical_path: logical,
             schedule: input.schedule,
         };
+        validate_mapping_protocol(&mapping)?;
         if let Some(slot) = snapshot
             .mappings
             .iter_mut()
@@ -260,6 +299,67 @@ impl CloudConfigStore {
         }
         self.save_locked(&snapshot)?;
         Ok(mapping)
+    }
+
+    /// Store verified discovery metadata or a pending selection via the existing encrypted vault.
+    /// This does not confirm TOFU or choose a root on the caller's behalf.
+    pub fn save_append_binding(
+        &self,
+        input: SaveAppendBindingInput,
+    ) -> Result<CloudMapping, ConfigError> {
+        let _guard = self.guard()?;
+        let mut snapshot = self.load_locked()?;
+        let mapping = snapshot
+            .mappings
+            .iter_mut()
+            .find(|m| m.id == input.mapping_id)
+            .ok_or_else(|| ConfigError::NotFound("mapping".into()))?;
+        mapping.protocol = StorageProtocol::AppendV2;
+        mapping.append_binding = Some(input.binding);
+        validate_mapping_protocol(mapping)?;
+        let saved = mapping.clone();
+        self.save_locked(&snapshot)?;
+        Ok(saved)
+    }
+
+    /// Returns pending metadata unchanged, including unconfirmed trust and no root selection.
+    pub fn load_append_binding(
+        &self,
+        mapping_id: &str,
+    ) -> Result<AppendRepositoryBinding, ConfigError> {
+        let snapshot = self.snapshot()?;
+        let mapping = snapshot
+            .mappings
+            .into_iter()
+            .find(|m| m.id == mapping_id)
+            .ok_or_else(|| ConfigError::NotFound("mapping".into()))?;
+        if mapping.protocol != StorageProtocol::AppendV2 {
+            return Err(ConfigError::Validation(
+                "mapping does not use append v2".into(),
+            ));
+        }
+        mapping
+            .append_binding
+            .ok_or_else(|| ConfigError::Validation("append binding is missing".into()))
+    }
+
+    /// Runtime must use this gate before opening a repository. It never upgrades trust or selects roots.
+    pub fn load_trusted_append_binding(
+        &self,
+        mapping_id: &str,
+    ) -> Result<AppendRepositoryBinding, ConfigError> {
+        let binding = self.load_append_binding(mapping_id)?;
+        if !binding.is_trusted() {
+            return Err(ConfigError::Validation(
+                "append anchor trust is unconfirmed".into(),
+            ));
+        }
+        if binding.selected_root.is_none() {
+            return Err(ConfigError::Validation(
+                "append root must be explicitly selected".into(),
+            ));
+        }
+        Ok(binding)
     }
 
     pub fn delete_mapping(&self, id: &str) -> Result<(), ConfigError> {
@@ -291,6 +391,36 @@ impl CloudConfigStore {
             snapshot.repositories.push(cached);
         }
         self.save_locked(&snapshot)
+    }
+
+    pub fn cache_append_repository(
+        &self,
+        cached: CachedAppendRepository,
+    ) -> Result<(), ConfigError> {
+        let _guard = self.guard()?;
+        let name = format!(
+            "cloud.append.{}.{}",
+            cached.connection_id, cached.binding.repo_id
+        );
+        self.vault
+            .store_secret(&name, &Zeroizing::new(serde_json::to_vec(&cached)?))?;
+        let mut snapshot = self.load_locked()?;
+        snapshot.append_repositories.retain(|item| {
+            item.connection_id != cached.connection_id
+                || item.binding.repo_id != cached.binding.repo_id
+        });
+        snapshot.append_repositories.push(cached.redacted());
+        self.save_locked(&snapshot)
+    }
+
+    pub fn load_append_repository(
+        &self,
+        connection: &str,
+        repository: &str,
+    ) -> Result<CachedAppendRepository, ConfigError> {
+        let _guard = self.guard()?;
+        let name = format!("cloud.append.{connection}.{repository}");
+        Ok(serde_json::from_slice(&self.vault.load_secret(&name)?)?)
     }
 
     pub fn load_repository(&self, connection_id: &str) -> Result<CachedRepository, ConfigError> {
@@ -326,6 +456,43 @@ impl CloudConfigStore {
 
     pub fn load_secret_snapshot(&self) -> Result<Zeroizing<Vec<u8>>, ConfigError> {
         self.vault.load_secret(SECRET_NAME).map_err(Into::into)
+    }
+}
+
+fn validate_mapping_protocol(mapping: &CloudMapping) -> Result<(), ConfigError> {
+    match (mapping.protocol, mapping.append_binding.as_ref()) {
+        (StorageProtocol::CasV1, None) => Ok(()),
+        (StorageProtocol::AppendV2, Some(binding)) => {
+            if binding.repo_id != mapping.repository_id
+                || binding.repo_id.trim().is_empty()
+                || binding.repo_id.contains('/')
+                || binding.anchor_fingerprint.len() != 64
+                || !binding
+                    .anchor_fingerprint
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || binding.anchor_key
+                    != format!(
+                        "v2/anchors/{}-{}",
+                        binding.repo_id, binding.anchor_fingerprint
+                    )
+                || binding
+                    .root_candidates
+                    .iter()
+                    .any(|root| root.trim().is_empty())
+                || binding.selected_root.as_ref().is_some_and(|root| {
+                    root.trim().is_empty() || !binding.root_candidates.contains(root)
+                })
+            {
+                return Err(ConfigError::Validation(
+                    "invalid append repository/root binding".into(),
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(ConfigError::Validation(
+            "storage protocol and binding disagree".into(),
+        )),
     }
 }
 

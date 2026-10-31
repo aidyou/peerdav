@@ -6,8 +6,38 @@ use thiserror::Error;
 use zeroize::Zeroize;
 
 use super::types::{ProxyMode, S3Config};
+use crate::sync::append_types::{AppendMode, TrustSource};
 use crate::sync::repository_types::{RepoDescriptor, RepositoryMode};
 use crate::sync::root_state::RootError;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CachedAppendRepository {
+    pub connection_id: String,
+    pub binding: AppendRepositoryBinding,
+    pub password: String,
+}
+impl Drop for CachedAppendRepository {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppendRepositoryRedacted {
+    pub connection_id: String,
+    pub protocol: StorageProtocol,
+    pub binding: AppendRepositoryBinding,
+}
+impl CachedAppendRepository {
+    pub fn redacted(&self) -> AppendRepositoryRedacted {
+        AppendRepositoryRedacted {
+            connection_id: self.connection_id.clone(),
+            protocol: StorageProtocol::AppendV2,
+            binding: self.binding.clone(),
+        }
+    }
+}
 
 pub const DEFAULT_SCHEDULE_INTERVAL: u64 = 900;
 pub const MIN_SCHEDULE_INTERVAL: u64 = 60;
@@ -104,6 +134,48 @@ pub struct CloudConnection {
     pub schedule: ScheduleConfig,
 }
 
+/// Missing protocol fields in legacy configurations mean CAS v1. Unknown values fail closed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageProtocol {
+    #[default]
+    CasV1,
+    AppendV2,
+}
+
+/// Persisted remote-root selection. Candidate order never implies selection.
+/// This is metadata only; repository keys/passwords remain in the vault's existing secret path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AppendRepositoryBinding {
+    pub repo_id: String,
+    pub anchor_key: String,
+    pub anchor_fingerprint: String,
+    pub append_mode: AppendMode,
+    pub trust_source: TrustSource,
+    #[serde(default)]
+    pub root_candidates: Vec<String>,
+    #[serde(default)]
+    pub selected_root: Option<String>,
+}
+
+impl AppendRepositoryBinding {
+    pub fn is_trusted(&self) -> bool {
+        matches!(
+            self.trust_source,
+            TrustSource::TrustedFingerprint | TrustSource::AcceptedTofu
+        )
+    }
+}
+
+/// Only the runtime that verified the anchor/explicit user confirmation should construct this.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SaveAppendBindingInput {
+    pub mapping_id: String,
+    pub binding: AppendRepositoryBinding,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CloudMapping {
@@ -113,6 +185,11 @@ pub struct CloudMapping {
     pub local_root: PathBuf,
     pub logical_path: String,
     pub schedule: ScheduleConfig,
+    /// Defaults provide old-to-new compatibility only (older deny_unknown_fields readers reject these).
+    #[serde(default)]
+    pub protocol: StorageProtocol,
+    #[serde(default)]
+    pub append_binding: Option<AppendRepositoryBinding>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -122,6 +199,8 @@ pub struct CloudConfigSnapshot {
     pub mappings: Vec<CloudMapping>,
     #[serde(default)]
     pub repositories: Vec<CachedRepository>,
+    #[serde(default)]
+    pub append_repositories: Vec<AppendRepositoryRedacted>,
 }
 impl Default for CloudConfigSnapshot {
     fn default() -> Self {
@@ -129,6 +208,7 @@ impl Default for CloudConfigSnapshot {
             connections: Vec::new(),
             mappings: Vec::new(),
             repositories: Vec::new(),
+            append_repositories: Vec::new(),
         }
     }
 }

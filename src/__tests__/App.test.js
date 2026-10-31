@@ -4038,6 +4038,24 @@ describe("admin session restore", () => {
     restored.unmount();
   });
 
+  it("restores independent cloud browser and navigates back to Home", async () => {
+    window.history.replaceState(null, "", "#/cloud/cloud-1");
+    const wrapper = await mountReady({
+      admin_session: async () => ({ username: "admin", mustChangePassword: false }),
+      cloud_list: async () => ({ connections: [{ id: "cloud-1", name: "Cloud" }] }),
+      cloud_object_list: async () => ({ prefix: "", objects: [], next: null, complete: true }),
+      cloud_object_status: async () => [],
+    });
+    expect(wrapper.find(".cloud-browser").exists()).toBe(true);
+    expect(wrapper.find(".peer-browser").exists()).toBe(false);
+    expect(window.location.hash).toBe("#/cloud/cloud-1");
+    window.history.replaceState(null, "", "#/home");
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+    await flushPromises();
+    expect(wrapper.find(".cloud-browser").exists()).toBe(false);
+    wrapper.unmount();
+  });
+
   it("keeps the selected settings tab after a webview reload", async () => {
     const wrapper = await mountReady();
     await signIn(wrapper);

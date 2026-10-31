@@ -1,5 +1,19 @@
 # PeerDAV S3 兼容扩展：新任务交接
 
+> **醒目当前更新（2026-10-31）：下方 2026-10-30 交接全文是历史快照，不是当前实施状态或当前授权边界。** 后续用户已批准双协议扩展：新建默认 `cas_v1`，`append_v2` 显式选择；保留 CAS 可读写及能力门槛，不自动降级、迁移或切为只读。`encrypted` 与 `authenticated_plain` 均已批准且有生产路径，两者都需要密码；原文“未授权实施”“plain 待批准”“尚未完成实施单位”等只描述历史，不可作为今日结论。
+>
+> 当前 AppendV2 已有 repository/索引/publisher/engine/runtime 与前端入口；四个新命令为 `cloud_append_discover`、`cloud_append_create`、`cloud_append_join`、`cloud_append_save_mapping`。加入需显式选择 anchor、可信指纹或明确 TOFU；映射需显式选认证逻辑根，空仓库显式命名根。vault schema 仍为 `2`，旧配置缺 protocol 默认 CAS，仅保证新读旧兼容。恢复档案与校验持久证据后安全续作已接入；不能把局部恢复测试扩大为完整硬终止矩阵。普通对象浏览与同步独立：原始对象不解密，保护未知默认只读，后端拒绝普通变更触及同步区；普通对象删除不是仓库 GC。
+>
+> **当前证据（父任务/代理分批报告，非本文编辑重跑）：** 后端 81 项专项及 24 项 runtime/schedule/manager、双模式 HTTP runtime fixture 端到端（236.71 秒）、CAS 44 项及独立慢项 1 项（406.08 秒）通过。此前 append/object 所列 `6+32+17+17+6+4+17+70+21+10+2 = 202`，分项合计确为 202；最终专项 discovery 35、engine 19、index 17、publish 6、recovery 6、contract 6、repository 17，以及 object `70+21+10+2` 均通过。各批次时间不同，不猜统一总数。全部 35 个集成 test targets 已分批执行；剩余 13 targets 实质 124 项通过，另有外部默认空跑 1 项、七牛 ignored 1 项；bin/doc 为 0 项。lib 在最终生产修改后重跑，166 项全部通过；最终预算修改后受影响组均已重跑通过。两次单命令 cargo test 600 秒超时不是目标未尝试，分批全目标已覆盖，不表示单命令全量成功或全部测试在最终修改后统一重跑。Rust fmt/check all-targets offline 通过，前端 21 文件/346 tests 与 build 通过，仍有大 chunk 警告。
+>
+> **资源与预算当前证据：** 真实 `65 MiB + 1 byte` 文件，最大 part 8 MiB、peak buffer 8 MiB、inflight 1，测试 4.33 秒；`/proc` VmHWM 65364 kB（约 63.83 MiB），不是 GNU time 或 RSS 硬限证明，256 MiB 仍为计量分配预算。discovery/apply/freeze 统一先持久记账 stat 请求，再按声明长度持久预留 GET 请求与 read 字节，之后 bounded stream；增大超声明长度立即拒绝，缩短保守计费不退款。S3 stat 为对象 HEAD：无 CAS 探测、不读写 `control/HEAD`，允许且计费对象 HEAD；publisher 按冻结已知长度预留，无需 HEAD。持久 active unfinished run 使外层新 run id 自动重试不能刷新账本，成功才新轮。
+>
+> **当前未验证：** 桌面及 400px 未实渲染；SIGKILL/掉电/磁盘满全矩阵、独立服务签名及真实厂商仍未测，本轮不读取凭据；future drop/独立 SQLite 重开不等于实测断电。最终 `git diff --check` 成功；仍保留工具 backend/worktree 差异限制，untracked 文件不能由普通 `git diff` 展示，须另核对内容。当前合同与局限见 `cloud-append-v2.md` 页首和 `cloud-storage.md`；生产可达不等于所有合同/厂商验收通过。
+
+---
+
+## 历史原文（2026-10-30，保留，不作为当前状态）
+
 > 整理日期：2026-10-30。
 > 本文是任务上下文、设计方向及未完成事项的交接，不是追加式协议实现或验收报告。
 > 最重要的约束：**新增兼容能力，不推翻现有条件读写/CAS 路径。**

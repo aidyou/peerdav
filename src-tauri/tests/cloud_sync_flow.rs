@@ -915,3 +915,163 @@ async fn encrypted_devices_join_same_store_with_same_password() {
     .unwrap();
     assert_eq!(read_file(b._root.path()), b"encrypted-content");
 }
+
+#[test]
+fn shared_final_verify_strict_rejects_extra_missing_and_incomplete_directories() {
+    use peerdav_lib::sync::{
+        materialize::verify_projection,
+        materialize_types::FinalVerifyMode,
+        merge_types::{EntityId, Node, Projection, ProjectionEntry, RevisionId, RevisionValue},
+        scan_types::ScanReport,
+    };
+    let projection = Projection {
+        entries: vec![ProjectionEntry {
+            entity: EntityId("directory".into()),
+            version: RevisionId("revision".into()),
+            logical_path: vec!["nested".into(), "empty".into()],
+            projection_path: vec!["nested".into(), "empty".into()],
+            value: RevisionValue::Live {
+                parent_dir: EntityId("parent".into()),
+                name: "empty".into(),
+                node: Node::Dir,
+            },
+            conflict: false,
+        }],
+    };
+    let mut observed = ScanReport {
+        files: vec![],
+        directories: vec!["".into(), "nested".into(), "nested/empty".into()],
+        ignored_paths: vec![],
+        complete: true,
+    };
+    assert!(verify_projection(&projection, &observed, FinalVerifyMode::Strict).is_ok());
+    observed.directories.push("unexpected".into());
+    assert!(verify_projection(&projection, &observed, FinalVerifyMode::TargetFiles).is_ok());
+    assert!(verify_projection(&projection, &observed, FinalVerifyMode::Strict).is_err());
+    observed.directories.pop();
+    observed.directories.pop();
+    assert!(verify_projection(&projection, &observed, FinalVerifyMode::Strict).is_err());
+    observed.directories.push("nested/empty".into());
+    observed.complete = false;
+    assert!(verify_projection(&projection, &observed, FinalVerifyMode::Strict).is_err());
+    observed.complete = true;
+    observed.ignored_paths.push("ignored".into());
+    assert!(verify_projection(&projection, &observed, FinalVerifyMode::Strict).is_err());
+}
+
+#[tokio::test]
+async fn shared_materialize_uses_only_block_reader_and_journal_and_keeps_block_source() {
+    use peerdav_lib::sync::{
+        materialize,
+        materialize_types::{FinalVerifyMode, LocalChunks, MaterializeError, MaterializeRequest},
+        merge_types::{
+            BlockRef, EntityId, FileNode, Node, Projection, ProjectionEntry, RevisionId,
+            RevisionValue,
+        },
+        scan,
+        scan_types::ScanOptions,
+        traits::BlockReader,
+    };
+    struct Reader {
+        fail: bool,
+    }
+    impl BlockReader for Reader {
+        type Error = std::io::Error;
+        fn verify_local(&self, _: &str, bytes: &[u8]) -> Result<bool, Self::Error> {
+            Ok(bytes == b"shared")
+        }
+        fn read_block<'a>(
+            &'a self,
+            _: &'a str,
+            length: usize,
+        ) -> BoxFuture<'a, Result<zeroize::Zeroizing<Vec<u8>>, Self::Error>> {
+            Box::pin(async move {
+                if self.fail {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "original block cause",
+                    ));
+                }
+                assert_eq!(length, 6);
+                Ok(zeroize::Zeroizing::new(b"shared".to_vec()))
+            })
+        }
+    }
+    let d = device("shared");
+    let current = scan::scan(d._root.path(), &ScanOptions::default()).unwrap();
+    let empty = Projection { entries: vec![] };
+    let projection = Projection {
+        entries: vec![ProjectionEntry {
+            entity: EntityId("file".into()),
+            version: RevisionId("revision".into()),
+            logical_path: vec!["file".into()],
+            projection_path: vec!["file".into()],
+            value: RevisionValue::Live {
+                parent_dir: EntityId("root".into()),
+                name: "file".into(),
+                node: Node::File(FileNode {
+                    blocks: vec![BlockRef {
+                        id: "opaque-id".into(),
+                        len: 6,
+                    }],
+                    length: 6,
+                    digest: hex::encode(Sha256::digest(b"shared")),
+                }),
+            },
+            conflict: false,
+        }],
+    };
+    let chunks = LocalChunks::new();
+    let request = MaterializeRequest {
+        root: d._root.path(),
+        private: d._private.path(),
+        mapping: "shared",
+        run_id: "shared-run",
+        source_scan: &current,
+        current_scan: &current,
+        base_projection: &empty,
+        target: &projection,
+        local_chunks: &chunks,
+        final_verify: FinalVerifyMode::Strict,
+    };
+    materialize::prepare(&request, &|| Ok(())).unwrap();
+    let mut intents = Vec::new();
+    let mut journal = |intent: &peerdav_lib::sync::apply_types::ApplyIntent| {
+        intents.push(intent.clone());
+        Ok(())
+    };
+    let error = materialize::materialize(
+        &request,
+        &Reader { fail: true },
+        &mut journal,
+        Arc::new(AtomicBool::new(false)),
+        &|| Ok(()),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(
+        matches!(&error, MaterializeError::Block(source) if source.kind() == std::io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(
+        std::error::Error::source(&error).unwrap().to_string(),
+        "original block cause"
+    );
+    assert!(!d._root.path().join("file").exists());
+    let result = materialize::materialize(
+        &request,
+        &Reader { fail: false },
+        &mut journal,
+        Arc::new(AtomicBool::new(false)),
+        &|| Ok(()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.applied_files, 1);
+    assert!(result.verified_scan.complete);
+    assert_eq!(
+        std::fs::read(d._root.path().join("file")).unwrap(),
+        b"shared"
+    );
+    assert_eq!(intents.len(), 3);
+}

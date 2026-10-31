@@ -130,6 +130,37 @@ pub async fn cloud_sync(
     cloud.0.manual_sync(&mapping_id, &preview_id).await
 }
 
+#[tauri::command]
+pub async fn cloud_append_discover(
+    connection_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<Vec<crate::sync::append_types::Candidate>, AppError> {
+    cloud.0.discover_append_repositories(&connection_id).await
+}
+#[tauri::command]
+pub async fn cloud_append_create(
+    input: CreateAppendRepositoryInput,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<super::config_types::AppendRepositoryRedacted, AppError> {
+    cloud.0.create_append_repository(input).await
+}
+#[tauri::command]
+pub async fn cloud_append_join(
+    input: JoinAppendRepositoryInput,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<super::config_types::AppendRepositoryRedacted, AppError> {
+    cloud.0.join_append_repository(input).await
+}
+#[tauri::command]
+pub async fn cloud_append_save_mapping(
+    input: SaveAppendMappingInput,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<CloudMapping, AppError> {
+    let result = cloud.0.save_append_mapping(input).await?;
+    cloud.0.refresh_schedules().await?;
+    Ok(result)
+}
+
 pub fn shared(runtime: Arc<CloudRuntime>) -> SharedCloud {
     SharedCloud(runtime)
 }

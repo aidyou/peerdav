@@ -203,6 +203,22 @@ impl CloudRuntime {
                 return Err(error);
             }
         };
+        if mapping.protocol == super::config_types::StorageProtocol::AppendV2 {
+            if self
+                .open_append_index(&mapping, &root_epoch)?
+                .active_epoch()
+                .map_err(|error| schedule_error("CLOUD_INDEX", &error.to_string()))?
+                .is_none()
+            {
+                return Err(schedule_error(
+                    "CLOUD_SCHEDULE_PAUSED",
+                    "尚未完成首次人工同步 / First manual sync is required",
+                ));
+            }
+            let preview = self.preview(mapping_id).await?;
+            self.manual_sync(mapping_id, &preview.preview_id).await?;
+            return Ok(());
+        }
         let key = self
             .config
             .get_or_create_index_key()

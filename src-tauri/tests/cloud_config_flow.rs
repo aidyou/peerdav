@@ -3,8 +3,12 @@ use std::sync::Arc;
 
 use peerdav_lib::Vault;
 use peerdav_lib::cloud::config::CloudConfigStore;
-use peerdav_lib::cloud::config_types::{AddMappingInput, SaveS3Input, ScheduleConfig};
+use peerdav_lib::cloud::config_types::{
+    AddMappingInput, AppendRepositoryBinding, CloudConfigSnapshot, CloudMapping,
+    SaveAppendBindingInput, SaveS3Input, ScheduleConfig, StorageProtocol,
+};
 use peerdav_lib::cloud::types::ProxyMode;
+use peerdav_lib::sync::append_types::{AppendMode, TrustSource};
 use peerdav_lib::sync::repository_types::{ChunkerProfile, RepoDescriptor, RepositoryMode};
 use tempfile::TempDir;
 
@@ -35,6 +39,130 @@ fn input() -> SaveS3Input {
         proxy: ProxyMode::Direct,
         schedule: None,
     }
+}
+
+fn legacy_mapping() -> serde_json::Value {
+    serde_json::json!({
+        "id": "mapping", "connectionId": "connection", "repositoryId": "repo",
+        "localRoot": "/legacy/root", "logicalPath": "remote",
+        "schedule": {"enabled": true, "interval": 60}
+    })
+}
+
+#[test]
+fn legacy_schema_defaults_to_cas_and_rejects_unknown_protocol_or_fields() {
+    let legacy = legacy_mapping();
+    let mapping: CloudMapping = serde_json::from_value(legacy.clone()).expect("legacy mapping");
+    assert_eq!(mapping.protocol, StorageProtocol::CasV1);
+    assert!(mapping.append_binding.is_none());
+    let encoded = serde_json::to_value(&mapping).expect("serialize");
+    for (key, value) in legacy.as_object().expect("object") {
+        assert_eq!(&encoded[key], value, "legacy field {key} changed");
+    }
+    let snapshot: CloudConfigSnapshot = serde_json::from_value(serde_json::json!({
+        "connections": [], "mappings": [legacy.clone()]
+    }))
+    .expect("pre-cache snapshot");
+    assert!(snapshot.repositories.is_empty());
+    for protocol in ["future_v3", "cas_v2", "AppendV2"] {
+        let mut invalid = legacy.clone();
+        invalid["protocol"] = protocol.into();
+        assert!(serde_json::from_value::<CloudMapping>(invalid).is_err());
+    }
+    let mut invalid = legacy;
+    invalid["unexpected"] = true.into();
+    assert!(serde_json::from_value::<CloudMapping>(invalid).is_err());
+}
+
+#[test]
+fn append_binding_roundtrip_preserves_selection_mode_trust_and_encryption() {
+    let (dir, store) = store();
+    let mut credentials = input();
+    credentials.secret_key = Some("PRIVATE_APPEND_CONFIG_CREDENTIAL".into());
+    let connection = store.save_connection(credentials).expect("connection");
+    let root = dir.path().join("root");
+    fs::create_dir(&root).expect("root");
+    let mapping_input = AddMappingInput {
+        connection_id: connection.id,
+        repository_id: "repo".into(),
+        local_root: root,
+        logical_path: "remote".into(),
+        schedule: ScheduleConfig::default(),
+    };
+    let mapping = store
+        .add_mapping(mapping_input.clone(), &[])
+        .expect("mapping");
+    let fingerprint = "ab".repeat(32);
+    let mut binding = AppendRepositoryBinding {
+        repo_id: "repo".into(),
+        anchor_key: format!("v2/anchors/repo-{fingerprint}"),
+        anchor_fingerprint: fingerprint,
+        append_mode: AppendMode::AuthenticatedPlain,
+        trust_source: TrustSource::Unconfirmed,
+        root_candidates: vec!["root-a".into(), "root-b".into()],
+        selected_root: None,
+    };
+    let save = |binding: AppendRepositoryBinding| {
+        store.save_append_binding(SaveAppendBindingInput {
+            mapping_id: mapping.id.clone(),
+            binding,
+        })
+    };
+    let pending = save(binding.clone()).expect("pending binding");
+    assert_eq!(pending.protocol, StorageProtocol::AppendV2);
+    assert_eq!(
+        store.load_append_binding(&mapping.id).expect("load"),
+        binding
+    );
+    assert!(store.load_trusted_append_binding(&mapping.id).is_err());
+    binding.selected_root = Some("root-b".into());
+    save(binding.clone()).expect("selection alone does not confirm trust");
+    assert!(!binding.is_trusted());
+    assert!(store.load_trusted_append_binding(&mapping.id).is_err());
+    for source in [TrustSource::AcceptedTofu, TrustSource::TrustedFingerprint] {
+        binding.trust_source = source;
+        save(binding.clone()).expect("confirmed");
+        assert_eq!(
+            store
+                .load_trusted_append_binding(&mapping.id)
+                .expect("trusted"),
+            binding
+        );
+    }
+    binding.selected_root = None;
+    save(binding.clone()).expect("pending root");
+    assert!(store.load_trusted_append_binding(&mapping.id).is_err());
+    binding.selected_root = Some("root-b".into());
+    binding.append_mode = AppendMode::Encrypted;
+    save(binding.clone()).expect("encrypted mode");
+    let edited = store
+        .edit_mapping(&mapping.id, mapping_input, &[])
+        .expect("edit preserves binding");
+    assert_eq!(edited.append_binding.as_ref(), Some(&binding));
+    let snapshot: CloudConfigSnapshot =
+        serde_json::from_slice(&store.load_secret_snapshot().expect("vault snapshot"))
+            .expect("decode");
+    assert_eq!(snapshot.mappings[0].append_binding.as_ref(), Some(&binding));
+    let raw = fs::read(dir.path().join("vault.pd")).expect("vault bytes");
+    // The vault schema itself contains "secret"; use a unique credential sentinel.
+    for secret in [
+        "PRIVATE_APPEND_CONFIG_CREDENTIAL",
+        binding.anchor_fingerprint.as_str(),
+    ] {
+        assert!(!raw.windows(secret.len()).any(|w| w == secret.as_bytes()));
+    }
+    let mut invalid = binding.clone();
+    invalid.selected_root = Some("not-a-candidate".into());
+    assert!(save(invalid).is_err());
+    let mut invalid = binding.clone();
+    invalid.repo_id = "another-repo".into();
+    assert!(save(invalid).is_err());
+    assert_eq!(
+        store
+            .load_trusted_append_binding(&mapping.id)
+            .expect("failed writes are atomic"),
+        binding
+    );
 }
 
 #[test]

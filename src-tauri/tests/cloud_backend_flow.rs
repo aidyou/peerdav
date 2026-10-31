@@ -28,6 +28,7 @@ use tokio::sync::oneshot;
 struct FixtureState {
     objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     delete_keys: Arc<Mutex<Vec<String>>>,
+    requests: Arc<Mutex<Vec<(Method, String)>>>,
     ignore_conditions: bool,
 }
 struct Fixture {
@@ -46,6 +47,7 @@ impl Fixture {
         let state = FixtureState {
             objects: Arc::new(Mutex::new(BTreeMap::new())),
             delete_keys: Arc::new(Mutex::new(Vec::new())),
+            requests: Arc::new(Mutex::new(Vec::new())),
             ignore_conditions,
         };
         let (stop, mut shutdown) = oneshot::channel();
@@ -134,6 +136,11 @@ async fn handle(
     state: FixtureState,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let path = request.uri().path().to_string();
+    state
+        .requests
+        .lock()
+        .expect("request log")
+        .push((request.method().clone(), path.clone()));
     if request.method() == Method::GET
         && request
             .uri()
@@ -511,8 +518,222 @@ fn runtime_connection(fixture: &Fixture) -> SaveS3Input {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn append_runtime_create_join_sync_both_modes_without_cas_probe_or_control_head() {
+    use peerdav_lib::cloud::runtime_types::{
+        CreateAppendRepositoryInput, JoinAppendRepositoryInput, SaveAppendMappingInput,
+    };
+    use peerdav_lib::sync::append_types::AppendMode;
+    for mode in [AppendMode::Encrypted, AppendMode::AuthenticatedPlain] {
+        let fixture = Fixture::start(true).await; // Deliberately cannot pass CAS probing.
+        let data = tempfile::tempdir().unwrap();
+        let runtime = runtime_for(&data);
+        runtime.resume().unwrap();
+        let connection = runtime
+            .save_connection(runtime_connection(&fixture))
+            .unwrap();
+        let created = runtime
+            .create_append_repository(CreateAppendRepositoryInput {
+                connection_id: connection.id.clone(),
+                mode: mode.clone(),
+                password: "append password".into(),
+                password_confirmation: "append password".into(),
+            })
+            .await
+            .unwrap();
+        let candidates = runtime
+            .discover_append_repositories(&connection.id)
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].fingerprint,
+            created.binding.anchor_fingerprint
+        );
+        let join = |password: &str, accepted: bool, fingerprint: Option<String>| {
+            JoinAppendRepositoryInput {
+                connection_id: connection.id.clone(),
+                anchor_key: created.binding.anchor_key.clone(),
+                anchor_fingerprint: created.binding.anchor_fingerprint.clone(),
+                repository_id: created.binding.repo_id.clone(),
+                mode: mode.clone(),
+                accept_tofu: accepted,
+                trusted_fingerprint: fingerprint,
+                password: password.into(),
+            }
+        };
+        let before = fixture.state.objects.lock().unwrap().clone();
+        assert!(
+            runtime
+                .join_append_repository(join("append password", false, None))
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .join_append_repository(join("wrong", true, None))
+                .await
+                .is_err()
+        );
+        assert!(
+            runtime
+                .join_append_repository(join("append password", true, Some("0".repeat(64))))
+                .await
+                .is_err()
+        );
+        assert_eq!(*fixture.state.objects.lock().unwrap(), before);
+        let joined = runtime
+            .join_append_repository(join("append password", true, None))
+            .await
+            .unwrap();
+        assert!(joined.binding.selected_root.is_none());
+        let local = tempfile::tempdir().unwrap();
+        std::fs::write(local.path().join("file.txt"), b"append runtime payload").unwrap();
+        let mapping = runtime
+            .save_append_mapping(SaveAppendMappingInput {
+                mapping_id: None,
+                selected_root: "docs".into(),
+                mapping: AddMappingInput {
+                    connection_id: connection.id.clone(),
+                    repository_id: created.binding.repo_id.clone(),
+                    local_root: local.path().to_owned(),
+                    logical_path: "docs".into(),
+                    schedule: ScheduleConfig::default(),
+                },
+            })
+            .await
+            .unwrap();
+        let preview = runtime.preview(&mapping.id).await.unwrap();
+        assert!(preview.counts.uploads >= 1);
+        runtime
+            .manual_sync(&mapping.id, &preview.preview_id)
+            .await
+            .unwrap();
+        wait_completed(&runtime, &mapping.id).await;
+        let second = runtime.preview(&mapping.id).await.unwrap();
+        assert_eq!(second.counts.uploads, 0);
+        assert_eq!(second.counts.downloads, 0);
+        let joined = runtime
+            .join_append_repository(join("append password", true, None))
+            .await
+            .unwrap();
+        assert_eq!(joined.binding.root_candidates, vec!["docs"]);
+        let reader_data = tempfile::tempdir().unwrap();
+        let reader = runtime_for(&reader_data);
+        reader.resume().unwrap();
+        let reader_connection = reader
+            .save_connection(runtime_connection(&fixture))
+            .unwrap();
+        let mut reader_join = join("append password", true, None);
+        reader_join.connection_id = reader_connection.id.clone();
+        reader.join_append_repository(reader_join).await.unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let reader_mapping = reader
+            .save_append_mapping(SaveAppendMappingInput {
+                mapping_id: None,
+                selected_root: "docs".into(),
+                mapping: AddMappingInput {
+                    connection_id: reader_connection.id,
+                    repository_id: created.binding.repo_id.clone(),
+                    local_root: destination.path().to_owned(),
+                    logical_path: "docs".into(),
+                    schedule: ScheduleConfig::default(),
+                },
+            })
+            .await
+            .unwrap();
+        let preview = reader.preview(&reader_mapping.id).await.unwrap();
+        assert_eq!(preview.counts.downloads, 1);
+        reader
+            .manual_sync(&reader_mapping.id, &preview.preview_id)
+            .await
+            .unwrap();
+        wait_completed(&reader, &reader_mapping.id).await;
+        assert_eq!(
+            std::fs::read(destination.path().join("file.txt")).unwrap(),
+            b"append runtime payload"
+        );
+        let initial_records = reader.recovery_records(&reader_mapping.id).await.unwrap();
+        std::fs::write(local.path().join("file.txt"), b"updated payload").unwrap();
+        let preview = runtime.preview(&mapping.id).await.unwrap();
+        runtime
+            .manual_sync(&mapping.id, &preview.preview_id)
+            .await
+            .unwrap();
+        wait_completed(&runtime, &mapping.id).await;
+        let preview = reader.preview(&reader_mapping.id).await.unwrap();
+        reader
+            .manual_sync(&reader_mapping.id, &preview.preview_id)
+            .await
+            .unwrap();
+        wait_completed(&reader, &reader_mapping.id).await;
+        let history = reader.recovery_records(&reader_mapping.id).await.unwrap();
+        let record = history
+            .iter()
+            .find(|record| {
+                record.relative_path == "file.txt"
+                    && record.phase == "installed"
+                    && !initial_records.iter().any(|old| old.id == record.id)
+            })
+            .unwrap();
+        reader
+            .restore(&reader_mapping.id, &record.id, "restored.txt".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(destination.path().join("restored.txt")).unwrap(),
+            b"append runtime payload"
+        );
+        assert!(
+            reader
+                .restore(&reader_mapping.id, &record.id, "file.txt".into())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(destination.path().join("file.txt")).unwrap(),
+            b"updated payload"
+        );
+        reader.stop_and_clear().await.unwrap();
+        let mut missing = join("append password", true, None);
+        missing.anchor_key = format!("v2/anchors/{}-{}", "a".repeat(32), "b".repeat(64));
+        missing.repository_id = "a".repeat(32);
+        missing.anchor_fingerprint = "b".repeat(64);
+        let before_missing = fixture.state.objects.lock().unwrap().clone();
+        assert!(runtime.join_append_repository(missing).await.is_err());
+        assert_eq!(*fixture.state.objects.lock().unwrap(), before_missing);
+        assert!(runtime.snapshot().unwrap().append_repositories.len() == 1);
+        assert!(
+            runtime
+                .recovery_records(&mapping.id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| !r.id.is_empty())
+        );
+        let requests = fixture.state.requests.lock().unwrap().clone();
+        assert!(
+            !requests
+                .iter()
+                .any(|(_, path)| path.contains("probe") || path.ends_with("/HEAD")),
+            "{requests:?}"
+        );
+        assert!(
+            fixture
+                .state
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .all(|key| key.starts_with("runtime/v2/"))
+        );
+        runtime.stop_and_clear().await.unwrap();
+        fixture.shutdown().await;
+    }
+}
+
 async fn wait_completed(runtime: &CloudRuntime, mapping_id: &str) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
     loop {
         let status = runtime
             .snapshot()

@@ -1,13 +1,20 @@
 use std::ops::Range;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use futures_util::future::BoxFuture;
 
 use super::types::{
-    CloudError, ObjectListing, ObjectMetadata, ObjectStream, PutCondition, StorageCapabilities,
+    CloudError, ObjectListing, ObjectMetadata, ObjectPage, ObjectStoreScope, ObjectStream,
+    PutCondition, StorageCapabilities,
 };
 
 /// Provider-neutral primitives. Missing optional capabilities must fail closed.
 pub trait ObjectStore: Send + Sync {
+    /// All operation keys are relative to this physical namespace. Unknown
+    /// stores remain usable by repository code, but cannot back ObjectService.
+    fn scope(&self) -> Option<ObjectStoreScope> {
+        None
+    }
     fn capabilities(&self) -> StorageCapabilities;
     /// Pull-based listing preserves provider pagination and does not collect the
     /// full repository in memory. Every page error must reach the caller.
@@ -25,4 +32,30 @@ pub trait ObjectStore: Send + Sync {
         condition: PutCondition,
     ) -> BoxFuture<'a, Result<ObjectMetadata, CloudError>>;
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), CloudError>>;
+
+    fn list_page<'a>(
+        &'a self,
+        _prefix: &'a str,
+        _token: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<ObjectPage, CloudError>> {
+        Box::pin(async { Err(CloudError::Unsupported) })
+    }
+
+    fn upload_stream<'a>(
+        &'a self,
+        _key: &'a str,
+        _body: ObjectStream,
+    ) -> BoxFuture<'a, Result<ObjectMetadata, CloudError>> {
+        Box::pin(async { Err(CloudError::Unsupported) })
+    }
+
+    fn upload_stream_with_control<'a>(
+        &'a self,
+        key: &'a str,
+        body: ObjectStream,
+        cancel: Arc<AtomicBool>,
+    ) -> BoxFuture<'a, Result<ObjectMetadata, CloudError>> {
+        let _ = cancel;
+        self.upload_stream(key, body)
+    }
 }

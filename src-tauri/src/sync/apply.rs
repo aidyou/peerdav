@@ -449,6 +449,194 @@ mod linux {
         }
         Ok(intent)
     }
+    /// Append-only continuation of the original durable intent. No new staging
+    /// object is created and every ambiguous state fails closed.
+    pub fn resume_append(
+        intent: &ApplyIntent,
+        root: &Path,
+        private: &Path,
+        journal: &mut DurableJournal<'_>,
+    ) -> Result<ApplyIntent, ApplyError> {
+        let rootf = root_fd(root)?;
+        let privatef = root_fd(private)?;
+        if root.starts_with(private)
+            || private.starts_with(root)
+            || fd_identity(&rootf)? != intent.root_identity
+            || fd_identity(&privatef)?.dev != intent.root_identity.dev
+            || privatef.metadata()?.permissions().mode() & 0o777 != 0o700
+            || intent.staging_path.parent() != Some(private)
+            || intent.recovery_path.parent() != Some(private)
+            || intent.staging_path == intent.recovery_path
+        {
+            return Err(ApplyError::InvalidPath);
+        }
+        let (parent, name) = parent_fd(&rootf, &intent.relative_target)?;
+        let target = root.join(&intent.relative_target);
+        let exists = |path: &Path| -> Result<bool, ApplyError> {
+            match fs::symlink_metadata(path) {
+                Ok(_) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e.into()),
+            }
+        };
+        let stage = exists(&intent.staging_path)?;
+        let preserved = exists(&intent.recovery_path)?;
+        let present = exists(&target)?;
+        let create = intent.action == ApplyAction::Create;
+        let delete = matches!(
+            intent.action,
+            ApplyAction::Delete | ApplyAction::DeleteDirectory
+        );
+        if create
+            && (preserved
+                || intent.expected_old_identity.is_some()
+                || intent.expected_old_digest.is_some()
+                || intent.expected_old_size.is_some())
+        {
+            return Err(ApplyError::IdentityChanged);
+        }
+        if delete
+            && (stage
+                || intent.staging_identity.is_some()
+                || intent.staging_digest.is_some()
+                || intent.staging_size.is_some())
+        {
+            return Err(ApplyError::IdentityChanged);
+        }
+        if !delete && stage {
+            validate_file(
+                &intent.staging_path,
+                &intent.staging_identity,
+                &intent.staging_digest,
+                &intent.staging_size,
+            )?;
+        }
+        if preserved {
+            validate_recovery(intent)?;
+        }
+        let mut next = intent.clone();
+        if delete && preserved && !present {
+            parent.sync_all()?;
+            privatef.sync_all()?;
+            next.phase = ApplyPhase::Deleted;
+            journal(&next)?;
+            return Ok(next);
+        }
+        // A missing stage is safe only if the *same inode* is already installed.
+        if !delete && !stage {
+            if (!create && !preserved) || !present {
+                return Err(ApplyError::IdentityChanged);
+            }
+            validate_file(
+                &target,
+                &intent.staging_identity,
+                &intent.staging_digest,
+                &intent.staging_size,
+            )?;
+            parent.sync_all()?;
+            privatef.sync_all()?;
+            next.phase = ApplyPhase::Installed;
+            journal(&next)?;
+            return Ok(next);
+        }
+        if matches!(intent.phase, ApplyPhase::Installed) && stage {
+            return Err(ApplyError::IdentityChanged);
+        }
+        if preserved && present {
+            return Err(ApplyError::IdentityChanged);
+        }
+        if !create && !preserved {
+            if !present
+                || matches!(
+                    intent.phase,
+                    ApplyPhase::OriginalPreserved | ApplyPhase::Installed | ApplyPhase::Deleted
+                )
+            {
+                return Err(ApplyError::IdentityChanged);
+            }
+            if intent.action == ApplyAction::DeleteDirectory {
+                if intent.expected_old_digest.is_some() || intent.expected_old_size.is_some() {
+                    return Err(ApplyError::IdentityChanged);
+                }
+                validate_directory(&target, &intent.expected_old_identity)?;
+            } else {
+                validate_file(
+                    &target,
+                    &intent.expected_old_identity,
+                    &intent.expected_old_digest,
+                    &intent.expected_old_size,
+                )?;
+            }
+            if fd_identity(&root_fd(root)?)? != intent.root_identity
+                || fd_identity(&parent_fd(&root_fd(root)?, &intent.relative_target)?.0)?
+                    != fd_identity(&parent)?
+                || fd_identity(&root_fd(private)?)? != fd_identity(&privatef)?
+            {
+                return Err(ApplyError::IdentityChanged);
+            }
+            move_fd(
+                &rootf,
+                &privatef,
+                &parent,
+                &name,
+                &privatef,
+                intent
+                    .recovery_path
+                    .file_name()
+                    .ok_or(ApplyError::InvalidPath)?,
+            )?;
+            parent.sync_all()?;
+            privatef.sync_all()?;
+            validate_recovery(intent)?;
+        } else if create && present {
+            return Err(ApplyError::AlreadyExists);
+        }
+        next.phase = ApplyPhase::OriginalPreserved;
+        journal(&next)?;
+        if delete {
+            if exists(&target)? {
+                return Err(ApplyError::IdentityChanged);
+            }
+            next.phase = ApplyPhase::Deleted;
+        } else {
+            if fd_identity(&root_fd(root)?)? != intent.root_identity
+                || fd_identity(&parent_fd(&root_fd(root)?, &intent.relative_target)?.0)?
+                    != fd_identity(&parent)?
+                || fd_identity(&root_fd(private)?)? != fd_identity(&privatef)?
+            {
+                return Err(ApplyError::IdentityChanged);
+            }
+            validate_file(
+                &intent.staging_path,
+                &intent.staging_identity,
+                &intent.staging_digest,
+                &intent.staging_size,
+            )?;
+            move_fd(
+                &rootf,
+                &privatef,
+                &privatef,
+                intent
+                    .staging_path
+                    .file_name()
+                    .ok_or(ApplyError::InvalidPath)?,
+                &parent,
+                &name,
+            )?;
+            parent.sync_all()?;
+            privatef.sync_all()?;
+            validate_file(
+                &target,
+                &intent.staging_identity,
+                &intent.staging_digest,
+                &intent.staging_size,
+            )?;
+            next.phase = ApplyPhase::Installed;
+        }
+        journal(&next)?;
+        Ok(next)
+    }
+
     pub fn recover(intent: &ApplyIntent, root: &Path) -> Result<ApplyPhase, ApplyError> {
         let rootf = root_fd(root)?;
         if fd_identity(&rootf)? != intent.root_identity {
@@ -590,7 +778,16 @@ mod linux {
     }
 }
 #[cfg(target_os = "linux")]
-pub use linux::{apply_bytes, recover, restore};
+pub use linux::{apply_bytes, recover, restore, resume_append};
+#[cfg(not(target_os = "linux"))]
+pub fn resume_append(
+    _: &super::apply_types::ApplyIntent,
+    _: &std::path::Path,
+    _: &std::path::Path,
+    _: &mut super::apply_types::DurableJournal<'_>,
+) -> Result<super::apply_types::ApplyIntent, super::apply_types::ApplyError> {
+    Err(super::apply_types::ApplyError::Unsupported)
+}
 #[cfg(not(target_os = "linux"))]
 pub fn apply_bytes<R: std::io::Read>(
     _: &std::path::Path,

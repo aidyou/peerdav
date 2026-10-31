@@ -121,6 +121,38 @@ async fn restore_missing_record_does_not_write_target() {
     assert!(!target.exists());
 }
 
+#[tokio::test]
+async fn append_commands_fail_closed_while_locked_and_validate_ipc_shapes() {
+    use peerdav_lib::cloud::runtime_types::{
+        CreateAppendRepositoryInput, JoinAppendRepositoryInput, SaveAppendMappingInput,
+    };
+    let (_directory, runtime) = runtime();
+    let create: CreateAppendRepositoryInput = serde_json::from_value(serde_json::json!({"connectionId":"missing","mode":"authenticated_plain","password":"secret","passwordConfirmation":"secret"})).unwrap();
+    assert_eq!(
+        runtime
+            .create_append_repository(create)
+            .await
+            .unwrap_err()
+            .code,
+        "CLOUD_GATE_LOCKED"
+    );
+    assert_eq!(
+        runtime
+            .discover_append_repositories("missing")
+            .await
+            .unwrap_err()
+            .code,
+        "CLOUD_GATE_LOCKED"
+    );
+    let join: JoinAppendRepositoryInput = serde_json::from_value(serde_json::json!({"connectionId":"missing","anchorKey":"key","anchorFingerprint":"fingerprint","repositoryId":"repo","mode":"encrypted","acceptTofu":false,"trustedFingerprint":null,"password":"secret"})).unwrap();
+    assert_eq!(
+        runtime.join_append_repository(join).await.unwrap_err().code,
+        "CLOUD_GATE_LOCKED"
+    );
+    assert!(serde_json::from_value::<SaveAppendMappingInput>(serde_json::json!({"mappingId":null,"mapping":{},"selectedRoot":"root","implicitTrust":true})).is_err());
+    assert!(serde_json::from_value::<CreateAppendRepositoryInput>(serde_json::json!({"connectionId":"missing","mode":"plain","password":"secret","passwordConfirmation":"secret"})).is_err());
+}
+
 #[test]
 fn credentials_are_not_present_in_debug_config() {
     let (_dir, runtime) = runtime();

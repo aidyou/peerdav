@@ -381,7 +381,41 @@ fn error_code(error: &DomainError) -> &'static str {
 /// Redacts cloud diagnostics before they cross the IPC boundary or enter logs.
 /// Provider errors frequently include signed URLs and proxy credentials.
 fn safe_cloud_chain(error: &DomainError) -> String {
+    use crate::cloud::types::CloudError;
+    if let DomainError::Cloud { source, .. } = error
+        && let Some(CloudError::MultipartAbort {
+            operation,
+            primary,
+            abort,
+        }) = source.downcast_ref::<CloudError>()
+    {
+        let mut rendered = error.to_string();
+        rendered.push_str(" during ");
+        rendered.push_str(operation);
+        append_error_chain(&mut rendered, primary.as_ref());
+        append_error_chain(&mut rendered, abort);
+        return redact_cloud_diagnostic(&rendered);
+    }
     redact_cloud_diagnostic(&error_chain(error))
+}
+
+/// Appends one original cause chain exactly once. Used when a failure retains
+/// two independent causes and neither may be dropped from diagnostics.
+fn append_error_chain(rendered: &mut String, error: &(dyn std::error::Error + 'static)) {
+    let text = error.to_string();
+    if !text.is_empty() && !rendered.contains(&text) {
+        rendered.push_str(": ");
+        rendered.push_str(&text);
+    }
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !text.is_empty() && !rendered.contains(&text) {
+            rendered.push_str(": ");
+            rendered.push_str(&text);
+        }
+        source = cause.source();
+    }
 }
 
 fn safe_cloud_reason(error: &(dyn std::error::Error + 'static)) -> String {
@@ -502,8 +536,116 @@ impl From<crate::cloud::types::CloudError> for DomainError {
             CloudError::Random { .. } => ("CLOUD_CONFIG_INVALID", "云存储安全随机数生成失败"),
             CloudError::Transport { .. } => ("CLOUD_TRANSPORT", "云存储传输失败"),
             CloudError::Storage { .. } => ("CLOUD_STORAGE", "云存储操作失败"),
+            CloudError::Multipart { .. } => ("CLOUD_STORAGE", "云端分片上传失败"),
+            CloudError::MultipartAbort { .. } => (
+                "CLOUD_UPLOAD_PENDING_RECOVERY",
+                "云端分片上传失败且清理未完成，需要恢复",
+            ),
+            CloudError::CompleteUnknown { .. } => (
+                "CLOUD_UPLOAD_PENDING_RECOVERY",
+                "云端分片上传结果未知，需要恢复",
+            ),
+            CloudError::UploadCancelled => ("CLOUD_CANCELLED", "云端上传已取消"),
+            CloudError::UploadBudgetExceeded => ("CLOUD_PRECONDITION", "云端对象超过大小限制"),
         };
         DomainError::Cloud {
+            code,
+            user_reason,
+            source: Box::new(source),
+        }
+    }
+}
+
+impl From<crate::cloud::ObjectGuardError> for DomainError {
+    fn from(source: crate::cloud::ObjectGuardError) -> Self {
+        use crate::cloud::ObjectGuardError;
+        let (code, user_reason) = match &source {
+            ObjectGuardError::IdentityUnconfirmed => (
+                "CLOUD_PHYSICAL_IDENTITY_UNCONFIRMED",
+                "请先确认物理存储身份 / Confirm physical storage identity first",
+            ),
+            ObjectGuardError::InvalidBinding => (
+                "CLOUD_PHYSICAL_BINDING_INVALID",
+                "物理存储关联无效 / Invalid physical storage binding",
+            ),
+            ObjectGuardError::BindingBusy => (
+                "CLOUD_PHYSICAL_BINDING_BUSY",
+                "物理存储仍有操作进行中 / Physical storage operations are active",
+            ),
+            ObjectGuardError::Protected | ObjectGuardError::Conflict => (
+                "CLOUD_OBJECT_PROTECTED",
+                "对象属于受保护的同步目录 / Object root is protected",
+            ),
+            ObjectGuardError::InvalidIdentity => (
+                "CLOUD_CONFIG_INVALID",
+                "存储身份无效 / Invalid storage identity",
+            ),
+            ObjectGuardError::OperationInProgress | ObjectGuardError::Busy => (
+                "CLOUD_OBJECT_BUSY",
+                "对象操作进行中 / Object operation is active",
+            ),
+            ObjectGuardError::NotFound => (
+                "CLOUD_NOT_FOUND",
+                "保护记录不存在 / Protection record not found",
+            ),
+            ObjectGuardError::KeyOrCorruption | ObjectGuardError::Storage { .. } => (
+                "CLOUD_GUARD_STORAGE",
+                "存储保护记录不可用 / Storage protection records unavailable",
+            ),
+        };
+        Self::Cloud {
+            code,
+            user_reason,
+            source: Box::new(source),
+        }
+    }
+}
+
+impl From<crate::cloud::ObjectServiceError> for DomainError {
+    fn from(source: crate::cloud::ObjectServiceError) -> Self {
+        use crate::cloud::ObjectServiceError;
+        let (code, user_reason) = match source {
+            ObjectServiceError::Cloud(error) => return error.into(),
+            ObjectServiceError::Guard(error) => return error.into(),
+            ObjectServiceError::UnknownStoreScope | ObjectServiceError::StoreScopeMismatch => (
+                "CLOUD_PHYSICAL_BINDING_INVALID",
+                "存储范围不匹配 / Invalid physical storage scope",
+            ),
+            ObjectServiceError::InvalidKey | ObjectServiceError::InvalidLocalCapability => (
+                "CLOUD_CONFIG_INVALID",
+                "对象路径或本地目录无效 / Invalid object path or local directory",
+            ),
+            ObjectServiceError::DiscoveryIncomplete => (
+                "CLOUD_DISCOVERY_INCOMPLETE",
+                "存储探测未完成 / Storage discovery incomplete",
+            ),
+            ObjectServiceError::StaleDeletePlan => (
+                "CLOUD_DELETE_PLAN_STALE",
+                "删除计划已失效 / Delete plan is stale",
+            ),
+            ObjectServiceError::ConfirmationRequired => (
+                "CLOUD_CONFIRMATION_REQUIRED",
+                "请确认删除操作 / Delete confirmation required",
+            ),
+            ObjectServiceError::Cancelled => ("CLOUD_CANCELLED", "下载已取消 / Download cancelled"),
+            ObjectServiceError::DestinationExists => (
+                "CLOUD_PRECONDITION",
+                "目标已存在 / Destination already exists",
+            ),
+            ObjectServiceError::DestinationSymlink => (
+                "CLOUD_PRECONDITION",
+                "目标是符号链接 / Destination is a symlink",
+            ),
+            ObjectServiceError::SizeMismatch => (
+                "CLOUD_PRECONDITION",
+                "下载大小不匹配 / Download size mismatch",
+            ),
+            ObjectServiceError::Io { .. } | ObjectServiceError::Cleanup { .. } => (
+                "CLOUD_LOCAL_IO",
+                "本地文件操作失败 / Local file operation failed",
+            ),
+        };
+        Self::Cloud {
             code,
             user_reason,
             source: Box::new(source),
@@ -823,9 +965,40 @@ fn error_reason(error: &DomainError) -> String {
             )
         }
         DomainError::Discovery { detail, .. } => failure("探测设备失败", "Device discovery failed", detail),
+        DomainError::Cloud { code, user_reason, .. }
+            if matches!(*code,
+                "CLOUD_PHYSICAL_IDENTITY_UNCONFIRMED"
+                | "CLOUD_PHYSICAL_BINDING_INVALID"
+                | "CLOUD_PHYSICAL_BINDING_BUSY") =>
+        {
+            (*user_reason).to_owned()
+        }
         DomainError::Cloud { source, .. } => {
+            use crate::cloud::types::CloudError;
             let reason = safe_cloud_reason(source.as_ref());
-            failure("云存储操作失败", "Cloud storage operation failed", &reason)
+            match source.downcast_ref::<CloudError>() {
+                Some(CloudError::MultipartAbort { primary, .. }) => {
+                    if matches!(primary.as_ref(), CloudError::UploadCancelled) {
+                        failure(
+                            "云端上传已取消，但分片清理未完成，需要恢复",
+                            "Cloud upload cancelled; multipart cleanup pending recovery",
+                            &reason,
+                        )
+                    } else {
+                        failure(
+                            "云端分片上传失败且清理未完成，需要恢复",
+                            "Cloud multipart upload failed; cleanup pending recovery",
+                            &reason,
+                        )
+                    }
+                }
+                Some(CloudError::CompleteUnknown { .. }) => failure(
+                    "云端分片上传结果未知，需要恢复",
+                    "Cloud multipart upload result is unknown; recovery required",
+                    &reason,
+                ),
+                _ => failure("云存储操作失败", "Cloud storage operation failed", &reason),
+            }
         }
         DomainError::Internal { detail } => failure("执行操作失败", "Operation failed", detail),
     }
@@ -865,6 +1038,22 @@ fn invalid_username_message(reason: &str) -> &'static str {
 
 fn error_context(error: &DomainError) -> Option<Value> {
     match error {
+        DomainError::Cloud { source, .. }
+            if matches!(
+                source.downcast_ref::<crate::cloud::types::CloudError>(),
+                Some(
+                    crate::cloud::types::CloudError::MultipartAbort { .. }
+                        | crate::cloud::types::CloudError::CompleteUnknown { .. }
+                )
+            ) =>
+        {
+            // object_store does not expose the provider multipart upload id.
+            // U3 recovery must discover or expire the residue; never report cleanup.
+            Some(json!({
+                "pendingRecovery": true,
+                "multipartUploadIdKnown": false
+            }))
+        }
         DomainError::DatabaseOpen { path, .. } => Some(json!({ "path": path })),
         DomainError::Io {
             path: Some(path), ..

@@ -21,10 +21,33 @@ impl CloudRuntime {
         self.admit()?;
         let mapping = self.mapping(mapping_id)?;
         let epoch = Self::root_epoch(&mapping.local_root)?;
-        let index = self.open_recovery_index(&mapping, &epoch)?;
-        index
-            .apply_records::<ApplyIntent>()
-            .map_err(|error| recovery_error("CLOUD_RECOVERY_INDEX", error.to_string()))?
+        let records = if mapping.protocol == super::config_types::StorageProtocol::AppendV2 {
+            let index = self.open_append_index(&mapping, &epoch)?;
+            let mut records = Vec::new();
+            let mut after = String::new();
+            loop {
+                let ids = index
+                    .recovery_record_ids(&after, 128)
+                    .map_err(|error| recovery_error("CLOUD_RECOVERY_INDEX", error.to_string()))?;
+                if ids.is_empty() {
+                    break;
+                }
+                for id in ids {
+                    after = id.clone();
+                    if let Some(intent) = index.recovery_record(&id).map_err(|error| {
+                        recovery_error("CLOUD_RECOVERY_INDEX", error.to_string())
+                    })? {
+                        records.push((id, intent));
+                    }
+                }
+            }
+            records
+        } else {
+            self.open_recovery_index(&mapping, &epoch)?
+                .apply_records::<ApplyIntent>()
+                .map_err(|error| recovery_error("CLOUD_RECOVERY_INDEX", error.to_string()))?
+        };
+        records
             .into_iter()
             .map(|(id, intent)| {
                 validate_intent(
@@ -58,20 +81,24 @@ impl CloudRuntime {
         self.manager.stop_mapping(mapping_id).await?;
         let mapping = self.mapping(mapping_id)?;
         let epoch = Self::root_epoch(&mapping.local_root)?;
-        let index = self.open_recovery_index(&mapping, &epoch)?;
-        let records = index
-            .apply_records::<ApplyIntent>()
-            .map_err(|error| recovery_error("CLOUD_RECOVERY_INDEX", error.to_string()))?;
-        let (id, intent) = records
-            .into_iter()
-            .find(|(id, _)| id == record_id)
-            .ok_or_else(|| {
-                recovery_error(
-                    "CLOUD_RECOVERY_NOT_FOUND",
-                    "恢复记录不存在 / Recovery record not found",
-                )
-            })?;
-        let _ = id;
+        let intent = if mapping.protocol == super::config_types::StorageProtocol::AppendV2 {
+            self.open_append_index(&mapping, &epoch)?
+                .recovery_record(record_id)
+                .map_err(|error| recovery_error("CLOUD_RECOVERY_INDEX", error.to_string()))?
+        } else {
+            self.open_recovery_index(&mapping, &epoch)?
+                .apply_records::<ApplyIntent>()
+                .map_err(|error| recovery_error("CLOUD_RECOVERY_INDEX", error.to_string()))?
+                .into_iter()
+                .find(|(id, _)| id == record_id)
+                .map(|(_, intent)| intent)
+        }
+        .ok_or_else(|| {
+            recovery_error(
+                "CLOUD_RECOVERY_NOT_FOUND",
+                "恢复记录不存在 / Recovery record not found",
+            )
+        })?;
         validate_intent(
             &mapping.local_root,
             &self.recovery_dir(mapping_id, &mapping.local_root),

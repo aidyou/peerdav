@@ -8,6 +8,27 @@ use thiserror::Error;
 pub type ObjectStream = BoxStream<'static, Result<Bytes, CloudError>>;
 pub type ObjectListing<'a> = BoxStream<'a, Result<ObjectMetadata, CloudError>>;
 
+#[derive(Clone, Debug, Default)]
+pub struct ObjectPage {
+    pub objects: Vec<ObjectMetadata>,
+    pub next_token: Option<String>,
+}
+
+/// Opaque continuation state bound to one prefix and pagination budget.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ObjectPageToken {
+    pub prefix: String,
+    pub provider_token: String,
+    pub pages: usize,
+    pub entries: usize,
+    /// Stable non-secret connection scope; this DTO is transport state, not authorization.
+    #[serde(default)]
+    pub scope_fingerprint: String,
+    /// Bounded provider-token history used to reject pagination cycles.
+    #[serde(default)]
+    pub seen_tokens: Vec<String>,
+}
+
 #[derive(Debug, Error)]
 pub enum CloudError {
     #[error("cloud configuration is invalid: {0}")]
@@ -32,6 +53,33 @@ pub enum CloudError {
     PayloadTooLarge,
     #[error("object key is outside the configured prefix")]
     PrefixViolation,
+    #[error("multipart upload failed during {operation}")]
+    Multipart {
+        operation: &'static str,
+        #[source]
+        source: object_store::Error,
+    },
+    /// Both the operation that needed an abort and the failed abort are kept.
+    /// object_store hides provider upload ids, so the remote upload id remains
+    /// unknown here; callers must not claim the upload was cleaned up.
+    #[error("multipart upload failed during {operation} and aborting it failed: {primary}")]
+    MultipartAbort {
+        operation: &'static str,
+        primary: Box<CloudError>,
+        #[source]
+        abort: object_store::Error,
+    },
+    /// Completion failed after the provider may already have committed the
+    /// object, so the outcome is unknown, not cancelled.
+    #[error("multipart upload completion result is unknown and may require recovery")]
+    CompleteUnknown {
+        #[source]
+        source: object_store::Error,
+    },
+    #[error("multipart upload cancelled")]
+    UploadCancelled,
+    #[error("multipart upload budget exceeded")]
+    UploadBudgetExceeded,
     #[error("secure random generation failed")]
     Random {
         #[source]
@@ -115,6 +163,14 @@ impl fmt::Debug for S3Config {
             .field("proxy", &self.proxy)
             .finish()
     }
+}
+
+/// Physical namespace of a store. Credentials and connection aliases are excluded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectStoreScope {
+    pub endpoint: String,
+    pub bucket: String,
+    pub prefix: String,
 }
 
 /// Repository objects are independently staged chunks or bounded metadata, not

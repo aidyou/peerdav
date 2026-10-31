@@ -13,6 +13,15 @@ afterEach(() => {
 });
 
 describe("workspace routes", () => {
+  it("roundtrips independent encoded cloud connection routes", () => {
+    const route = { view: "cloud", connectionId: "connection/a b" };
+    expect(routeHash(route)).toBe("#/cloud/connection%2Fa%20b");
+    writeRoute(route);
+    expect(readRoute()).toEqual({ ...route, peerId: "", settingsTab: "cloud" });
+    expect(parseRoute("#/cloud/").view).toBe("home");
+    expect(parseRoute("#/cloud/%broken").connectionId).toBe("%broken");
+    expect(routeHash({ view: "settings", settingsTab: "cloud" })).toBe("#/settings/cloud");
+  });
   it("falls back to Home for empty, unknown and malformed hashes", () => {
     for (const hash of ["", "#", "#/home", "#/unknown", "#/peer/"]) {
       expect(parseRoute(hash)).toEqual({

@@ -287,6 +287,10 @@ pub fn run() {
                     cloud::cloud_commands::cloud_restore,
                     cloud::cloud_commands::cloud_save_connection,
                     cloud::cloud_commands::cloud_delete_connection,
+                    cloud::cloud_commands::cloud_append_discover,
+                    cloud::cloud_commands::cloud_append_create,
+                    cloud::cloud_commands::cloud_append_join,
+                    cloud::cloud_commands::cloud_append_save_mapping,
                     cloud::cloud_commands::cloud_create_repository,
                     cloud::cloud_commands::cloud_join_repository,
                     cloud::cloud_commands::cloud_save_mapping,
@@ -295,6 +299,17 @@ pub fn run() {
                     cloud::cloud_commands::cloud_cancel,
                     cloud::cloud_commands::cloud_preview,
                     cloud::cloud_commands::cloud_sync,
+                    cloud::object_commands::cloud_object_list,
+                    cloud::object_commands::cloud_object_discover,
+                    cloud::object_commands::cloud_object_register_physical_identity,
+                    cloud::object_commands::cloud_object_select_local,
+                    cloud::object_commands::cloud_object_upload,
+                    cloud::object_commands::cloud_object_download,
+                    cloud::object_commands::cloud_object_delete_plan,
+                    cloud::object_commands::cloud_object_delete_execute,
+                    cloud::object_commands::cloud_object_cancel,
+                    cloud::object_commands::cloud_object_status,
+                    cloud::object_commands::cloud_object_recovery_acknowledge,
                 ]);
             handler(invoke)
         })

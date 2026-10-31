@@ -21,6 +21,7 @@ pub struct CloudCapabilities {
 pub struct CloudRuntimeSnapshot {
     pub connections: Vec<ConnectionRedacted>,
     pub repositories: Vec<RepositoryRedacted>,
+    pub append_repositories: Vec<crate::cloud::config_types::AppendRepositoryRedacted>,
     pub mappings: Vec<CloudMapping>,
     pub statuses: Vec<SyncStatus>,
     pub capabilities: CloudCapabilities,
@@ -101,6 +102,34 @@ pub struct CloudRestoreInput {
     pub mapping_id: String,
     pub record_id: String,
     pub destination: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateAppendRepositoryInput {
+    pub connection_id: String,
+    pub mode: crate::sync::append_types::AppendMode,
+    pub password: String,
+    pub password_confirmation: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JoinAppendRepositoryInput {
+    pub connection_id: String,
+    pub anchor_key: String,
+    pub anchor_fingerprint: String,
+    pub repository_id: String,
+    pub mode: crate::sync::append_types::AppendMode,
+    pub accept_tofu: bool,
+    pub trusted_fingerprint: Option<String>,
+    pub password: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SaveAppendMappingInput {
+    pub mapping_id: Option<String>,
+    pub mapping: AddMappingInput,
+    pub selected_root: String,
 }
 
 pub type CloudPath = PathBuf;

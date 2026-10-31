@@ -53,120 +53,22 @@ fn check(control: &PublishControl) -> Result<(), EngineError> {
         Err(EngineError::Cancelled)
     }
 }
-fn open_root(root: &Path) -> Result<cap_std::fs::Dir, EngineError> {
-    use cap_fs_ext::DirExt;
-    if !root.is_absolute() {
-        return Err(EngineError::UnsafePath(root.into()));
+use super::materialize::open_nofollow;
+
+impl super::traits::BlockReader for Repository {
+    type Error = super::repository::RepositoryError;
+
+    fn verify_local(&self, id: &str, bytes: &[u8]) -> Result<bool, Self::Error> {
+        self.verify_local_block(id, bytes)
     }
-    let mut dir = cap_std::fs::Dir::open_ambient_dir("/", cap_std::ambient_authority())
-        .map_err(EngineError::Io)?;
-    for part in root.components() {
-        match part {
-            std::path::Component::RootDir => {}
-            std::path::Component::Normal(name) => {
-                dir = dir.open_dir_nofollow(name).map_err(EngineError::Io)?
-            }
-            _ => return Err(EngineError::UnsafePath(root.into())),
-        }
+
+    fn read_block<'a>(
+        &'a self,
+        id: &'a str,
+        expected_len: usize,
+    ) -> futures_util::future::BoxFuture<'a, Result<zeroize::Zeroizing<Vec<u8>>, Self::Error>> {
+        Box::pin(self.get_block(id, expected_len))
     }
-    Ok(dir)
-}
-fn open_nofollow(root: &Path, relative: &Path) -> Result<std::fs::File, EngineError> {
-    use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
-    super::paths::validate_relative(relative)
-        .map_err(|_| EngineError::UnsafePath(relative.into()))?;
-    let mut dir = open_root(root)?;
-    let mut parts = relative.components();
-    let name = parts
-        .next_back()
-        .ok_or_else(|| EngineError::UnsafePath(relative.into()))?;
-    for part in parts {
-        dir = dir
-            .open_dir_nofollow(part.as_os_str())
-            .map_err(EngineError::Io)?;
-    }
-    let mut options = cap_std::fs::OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
-    let file = dir
-        .open_with(name.as_os_str(), &options)
-        .map_err(EngineError::Io)?
-        .into_std();
-    if !file.metadata().map_err(EngineError::Io)?.is_file() {
-        return Err(EngineError::UnsafePath(relative.into()));
-    }
-    Ok(file)
-}
-#[cfg(target_os = "linux")]
-fn ensure_directory(root: &Path, private: &Path, relative: &Path) -> Result<(), EngineError> {
-    let root_cap = open_root(root)?.into_std_file();
-    let private_cap = open_root(private)?.into_std_file();
-    // Capability directories may carry O_PATH descriptors, which cannot fsync.
-    let root = std::fs::File::from(
-        rustix::fs::openat(
-            &root_cap,
-            ".",
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )
-        .map_err(|e| EngineError::Io(e.into()))?,
-    );
-    let private = std::fs::File::from(
-        rustix::fs::openat(
-            &private_cap,
-            ".",
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::empty(),
-        )
-        .map_err(|e| EngineError::Io(e.into()))?,
-    );
-    let relative = relative.to_owned();
-    super::sandbox::run_confined(root, private, move |mut dir, _| {
-        let outcome = (|| -> Result<(), EngineError> {
-            for part in relative.components() {
-                let std::path::Component::Normal(name) = part else {
-                    return Err(EngineError::UnsafePath(relative.clone()));
-                };
-                match rustix::fs::openat(
-                    &dir,
-                    name,
-                    rustix::fs::OFlags::DIRECTORY
-                        | rustix::fs::OFlags::RDONLY
-                        | rustix::fs::OFlags::NOFOLLOW,
-                    rustix::fs::Mode::empty(),
-                ) {
-                    Ok(fd) => dir = std::fs::File::from(fd),
-                    Err(rustix::io::Errno::NOENT) => {
-                        rustix::fs::mkdirat(&dir, name, rustix::fs::Mode::from_raw_mode(0o700))
-                            .map_err(|e| EngineError::Io(e.into()))?;
-                        dir.sync_all().map_err(EngineError::Io)?;
-                        dir = std::fs::File::from(
-                            rustix::fs::openat(
-                                &dir,
-                                name,
-                                rustix::fs::OFlags::DIRECTORY
-                                    | rustix::fs::OFlags::RDONLY
-                                    | rustix::fs::OFlags::NOFOLLOW,
-                                rustix::fs::Mode::empty(),
-                            )
-                            .map_err(|e| EngineError::Io(e.into()))?,
-                        );
-                    }
-                    Err(error) => return Err(EngineError::Io(error.into())),
-                }
-            }
-            Ok(())
-        })();
-        Ok(outcome)
-    })
-    .map_err(EngineError::Sandbox)?
-}
-#[cfg(not(target_os = "linux"))]
-fn ensure_directory(_: &Path, _: &Path, _: &Path) -> Result<(), EngineError> {
-    Err(EngineError::Unsupported)
 }
 
 async fn load_remote(
@@ -527,33 +429,24 @@ pub async fn run_with_progress(
     let projection =
         super::namespace::project_scoped(&merge::project(&final_snapshot.revisions)?, mapping)
             .map_err(EngineError::Merge)?;
-    // Private staging must already have been established and validated by the caller.
-    if !std::fs::symlink_metadata(private)
-        .map_err(|_| EngineError::UnsafePath(private.into()))?
-        .is_dir()
-    {
-        return Err(EngineError::UnsafePath(private.into()));
-    }
+    let source_scan = pending
+        .as_ref()
+        .map_or(&scan_report, |pending| &pending.source_scan);
+    let request = super::materialize_types::MaterializeRequest {
+        root,
+        private,
+        mapping,
+        run_id: operation_id,
+        source_scan,
+        current_scan: &scan_report,
+        base_projection: &base_projection,
+        target: &projection,
+        local_chunks: &local_chunks,
+        final_verify: super::materialize_types::FinalVerifyMode::TargetFiles,
+    };
     progress(super::manager_types::SyncPhase::Applying);
-    let mut applied = 0;
-    for entry in &projection.entries {
-        let relative = entry.projection_path.iter().collect::<PathBuf>();
-        super::paths::validate_relative(&relative)
-            .map_err(|_| EngineError::UnsafePath(relative.clone()))?;
-    }
-    for entry in &projection.entries {
-        check(control)?;
-        let rel = entry.projection_path.iter().collect::<PathBuf>();
-        if matches!(
-            entry.value,
-            RevisionValue::Live {
-                node: Node::Dir,
-                ..
-            }
-        ) {
-            ensure_directory(root, private, &rel)?;
-        }
-    }
+    let allowed = || check(control);
+    super::materialize::prepare(&request, &allowed)?;
     if pending.is_some() {
         let summary = super::recovery::recover_pending(index, root, private)
             .map_err(EngineError::Recovery)?;
@@ -561,256 +454,24 @@ pub async fn run_with_progress(
             return Err(EngineError::PendingRecovery);
         }
     }
-    let source_scan = pending
-        .as_ref()
-        .map_or(&scan_report, |pending| &pending.source_scan);
-    for entry in &projection.entries {
-        check(control)?;
-        let RevisionValue::Live {
-            node: Node::File(file),
-            ..
-        } = &entry.value
-        else {
-            continue;
-        };
-        let rel = entry.projection_path.iter().collect::<PathBuf>();
-        let target = root.join(&rel);
-        let scanned = scan_report
-            .files
-            .iter()
-            .find(|scan| Path::new(&scan.path) == rel);
-        if scanned
-            .is_some_and(|scan| scan.whole_file_hash == file.digest && scan.size == file.length)
-        {
-            continue;
-        }
-        let scanned = source_scan
-            .files
-            .iter()
-            .find(|scan| Path::new(&scan.path) == rel);
-        let action = if scanned.is_some() {
-            super::apply_types::ApplyAction::Replace
-        } else {
-            super::apply_types::ApplyAction::Create
-        };
-        let mut tmp = tempfile::NamedTempFile::new_in(private)
-            .map_err(|_| EngineError::Changed(target.clone()))?;
-        for block in &file.blocks {
-            check(control)?;
-            let len =
-                usize::try_from(block.len).map_err(|_| EngineError::Changed(target.clone()))?;
-            if len > super::repository_types::MAX_BLOCK_SIZE {
-                return Err(EngineError::Unsupported);
-            }
-            let reused =
-                local_chunks
-                    .get(&(block.id.clone(), block.len))
-                    .and_then(|(path, offset)| {
-                        use std::io::{Seek, SeekFrom};
-                        let mut source = open_nofollow(root, path).ok()?;
-                        source.seek(SeekFrom::Start(*offset)).ok()?;
-                        let mut bytes = zeroize::Zeroizing::new(vec![0_u8; len]);
-                        source.read_exact(&mut bytes).ok()?;
-                        match repository.verify_local_block(&block.id, &bytes) {
-                            Ok(true) => Some(bytes),
-                            _ => None,
-                        }
-                    });
-            let bytes = match reused {
-                Some(bytes) => bytes,
-                None => repository.get_block(&block.id, len).await?,
-            };
-            std::io::Write::write_all(&mut tmp, &bytes)
-                .map_err(|_| EngineError::Changed(target.clone()))?;
-        }
-        tmp.as_file_mut()
-            .sync_all()
-            .map_err(|_| EngineError::Changed(target.clone()))?;
-        let apply_operation =
-            hex::encode(Sha256::digest(format!("{operation_id}:{}", rel.display())));
-        let mut journal = |intent: &super::apply_types::ApplyIntent| {
-            index
-                .record_apply(&apply_operation, intent)
-                .map_err(|_| super::apply_types::ApplyError::Journal)
-        };
-        super::apply::apply_bytes(
-            root,
-            private,
-            &apply_operation,
-            &rel,
-            action,
-            tmp.reopen()
-                .map_err(|_| EngineError::Changed(target.clone()))?,
-            scanned.map(|scan| super::apply_types::FileIdentity {
-                dev: scan.device,
-                ino: scan.inode,
-            }),
-            scanned.map(|scan| scan.whole_file_hash.as_str()),
-            scanned.map(|scan| scan.size),
-            &file.digest,
-            file.length,
-            &mut journal,
-        )?;
-        applied += 1;
-    }
-    let target_paths: std::collections::BTreeSet<PathBuf> = projection
-        .entries
-        .iter()
-        .filter(|entry| matches!(entry.value, RevisionValue::Live { .. }))
-        .map(|entry| entry.projection_path.iter().collect())
-        .collect();
-    for (relative, old) in &known_paths {
-        if target_paths.contains(relative)
-            || !matches!(
-                old.value,
-                RevisionValue::Live {
-                    node: Node::File(_),
-                    ..
-                }
-            )
-        {
-            continue;
-        }
-        if !scan_report
-            .files
-            .iter()
-            .any(|scan| Path::new(&scan.path) == relative)
-        {
-            continue;
-        }
-        if let Some(scan) = source_scan
-            .files
-            .iter()
-            .find(|scan| Path::new(&scan.path) == relative)
-        {
-            check(control)?;
-            let apply_operation = hex::encode(Sha256::digest(format!(
-                "{operation_id}:delete:{}",
-                relative.display()
-            )));
-            let mut journal = |intent: &super::apply_types::ApplyIntent| {
-                index
-                    .record_apply(&apply_operation, intent)
-                    .map_err(|_| super::apply_types::ApplyError::Journal)
-            };
-            super::apply::apply_bytes(
-                root,
-                private,
-                &apply_operation,
-                relative,
-                super::apply_types::ApplyAction::Delete,
-                std::io::empty(),
-                Some(super::apply_types::FileIdentity {
-                    dev: scan.device,
-                    ino: scan.inode,
-                }),
-                Some(&scan.whole_file_hash),
-                Some(scan.size),
-                "",
-                0,
-                &mut journal,
-            )?;
-        }
-    }
-    let mut deleted_directories = known_paths
-        .iter()
-        .filter(|(relative, entry)| {
-            !target_paths.contains(*relative)
-                && matches!(
-                    entry.value,
-                    RevisionValue::Live {
-                        node: Node::Dir,
-                        ..
-                    }
-                )
-        })
-        .map(|(relative, _)| relative.clone())
-        .collect::<Vec<_>>();
-    deleted_directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for relative in deleted_directories {
-        if !scan_report
-            .directories
-            .iter()
-            .any(|path| Path::new(path) == relative)
-        {
-            continue;
-        }
-        check(control)?;
-        let directory = open_root(&root.join(&relative))?
-            .dir_metadata()
-            .map_err(EngineError::Io)?;
-        #[cfg(unix)]
-        let identity = {
-            use cap_std::fs::MetadataExt;
-            super::apply_types::FileIdentity {
-                dev: directory.dev(),
-                ino: directory.ino(),
-            }
-        };
-        #[cfg(not(unix))]
-        {
-            let _ = directory;
-            return Err(EngineError::Unsupported);
-        }
-        #[cfg(unix)]
-        {
-            let operation = hex::encode(Sha256::digest(format!(
-                "{operation_id}:directory:{}",
-                relative.display()
-            )));
-            let mut journal = |intent: &super::apply_types::ApplyIntent| {
-                index
-                    .record_apply(&operation, intent)
-                    .map_err(|_| super::apply_types::ApplyError::Journal)
-            };
-            super::apply::apply_bytes(
-                root,
-                private,
-                &operation,
-                &relative,
-                super::apply_types::ApplyAction::DeleteDirectory,
-                std::io::empty(),
-                Some(identity),
-                None,
-                None,
-                "",
-                0,
-                &mut journal,
-            )?;
-        }
-    }
-    // Re-read the materialized view before advancing the baseline. Changes made
-    // while network/apply work was in flight must not be certified as applied.
-    let verify_root = root.to_owned();
-    let cancel = Arc::clone(&control.cancel);
-    let verified = tokio::task::spawn_blocking(move || {
-        scan::scan(
-            &verify_root,
-            &ScanOptions {
-                cancel,
-                ..Default::default()
-            },
-        )
-    })
+    let mut journal = |intent: &super::apply_types::ApplyIntent| {
+        index
+            .record_apply(&intent.op_id, intent)
+            .map_err(|_| super::apply_types::ApplyError::Journal)
+    };
+    let materialized = super::materialize::materialize(
+        &request,
+        repository.as_ref(),
+        &mut journal,
+        Arc::clone(&control.cancel),
+        &allowed,
+    )
     .await
-    .map_err(EngineError::Join)??;
-    for entry in &projection.entries {
-        if let RevisionValue::Live {
-            node: Node::File(file),
-            ..
-        } = &entry.value
-        {
-            let relative = entry.projection_path.iter().collect::<PathBuf>();
-            if !verified.files.iter().any(|observed| {
-                Path::new(&observed.path) == relative
-                    && observed.whole_file_hash == file.digest
-                    && observed.size == file.length
-            }) {
-                return Err(EngineError::Changed(relative));
-            }
-        }
-    }
-    check(control)?;
+    .map_err(|error| match error {
+        super::materialize_types::MaterializeError::Local(error) => error,
+        super::materialize_types::MaterializeError::Block(error) => EngineError::Repository(error),
+    })?;
+    let applied = materialized.applied_files;
     let baseline_entries = projection
         .entries
         .iter()

@@ -58,7 +58,7 @@ describe("cloud API wrappers", () => {
     expect(invoke).toBeDefined();
     expect(Object.keys(cloud)).toEqual([
       "list", "saveConnection", "testConnection", "deleteConnection",
-      "createRepository", "joinRepository", "saveMapping", "deleteMapping",
+      "createRepository", "joinRepository", "saveMapping", "appendDiscover", "appendCreate", "appendJoin", "appendSaveMapping", "deleteMapping",
       "preview", "sync", "cancel", "recoveryRecords", "restore", "status",
     ]);
   });

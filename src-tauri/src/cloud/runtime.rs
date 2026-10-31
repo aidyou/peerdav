@@ -29,6 +29,9 @@ use crate::sync::{
 };
 use crate::{AppError, DomainError, Vault};
 
+#[path = "runtime_append.rs"]
+pub mod append;
+
 #[derive(Clone)]
 struct Ticket {
     id: String,
@@ -332,7 +335,10 @@ pub struct CloudRuntime {
     safe_apply: bool,
     gate: AtomicBool,
     cancel: Arc<AtomicBool>,
-    pub(crate) network: RwLock<()>,
+    pub(crate) network: Arc<RwLock<()>>,
+    pub(crate) objects: tokio::sync::Mutex<super::object_runtime_types::ObjectState>,
+    pub(crate) object_events: Arc<dyn SyncEvents>,
+    pub(crate) object_lifecycle: tokio::sync::Mutex<()>,
     tickets: Mutex<HashMap<String, Ticket>>,
     pub(crate) schedules: super::runtime_schedule::CloudSchedules,
 }
@@ -340,13 +346,16 @@ impl CloudRuntime {
     pub fn new(vault: Arc<Vault>, events: Arc<dyn SyncEvents>, data_dir: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             config: CloudConfigStore::new(Arc::clone(&vault)),
-            manager: SyncManager::new(events),
+            manager: SyncManager::new(Arc::clone(&events)),
+            object_events: events,
+            object_lifecycle: tokio::sync::Mutex::new(()),
+            objects: tokio::sync::Mutex::new(super::object_runtime_types::ObjectState::new()),
             vault,
             safe_apply: probe_apply_capability(&data_dir),
             data_dir,
             gate: AtomicBool::new(false),
             cancel: Arc::new(AtomicBool::new(false)),
-            network: RwLock::new(()),
+            network: Arc::new(RwLock::new(())),
             tickets: Mutex::new(HashMap::new()),
             schedules: super::runtime_schedule::CloudSchedules::new(),
         })
@@ -354,18 +363,34 @@ impl CloudRuntime {
     pub async fn stop_and_clear(&self) -> Result<(), AppError> {
         self.gate.store(false, Ordering::Release);
         self.cancel.store(true, Ordering::Release);
-        self.schedules.stop_all().await?;
-        self.manager.block_new_and_stop_all().await?;
+        let _objects = self.object_lifecycle.lock().await;
+        for result in [
+            self.object_invalidate(None).await,
+            self.schedules.stop_all().await,
+            self.manager.block_new_and_stop_all().await,
+        ] {
+            if let Err(error) = result {
+                log::error!("cloud shutdown error: {error:?}");
+                if let Err(source) = self.object_events.error(error) {
+                    log::error!("cloud shutdown error event failed: {source}");
+                }
+            }
+        }
         let _p = self.network.write().await;
-        self.tickets
-            .lock()
-            .map_err(|_| {
-                runtime_error(
+        match self.tickets.lock() {
+            Ok(mut tickets) => tickets.clear(),
+            Err(poisoned) => {
+                poisoned.into_inner().clear();
+                let error = runtime_error(
                     "CLOUD_TICKET_LOCK",
                     "预览状态不可用 / Preview state unavailable",
-                )
-            })?
-            .clear();
+                );
+                log::error!("cloud shutdown error: {error:?}");
+                if let Err(source) = self.object_events.error(error) {
+                    log::error!("cloud shutdown error event failed: {source}");
+                }
+            }
+        }
         Ok(())
     }
     pub async fn refresh_schedules(self: &Arc<Self>) -> Result<(), AppError> {
@@ -405,6 +430,7 @@ impl CloudRuntime {
                 .iter()
                 .map(CachedRepository::redacted)
                 .collect(),
+            append_repositories: s.append_repositories,
             mappings: s.mappings,
             statuses: self.manager.snapshots(),
             capabilities: CloudCapabilities {
@@ -420,6 +446,8 @@ impl CloudRuntime {
         input: SaveS3Input,
     ) -> Result<ConnectionRedacted, AppError> {
         self.admit()?;
+        let _objects = self.object_lifecycle.lock().await;
+        self.object_invalidate(input.id.as_deref()).await?;
         let _permit = self.network.write().await;
         self.admit()?;
         if let Some(id) = input.id.as_deref() {
@@ -438,6 +466,8 @@ impl CloudRuntime {
     }
     pub async fn delete_connection(&self, id: &str) -> Result<(), AppError> {
         self.admit()?;
+        let _objects = self.object_lifecycle.lock().await;
+        self.object_invalidate(Some(id)).await?;
         let _permit = self.network.write().await;
         self.admit()?;
         for mapping in self
@@ -560,6 +590,8 @@ impl CloudRuntime {
             &mapping.logical_path,
             &mapping.local_root,
             &mapping.schedule,
+            &mapping.protocol,
+            &mapping.append_binding,
         ))
         .map(|value| hex::encode(Sha256::digest(value)))
         .map_err(|error| runtime_error("CLOUD_CONFIG_INVALID", &error.to_string()))
@@ -597,16 +629,24 @@ impl CloudRuntime {
         .map_err(|_| runtime_error("CLOUD_SCAN_FAILED", "扫描任务异常退出 / Scan task failed"))?
         .map_err(|e| runtime_error("CLOUD_SCAN_FAILED", &e.to_string()))?;
         let digest = Self::digest(&report)?;
-        let (repo, rev) = self.repo(&m).await?;
-        let head = repo.head().await.map_err(repo_error)?;
-        let remote = match head.commit.as_deref() {
-            Some(commit) => {
-                let control = PublishControl {
-                    cancel: Arc::clone(&self.cancel),
-                    epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                    expected_epoch: 0,
-                };
-                crate::sync::tree::load_commit_snapshot(&repo, commit, &control)
+        let (total, rev, head_commit) = if m.protocol == StorageProtocol::AppendV2 {
+            let (counts, signature) = self.append_preview_state(&m, &epoch).await?;
+            (
+                counts,
+                self.connection(&m.connection_id)?.revision,
+                Some(signature),
+            )
+        } else {
+            let (repo, rev) = self.repo(&m).await?;
+            let head = repo.head().await.map_err(repo_error)?;
+            let remote = match head.commit.as_deref() {
+                Some(commit) => {
+                    let control = PublishControl {
+                        cancel: Arc::clone(&self.cancel),
+                        epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        expected_epoch: 0,
+                    };
+                    crate::sync::tree::load_commit_snapshot(&repo, commit, &control)
                     .await
                     .map_err(|error| {
                         AppError::from(DomainError::Cloud {
@@ -616,42 +656,44 @@ impl CloudRuntime {
                         })
                     })?
                     .snapshot
-            }
-            None => MergeSet {
-                revisions: std::collections::BTreeMap::new(),
-            },
+                }
+                None => MergeSet {
+                    revisions: std::collections::BTreeMap::new(),
+                },
+            };
+            let remote_projection = crate::sync::namespace::project_scoped(
+                &merge::project(&remote.revisions)
+                    .map_err(|e| runtime_error("CLOUD_REMOTE_METADATA", &e.to_string()))?,
+                &m.logical_path,
+            )
+            .map_err(|e| runtime_error("CLOUD_REMOTE_METADATA", &e.to_string()))?;
+            let base = self
+                .config
+                .get_or_create_index_key()
+                .map_err(config_error)
+                .and_then(|key| {
+                    SyncIndex::open(
+                        &self.data_dir.join("cloud-sync.sqlite"),
+                        key,
+                        m.repository_id.clone(),
+                        Self::index_scope(&m, &epoch),
+                    )
+                    .map_err(|e| runtime_error("CLOUD_INDEX", &e.to_string()))
+                })?
+                .load::<MergeSet>("engine", "materialized")
+                .map_err(|e| runtime_error("CLOUD_INDEX", &e.to_string()))?
+                .unwrap_or(MergeSet {
+                    revisions: std::collections::BTreeMap::new(),
+                });
+            let base_projection = crate::sync::namespace::project_scoped(
+                &merge::project(&base.revisions)
+                    .map_err(|e| runtime_error("CLOUD_REMOTE_METADATA", &e.to_string()))?,
+                &m.logical_path,
+            )
+            .map_err(|e| runtime_error("CLOUD_REMOTE_METADATA", &e.to_string()))?;
+            let total = preview_counts(&report, &base_projection, &remote_projection);
+            (total, rev, head.commit)
         };
-        let remote_projection = crate::sync::namespace::project_scoped(
-            &merge::project(&remote.revisions)
-                .map_err(|e| runtime_error("CLOUD_REMOTE_METADATA", &e.to_string()))?,
-            &m.logical_path,
-        )
-        .map_err(|e| runtime_error("CLOUD_REMOTE_METADATA", &e.to_string()))?;
-        let base = self
-            .config
-            .get_or_create_index_key()
-            .map_err(config_error)
-            .and_then(|key| {
-                SyncIndex::open(
-                    &self.data_dir.join("cloud-sync.sqlite"),
-                    key,
-                    m.repository_id.clone(),
-                    Self::index_scope(&m, &epoch),
-                )
-                .map_err(|e| runtime_error("CLOUD_INDEX", &e.to_string()))
-            })?
-            .load::<MergeSet>("engine", "materialized")
-            .map_err(|e| runtime_error("CLOUD_INDEX", &e.to_string()))?
-            .unwrap_or(MergeSet {
-                revisions: std::collections::BTreeMap::new(),
-            });
-        let base_projection = crate::sync::namespace::project_scoped(
-            &merge::project(&base.revisions)
-                .map_err(|e| runtime_error("CLOUD_REMOTE_METADATA", &e.to_string()))?,
-            &m.logical_path,
-        )
-        .map_err(|e| runtime_error("CLOUD_REMOTE_METADATA", &e.to_string()))?;
-        let total = preview_counts(&report, &base_projection, &remote_projection);
 
         let id = hex::encode(rand::random::<[u8; 16]>());
         let ticket = Ticket {
@@ -662,7 +704,7 @@ impl CloudRuntime {
             identity: epoch.clone(),
             digest,
             revision: rev,
-            head: head.commit.clone(),
+            head: head_commit.clone(),
             epoch: epoch.clone(),
             created: Instant::now(),
         };
@@ -697,7 +739,7 @@ impl CloudRuntime {
                 conflicts: total.conflicts,
             },
             requires_confirmation: true,
-            head_commit: head.commit,
+            head_commit,
             root_epoch: epoch,
         })
     }
@@ -760,6 +802,18 @@ impl CloudRuntime {
         }
         let m = self.mapping(mapping_id)?;
         self.authorize_root_for_manual(&m, &ticket.root, true)?;
+        if m.protocol == StorageProtocol::AppendV2 {
+            let (_, signature) = self.append_preview_state(&m, &ticket.epoch).await?;
+            if self.connection(&m.connection_id)?.revision != ticket.revision
+                || Some(signature) != ticket.head
+            {
+                return Err(runtime_error(
+                    "CLOUD_PREVIEW_STALE",
+                    "远端或配置已变化 / Remote or configuration changed",
+                ));
+            }
+            return self.start_append_worker(m, &ticket.epoch).await;
+        }
         let (repo, rev) = self.repo(&m).await?;
         if rev != ticket.revision || repo.head().await.map_err(repo_error)?.commit != ticket.head {
             return Err(runtime_error(

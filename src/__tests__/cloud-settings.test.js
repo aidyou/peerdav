@@ -39,6 +39,15 @@ async function mountCloud(data = rows) {
 beforeEach(() => { setLocale("zh-CN"); Object.values(cloud).forEach((fn) => fn.mockReset()); confirmAction.mockReset(); confirmAction.mockResolvedValue(true); openDialog.mockReset(); app.handleFailure.mockReset(); app.setNotice.mockReset(); app.setError.mockReset(); progressHandler = undefined; });
 
 describe("CloudSettings", () => {
+  it("opens independent browsing for the selected connection without starting sync", async () => {
+    const wrapper = await mountCloud({ ...rows, connections: [{ id: "cloud/a b", name: "Browse target" }] });
+    await wrapper.find(".cloud-browse-entry").trigger("click");
+    expect(window.location.hash).toBe("#/cloud/cloud%2Fa%20b");
+    expect(cloud.sync).not.toHaveBeenCalled();
+    expect(wrapper.text()).toContain("普通网盘对象使用独立浏览视图");
+    wrapper.unmount();
+    window.history.replaceState(null, "", window.location.pathname);
+  });
   it("renders the connection, repository secret/password, and mapping inputs", async () => {
     setLocale("zh-CN"); const wrapper = await mountCloud();
     expect(wrapper.findAll("input").length).toBeGreaterThanOrEqual(7);

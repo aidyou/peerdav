@@ -2,6 +2,10 @@
 
 > **文档状态：当前协议与验证边界。** 本文只记录当前 Rust source 已存在的行为；不把尚未完成的 UI/manager 或未执行的集成矩阵写成已交付。本版目录树实现已接入 publisher、engine 和 cloud runtime；验证状态按已实际运行的 focused checks 记录，不替代完整回归声明。本文件不是性能或兼容性营销承诺。
 
+> **当前更新（2026-10-31）：本文协议章节专述 CAS v1，不是全部云仓库的共同门槛。** 用户已批准保留 CAS 可读写并新增 AppendV2；新建默认 `cas_v1`，append 必须显式选择，不自动降级/迁移。Append 的 `encrypted` 与 `authenticated_plain` 均已批准并有生产路径，两者都需要密码；TOFU、anchor/逻辑根显式选择、四个新命令、vault schema `2` 与旧配置默认 CAS、恢复档案/安全续作及普通浏览保护，详见 `cloud-append-v2.md` 页首和 `cloud-storage.md` 第 0 节。四个命令为 `cloud_append_discover`、`cloud_append_create`、`cloud_append_join`、`cloud_append_save_mapping`。仅新读旧配置兼容，不承诺旧应用读取新增字段。
+>
+> 本文所述 v1 HEAD wire、revision 哈希与 generation 不套用到 append frontier。普通浏览显示原始对象、不解密仓库；保护未知只读，后端保护 CAS/append 同步区，普通删除不等于仓库 GC。生产可达、测试通过及未验证项必须分别解读。
+
 ## 1. 来源与范围
 
 核对来源：
@@ -95,6 +99,16 @@ Linux safe apply 仅在 Landlock ABI v3 且 ruleset status 为 `FullyEnforced`�
 `src-tauri/tests/cloud_sync_flow.rs` 的 engine fixture 已覆盖：空设备物化首个文件、第二设备编辑回传、unknown/empty 不删除远端、missing root 不推进 generation、已知删除本地物化并保留 recovery 内容、encrypted devices 使用同一密码 join。它们使用进程内 local fake object store，不是真实多 part/AWS/R2 provider 集成。Linux Landlock 测试真实覆盖 held parent fd：root/a 移出后 private→held-a 的 INSTALL denied、held-a→private 的 preservation denied，以及正常 cross-directory rename；应用层 all-rename gate 已接入。Windows/macOS 是 unsupported。
 
 ## 8. 验证状态与 pending
+
+### 当前证据（2026-10-31）
+
+以下是父任务/代理分批运行报告，本文编辑未重跑：后端 81 项专项及 24 项 runtime/schedule/manager 通过；双模式 HTTP runtime fixture 端到端 236.71 秒通过，CAS 44 项及独立慢项 1 项（406.08 秒）通过。此前 append/object 所列 `6+32+17+17+6+4+17+70+21+10+2 = 202`，分项合计确为 202；最终专项 discovery 35、engine 19、index 17、publish 6、recovery 6、contract 6、repository 17，以及 object `70+21+10+2` 均通过。各批次时间不同，不猜统一总数。全部 35 个集成 test targets 已分批执行，剩余 13 targets 实质 124 项通过，另有外部默认空跑 1 项、七牛 ignored 1 项；bin/doc 为 0 项。lib 在最终生产修改后重跑，166 项全部通过，最终预算修改后受影响组均重跑通过。两次单命令 `cargo test` 达到 600 秒超时，但不是未尝试目标；分批全目标已覆盖，不表示单命令全量成功或全部测试在最终修改后统一重跑。`cargo fmt --check` 与 `cargo check --all-targets --offline` 通过；前端全部 21 文件/346 tests 和 build 通过，仍有大 chunk 警告。
+
+资源专项真实文件为 `65 MiB + 1 byte`，最大 part 8 MiB、peak buffer 8 MiB、inflight 1，测试 4.33 秒；`/proc` VmHWM 65364 kB（约 63.83 MiB），不是 GNU time 或 RSS 硬限证明，256 MiB 仍为计量分配预算。最终 append discovery/apply/freeze 统一先持久记账 stat 请求，再按声明长度持久预留 GET 请求与 read 字节，之后 bounded stream；增大超声明长度立即拒绝，缩短保守计费不退款。S3 stat 为对象 HEAD：无 CAS 探测、不读写 `control/HEAD`，允许且计费对象 HEAD；publisher 按冻结已知长度预留，无需 HEAD。持久 active unfinished run 让外层新 run id 自动重试复用原账本，成功才新轮；此为 append 当前实现证据，不改变本文 CAS v1 协议。
+
+桌面及 400px 视觉未实渲染，真实厂商本轮未测、不读凭据；SIGKILL/掉电/磁盘满全矩阵、独立服务签名验收仍未完成，future drop/独立 SQLite 重开不等于实测断电。最终 `git diff --check` 成功；仍保留工具 backend/worktree 差异限制，untracked 文件不能由普通 `git diff` 展示，须另核对内容。
+
+### 历史验证记录（保留原结果，不是当前总量或当前全量通过证明）
 
 最终代码验证已通过：Rust 共 344 项测试，含 127 项 lib、12 项 tree、13 项 publisher、16 项 sync，以及既有 peer/server/vault 回归；前端 19 个文件、292 项测试及 `pnpm build` 通过（主 bundle 大于 500 kB 的构建提示仍存在）。`cargo fmt --check`、`cargo check --all-targets --offline` 和 `git diff --check` 通过，无新增 Rust 警告。
 

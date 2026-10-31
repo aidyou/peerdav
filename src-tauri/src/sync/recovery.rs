@@ -137,6 +137,43 @@ mod unix {
         )
     }
 
+    /// Opt-in append recovery. Unlike CAS recovery, Prepared and legacy Paused
+    /// intents may continue only after validating the original durable evidence.
+    pub fn recover_append_records(
+        root: &Path,
+        private: &Path,
+        records: Vec<(String, ApplyIntent)>,
+        journal: &mut dyn FnMut(&str, &ApplyIntent) -> Result<(), RecoveryError>,
+    ) -> Result<RecoverySummary, RecoveryError> {
+        let mut out = RecoverySummary::default();
+        for (id, intent) in records {
+            out.requires_remote_reconcile = true;
+            let result = trusted_layout(root, private, &intent).and_then(|()| {
+                let mut journal_error = None;
+                let result = apply::resume_append(&intent, root, private, &mut |next| {
+                    journal(&id, next).map_err(|error| {
+                        journal_error = Some(error);
+                        crate::sync::apply_types::ApplyError::Journal
+                    })
+                });
+                if let Some(error) = journal_error {
+                    return Err(error);
+                }
+                result.map(|_| ()).map_err(RecoveryError::from)
+            });
+            match result {
+                Ok(()) => out.recovered_operations.push(id),
+                Err(error @ RecoveryError::Index(_)) => return Err(error),
+                Err(_) => {
+                    // Do not discard the original phase/evidence on uncertainty.
+                    out.needs_user_confirmation = true;
+                    out.operation = Some(id);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn recover_pending(
         index: &mut SyncIndex,
         root: &Path,
@@ -146,6 +183,19 @@ mod unix {
             .load("engine", "completed_apply_operations")?
             .unwrap_or_default();
         let records: Vec<(String, ApplyIntent)> = index.apply_records()?;
+        recover_records(root, private, records, &completed, &mut |op, intent| {
+            index.record_apply(op, intent).map_err(RecoveryError::from)
+        })
+    }
+
+    /// Storage-neutral recovery; the caller owns record loading and durable updates.
+    pub fn recover_records(
+        root: &Path,
+        private: &Path,
+        records: Vec<(String, ApplyIntent)>,
+        completed: &[String],
+        journal: &mut dyn FnMut(&str, &ApplyIntent) -> Result<(), RecoveryError>,
+    ) -> Result<RecoverySummary, RecoveryError> {
         let mut out = RecoverySummary::default();
         for (op, intent) in records {
             if completed.iter().any(|x| x == &op) {
@@ -187,13 +237,13 @@ mod unix {
                     if phase == ApplyPhase::Prepared {
                         let mut paused = intent.clone();
                         paused.phase = ApplyPhase::Paused;
-                        index.record_apply(&op, &paused)?;
+                        journal(&op, &paused)?;
                         out.needs_user_confirmation = true;
                         out.operation = Some(op.clone());
                     } else {
                         let mut next = intent.clone();
                         next.phase = phase;
-                        index.record_apply(&op, &next)?;
+                        journal(&op, &next)?;
                     }
                     out.requires_remote_reconcile = true;
                     out.recovered_operations.push(op);
@@ -202,7 +252,7 @@ mod unix {
                     let phase = apply::recover(&intent, root)?;
                     let mut next = intent.clone();
                     next.phase = phase;
-                    index.record_apply(&op, &next)?;
+                    journal(&op, &next)?;
                     out.requires_remote_reconcile = true;
                     out.recovered_operations.push(op);
                 }
@@ -241,7 +291,28 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::recover_pending;
+pub use unix::{recover_append_records, recover_pending, recover_records};
+
+#[cfg(not(unix))]
+pub fn recover_append_records(
+    _: &std::path::Path,
+    _: &std::path::Path,
+    _: Vec<(String, ApplyIntent)>,
+    _: &mut dyn FnMut(&str, &ApplyIntent) -> Result<(), RecoveryError>,
+) -> Result<RecoverySummary, RecoveryError> {
+    Err(RecoveryError::Unsupported)
+}
+
+#[cfg(not(unix))]
+pub fn recover_records(
+    _: &std::path::Path,
+    _: &std::path::Path,
+    _: Vec<(String, ApplyIntent)>,
+    _: &[String],
+    _: &mut dyn FnMut(&str, &ApplyIntent) -> Result<(), RecoveryError>,
+) -> Result<RecoverySummary, RecoveryError> {
+    Err(RecoveryError::Unsupported)
+}
 
 #[cfg(not(unix))]
 pub fn recover_pending(

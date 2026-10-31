@@ -70,6 +70,197 @@ fn apply(
 }
 
 #[test]
+fn append_prepared_and_legacy_paused_resume_all_actions() {
+    for action in [
+        ApplyAction::Create,
+        ApplyAction::Replace,
+        ApplyAction::Delete,
+        ApplyAction::DeleteDirectory,
+    ] {
+        for paused in [false, true] {
+            let (_tmp, root, private, _index) = setup();
+            let target = root.join("a");
+            let directory = action == ApplyAction::DeleteDirectory;
+            let existing = action != ApplyAction::Create;
+            if directory {
+                fs::create_dir(&target).unwrap();
+            } else if existing {
+                fs::write(&target, b"old").unwrap();
+            }
+            let old = existing.then(|| id(&target));
+            let old_digest = (existing && !directory).then(|| digest(b"old"));
+            let mut saved = None;
+            assert!(
+                apply(
+                    &root,
+                    &private,
+                    "append-resume",
+                    Path::new("a"),
+                    action.clone(),
+                    b"new",
+                    old,
+                    old_digest.as_deref(),
+                    (existing && !directory).then_some(3),
+                    &mut |intent| {
+                        saved = Some(intent.clone());
+                        Err(ApplyError::Journal)
+                    }
+                )
+                .is_err()
+            );
+            let mut intent = saved.unwrap();
+            if paused {
+                intent.phase = ApplyPhase::Paused;
+            }
+            let mut durable = intent.clone();
+            let summary = peerdav_lib::sync::recovery::recover_append_records(
+                &root,
+                &private,
+                vec![("record-id".into(), intent.clone())],
+                &mut |record, next| {
+                    assert_eq!(record, "record-id");
+                    durable = next.clone();
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert!(!summary.needs_user_confirmation);
+            if matches!(action, ApplyAction::Delete | ApplyAction::DeleteDirectory) {
+                assert!(!target.exists());
+                assert_eq!(durable.phase, ApplyPhase::Deleted);
+            } else {
+                assert_eq!(fs::read(&target).unwrap(), b"new");
+                assert_eq!(durable.phase, ApplyPhase::Installed);
+            }
+            if existing {
+                assert!(intent.recovery_path.exists());
+            }
+            // Replaying a completed pending record is idempotent.
+            let summary = peerdav_lib::sync::recovery::recover_append_records(
+                &root,
+                &private,
+                vec![("record-id".into(), durable)],
+                &mut |_, _| Ok(()),
+            )
+            .unwrap();
+            assert!(!summary.needs_user_confirmation);
+        }
+    }
+}
+
+#[test]
+fn append_resume_refuses_uncertain_prepared_states_without_mutation() {
+    for fault in [
+        "old-edit",
+        "stage-edit",
+        "stage-missing",
+        "symlink",
+        "root",
+        "nonempty",
+    ] {
+        let (_tmp, root, private, _index) = setup();
+        let target = root.join("a");
+        let directory = fault == "nonempty";
+        if directory {
+            fs::create_dir(&target).unwrap();
+        } else {
+            fs::write(&target, b"old").unwrap();
+        }
+        let mut saved = None;
+        assert!(
+            apply(
+                &root,
+                &private,
+                "uncertain",
+                Path::new("a"),
+                if directory {
+                    ApplyAction::DeleteDirectory
+                } else {
+                    ApplyAction::Replace
+                },
+                b"new",
+                Some(id(&target)),
+                (!directory).then(|| digest(b"old")).as_deref(),
+                (!directory).then_some(3),
+                &mut |intent| {
+                    saved = Some(intent.clone());
+                    Err(ApplyError::Journal)
+                }
+            )
+            .is_err()
+        );
+        let intent = saved.unwrap();
+        match fault {
+            "old-edit" => fs::write(&target, b"concurrent").unwrap(),
+            "stage-edit" => fs::write(&intent.staging_path, b"tamper").unwrap(),
+            "stage-missing" => fs::remove_file(&intent.staging_path).unwrap(),
+            "symlink" => {
+                fs::remove_file(&target).unwrap();
+                std::os::unix::fs::symlink("elsewhere", &target).unwrap();
+            }
+            "root" => {
+                fs::rename(&root, root.with_file_name("old-root")).unwrap();
+                fs::create_dir(&root).unwrap();
+            }
+            "nonempty" => fs::write(target.join("child"), b"precious").unwrap(),
+            _ => unreachable!(),
+        }
+        let summary = peerdav_lib::sync::recovery::recover_append_records(
+            &root,
+            &private,
+            vec![("id".into(), intent.clone())],
+            &mut |_, _| panic!("must not journal uncertain evidence"),
+        )
+        .unwrap();
+        assert!(summary.needs_user_confirmation, "{fault}");
+        assert!(!intent.recovery_path.exists(), "{fault}");
+    }
+}
+
+#[test]
+fn append_recognizes_rename_before_phase_write() {
+    for install in [false, true] {
+        let (_tmp, root, private, _index) = setup();
+        let target = root.join("a");
+        fs::write(&target, b"old").unwrap();
+        let mut saved = None;
+        assert!(
+            apply(
+                &root,
+                &private,
+                "rename-window",
+                Path::new("a"),
+                ApplyAction::Replace,
+                b"new",
+                Some(id(&target)),
+                Some(&digest(b"old")),
+                Some(3),
+                &mut |intent| {
+                    saved = Some(intent.clone());
+                    Err(ApplyError::Journal)
+                }
+            )
+            .is_err()
+        );
+        let intent = saved.unwrap();
+        fs::rename(&target, &intent.recovery_path).unwrap();
+        if install {
+            fs::rename(&intent.staging_path, &target).unwrap();
+        }
+        let summary = peerdav_lib::sync::recovery::recover_append_records(
+            &root,
+            &private,
+            vec![("id".into(), intent.clone())],
+            &mut |_, _| Ok(()),
+        )
+        .unwrap();
+        assert!(!summary.needs_user_confirmation);
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(fs::read(&intent.recovery_path).unwrap(), b"old");
+    }
+}
+
+#[test]
 fn empty_index_is_unknown_and_has_no_recovery() {
     let (_tmp, root, private, mut index) = setup();
     let summary = recover_pending(&mut index, &root, &private).expect("recover");

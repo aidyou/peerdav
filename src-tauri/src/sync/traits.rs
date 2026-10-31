@@ -6,6 +6,18 @@ use std::sync::Arc;
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub use super::manager_types::RunContext;
 
+/// Read and authenticate plaintext blocks without exposing publication or repository state.
+pub trait BlockReader: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn verify_local(&self, id: &str, bytes: &[u8]) -> Result<bool, Self::Error>;
+    fn read_block<'a>(
+        &'a self,
+        id: &'a str,
+        expected_len: usize,
+    ) -> BoxFuture<'a, Result<zeroize::Zeroizing<Vec<u8>>, Self::Error>>;
+}
+
 pub trait SyncWorker: Send + Sync + 'static {
     fn run(&self, context: RunContext) -> BoxFuture<'static, Result<WorkerOutcome, AppError>>;
 }

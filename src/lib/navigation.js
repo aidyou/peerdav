@@ -20,6 +20,12 @@ export function parseRoute(hash) {
     return { view: "peer", peerId, settingsTab: "shares" };
   }
 
+  if (view === "cloud" && rest[0]) {
+    let connectionId = rest[0];
+    try { connectionId = decodeURIComponent(connectionId); } catch { /* Keep unavailable ids visible. */ }
+    return { view: "cloud", connectionId, peerId: "", settingsTab: "cloud" };
+  }
+
   if (view === "settings") {
     return {
       view: "settings",
@@ -31,7 +37,8 @@ export function parseRoute(hash) {
   return { view: "home", peerId: "", settingsTab: "shares" };
 }
 
-export function routeHash({ view, peerId, settingsTab } = {}) {
+export function routeHash({ view, peerId, settingsTab, connectionId } = {}) {
+  if (view === "cloud" && connectionId) return `#/cloud/${encodeURIComponent(connectionId)}`;
   if (view === "peer" && peerId) {
     return `#/peer/${encodeURIComponent(peerId)}`;
   }

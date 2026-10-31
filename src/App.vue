@@ -22,6 +22,7 @@ import AppRail from "./components/AppRail.vue";
 import AuthView from "./components/AuthView.vue";
 import HomeView from "./components/HomeView.vue";
 import PeerBrowser from "./components/PeerBrowser.vue";
+import CloudBrowser from "./components/CloudBrowser.vue";
 import SettingsView from "./components/SettingsView.vue";
 import TitleBarMenu from "./components/TitleBarMenu.vue";
 
@@ -90,6 +91,7 @@ const discoveredLoading = ref(true);
 const activePeerId = ref("");
 const activePeerSnapshot = ref(null);
 const workspaceView = ref("home");
+const activeCloudConnectionId = ref("");
 let lastInterfaceActivity = Date.now();
 const interfaceLocked = ref(false);
 const unlockPassword = ref("");
@@ -446,6 +448,12 @@ async function refreshStatus() {
 /// instead of silently redirecting to Home.
 function applyRoute(route) {
   activePeerSnapshot.value = null;
+  activeCloudConnectionId.value = route.connectionId || "";
+  if (route.view === "cloud" && route.connectionId) {
+    activePeerId.value = "";
+    workspaceView.value = "cloud";
+    return;
+  }
   if (route.view === "peer" && route.peerId) {
     activePeerId.value = route.peerId;
     activePeerSnapshot.value =
@@ -467,6 +475,7 @@ function applyRoute(route) {
 function syncRoute() {
   writeRoute({
     view: workspaceView.value,
+    connectionId: activeCloudConnectionId.value,
     peerId: activePeerId.value,
     settingsTab: settingsTab.value,
   });
@@ -1153,6 +1162,7 @@ provide(
             :key="activePeer.id"
             :peer="activePeer"
           />
+          <CloudBrowser v-else-if="workspaceView === 'cloud'" :connection-id="activeCloudConnectionId" />
           <SettingsView v-else-if="workspaceView === 'settings'" />
           <div v-else-if="workspaceView === 'peer'" class="peer-unavailable">
             <p>{{ t("peer.unavailable") }}</p>
