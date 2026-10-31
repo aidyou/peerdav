@@ -119,6 +119,8 @@ const DISCOVERED = {
 
 function mockCommands(overrides = {}) {
   const handlers = {
+    cloud_list: async () => ({ connections: [], mappings: [], repositories: [], appendRepositories: [], statuses: [] }),
+    cloud_object_prepare: async () => ({ discovered: true }),
     vault_status: async () => ({ initialized: true, unlocked: true }),
     server_status: async () => ({ ...SERVER_STATUS }),
     resume_server: async () => ({ ...SERVER_STATUS }),
@@ -4036,6 +4038,37 @@ describe("admin session restore", () => {
     const restored = await mountReady(overrides);
     expect(restored.find(".peer-browser").exists()).toBe(true);
     restored.unmount();
+  });
+
+  it("refreshes cloud rail entries, opens the selected drive and returns home after removal", async () => {
+    let connections = [{ id: 'cloud-1', name: 'Personal' }];
+    const wrapper = await mountReady({
+      admin_session: async () => ({ username: 'admin', mustChangePassword: false }),
+      cloud_list: async () => ({ connections }),
+      cloud_object_list: async () => ({ objects: [], next: null, complete: true }),
+      cloud_object_status: async () => [],
+    });
+    expect(wrapper.findAll('.rail-cloud')).toHaveLength(1);
+    connections = [...connections, { id: 'cloud-2', name: 'Family' }];
+    window.dispatchEvent(new CustomEvent('peerdav:cloud-changed')); await flushPromises();
+    expect(wrapper.findAll('.rail-cloud')).toHaveLength(2);
+    const entry = wrapper.findAll('.rail-cloud')[1];
+    expect(entry.attributes('aria-label')).toContain('Family');
+    await entry.trigger('click'); await flushPromises();
+    expect(window.location.hash).toBe('#/cloud/cloud-2');
+    expect(entry.classes()).toContain('is-active'); expect(entry.attributes('aria-current')).toBe('page');
+    expect(invoke).toHaveBeenCalledWith('cloud_object_prepare', { connectionId: 'cloud-2' });
+    expect(wrapper.find('.cloud-browser .sidebar-identity strong').text()).toBe('Family');
+    expect(wrapper.find('.workspace-content').classes()).toContain('workspace-content--browser');
+    expect(wrapper.find('.cloud-browser .browser-sidebar').exists()).toBe(true);
+    expect(wrapper.find('.cloud-browser .browser-main').exists()).toBe(true);
+    connections = connections.filter((drive) => drive.id !== 'cloud-2');
+    window.dispatchEvent(new CustomEvent('peerdav:cloud-changed')); await flushPromises();
+    expect(window.location.hash).toBe('#/home'); expect(wrapper.find('.cloud-browser').exists()).toBe(false);
+    expect(wrapper.findAll('.rail-cloud')).toHaveLength(1);
+    wrapper.unmount(); invoke.mockClear();
+    window.dispatchEvent(new CustomEvent('peerdav:cloud-changed')); await flushPromises();
+    expect(invoke).not.toHaveBeenCalledWith('cloud_list', expect.anything());
   });
 
   it("restores independent cloud browser and navigates back to Home", async () => {

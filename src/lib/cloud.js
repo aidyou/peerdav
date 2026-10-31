@@ -27,6 +27,7 @@ export const cloud = Object.freeze({
   joinRepository: (args) => invoke("cloud_join_repository", args),
   saveMapping: (mappingId, input) => invoke("cloud_save_mapping", { mappingId, input: toSaveMappingInput(input) }),
   appendDiscover: (connectionId) => invoke("cloud_append_discover", { connectionId }),
+  createSyncDrive: ({ connectionId, mode, password, passwordConfirmation }) => invoke("cloud_create_sync_drive", { input: { connectionId, mode, password, passwordConfirmation } }),
   appendCreate: ({ connectionId, mode, password, passwordConfirmation }) => invoke("cloud_append_create", { input: { connectionId, mode, password, passwordConfirmation } }),
   appendJoin: ({ connectionId, anchorKey, anchorFingerprint, repositoryId, mode, acceptTofu, trustedFingerprint, password }) => invoke("cloud_append_join", { input: { connectionId, anchorKey, anchorFingerprint, repositoryId, mode, acceptTofu: acceptTofu === true, trustedFingerprint: trustedFingerprint || null, password } }),
   appendSaveMapping: (mappingId, mapping, selectedRoot) => invoke("cloud_append_save_mapping", { input: { mappingId: mappingId || null, mapping: toSaveMappingInput(mapping), selectedRoot } }),
@@ -44,7 +45,7 @@ export const cloud = Object.freeze({
 export const cloudObjects = Object.freeze({
   list: ({ connectionId, prefix, next = null }) => invoke("cloud_object_list", { connectionId, prefix, next }),
   discover: ({ connectionId, prefix }) => invoke("cloud_object_discover", { connectionId, prefix }),
-  registerIdentity: ({ connectionId, association }) => invoke("cloud_object_register_physical_identity", { connectionId, association: association.kind === "existing" ? { kind: "existing", physicalId: association.physicalId } : { kind: "new" } }),
+  prepare: ({ connectionId }) => invoke("cloud_object_prepare", { connectionId }),
   selectLocal: ({ connectionId, direction }) => invoke("cloud_object_select_local", { connectionId, direction }),
   upload: ({ connectionId, localToken, key, overwriteEtag = null, overwriteConfirmed = false }) => invoke("cloud_object_upload", { connectionId, localToken, key, overwriteEtag, overwriteConfirmed }),
   download: ({ connectionId, localToken, key, fileName, overwriteConfirmed = false }) => invoke("cloud_object_download", { connectionId, localToken, key, fileName, overwriteConfirmed }),

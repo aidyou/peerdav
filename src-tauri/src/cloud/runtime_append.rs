@@ -71,6 +71,15 @@ impl CloudRuntime {
             .await
             .map_err(append_error)
     }
+    /// New sync drives use Append v2 without probing conditional-write support.
+    /// Existing CAS repositories and mappings retain their stored protocol.
+    pub async fn create_sync_drive(
+        &self,
+        input: CreateAppendRepositoryInput,
+    ) -> Result<AppendRepositoryRedacted, AppError> {
+        self.create_append_repository(input).await
+    }
+
     pub async fn create_append_repository(
         &self,
         input: CreateAppendRepositoryInput,

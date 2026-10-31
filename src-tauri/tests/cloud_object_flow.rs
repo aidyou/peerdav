@@ -1060,6 +1060,43 @@ fn discovery_fixture(store: Arc<FakeStore>) -> (ObjectService, ObjectGuard, temp
     (service, guard, directory)
 }
 
+#[tokio::test]
+async fn ensure_identity_reuses_exact_scope_and_discovers_relative_root() {
+    let directory = tempdir().unwrap();
+    let guard = ObjectGuard::open(directory.path().join("guard.db"), &[91; 32]).unwrap();
+    let scope = identity("scope", "browse");
+    let physical_id = guard.ensure_storage_identity(&scope).unwrap();
+    // The same endpoint and bucket always resolve to the same local identity,
+    // regardless of the prefix or display alias.
+    assert_eq!(
+        guard
+            .ensure_storage_identity(&identity("scope/sub", "other"))
+            .unwrap(),
+        physical_id
+    );
+    let mut other = identity("scope", "browse");
+    other.bucket = "other-bucket".into();
+    let other_id = guard.ensure_storage_identity(&other).unwrap();
+    assert_ne!(other_id, physical_id);
+    assert!(!guard.has_completed_discovery(&scope).unwrap());
+    let (mut store, _calls) = FakeStore::new(vec![page(&[], None)]);
+    Arc::get_mut(&mut store).unwrap().scope = Some(ObjectStoreScope {
+        endpoint: "https://example.test:443/".into(),
+        bucket: "bucket".into(),
+        prefix: "scope".into(),
+    });
+    let service = ObjectService::try_new(store, guard.clone(), scope.clone(), "revision").unwrap();
+    // `discover` takes a prefix relative to the connection scope.
+    service.discover("").await.unwrap();
+    assert!(guard.has_completed_discovery(&scope).unwrap());
+    assert!(
+        guard
+            .has_completed_discovery(&identity("scope/sub", "child"))
+            .unwrap()
+    );
+    assert!(!guard.has_completed_discovery(&other).unwrap());
+}
+
 async fn assert_marker_protection(mode: peerdav_lib::sync::append_types::AppendMode) {
     let (relative, bytes) = append_marker(mode);
     for root in ["", "nested/repository"] {

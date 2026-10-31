@@ -2,9 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { defineComponent, h } from "vue";
 import { flushPromises, mount } from "@vue/test-utils";
 
-const { nativeInvoke, confirmAction } = vi.hoisted(() => ({ nativeInvoke: vi.fn(), confirmAction: vi.fn() }));
+const { nativeInvoke, confirmAction, app } = vi.hoisted(() => ({ nativeInvoke: vi.fn(), confirmAction: vi.fn(), app: { handleFailure: vi.fn() } }));
+vi.mock("../lib/appContext", () => ({ useAppContext: () => app }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: nativeInvoke }));
 vi.mock("../lib/confirm", () => ({ confirmAction }));
+vi.mock("../components/CloudSyncDrives.vue", () => ({ default: { props: ['connectionId', 'focusId'], emits: ['changed'], template: '<div data-test="sync-manager">{{ connectionId }}<button data-test="catalog-changed" @click="$emit(\'changed\')">Changed</button></div>' } }));
 import CloudBrowser from "../components/CloudBrowser.vue";
 import { cloudObjects, objectChildren } from "../lib/cloud";
 import { errorStrategy } from "../lib/invoke";
@@ -26,16 +28,56 @@ let handlers;
 const wrappers = [];
 async function browser() { const wrapper = mount(CloudBrowser, { props: { connectionId: "c1" }, global: { stubs: { "el-button": button, "el-input": input, "el-select": select, "el-option": option, "el-tag": { template: "<span><slot /></span>" } } } }); wrappers.push(wrapper); await flushPromises(); return wrapper; }
 async function click(wrapper, selector) { await wrapper.find(selector).trigger("click"); await flushPromises(); }
-async function prepare(wrapper) { await click(wrapper, '[data-test=prepare]'); }
+async function prepare() { await flushPromises(); }
 function textButton(wrapper, label) { return wrapper.findAll("button").find((item) => item.text() === label); }
 beforeEach(() => {
   vi.useFakeTimers(); nativeInvoke.mockReset(); confirmAction.mockReset(); confirmAction.mockResolvedValue(true); setLocale("en");
-  handlers = { cloud_list: () => ({ connections: [{ id: "c1", name: "Main", prefix: "configured/" }, { id: "c2", name: "Other" }] }), cloud_object_list: () => page([file]), cloud_object_status: () => [], cloud_object_register_physical_identity: () => ({ physicalId: "physical" }), cloud_object_discover: () => ({ complete: true }), cloud_object_select_local: () => ({ token: "opaque", fileName: "a.txt", localPath: "/must-not-leak" }), cloud_object_upload: () => transfer(), cloud_object_download: () => transfer("running", { direction: "download" }), cloud_object_cancel: () => transfer("cancelling"), cloud_object_recovery_acknowledge: () => transfer("acknowledged"), cloud_object_delete_plan: () => deletePlan(), cloud_object_delete_execute: () => ({ deleted: [file.key], failed: [] }) };
+  handlers = { cloud_list: () => ({ connections: [{ id: "c1", name: "Main", prefix: "configured/" }, { id: "c2", name: "Other" }] }), cloud_object_list: () => page([file]), cloud_object_status: () => [], cloud_object_discover: () => ({ complete: true }), cloud_object_prepare: () => ({ physicalId: "physical", discovered: true }), cloud_object_select_local: () => ({ token: "opaque", fileName: "a.txt", localPath: "/must-not-leak" }), cloud_object_upload: () => transfer(), cloud_object_download: () => transfer("running", { direction: "download" }), cloud_object_cancel: () => transfer("cancelling"), cloud_object_recovery_acknowledge: () => transfer("acknowledged"), cloud_object_delete_plan: () => deletePlan(), cloud_object_delete_execute: () => ({ deleted: [file.key], failed: [] }) };
   nativeInvoke.mockImplementation(async (command, args) => { if (!handlers[command]) throw new Error(`Unexpected command ${command}`); return handlers[command](args); });
 });
 afterEach(() => { wrappers.splice(0).forEach((wrapper) => { if (wrapper.exists()) wrapper.unmount(); }); vi.useRealTimers(); });
 
 describe("CloudBrowser", () => {
+  it('uses a sidebar and main pane with a persistent create/connect entry', async () => {
+    const wrapper = await browser();
+    expect(wrapper.find('.browser-sidebar').exists()).toBe(true); expect(wrapper.find('.browser-main').exists()).toBe(true);
+    expect(wrapper.find('.sync-management-entry').exists()).toBe(false); expect(wrapper.find('select').exists()).toBe(false);
+    expect(wrapper.find('.all-files').classes()).toContain('is-active'); expect(wrapper.find('.sidebar-empty').text()).toBe(t('cloudBrowser.noSyncDrives'));
+    await click(wrapper, '.create-drive-entry'); expect(wrapper.find('[data-test="sync-manager"]').text()).toContain('c1');
+    expect(wrapper.find('[data-test="upload"]').exists()).toBe(false); expect(wrapper.text()).not.toMatch(/CAS|Append V2/);
+    await wrapper.setProps({ connectionId: 'c2' }); await flushPromises();
+    expect(wrapper.find('[data-test="sync-manager"]').exists()).toBe(false); expect(wrapper.find('[data-test="upload"]').exists()).toBe(true);
+    expect(nativeInvoke.mock.calls.some(([name]) => name === 'cloud_sync' || name === 'cloud_create_repository')).toBe(false);
+  });
+  it('numbers current-connection drives in manager order, highlights focus and returns to all files without preparing again', async () => {
+    handlers.cloud_list = () => ({ connections: [{ id: 'c1', name: 'Main' }], repositories: [{ id: 'cas', connectionId: 'c1' }, { id: 'other', connectionId: 'c2' }], appendRepositories: [{ connectionId: 'c1', binding: { repoId: 'append' } }] });
+    const wrapper = await browser();
+    expect(wrapper.findAll('.drive-link').map((item) => item.text())).toEqual(['Sync drive 1', 'Sync drive 2']);
+    await wrapper.findAll('.drive-link')[1].trigger('click'); await flushPromises();
+    expect(wrapper.findComponent('[data-test="sync-manager"]').props('focusId')).toBe('append');
+    expect(wrapper.findAll('.drive-link')[1].classes()).toContain('is-active');
+    await click(wrapper, '.back-to-files'); expect(wrapper.find('.all-files').classes()).toContain('is-active');
+    await wrapper.findAll('.drive-link')[0].trigger('click'); await flushPromises();
+    expect(wrapper.findComponent('[data-test="sync-manager"]').props('focusId')).toBe('cas');
+    await click(wrapper, '.all-files');
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_prepare')).toHaveLength(1);
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_list')).toHaveLength(1);
+  });
+  it('refreshes sidebar after manager changes and drops a removed active drive', async () => {
+    const catalog = { connections: [{ id: 'c1', name: 'Main' }], repositories: [], appendRepositories: [] };
+    handlers.cloud_list = () => structuredClone(catalog);
+    const wrapper = await browser(); await click(wrapper, '.create-drive-entry');
+    catalog.appendRepositories.push({ connectionId: 'c1', binding: { repoId: 'new' } });
+    await click(wrapper, '[data-test="catalog-changed"]'); expect(wrapper.find('.drive-link').text()).toBe('Sync drive 1');
+    await click(wrapper, '.drive-link'); catalog.appendRepositories = [];
+    await click(wrapper, '[data-test="catalog-changed"]');
+    expect(wrapper.find('.drive-link').exists()).toBe(false); expect(wrapper.find('.all-files').classes()).toContain('is-active');
+    expect(wrapper.find('[data-test="upload"]').exists()).toBe(true);
+  });
+  it('routes catalog errors through the shared application failure handler', async () => {
+    const failure = error('CLOUD_STORAGE', 'Catalog unavailable'); handlers.cloud_list = () => { throw failure; };
+    await browser(); expect(app.handleFailure).toHaveBeenCalledWith(failure);
+  });
   it("groups flat object keys as navigable virtual folders and keeps configured scope server-side", async () => {
     handlers.cloud_object_list = ({ prefix }) => prefix ? page([{ key: "docs/nested/a", size: 1 }]) : page([{ key: "docs/a", size: 1 }, file, { key: "docs/b", size: 2 }]);
     const wrapper = await browser(); expect(wrapper.findAll(".folder-link")).toHaveLength(1); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_list", { connectionId: "c1", prefix: "", next: null });
@@ -50,16 +92,47 @@ describe("CloudBrowser", () => {
   });
   it("does not claim an empty or complete listing after loading failure", async () => { handlers.cloud_object_list = () => { throw error("CLOUD_TRANSPORT"); }; const wrapper = await browser(); expect(wrapper.text()).toContain("Original backend reason"); expect(wrapper.text()).not.toContain(t("cloudBrowser.empty")); expect(wrapper.find('[data-test=incomplete]').exists()).toBe(true); });
   it("shows true empty state only after complete listing", async () => { handlers.cloud_object_list = () => page(); const wrapper = await browser(); expect(wrapper.text()).toContain(t("cloudBrowser.empty")); });
-  it("defaults to unknown read-only and requires explicit identity plus complete discovery", async () => {
-    handlers.cloud_object_discover = () => ({ complete: false }); const wrapper = await browser(); expect(wrapper.find('[data-test=upload]').attributes("disabled")).toBeDefined(); expect(wrapper.text()).toContain(t("cloudBrowser.unknownReadonly"));
-    await prepare(wrapper); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_register_physical_identity", { connectionId: "c1", association: { kind: "new" } }); expect(wrapper.find('[data-test=upload]').attributes("disabled")).toBeDefined();
-    handlers.cloud_object_discover = () => ({ complete: true }); await prepare(wrapper); expect(wrapper.find('[data-test=upload]').attributes("disabled")).toBeUndefined(); expect(wrapper.text()).toContain(t("cloudBrowser.attemptOnly"));
+  it("automatically checks protection and requires discovered true before edits", async () => {
+    handlers.cloud_object_prepare = () => ({ physicalId: 'physical', discovered: false });
+    const wrapper = await browser();
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_prepare', { connectionId: 'c1' });
+    expect(wrapper.find('[data-test=upload]').attributes('disabled')).toBeDefined();
+    expect(wrapper.find('[data-test=prepare]').exists()).toBe(false);
+    expect(wrapper.find('input[aria-label="Object name (default: selected filename)"]').exists()).toBe(false);
+    expect(wrapper.text()).not.toMatch(/physical|identity/i);
+    handlers.cloud_object_prepare = () => ({ discovered: true });
+    await click(wrapper, '[data-test=recheck]');
+    expect(wrapper.find('[data-test=upload]').attributes('disabled')).toBeUndefined();
+    expect(wrapper.text()).toContain(t('cloudBrowser.editable'));
+    expect(wrapper.find('.sidebar-identity strong').text()).toBe('Main');
+    expect(wrapper.find('.cloud-transfers').exists()).toBe(false);
   });
-  it("supports explicit existing physical identity association", async () => { const wrapper = await browser(); wrapper.findAllComponents({ name: "ElSelect" })[1].vm.$emit("update:modelValue", "existing"); await flushPromises(); await wrapper.find('input[aria-label="Existing physical identity ID"]').setValue("physical-existing"); await prepare(wrapper); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_register_physical_identity", { connectionId: "c1", association: { kind: "existing", physicalId: "physical-existing" } }); });
+  it("keeps browsing available after preparation failure and shows only the original reason", async () => {
+    handlers.cloud_object_prepare = () => { throw error('CLOUD_STORAGE', 'Storage permission denied'); };
+    const wrapper = await browser();
+    expect(wrapper.find('[role=alert]').text()).toBe('Storage permission denied');
+    expect(wrapper.text()).not.toContain('CLOUD_STORAGE');
+    expect(wrapper.find('[data-test=upload]').attributes('disabled')).toBeDefined();
+    expect(wrapper.find('[data-test=delete-prefix]').attributes('disabled')).toBeDefined();
+    expect(textButton(wrapper, 'Download').attributes('disabled')).toBeUndefined();
+    await click(wrapper, '[data-test=refresh]');
+    expect(wrapper.find('[role=alert]').text()).toBe('Storage permission denied');
+  });
   it("honors protected error codes and displays original message without matching text", async () => {
     handlers.cloud_object_upload = () => { throw error("CLOUD_OBJECT_PROTECTED", "anything at all"); }; const wrapper = await browser(); await prepare(wrapper); await click(wrapper, '[data-test=upload]'); expect(wrapper.text()).toContain("anything at all"); expect(wrapper.text()).toContain(t("cloudBrowser.protected")); expect(wrapper.find('[data-test=upload]').attributes("disabled")).toBeDefined(); expect(errorStrategy(error("CLOUD_DELETE_PLAN_STALE"))).toBe("retry");
   });
   it("confirms same-key ETag overwrite and sends only opaque local token", async () => { const wrapper = await browser(); await prepare(wrapper); await click(wrapper, '[data-test=upload]'); expect(confirmAction).toHaveBeenCalledWith(expect.stringContaining("etag-1"), t("cloudBrowser.upload")); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_upload", { connectionId: "c1", localToken: "opaque", key: "a.txt", overwriteEtag: "etag-1", overwriteConfirmed: true }); });
+  it("uploads the selected filename directly and does not repeat preparation for folder navigation", async () => {
+    handlers.cloud_object_list = ({ prefix }) => prefix ? page([]) : page([{ key: 'docs/old.txt', size: 1 }]);
+    handlers.cloud_object_select_local = () => ({ token: 'selected-file', fileName: 'photo.jpg' });
+    const wrapper = await browser();
+    await click(wrapper, '.folder-link'); await click(wrapper, '[data-test=upload]');
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_select_local', { connectionId: 'c1', direction: 'upload' });
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_upload', { connectionId: 'c1', localToken: 'selected-file', key: 'docs/photo.jpg', overwriteEtag: null, overwriteConfirmed: false });
+    expect(nativeInvoke.mock.calls.filter(([command]) => command === 'cloud_object_prepare')).toHaveLength(1);
+    expect(confirmAction).not.toHaveBeenCalled();
+    expect(wrapper.find('.cloud-transfers').text()).not.toContain('t1');
+  });
   it("does not upload if ETag overwrite confirmation is declined", async () => { confirmAction.mockResolvedValue(false); const wrapper = await browser(); await prepare(wrapper); await click(wrapper, '[data-test=upload]'); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_upload")).toBe(false); });
   it("downloads without overwrite then confirms and reselects a token after backend conflict", async () => {
     let selects = 0; handlers.cloud_object_select_local = () => ({ token: `token-${++selects}` }); let attempts = 0; handlers.cloud_object_download = () => { if (++attempts === 1) throw error("CLOUD_PRECONDITION"); return transfer("running", { direction: "download" }); };
@@ -75,9 +148,9 @@ describe("CloudBrowser", () => {
   it("plans deletion before confirming exact target prefix count and irreversible warning", async () => {
     handlers.cloud_object_delete_execute = () => ({ deleted: ["a"], failed: [{ key: "b", error: error("CLOUD_STORAGE") }] }); const wrapper = await browser(); await prepare(wrapper); await click(wrapper, '[data-test=delete-prefix]'); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_delete_plan", { connectionId: "c1", prefix: "" }); expect(confirmAction.mock.calls[0][1]).toBe(t("cloudBrowser.delete")); const review = mount({ render: () => confirmAction.mock.calls[0][0] }); expect(review.text()).toContain('Target prefix: ""'); expect(review.text()).toContain("5"); expect(review.text()).toContain("cannot be undone"); expect(review.find('[data-test=delete-keys]').element.style.overflow).toBe("auto"); expect(review.findAll("li").map((item) => item.text())).toEqual(deletePlan().entries.map((item) => JSON.stringify(item.key))); review.unmount(); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_delete_execute", { connectionId: "c1", planId: "plan-1", confirmed: true }); expect(wrapper.text()).toContain("Deleted: 1; failed: 1"); expect(wrapper.text()).toContain("Original backend reason");
   });
-  it("does not execute cancelled or expired delete plans", async () => { const wrapper = await browser(); await prepare(wrapper); confirmAction.mockResolvedValue(false); await click(wrapper, '[data-test=delete-prefix]'); confirmAction.mockResolvedValue(true); handlers.cloud_object_delete_plan = () => deletePlan({ planId: "expired", expiresAtUnix: 1 }); await click(wrapper, '[data-test=delete-prefix]'); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_delete_execute")).toBe(false); expect(wrapper.text()).toContain("CLOUD_DELETE_PLAN_STALE"); });
+  it("does not execute cancelled or expired delete plans", async () => { const wrapper = await browser(); await prepare(wrapper); confirmAction.mockResolvedValue(false); await click(wrapper, '[data-test=delete-prefix]'); confirmAction.mockResolvedValue(true); handlers.cloud_object_delete_plan = () => deletePlan({ planId: "expired", expiresAtUnix: 1 }); await click(wrapper, '[data-test=delete-prefix]'); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_delete_execute")).toBe(false); expect(wrapper.text()).toContain(t('cloudBrowser.stalePlan')); });
   it("ignores stale directory page results after navigation", async () => { const late = deferred(); let count = 0; handlers.cloud_object_list = ({ prefix }) => { if (prefix) return page([{ key: "docs/new", size: 1 }]); if (++count === 1) return page([{ key: "docs/old", size: 1 }], "next", false); return late.promise; }; const wrapper = await browser(); await wrapper.find('[data-test=more]').trigger("click"); await click(wrapper, ".folder-link"); late.resolve(page([{ key: "stale", size: 2 }])); await flushPromises(); expect(wrapper.text()).toContain("new"); expect(wrapper.text()).not.toContain("stale"); });
-  it("ignores pending identity confirmation after connection change", async () => { const late = deferred(); handlers.cloud_object_register_physical_identity = () => late.promise; const wrapper = await browser(); await wrapper.find('[data-test=prepare]').trigger("click"); await wrapper.setProps({ connectionId: "c2" }); await flushPromises(); late.resolve({ physicalId: "late" }); await flushPromises(); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_discover")).toBe(false); expect(wrapper.find('[data-test=upload]').attributes("disabled")).toBeDefined(); });
+  it("ignores pending preparation after a connection change", async () => { const late = deferred(); handlers.cloud_object_prepare = ({ connectionId }) => connectionId === 'c1' ? late.promise : { discovered: false }; const wrapper = await browser(); expect(wrapper.text()).toContain(t('cloudBrowser.checking')); await wrapper.setProps({ connectionId: 'c2' }); await flushPromises(); late.resolve({ discovered: true }); await flushPromises(); expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_prepare', { connectionId: 'c2' }); expect(wrapper.find('[data-test=upload]').attributes('disabled')).toBeDefined(); });
   it("cleans polling on unmount and ignores in-flight poll completion", async () => { const late = deferred(); handlers.cloud_object_status = () => late.promise; const wrapper = await browser(); wrapper.unmount(); late.resolve([transfer()]); await flushPromises(); await vi.advanceTimersByTimeAsync(4500); expect(nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_status")).toHaveLength(1); expect(vi.getTimerCount()).toBe(0); });
   it("does not execute a deletion confirmed after directory switch", async () => {
     handlers.cloud_object_list = () => page([{ key: "docs/a", size: 1 }]); const answer = deferred(); confirmAction.mockImplementation(() => answer.promise); const wrapper = await browser(); await prepare(wrapper); await wrapper.find('[data-test=delete-prefix]').trigger("click"); await flushPromises(); await click(wrapper, ".folder-link"); answer.resolve(true); await flushPromises(); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_delete_execute")).toBe(false);
@@ -93,7 +166,7 @@ describe("CloudBrowser", () => {
   });
   it("whitelists all object payloads and strips arbitrary paths and association fields", async () => {
     const args = { connectionId: "c1", localToken: "opaque", key: "a", fileName: "a", path: "/secret", localPath: "/secret", extra: true };
-    await cloudObjects.upload(args); await cloudObjects.download(args); await cloudObjects.registerIdentity({ ...args, association: { kind: "existing", physicalId: "p", path: "/secret" } }); await cloudObjects.list(args); await cloudObjects.discover(args); await cloudObjects.selectLocal({ ...args, direction: "upload" }); await cloudObjects.deletePlan(args); await cloudObjects.deleteExecute({ ...args, planId: "p", confirmed: true }); await cloudObjects.recoveryAcknowledge({ ...args, transferId: "t1", connectionRevision: 1, confirmed: true });
+    await cloudObjects.upload(args); await cloudObjects.download(args); await cloudObjects.prepare(args); await cloudObjects.list(args); await cloudObjects.discover(args); await cloudObjects.selectLocal({ ...args, direction: "upload" }); await cloudObjects.deletePlan(args); await cloudObjects.deleteExecute({ ...args, planId: "p", confirmed: true }); await cloudObjects.recoveryAcknowledge({ ...args, transferId: "t1", connectionRevision: 1, confirmed: true });
     expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_recovery_acknowledge", { transferId: "t1", connectionId: "c1", connectionRevision: 1, confirmed: true });
     for (const [, payload] of nativeInvoke.mock.calls) { expect(JSON.stringify(payload)).not.toContain("/secret"); expect(payload).not.toHaveProperty("extra"); }
   });
@@ -116,7 +189,7 @@ describe("CloudBrowser", () => {
   });
   it("uses prefix protection for read-only controls while allowing raw download", async () => {
     handlers.cloud_object_list = () => ({ ...page([file]), prefixProtected: true }); const wrapper = await browser();
-    expect(wrapper.find('[data-test=prepare]').attributes("disabled")).toBeDefined(); expect(wrapper.find('[data-test=upload]').attributes("disabled")).toBeDefined(); expect(wrapper.find('[data-test=delete-prefix]').attributes("disabled")).toBeDefined();
+    expect(wrapper.find('[data-test=prepare]').exists()).toBe(false); expect(wrapper.find('[data-test=upload]').attributes("disabled")).toBeDefined(); expect(wrapper.find('[data-test=delete-prefix]').attributes("disabled")).toBeDefined();
     await textButton(wrapper, t("cloudBrowser.download")).trigger("click"); await flushPromises(); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_download")).toBe(true);
   });
   it("blocks protected single objects, ancestor-prefix deletion and protected overwrite, not downloads", async () => {
@@ -124,7 +197,7 @@ describe("CloudBrowser", () => {
     const wrapper = await browser(); await prepare(wrapper); expect(wrapper.find('[data-test=delete-prefix]').attributes("disabled")).toBeDefined();
     expect(wrapper.findAll(".cloud-actions").every((item) => item.findAll("button").at(-1).attributes("disabled") !== undefined)).toBe(true);
     await click(wrapper, '[data-test=upload]'); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_upload")).toBe(false);
-    await wrapper.find('input[aria-label="Object name (default: selected filename)"]').setValue("a.txt"); expect(wrapper.find('[data-test=upload]').attributes("disabled")).toBeDefined();
+    expect(wrapper.find('input[aria-label="Object name (default: selected filename)"]').exists()).toBe(false);
     await textButton(wrapper, t("cloudBrowser.download")).trigger("click"); await flushPromises(); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_download")).toBe(true);
   });
   it.each(["en", "zh-CN"])("requires explicit acknowledgement and explains local-only risk in %s", async (locale) => {
@@ -146,9 +219,9 @@ describe("CloudBrowser", () => {
     handlers.cloud_object_status = () => [transfer("unknown")]; await vi.advanceTimersByTimeAsync(1500); const answer = deferred(); confirmAction.mockImplementation(() => answer.promise); await textButton(wrapper, t("cloudBrowser.acknowledge")).trigger("click"); await flushPromises(); await wrapper.setProps({ connectionId: "c2" }); await flushPromises(); answer.resolve(true); await flushPromises(); expect(nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_recovery_acknowledge")).toHaveLength(1);
   });
   it("shows stop timeout guidance without hiding the original error", async () => {
-    handlers.cloud_object_status = () => [transfer()]; handlers.cloud_object_cancel = () => { throw error("CLOUD_OBJECT_STOP_TIMEOUT"); }; const wrapper = await browser(); await textButton(wrapper, t("cloudBrowser.cancel")).trigger("click"); await flushPromises(); expect(wrapper.text()).toContain("Original backend reason"); expect(wrapper.text()).toContain(t("cloudBrowser.stopTimeout")); expect(errorStrategy(error("CLOUD_OBJECT_STOP_TIMEOUT"))).toBe("show");
+    handlers.cloud_object_status = () => [transfer()]; handlers.cloud_object_cancel = () => { throw error("CLOUD_OBJECT_STOP_TIMEOUT"); }; const wrapper = await browser(); await textButton(wrapper, t("cloudBrowser.cancel")).trigger("click"); await flushPromises(); expect(wrapper.text()).toContain("Original backend reason"); expect(wrapper.find('[role=alert]').text()).toBe('Original backend reason'); expect(wrapper.text()).not.toContain('CLOUD_OBJECT_STOP_TIMEOUT'); expect(errorStrategy(error("CLOUD_OBJECT_STOP_TIMEOUT"))).toBe("show");
   });
   it("has identical real bilingual keys and renders both locales without raw keys", async () => {
-    const keys = Object.keys(en).filter((key) => key.startsWith("cloudBrowser.")); expect(keys.sort()).toEqual(Object.keys(zh).filter((key) => key.startsWith("cloudBrowser.")).sort()); for (const language of ["en", "zh-CN"]) { setLocale(language); const wrapper = await browser(); expect(wrapper.text()).toContain(t("cloudBrowser.title")); expect(wrapper.text()).not.toContain("cloudBrowser."); for (const key of keys) expect(t(key)).not.toBe(key); wrapper.unmount(); }
+    const keys = Object.keys(en).filter((key) => key.startsWith("cloudBrowser.")); expect(keys.sort()).toEqual(Object.keys(zh).filter((key) => key.startsWith("cloudBrowser.")).sort()); for (const language of ["en", "zh-CN"]) { setLocale(language); const wrapper = await browser(); expect(wrapper.find('.sidebar-identity strong').text()).toBe('Main'); expect(wrapper.text()).not.toContain("cloudBrowser."); for (const key of keys) expect(t(key)).not.toBe(key); wrapper.unmount(); }
   });
 });

@@ -166,6 +166,22 @@ impl ObjectGuard {
         scope: &ProtectedIdentity,
         association: StorageIdentityAssociation,
     ) -> Result<String, ObjectGuardError> {
+        self.bind_storage_identity(scope, Some(association))
+    }
+
+    /// Reuse only an exact endpoint/bucket binding, or create a distinct identity.
+    pub fn ensure_storage_identity(
+        &self,
+        scope: &ProtectedIdentity,
+    ) -> Result<String, ObjectGuardError> {
+        self.bind_storage_identity(scope, None)
+    }
+
+    fn bind_storage_identity(
+        &self,
+        scope: &ProtectedIdentity,
+        association: Option<StorageIdentityAssociation>,
+    ) -> Result<String, ObjectGuardError> {
         let scope = canonical(scope.clone())?;
         let _domain = self.guard_lock()?;
         if !self
@@ -195,12 +211,15 @@ impl ObjectGuard {
             .find(|b| b.endpoint == scope.endpoint && b.bucket == scope.bucket);
         if let Some(binding) = existing {
             return match association {
-                StorageIdentityAssociation::Existing(id) if id == binding.physical_id => Ok(id),
+                None => Ok(binding.physical_id.clone()),
+                Some(StorageIdentityAssociation::Existing(id)) if id == binding.physical_id => {
+                    Ok(id)
+                }
                 _ => Err(ObjectGuardError::InvalidBinding),
             };
         }
         let physical_id = match association {
-            StorageIdentityAssociation::New => loop {
+            None | Some(StorageIdentityAssociation::New) => loop {
                 let mut random = [0u8; 32];
                 OsRng.try_fill_bytes(&mut random).map_err(storage)?;
                 let id: String = random.iter().map(|b| format!("{b:02x}")).collect();
@@ -208,7 +227,7 @@ impl ObjectGuard {
                     break id;
                 }
             },
-            StorageIdentityAssociation::Existing(id) => {
+            Some(StorageIdentityAssociation::Existing(id)) => {
                 if !registry.bindings.iter().any(|b| b.physical_id == id) {
                     return Err(ObjectGuardError::InvalidBinding);
                 }
@@ -333,14 +352,17 @@ impl ObjectGuard {
     ) -> Result<ObjectLease, ObjectGuardError> {
         self.admit(identity)
     }
-    pub fn admit(&self, identity: &ProtectedIdentity) -> Result<ObjectLease, ObjectGuardError> {
-        let id = canonical(identity.clone())?;
+    pub fn has_completed_discovery(
+        &self,
+        scope: &ProtectedIdentity,
+    ) -> Result<bool, ObjectGuardError> {
+        let id = canonical(scope.clone())?;
         let _g = self.guard_lock()?;
         let id = self.project(&id, true)?;
-        let rows = self.projected_rows()?;
-        if rows.iter().any(|m| overlaps(m, &id)) {
-            return Err(ObjectGuardError::Protected);
-        }
+        self.discovery_contains(&id)
+    }
+
+    fn discovery_contains(&self, id: &ProtectedIdentity) -> Result<bool, ObjectGuardError> {
         let discovery_scopes = {
             let c = self
                 .db
@@ -360,11 +382,22 @@ impl ObjectGuard {
         };
         let mut discovered = false;
         for scope in discovery_scopes {
-            if contains(&self.project(&scope, false)?, &id) {
+            if contains(&self.project(&scope, false)?, id) {
                 discovered = true;
             }
         }
-        if !discovered {
+        Ok(discovered)
+    }
+
+    pub fn admit(&self, identity: &ProtectedIdentity) -> Result<ObjectLease, ObjectGuardError> {
+        let id = canonical(identity.clone())?;
+        let _g = self.guard_lock()?;
+        let id = self.project(&id, true)?;
+        let rows = self.projected_rows()?;
+        if rows.iter().any(|m| overlaps(m, &id)) {
+            return Err(ObjectGuardError::Protected);
+        }
+        if !self.discovery_contains(&id)? {
             return Err(ObjectGuardError::Protected);
         }
         if self.has_active_overlap(&id)? {

@@ -17,7 +17,7 @@ vi.mock("../lib/confirm", () => ({ confirmAction }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openDialog }));
 vi.mock("@tauri-apps/api/event", () => ({ listen }));
 
-import { initLocale, setLocale } from "../lib/i18n";
+import { setLocale } from "../lib/i18n";
 import CloudSettings from "../components/CloudSettings.vue";
 
 const inputStub = defineComponent({ props: ["modelValue", "type", "autocomplete"], emits: ["update:modelValue"], setup(props, { emit }) { return () => h("input", { value: props.modelValue, type: props.type || "text", autocomplete: props.autocomplete, onInput: (e) => emit("update:modelValue", e.target.value) }); } });
@@ -39,92 +39,69 @@ async function mountCloud(data = rows) {
 beforeEach(() => { setLocale("zh-CN"); Object.values(cloud).forEach((fn) => fn.mockReset()); confirmAction.mockReset(); confirmAction.mockResolvedValue(true); openDialog.mockReset(); app.handleFailure.mockReset(); app.setNotice.mockReset(); app.setError.mockReset(); progressHandler = undefined; });
 
 describe("CloudSettings", () => {
-  it("opens independent browsing for the selected connection without starting sync", async () => {
-    const wrapper = await mountCloud({ ...rows, connections: [{ id: "cloud/a b", name: "Browse target" }] });
-    await wrapper.find(".cloud-browse-entry").trigger("click");
-    expect(window.location.hash).toBe("#/cloud/cloud%2Fa%20b");
-    expect(cloud.sync).not.toHaveBeenCalled();
-    expect(wrapper.text()).toContain("普通网盘对象使用独立浏览视图");
-    wrapper.unmount();
-    window.history.replaceState(null, "", window.location.pathname);
+  it("defaults to a multi-drive list without connection or sync forms", async () => {
+    const wrapper = await mountCloud();
+    expect(wrapper.text()).toContain('Primary'); expect(wrapper.findAll('input')).toHaveLength(0);
+    expect(wrapper.findAll('.settings-group')).toHaveLength(0); expect(wrapper.text()).not.toMatch(/CAS|Append|Repo/);
+    await wrapper.find('.cloud-browse-entry').trigger('click'); expect(window.location.hash).toBe('#/cloud/c1');
+    expect(cloud.sync).not.toHaveBeenCalled(); wrapper.unmount(); window.history.replaceState(null, '', window.location.pathname);
   });
-  it("renders the connection, repository secret/password, and mapping inputs", async () => {
-    setLocale("zh-CN"); const wrapper = await mountCloud();
-    expect(wrapper.findAll("input").length).toBeGreaterThanOrEqual(7);
-    expect(wrapper.findAll('input[type="password"]').length).toBe(4);
-    expect(wrapper.text()).toContain("Primary");
-    expect(wrapper.text()).toContain("Repo");
+  it("opens a minimal add form with collapsed advanced settings and HTTP disabled", async () => {
+    const wrapper = await mountCloud(); await wrapper.find('.connection-add').trigger('click');
+    expect(wrapper.find('.connection-advanced').attributes('open')).toBeUndefined();
+    expect(wrapper.find('.connection-editor').findAll('label').filter((l) => !l.element.closest('details'))).toHaveLength(4);
+    expect(wrapper.findAll('input[type="checkbox"]').every((i) => !i.element.checked)).toBe(true); wrapper.unmount();
   });
-
-  it("saves connection with wrapper-shaped input and clears secrets", async () => {
-    setLocale("zh-CN"); const wrapper = await mountCloud();
-    const inputByLabel = (label) => wrapper.findAll("label").find((item) => item.text().includes(label)).find("input");
-    await inputByLabel("名称").setValue("New"); await inputByLabel("区域").setValue("access"); await inputByLabel("前缀").setValue("secret");
-    cloud.saveConnection.mockResolvedValue({});
-    await wrapper.findAll("button").find((b) => b.text() === "保存").trigger("click");
-    await flushPromises();
-    expect(cloud.saveConnection).toHaveBeenCalledWith(expect.objectContaining({ name: "New", region: "access", prefix: "secret" }));
-    expect(inputByLabel("区域").element.value).toBe("access"); expect(inputByLabel("前缀").element.value).toBe("secret");
+  it("infers Qiniu into the service endpoint and keeps HTTP opt-in", async () => {
+    const wrapper = await mountCloud(); await wrapper.find('.connection-add').trigger('click');
+    await wrapper.find('.connection-name input').setValue('New'); await wrapper.find('.connection-url input').setValue('http://peerdav.s3.cn-east-1.qiniucs.com');
+    await wrapper.find('.connection-save').trigger('click'); await flushPromises();
+    expect(cloud.saveConnection).toHaveBeenCalledWith(expect.objectContaining({ name: 'New', endpoint: 'http://s3.cn-east-1.qiniucs.com', bucket: 'peerdav', region: 'cn-east-1', pathStyle: true, allowInsecureHttp: false }));
+    expect(wrapper.find('.connection-editor').exists()).toBe(false); wrapper.unmount();
   });
-
-  it("passes both password inputs to create and clears them after success", async () => {
-    setLocale("zh-CN"); const wrapper = await mountCloud();
-    const passwordInputs = wrapper.findAll('input[type="password"]');
-    await passwordInputs[2].setValue("pass123"); await passwordInputs[3].setValue("pass123");
-    cloud.createRepository.mockResolvedValue({});
-    await wrapper.findAll("button").find((b) => b.text() === "创建仓库").trigger("click"); await flushPromises();
-    expect(cloud.createRepository).toHaveBeenCalledWith(expect.objectContaining({ connectionId: "c1", password: "pass123", passwordConfirmation: "pass123" }));
-    expect(passwordInputs[2].element.value).toBe(""); expect(passwordInputs[3].element.value).toBe("");
+  it("preserves edited values and credentials when URL is unchanged", async () => {
+    const wrapper = await mountCloud({ ...rows, connections: [{ id: 'c1', name: 'Primary', endpoint: 'https://custom.example', bucket: 'old', region: 'custom', prefix: 'keep', pathStyle: true, proxy: { mode: 'custom', url: 'http://proxy', username: 'secret-user', password: 'secret-pass' } }] });
+    await wrapper.find('.connection-edit').trigger('click'); expect(wrapper.findAll('input').some((i) => ['secret-user', 'secret-pass'].includes(i.element.value))).toBe(false);
+    await wrapper.find('.connection-name input').setValue('Renamed'); await wrapper.find('.connection-save').trigger('click'); await flushPromises();
+    expect(cloud.saveConnection).toHaveBeenCalledWith(expect.objectContaining({ id: 'c1', name: 'Renamed', endpoint: 'https://custom.example', bucket: 'old', region: 'custom', prefix: 'keep', pathStyle: true, accessKey: undefined, secretKey: undefined, sessionToken: undefined })); wrapper.unmount();
   });
-
-  it("rejects mismatched repository passwords without invoking", async () => {
-    setLocale("zh-CN"); const wrapper = await mountCloud(); const inputs = wrapper.findAll('input[type="password"]');
-    await inputs[2].setValue("one"); await inputs[3].setValue("two");
-    await wrapper.findAll("button").find((b) => b.text() === "创建仓库").trigger("click");
-    expect(cloud.createRepository).not.toHaveBeenCalled(); expect(app.setError).toHaveBeenCalledWith("login.mismatch");
+  it("clears stale URL inference and requests missing bucket/region for unknown URLs", async () => {
+    const wrapper = await mountCloud(); await wrapper.find('.connection-add').trigger('click');
+    await wrapper.find('.connection-url input').setValue('https://peerdav.s3.cn-east-1.qiniucs.com');
+    await wrapper.find('.connection-url input').setValue('https://custom.example'); await wrapper.find('.connection-save').trigger('click');
+    expect(cloud.saveConnection).not.toHaveBeenCalled(); expect(app.setError).toHaveBeenCalledWith('drive.detailsRequired');
+    const labels = wrapper.findAll('label'); expect(labels.find((l) => l.text().includes('存储桶')).find('input').element.value).toBe('');
+    expect(wrapper.find('.connection-advanced').attributes('open')).toBeDefined(); wrapper.unmount();
   });
-
-  it("chooses a root directory and saves mapping", async () => {
-    openDialog.mockResolvedValue("/new-root"); setLocale("zh-CN"); const wrapper = await mountCloud();
-    await wrapper.findAll("button").find((b) => b.text() === "选择目录").trigger("click"); await flushPromises();
-    expect(openDialog).toHaveBeenCalledWith({ directory: true, multiple: false });
-    expect(wrapper.findAll("input").some((input) => input.element.value === "/new-root")).toBe(true);
-    cloud.saveMapping.mockResolvedValue({}); const saveButtons = wrapper.findAll("button").filter((b) => b.text() === "保存"); await saveButtons[1].trigger("click"); await flushPromises();
-    expect(cloud.saveMapping).toHaveBeenCalledWith(null, expect.objectContaining({ localRoot: "/new-root" }));
+  it("renders local-only removal confirmation with a red counted sync warning and cancellation is inert", async () => {
+    confirmAction.mockResolvedValue(false);
+    const wrapper = await mountCloud({ ...rows, mappings: [{ connectionId: 'c1' }, { connectionId: 'c1' }, { connectionId: 'other' }] });
+    await wrapper.find('.connection-remove').trigger('click'); await flushPromises();
+    const [vnode, , options] = confirmAction.mock.calls[0];
+    const dialog = mount(defineComponent({ render: () => vnode }));
+    expect(dialog.text()).toContain('不会删除远端文件'); expect(dialog.find('[data-test="sync-removal-warning"]').text()).toContain('2');
+    expect(dialog.find('[data-test="sync-removal-warning"]').attributes('style')).toContain('color:'); expect(options.type).toBe('error');
+    expect(cloud.deleteConnection).not.toHaveBeenCalled(); expect(cloud.deleteMapping).not.toHaveBeenCalled(); dialog.unmount(); wrapper.unmount();
   });
-
-  it("previews the requested mapping and applies that preview, not the first mapping", async () => {
-    const wrapper = await mountCloud({ ...rows, mappings: [{ id: "first", localRoot: "/1", logicalPath: "" }, { id: "second", localRoot: "/2", logicalPath: "" }] });
-    cloud.preview.mockResolvedValue({ previewId: "preview-2", summary: "second summary" });
-    const previewButtons = wrapper.findAll("button").filter((b) => b.text() === "预览"); await previewButtons[1].trigger("click"); await flushPromises();
-    expect(cloud.preview).toHaveBeenCalledWith("second"); expect(wrapper.text()).toContain("second summary");
-    cloud.sync.mockResolvedValue({}); await wrapper.findAll("button").find((b) => b.text() === "应用预览").trigger("click"); await flushPromises();
-    expect(cloud.sync).toHaveBeenCalledWith("second", "preview-2");
+  it("removes only the local connection after explicit acceptance", async () => {
+    const wrapper = await mountCloud({ ...rows, mappings: [] }); await wrapper.find('.connection-remove').trigger('click'); await flushPromises();
+    expect(cloud.deleteConnection).toHaveBeenCalledWith('c1'); expect(cloud.deleteMapping).not.toHaveBeenCalled();
+    expect(confirmAction.mock.calls[0][2].type).toBe('warning'); wrapper.unmount();
   });
-
-  it("cancels the selected mapping run", async () => { setLocale("zh-CN"); const wrapper = await mountCloud(); await wrapper.findAll("button").find((b) => b.text() === "取消同步").trigger("click"); expect(cloud.cancel).toHaveBeenCalledWith("m1"); });
-  it("shows pending recovery progress", async () => { setLocale("zh-CN"); const wrapper = await mountCloud(); progressHandler({ payload: { phase: "pendingRecovery", completed: 1, total: 2 } }); await nextTick(); expect(wrapper.text()).toContain("等待恢复"); expect(wrapper.text()).toContain("等待恢复"); });
-  it("asks for confirmation before deleting a mapping", async () => { setLocale("zh-CN"); const wrapper = await mountCloud(); const deleteButtons = wrapper.findAll("button").filter((b) => b.text() === "删除"); await deleteButtons[1].trigger("click"); await flushPromises(); expect(confirmAction).toHaveBeenCalled(); });
-  it("does not delete when confirmation is cancelled", async () => { confirmAction.mockResolvedValue(false); setLocale("zh-CN"); const wrapper = await mountCloud(); const deleteButtons = wrapper.findAll("button").filter((b) => b.text() === "删除"); await deleteButtons[1].trigger("click"); await flushPromises(); expect(cloud.deleteConnection).not.toHaveBeenCalled(); expect(cloud.deleteMapping).not.toHaveBeenCalled(); });
-  it("uses initial status rows and renders recovery detail", async () => {
-    const wrapper = await mountCloud({ ...rows, statuses: [{ mappingId: "m2", phase: "pendingRecovery", detail: "手动恢复" }] });
-    expect(wrapper.text()).toContain("等待恢复"); expect(wrapper.text()).toContain("手动恢复");
+  it("emits a catalog refresh event only after successful save or removal", async () => {
+    const changed = vi.fn(); window.addEventListener('peerdav:cloud-changed', changed);
+    const wrapper = await mountCloud();
+    await wrapper.find('.connection-add').trigger('click');
+    await wrapper.find('.connection-url input').setValue('https://peerdav.s3.cn-east-1.qiniucs.com');
+    cloud.saveConnection.mockRejectedValueOnce({ code: 'CLOUD_STORAGE', message: 'original' });
+    await wrapper.find('.connection-save').trigger('click'); await flushPromises(); expect(changed).not.toHaveBeenCalled();
+    await wrapper.find('.connection-save').trigger('click'); await flushPromises(); expect(changed).toHaveBeenCalledTimes(1);
+    cloud.list.mockResolvedValue({ ...rows, connections: [] });
+    await wrapper.find('.connection-remove').trigger('click'); await flushPromises(); expect(changed).toHaveBeenCalledTimes(2);
+    expect(wrapper.find('.cloud-browse-entry').exists()).toBe(false);
+    window.removeEventListener('peerdav:cloud-changed', changed); wrapper.unmount();
   });
-  it("shows encrypted repository mode from the backend", async () => {
-    const wrapper = await mountCloud({ ...rows, repositories: [{ id: "r1", name: "Repo", mode: "encrypted" }] });
-    expect(wrapper.text()).toContain("已加密");
-  });
-  it("keeps proxy credential fields blank until explicitly entered", async () => {
-    const wrapper = await mountCloud({ ...rows, connections: [{ id: "c1", name: "Primary", proxy: { mode: "custom", url: "http://proxy", username: "secret-user", password: "secret-pass" } }] });
-    expect(wrapper.findAll("input").some((input) => input.element.value === "secret-user" || input.element.value === "secret-pass")).toBe(false);
-  });
-  it("disables repository creation and does not invoke without a connection", async () => {
-    const wrapper = await mountCloud({ ...rows, connections: [] });
-    const create = wrapper.findAll("button").find((b) => b.text() === "创建仓库");
-    expect(create.attributes("disabled")).toBeDefined(); await create.trigger("click");
-    expect(cloud.createRepository).not.toHaveBeenCalled();
-  });
-  it("renders both locale key sets through the actual translation function", async () => { setLocale("zh-CN"); const wrapper = await mountCloud(); expect(wrapper.text()).toContain("S3 连接"); expect(wrapper.text()).not.toContain("cloud.connections"); wrapper.unmount();
-    localStorage.setItem("peerdav.locale", "en"); setLocale("en"); const second = await mountCloud(); expect(second.text()).toContain("S3 connections"); expect(second.text()).not.toContain("cloud.connections");
+  it("renders both locales", async () => {
+    const wrapper = await mountCloud(); expect(wrapper.text()).toContain('添加网盘'); setLocale('en'); await nextTick(); expect(wrapper.text()).toContain('Add cloud drive'); wrapper.unmount();
   });
 });

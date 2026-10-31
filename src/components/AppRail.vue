@@ -3,11 +3,13 @@ import { t } from "../lib/i18n";
 
 defineProps({
   peers: { type: Array, required: true },
+  clouds: { type: Array, default: () => [] },
+  activeCloudId: { type: String, default: "" },
   activePeerId: { type: String, default: "" },
   activeView: { type: String, default: "home" },
 });
 
-const emit = defineEmits(["open-home", "open-peer", "open-settings"]);
+const emit = defineEmits(["open-home", "open-peer", "open-cloud", "open-settings"]);
 
 function initials(peer) {
   const label = (peer?.label ?? "").trim();
@@ -59,6 +61,12 @@ function initials(peer) {
           @click="emit('open-peer', peer)"
         >
           {{ initials(peer) }}
+        </button>
+      </el-tooltip>
+      <el-tooltip v-for="drive in clouds" :key="`cloud-${drive.id}`" :content="t('drive.railLabel', { name: drive.name })" placement="right" :show-after="200" :hide-after="0" :enterable="false">
+        <button type="button" class="rail-avatar rail-cloud" :class="{ 'is-active': activeView === 'cloud' && activeCloudId === String(drive.id) }" :aria-label="t('drive.railLabel', { name: drive.name })" :aria-current="activeView === 'cloud' && activeCloudId === String(drive.id) ? 'page' : undefined" @click="emit('open-cloud', drive)">
+          {{ [...(drive.name || '?').trim()][0]?.toUpperCase() || '?' }}
+          <svg class="cloud-badge" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 18a4 4 0 0 1-1-7.9 7 7 0 0 1 13.6-1.6A4.8 4.8 0 0 1 18 18Z" /></svg>
         </button>
       </el-tooltip>
     </div>
@@ -146,6 +154,9 @@ function initials(peer) {
 .rail-avatar {
   background: var(--app-surface-3);
 }
+
+.rail-cloud { position: relative; }
+.cloud-badge { position: absolute; right: -3px; bottom: -2px; width: 18px; height: 18px; padding: 2px; border-radius: 50%; background: var(--titlebar-bg); fill: none; stroke: currentColor; stroke-width: 2; }
 
 .rail-home {
   margin-bottom: 2px;

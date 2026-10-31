@@ -16,7 +16,7 @@ export async function confirmAction(
 ) {
   try {
     await ElMessageBox.confirm(message, title, {
-      type: "warning",
+      type: options.type ?? "warning",
       confirmButtonText: options.confirmText ?? t("confirm.ok"),
       cancelButtonText: options.cancelText ?? t("confirm.cancel"),
       closeOnClickModal: false,

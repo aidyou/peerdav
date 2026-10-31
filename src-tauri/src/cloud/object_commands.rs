@@ -24,6 +24,13 @@ pub async fn cloud_object_list(
         .await
 }
 #[tauri::command]
+pub async fn cloud_object_prepare(
+    connection_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<ObjectPreparedDto, AppError> {
+    cloud.0.object_prepare(&connection_id).await
+}
+#[tauri::command]
 pub async fn cloud_object_discover(
     connection_id: String,
     prefix: String,

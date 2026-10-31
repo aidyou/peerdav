@@ -40,6 +40,15 @@ describe("confirmAction", () => {
     });
   });
 
+  it("supports an explicit danger type and safe vnode content", async () => {
+    confirm.mockResolvedValue('confirm');
+    const { h } = await import('vue');
+    const message = h('p', { style: { color: 'red' } }, '2 sync configurations');
+    await expect(confirmAction(message, 'Remove', { type: 'error' })).resolves.toBe(true);
+    expect(confirm).toHaveBeenCalledWith(message, 'Remove', expect.objectContaining({ type: 'error' }));
+    expect(confirm.mock.calls[0][2].dangerouslyUseHTMLString).toBeUndefined();
+  });
+
   it("returns false when the user cancels", async () => {
     confirm.mockRejectedValue("cancel");
 

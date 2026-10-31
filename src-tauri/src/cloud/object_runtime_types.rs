@@ -46,6 +46,12 @@ pub struct ObjectDiscoveryDto {
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ObjectPreparedDto {
+    pub physical_id: String,
+    pub discovered: bool,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ObjectIdentityDto {
     pub physical_id: String,
 }

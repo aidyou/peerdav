@@ -29,6 +29,7 @@ struct FixtureState {
     objects: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     delete_keys: Arc<Mutex<Vec<String>>>,
     requests: Arc<Mutex<Vec<(Method, String)>>>,
+    conditional_puts: Arc<Mutex<Vec<String>>>,
     ignore_conditions: bool,
 }
 struct Fixture {
@@ -48,6 +49,7 @@ impl Fixture {
             objects: Arc::new(Mutex::new(BTreeMap::new())),
             delete_keys: Arc::new(Mutex::new(Vec::new())),
             requests: Arc::new(Mutex::new(Vec::new())),
+            conditional_puts: Arc::new(Mutex::new(Vec::new())),
             ignore_conditions,
         };
         let (stop, mut shutdown) = oneshot::channel();
@@ -225,6 +227,15 @@ async fn handle(
     };
     match *request.method() {
         Method::PUT => {
+            if request.headers().contains_key("if-match")
+                || request.headers().contains_key("if-none-match")
+            {
+                state
+                    .conditional_puts
+                    .lock()
+                    .expect("conditional PUT log")
+                    .push(path);
+            }
             let none_match = request
                 .headers()
                 .get("if-none-match")
@@ -519,7 +530,157 @@ fn runtime_connection(fixture: &Fixture) -> SaveS3Input {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn append_runtime_create_join_sync_both_modes_without_cas_probe_or_control_head() {
+async fn sync_drive_defaults_to_append_preserves_cas_and_deletes_only_local_associations() {
+    use peerdav_lib::cloud::config_types::StorageProtocol;
+    use peerdav_lib::cloud::runtime_types::{CreateAppendRepositoryInput, SaveAppendMappingInput};
+
+    let fixture = Fixture::start(false).await;
+    let data = tempfile::tempdir().expect("data dir");
+    let runtime = runtime_for(&data);
+    runtime.resume().expect("resume");
+    let connection = runtime
+        .save_connection(runtime_connection(&fixture))
+        .expect("connection");
+    let cas = runtime
+        .create_repository(CreateRepositoryInput {
+            connection_id: connection.id.clone(),
+            repository_id: None,
+            encrypted: true,
+            password: "CAS password".into(),
+            password_confirmation: "CAS password".into(),
+        })
+        .await
+        .expect("legacy CAS creation remains supported");
+    let cas_root = tempfile::tempdir().expect("CAS root");
+    let cas_mapping = runtime
+        .save_mapping(
+            None,
+            AddMappingInput {
+                connection_id: connection.id.clone(),
+                repository_id: cas.id.clone(),
+                local_root: cas_root.path().to_owned(),
+                logical_path: "legacy".into(),
+                schedule: ScheduleConfig::default(),
+            },
+        )
+        .await
+        .expect("CAS mapping");
+    assert_eq!(cas_mapping.protocol, StorageProtocol::CasV1);
+    assert!(
+        !fixture
+            .state
+            .conditional_puts
+            .lock()
+            .expect("log")
+            .is_empty()
+    );
+    let cas_objects = fixture.state.objects.lock().expect("objects").clone();
+    fixture.state.requests.lock().expect("requests").clear();
+    fixture.state.conditional_puts.lock().expect("log").clear();
+
+    // This is exactly the camelCase input object accepted by the Tauri command.
+    let input = |password: &str, confirmation: &str| {
+        serde_json::from_value::<CreateAppendRepositoryInput>(serde_json::json!({
+            "connectionId": connection.id,
+            "mode": "encrypted",
+            "password": password,
+            "passwordConfirmation": confirmation,
+        }))
+        .expect("sync-drive input contract")
+    };
+    for (password, confirmation) in [("", ""), ("password", "different")] {
+        let error = runtime
+            .create_sync_drive(input(password, confirmation))
+            .await
+            .err()
+            .expect("invalid passwords rejected");
+        assert_eq!(error.code, "CLOUD_APPEND_PASSWORD");
+    }
+    assert!(fixture.state.requests.lock().expect("requests").is_empty());
+    let append = runtime
+        .create_sync_drive(input("append password", "append password"))
+        .await
+        .expect("default Append creation");
+    let requests = fixture.state.requests.lock().expect("requests").clone();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|(method, _)| *method == Method::PUT)
+            .count(),
+        1
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|(_, path)| path.contains("/v2/anchors/")),
+        "{requests:?}"
+    );
+    assert!(
+        fixture
+            .state
+            .conditional_puts
+            .lock()
+            .expect("log")
+            .is_empty()
+    );
+    for (key, bytes) in &cas_objects {
+        assert_eq!(
+            fixture.state.objects.lock().expect("objects").get(key),
+            Some(bytes)
+        );
+    }
+    let append_root = tempfile::tempdir().expect("Append root");
+    let append_mapping = runtime
+        .save_append_mapping(SaveAppendMappingInput {
+            mapping_id: None,
+            selected_root: "docs".into(),
+            mapping: AddMappingInput {
+                connection_id: connection.id.clone(),
+                repository_id: append.binding.repo_id.clone(),
+                local_root: append_root.path().to_owned(),
+                logical_path: "docs".into(),
+                schedule: ScheduleConfig::default(),
+            },
+        })
+        .await
+        .expect("Append mapping");
+    assert_eq!(append_mapping.protocol, StorageProtocol::AppendV2);
+    let snapshot = runtime.snapshot().expect("snapshot");
+    assert_eq!(snapshot.repositories.len(), 1);
+    assert_eq!(snapshot.repositories[0].id, cas.id);
+    assert_eq!(
+        snapshot
+            .mappings
+            .iter()
+            .find(|m| m.id == cas_mapping.id)
+            .expect("CAS mapping preserved")
+            .protocol,
+        StorageProtocol::CasV1
+    );
+    assert_eq!(snapshot.append_repositories.len(), 1);
+
+    let remote_before_delete = fixture.state.objects.lock().expect("objects").clone();
+    fixture.state.requests.lock().expect("requests").clear();
+    runtime
+        .delete_connection(&connection.id)
+        .await
+        .expect("local cascade");
+    let snapshot = runtime.snapshot().expect("snapshot after deletion");
+    assert!(snapshot.connections.is_empty());
+    assert!(snapshot.repositories.is_empty());
+    assert!(snapshot.append_repositories.is_empty());
+    assert!(snapshot.mappings.is_empty());
+    assert!(fixture.state.requests.lock().expect("requests").is_empty());
+    assert_eq!(
+        *fixture.state.objects.lock().expect("objects"),
+        remote_before_delete
+    );
+    runtime.stop_and_clear().await.expect("stop runtime");
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_drive_create_join_sync_both_modes_without_cas_probe_or_control_head() {
     use peerdav_lib::cloud::runtime_types::{
         CreateAppendRepositoryInput, JoinAppendRepositoryInput, SaveAppendMappingInput,
     };
@@ -533,7 +694,7 @@ async fn append_runtime_create_join_sync_both_modes_without_cas_probe_or_control
             .save_connection(runtime_connection(&fixture))
             .unwrap();
         let created = runtime
-            .create_append_repository(CreateAppendRepositoryInput {
+            .create_sync_drive(CreateAppendRepositoryInput {
                 connection_id: connection.id.clone(),
                 mode: mode.clone(),
                 password: "append password".into(),

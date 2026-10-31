@@ -2,8 +2,36 @@
 import { computed, h, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { cloud, cloudObjects, objectChildren } from "../lib/cloud";
 import { confirmAction } from "../lib/confirm";
-import { writeRoute } from "../lib/navigation";
+import { useAppContext } from "../lib/appContext";
+import FileGlyph from "./FileGlyph.vue";
+import { errorStrategy, normalizeAppError } from "../lib/invoke";
+import CloudSyncDrives from "./CloudSyncDrives.vue";
 import { t } from "../lib/i18n";
+const app = useAppContext();
+const view = ref("files");
+const activeDriveId = ref("");
+const catalogDrives = ref([]);
+let catalogVersion = 0;
+const drives = computed(() => catalogDrives.value.map((item, index) => ({ ...item, label: t("drive.number", { number: index + 1 }) })));
+function openManagement(id = "") { activeDriveId.value = id; view.value = "management"; }
+async function refreshCatalog() {
+  const connectionId = props.connectionId;
+  const version = ++catalogVersion;
+  try {
+    const catalog = await cloud.list();
+    if (disposed || version !== catalogVersion || connectionId !== props.connectionId) return;
+    connections.value = catalog.connections;
+    catalogDrives.value = [
+      ...(catalog.repositories || []).filter((item) => item.connectionId === connectionId),
+      ...(catalog.appendRepositories || []).filter((item) => item.connectionId === connectionId).map((item) => ({ id: item.binding.repoId })),
+    ];
+    if (activeDriveId.value && !catalogDrives.value.some((item) => item.id === activeDriveId.value)) {
+      activeDriveId.value = ""; view.value = "files";
+    }
+  } catch (cause) {
+    if (!disposed && version === catalogVersion && connectionId === props.connectionId) app.handleFailure(cause);
+  }
+}
 
 const props = defineProps({ connectionId: { type: String, required: true } });
 const connections = ref([]);
@@ -16,11 +44,13 @@ const loading = ref(false);
 const busy = ref(false);
 const error = ref(null);
 const protectedRoot = ref(false);
-const identified = ref(false);
-const discovered = ref(false);
-const association = ref("new");
-const physicalId = ref("");
-const uploadName = ref("");
+const prepared = ref(false);
+const preparing = ref(false);
+const preparationError = ref(null);
+let preparationVersion = 0;
+const connectionName = computed(() => connections.value.find((item) => String(item.id) === props.connectionId)?.name || t("cloudBrowser.title"));
+const visibleError = computed(() => preparationError.value || error.value);
+const failureStrategy = computed(() => visibleError.value ? errorStrategy(visibleError.value) : null);
 const transfers = ref([]);
 const partial = ref(null);
 let disposed = false;
@@ -31,15 +61,14 @@ let timer;
 const children = computed(() => objectChildren(objects.value, prefix.value));
 const hasProtectedObjects = computed(() => objects.value.some((item) => item.protected === true));
 const targetProtected = (target) => protectedRoot.value || objects.value.some((item) => item.protected === true && item.key.startsWith(target));
-const canMutate = computed(() => identified.value && discovered.value && !protectedRoot.value && !busy.value && !loading.value);
+const canMutate = computed(() => prepared.value && !preparing.value && !protectedRoot.value && !busy.value && !loading.value);
 const current = () => ({ id: requestId, connectionId: props.connectionId, prefix: prefix.value });
 const valid = (scope) => !disposed && scope.id === requestId && scope.connectionId === props.connectionId && scope.prefix === prefix.value;
 function fail(cause, scope) {
   if (!valid(scope)) return;
-  error.value = cause;
-  if (cause?.code === "CLOUD_OBJECT_PROTECTED") { protectedRoot.value = true; discovered.value = false; }
-  if (["CLOUD_PHYSICAL_IDENTITY_UNCONFIRMED", "CLOUD_PHYSICAL_BINDING_INVALID"].includes(cause?.code)) { identified.value = false; discovered.value = false; }
-  if (cause?.code === "CLOUD_DISCOVERY_INCOMPLETE") discovered.value = false;
+  error.value = normalizeAppError(cause);
+  if (cause?.code === "CLOUD_OBJECT_PROTECTED") protectedRoot.value = true;
+  if (["CLOUD_PHYSICAL_IDENTITY_UNCONFIRMED", "CLOUD_PHYSICAL_BINDING_INVALID", "CLOUD_DISCOVERY_INCOMPLETE"].includes(cause?.code)) { prepared.value = false; preparationError.value = error.value; }
 }
 async function load(more = false) {
   if (more && (loading.value || !next.value)) return;
@@ -58,7 +87,7 @@ async function load(more = false) {
 function navigate(value) {
   if (!value.startsWith(root.value)) return;
   requestId++; prefix.value = value; objects.value = []; next.value = null; complete.value = false;
-  discovered.value = false; protectedRoot.value = false; busy.value = false; partial.value = null;
+  protectedRoot.value = false; busy.value = false; partial.value = null;
   void load();
 }
 function up() { const path = prefix.value.slice(root.value.length); const relative = path.endsWith("/") ? path.slice(0, -1) : path; const slash = relative.lastIndexOf("/"); navigate(root.value + (slash < 0 ? "" : relative.slice(0, slash + 1))); }
@@ -69,17 +98,19 @@ async function operate(action) {
   finally { if (valid(scope)) busy.value = false; }
 }
 async function prepare() {
-  if (busy.value || loading.value || protectedRoot.value) return;
-  identified.value = false; discovered.value = false;
-  await operate(async (scope) => {
-    if (association.value === "existing" && !physicalId.value.trim()) return;
-    const result = await cloudObjects.registerIdentity({ connectionId: scope.connectionId, association: association.value === "existing" ? { kind: "existing", physicalId: physicalId.value.trim() } : { kind: "new" } });
-    if (!valid(scope)) return;
-    identified.value = Boolean(result.physicalId);
-    if (!identified.value) return;
-    const scan = await cloudObjects.discover({ connectionId: scope.connectionId, prefix: scope.prefix });
-    if (valid(scope)) discovered.value = scan.complete === true;
-  });
+  if (preparing.value) return;
+  const connectionId = props.connectionId;
+  const version = ++preparationVersion;
+  const isCurrent = () => !disposed && version === preparationVersion && connectionId === props.connectionId;
+  preparing.value = true; prepared.value = false; preparationError.value = null;
+  try {
+    const result = await cloudObjects.prepare({ connectionId });
+    if (!isCurrent()) return;
+    prepared.value = result?.discovered === true;
+    if (!prepared.value) preparationError.value = { code: "CLOUD_DISCOVERY_INCOMPLETE", message: t("cloudBrowser.checkIncomplete") };
+  } catch (cause) {
+    if (isCurrent()) { preparationError.value = normalizeAppError(cause); if (cause?.code === "CLOUD_OBJECT_PROTECTED") protectedRoot.value = true; }
+  } finally { if (isCurrent()) preparing.value = false; }
 }
 function remember(transfer, scope) {
   if (!valid(scope)) return;
@@ -92,7 +123,8 @@ async function upload() {
   await operate(async (scope) => {
     const selected = await cloudObjects.selectLocal({ connectionId: scope.connectionId, direction: "upload" });
     if (!valid(scope) || !selected?.token) return;
-    const key = scope.prefix + (uploadName.value || selected.fileName);
+    if (typeof selected.fileName !== "string" || !selected.fileName) return;
+    const key = scope.prefix + selected.fileName;
     const existing = objects.value.find((item) => item.key === key);
     if (existing?.protected === true || protectedRoot.value) return;
     if (existing && (!existing.etag || !await confirmAction(t("cloudBrowser.uploadOverwrite", { key, etag: existing.etag }), t("cloudBrowser.upload")))) return;
@@ -174,16 +206,13 @@ async function poll() {
   } catch (cause) { if (version === statusVersion) fail(cause, scope); }
   finally { polling = false; }
 }
-watch(() => props.connectionId, async () => {
-  const id = ++requestId; statusVersion++; downloadTargets.value = {}; identified.value = false; discovered.value = false; protectedRoot.value = false;
-  objects.value = []; transfers.value = []; partial.value = null; prefix.value = ""; root.value = ""; next.value = null; complete.value = false; busy.value = false; loading.value = true;
-  try {
-    const catalog = await cloud.list();
-    if (disposed || id !== requestId) return;
-    connections.value = catalog.connections;
-    // Object keys are relative to the backend-configured connection scope.
-    prefix.value = root.value; await load();
-  } catch (cause) { if (!disposed && id === requestId) { fail(cause, current()); loading.value = false; } }
+watch(() => props.connectionId, () => {
+  requestId++; statusVersion++; preparationVersion++; downloadTargets.value = {}; prepared.value = false; preparing.value = false; preparationError.value = null; protectedRoot.value = false; connections.value = [];
+  view.value = "files"; activeDriveId.value = ""; catalogDrives.value = [];
+  objects.value = []; transfers.value = []; partial.value = null; prefix.value = ""; root.value = ""; next.value = null; complete.value = false; busy.value = false; loading.value = false; error.value = null;
+  void prepare();
+  void load();
+  void refreshCatalog();
 }, { immediate: true });
 onMounted(() => { void poll(); timer = setInterval(poll, 1500); });
 onBeforeUnmount(() => { disposed = true; requestId++; statusVersion++; clearInterval(timer); });
@@ -191,20 +220,32 @@ onBeforeUnmount(() => { disposed = true; requestId++; statusVersion++; clearInte
 
 <template>
   <section class="cloud-browser" :aria-label="t('cloudBrowser.title')">
-    <header class="cloud-toolbar">
-      <h2>{{ t('cloudBrowser.title') }}</h2>
-      <el-select :model-value="connectionId" :aria-label="t('cloud.connection')" @update:model-value="(value) => writeRoute({ view: 'cloud', connectionId: value })"><el-option v-for="item in connections" :key="item.id" :value="String(item.id)" :label="item.name" /></el-select>
-      <el-button @click="writeRoute({ view: 'settings', settingsTab: 'cloud' })">{{ t('cloudBrowser.syncSettings') }}</el-button>
-    </header>
-    <p>{{ t('cloudBrowser.rawOnly') }}</p>
-    <div class="cloud-toolbar"><el-tag>{{ protectedRoot ? t('cloudBrowser.protected') : t('cloudBrowser.unknownReadonly') }}</el-tag><span v-if="canMutate">{{ t('cloudBrowser.attemptOnly') }}</span></div>
+    <div class="browser-body">
+      <aside class="browser-sidebar">
+        <div class="sidebar-identity"><strong>{{ connectionName }}</strong><span>{{ t('cloudBrowser.connectionHint') }}</span></div>
+        <p class="sidebar-label">{{ t('cloudBrowser.syncDrives') }}</p>
+        <button type="button" class="share-link all-files" :class="{ 'is-active': view === 'files' }" @click="view = 'files'; activeDriveId = ''">
+          <FileGlyph :entry="{ isDir: true, name: t('cloudBrowser.allFiles') }" /><span>{{ t('cloudBrowser.allFiles') }}</span>
+        </button>
+        <button v-for="(drive, index) in drives" :key="index" type="button" class="share-link drive-link" :class="{ 'is-active': view === 'management' && activeDriveId === drive.id }" @click="openManagement(drive.id)">
+          <FileGlyph :entry="{ isDir: true, name: drive.label }" /><span>{{ drive.label }}</span>
+        </button>
+        <p v-if="!drives.length" class="sidebar-empty">{{ t('cloudBrowser.noSyncDrives') }}</p>
+        <button type="button" class="share-link create-drive-entry" :class="{ 'is-active': view === 'management' && !activeDriveId }" @click="openManagement()"><span>{{ t('drive.createOrConnect') }}</span></button>
+      </aside>
+      <main class="browser-main">
+        <div v-if="view === 'management'" class="management-view">
+          <header class="cloud-toolbar"><el-button class="back-to-files" @click="view = 'files'; activeDriveId = ''">{{ t('cloudBrowser.allFiles') }}</el-button><h2>{{ t('drive.manage') }}</h2></header>
+          <div class="management-content"><CloudSyncDrives :key="connectionId" :connection-id="connectionId" :focus-id="activeDriveId" @changed="refreshCatalog" /></div>
+        </div>
+        <div v-else class="files-view">
     <div class="cloud-toolbar">
-      <el-select v-model="association" :aria-label="t('cloudBrowser.identity')"><el-option value="new" :label="t('cloudBrowser.newIdentity')" /><el-option value="existing" :label="t('cloudBrowser.existingIdentity')" /></el-select>
-      <el-input v-if="association === 'existing'" v-model="physicalId" :placeholder="t('cloudBrowser.physicalId')" :aria-label="t('cloudBrowser.physicalId')" />
-      <el-button data-test="prepare" :disabled="busy || loading || protectedRoot || (association === 'existing' && !physicalId.trim())" @click="prepare">{{ t('cloudBrowser.prepare') }}</el-button>
+      <p v-if="preparing" role="status">{{ t('cloudBrowser.checking') }}</p>
+      <el-tag v-else>{{ protectedRoot ? t('cloudBrowser.protected') : prepared ? t('cloudBrowser.editable') : t('cloudBrowser.checkFailed') }}</el-tag>
+      <el-button v-if="!preparing && preparationError" data-test="recheck" :disabled="busy" @click="prepare">{{ t('cloudBrowser.recheck') }}</el-button>
     </div>
     <nav class="cloud-toolbar" :aria-label="t('cloudBrowser.directory')"><el-button data-test="up" :disabled="prefix === root" @click="up">{{ t('cloudBrowser.up') }}</el-button><code>{{ prefix || '/' }}</code><el-button data-test="refresh" :disabled="busy || loading" @click="navigate(prefix)">{{ t('cloudBrowser.refresh') }}</el-button></nav>
-    <div v-if="error" role="alert"><strong>{{ error.code }}</strong> {{ error.message }}<p v-if="error.code === 'CLOUD_OBJECT_STOP_TIMEOUT'">{{ t('cloudBrowser.stopTimeout') }}</p></div>
+    <div v-if="visibleError" role="alert" :data-error-strategy="failureStrategy">{{ visibleError.message }}</div>
     <p v-if="loading" role="status">{{ t('cloudBrowser.loading') }}</p>
     <p v-if="!complete" data-test="incomplete">{{ t('cloudBrowser.incomplete') }}</p>
     <p v-if="!loading && complete && !children.length">{{ t('cloudBrowser.empty') }}</p>
@@ -217,15 +258,43 @@ onBeforeUnmount(() => { disposed = true; requestId++; statusVersion++; clearInte
       </li>
     </ul>
     <el-button v-if="next" data-test="more" :disabled="loading" @click="load(true)">{{ t('cloudBrowser.more') }}</el-button>
-    <div class="cloud-toolbar"><el-input v-model="uploadName" :aria-label="t('cloudBrowser.uploadName')" :placeholder="t('cloudBrowser.uploadName')" /><el-button data-test="upload" :disabled="!canMutate || objects.some((item) => item.protected && item.key === prefix + uploadName)" @click="upload">{{ t('cloudBrowser.upload') }}</el-button><el-button data-test="delete-prefix" :disabled="!canMutate || hasProtectedObjects" @click="remove(prefix)">{{ t('cloudBrowser.deletePrefix') }}</el-button></div>
-    <div v-if="partial" role="status"><p>{{ t('cloudBrowser.deleteResult', { deleted: partial.deleted.length, failed: partial.failed.length }) }}</p><ul><li v-for="item in partial.failed" :key="item.key">{{ item.key }} · {{ item.error.code }} · {{ item.error.message }}</li></ul></div>
-    <h3>{{ t('cloudBrowser.transfers') }}</h3>
-    <ul class="cloud-tree"><li v-for="item in transfers" :key="item.transferId"><span>{{ item.transferId }} · {{ item.key == null ? t('cloudBrowser.unknownTarget') : JSON.stringify(item.key) }}<span v-if="item.sizeHint != null"> · {{ t('cloudBrowser.bytes', { size: item.sizeHint }) }}</span> · {{ t(`cloudBrowser.${item.direction}`) }} · {{ t(`cloudBrowser.phase.${item.phase}`) }}<strong v-if="item.recoveryRequired || item.phase === 'unknown'"> · {{ t('cloudBrowser.recovery') }}</strong><span v-if="item.error"> · {{ item.error.code }} · {{ item.error.message }}</span></span><el-button v-if="item.phase === 'failed' && item.direction === 'download' && item.error?.code === 'CLOUD_PRECONDITION' && downloadTargets[item.transferId]" :disabled="busy" @click="retryDownload(downloadTargets[item.transferId])">{{ t('cloudBrowser.retryDownload') }}</el-button><p v-if="item.phase === 'acknowledged'">{{ t('cloudBrowser.acknowledgedNotice') }}</p><el-button v-if="item.phase === 'unknown'" :disabled="busy" @click="acknowledge(item)">{{ t('cloudBrowser.acknowledge') }}</el-button><el-button v-if="item.phase === 'running'" :disabled="busy" @click="cancel(item)">{{ t('cloudBrowser.cancel') }}</el-button></li></ul>
+    <div class="cloud-toolbar"><el-button data-test="upload" :disabled="!canMutate" @click="upload">{{ t('cloudBrowser.upload') }}</el-button><el-button data-test="delete-prefix" :disabled="!canMutate || hasProtectedObjects" @click="remove(prefix)">{{ t('cloudBrowser.deletePrefix') }}</el-button></div>
+    <div v-if="partial" role="status"><p>{{ t('cloudBrowser.deleteResult', { deleted: partial.deleted.length, failed: partial.failed.length }) }}</p><ul><li v-for="item in partial.failed" :key="item.key">{{ item.key }} · {{ item.error.message }}</li></ul></div>
+    <h3 v-if="transfers.length">{{ t('cloudBrowser.transfers') }}</h3>
+    <ul v-if="transfers.length" class="cloud-tree cloud-transfers"><li v-for="item in transfers" :key="item.transferId"><span>{{ item.key == null ? t('cloudBrowser.unknownTarget') : JSON.stringify(item.key) }}<span v-if="item.sizeHint != null"> · {{ t('cloudBrowser.bytes', { size: item.sizeHint }) }}</span> · {{ t(`cloudBrowser.${item.direction}`) }} · {{ t(`cloudBrowser.phase.${item.phase}`) }}<strong v-if="item.recoveryRequired || item.phase === 'unknown'"> · {{ t('cloudBrowser.recovery') }}</strong><span v-if="item.error"> · {{ item.error.message }}</span></span><el-button v-if="item.phase === 'failed' && item.direction === 'download' && item.error?.code === 'CLOUD_PRECONDITION' && downloadTargets[item.transferId]" :disabled="busy" @click="retryDownload(downloadTargets[item.transferId])">{{ t('cloudBrowser.retryDownload') }}</el-button><p v-if="item.phase === 'acknowledged'">{{ t('cloudBrowser.acknowledgedNotice') }}</p><el-button v-if="item.phase === 'unknown'" :disabled="busy" @click="acknowledge(item)">{{ t('cloudBrowser.acknowledge') }}</el-button><el-button v-if="item.phase === 'running'" :disabled="busy" @click="cancel(item)">{{ t('cloudBrowser.cancel') }}</el-button></li></ul>
+        </div>
+      </main>
+    </div>
   </section>
 </template>
 
 <style scoped>
-.cloud-browser { flex: 1; min-width: 0; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 12px; color: var(--app-text); padding: 16px; box-sizing: border-box; }
+.cloud-browser { flex: 1; min-width: 0; min-height: 0; overflow: hidden; display: flex; color: var(--app-text); }
+.browser-body { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template-columns: 200px minmax(0, 1fr); overflow: hidden; background: var(--app-surface); }
+.browser-sidebar { min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 4px; padding: 14px 10px; overflow: auto; background: var(--app-surface-2); border-right: 1px solid var(--app-border); }
+.sidebar-identity { display: flex; flex-direction: column; gap: 4px; padding: 0 8px 16px; min-width: 0; }
+.sidebar-identity strong, .sidebar-identity span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar-identity span, .sidebar-label, .sidebar-empty { font-size: 12px; color: var(--app-text-muted); }
+.sidebar-label, .sidebar-empty { padding: 6px 8px; }
+.share-link { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; padding: 8px; border: 0; border-radius: 6px; background: transparent; color: var(--app-text); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; }
+.cloud-browser .share-link span, .cloud-browser .sidebar-identity span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.share-link :deep(.file-glyph) { flex: 0 0 18px; width: 18px; height: 18px; }
+.share-link:hover, .share-link.is-active { background: var(--app-surface-3); }
+.share-link.is-active { box-shadow: inset 3px 0 var(--el-color-primary); }
+.browser-main { min-width: 0; min-height: 0; display: flex; overflow: hidden; }
+.files-view, .management-view { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 12px; padding: 16px; overflow: hidden; }
+.files-view { overflow-y: auto; }
+.files-view > :not(.cloud-tree) { flex-shrink: 0; }
+.files-view > .cloud-tree { flex: 1 1 auto; min-height: 0; overflow: auto; }
+.files-view > .cloud-transfers { flex: 0 1 30%; }
+.management-content { flex: 1; min-height: 0; overflow: auto; }
+@media (max-width: 719px) {
+  .browser-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .browser-sidebar { flex-direction: row; align-items: center; border-right: 0; border-bottom: 1px solid var(--app-border); padding: 8px; }
+  .sidebar-identity { flex: 0 0 auto; max-width: 140px; padding: 0 8px; }
+  .sidebar-label, .sidebar-empty { display: none; }
+  .share-link { flex: 0 0 auto; width: auto; max-width: 200px; white-space: nowrap; }
+}
 .cloud-browser p, .cloud-browser h2, .cloud-browser h3 { margin: 0; }
 .cloud-browser p { color: var(--app-text-muted); line-height: 1.6; }
 .cloud-toolbar, .cloud-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
@@ -236,5 +305,5 @@ onBeforeUnmount(() => { disposed = true; requestId++; statusVersion++; clearInte
 .cloud-browser span, .cloud-browser code, .cloud-browser [role=alert], .cloud-browser li { min-width: 0; overflow-wrap: anywhere; white-space: normal; }
 .cloud-browser :deep(.el-button + .el-button) { margin-left: 0; }
 .cloud-browser [role=alert] { color: var(--el-color-danger); }
-@media (max-width: 480px) { .cloud-browser { padding: 10px; } .cloud-tree li { flex-wrap: wrap; align-items: flex-start; } .cloud-toolbar :deep(.el-input), .cloud-toolbar :deep(.el-select) { width: 100%; } .cloud-actions { width: 100%; } }
+@media (max-width: 480px) { .files-view, .management-view { padding: 10px; } .cloud-tree li { flex-wrap: wrap; align-items: flex-start; } .cloud-toolbar :deep(.el-input), .cloud-toolbar :deep(.el-select) { width: 100%; } .cloud-actions { width: 100%; } }
 </style>

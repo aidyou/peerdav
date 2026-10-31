@@ -285,6 +285,22 @@ mod tests {
         f.runtime.object_discover("connection", "").await?;
         Ok(())
     }
+    #[tokio::test]
+    async fn prepare_reuses_identity_and_skips_completed_discovery() -> Result<(), TestError> {
+        let f = fixture().await?;
+        f.runtime.resume()?;
+        let first = f.runtime.object_prepare("connection").await?;
+        assert!(first.discovered);
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), 1);
+        let second = f.runtime.object_prepare("connection").await?;
+        assert!(second.discovered);
+        assert_eq!(second.physical_id, first.physical_id);
+        // A completed discovery is persisted, so reopening the drive must not
+        // scan the connection scope again.
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
     async fn grant(f: &Fixture) -> Result<String, TestError> {
         let path = f._dir.path().join("source");
         std::fs::write(&path, b"x")?;
@@ -1083,6 +1099,39 @@ impl CloudRuntime {
             prefix_protected,
         })
     }
+    pub async fn object_prepare(&self, connection_id: &str) -> Result<ObjectPreparedDto, AppError> {
+        self.object_admit()?;
+        let _permit = self.network.read().await;
+        let session = self.object_session(connection_id).await?;
+        let (guard, physical_id) = {
+            let mut state = self.objects.lock().await;
+            state.prune();
+            let guard = state.guard.as_ref().ok_or_else(state_error)?.clone();
+            let physical_id = guard
+                .ensure_storage_identity(&session.identity)
+                .map_err(app)?;
+            (guard, physical_id)
+        };
+        if !guard
+            .has_completed_discovery(&session.identity)
+            .map_err(app)?
+        {
+            // `discover` takes a prefix relative to the connection scope; the
+            // connection prefix itself is already part of the service identity.
+            session.service.discover("").await.map_err(app)?;
+        }
+        if !guard
+            .has_completed_discovery(&session.identity)
+            .map_err(app)?
+        {
+            return Err(app(ObjectServiceError::DiscoveryIncomplete));
+        }
+        Ok(ObjectPreparedDto {
+            physical_id,
+            discovered: true,
+        })
+    }
+
     pub async fn object_discover(
         &self,
         connection_id: &str,

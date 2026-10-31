@@ -138,6 +138,13 @@ pub async fn cloud_append_discover(
     cloud.0.discover_append_repositories(&connection_id).await
 }
 #[tauri::command]
+pub async fn cloud_create_sync_drive(
+    input: CreateAppendRepositoryInput,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<super::config_types::AppendRepositoryRedacted, AppError> {
+    cloud.0.create_sync_drive(input).await
+}
+#[tauri::command]
 pub async fn cloud_append_create(
     input: CreateAppendRepositoryInput,
     cloud: tauri::State<'_, SharedCloud>,

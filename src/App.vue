@@ -6,6 +6,7 @@ import { ElMessage } from "element-plus";
 
 import { errorStrategy, invoke, normalizeAppError, toUserMessage } from "./lib/invoke";
 import { confirmAction } from "./lib/confirm";
+import { cloud } from "./lib/cloud";
 import { stableList } from "./lib/listOrder";
 import { generalSettings } from "./lib/general";
 import { applyUpdateStatus, checkForUpdates, updateState } from "./lib/updater";
@@ -92,11 +93,28 @@ const activePeerId = ref("");
 const activePeerSnapshot = ref(null);
 const workspaceView = ref("home");
 const activeCloudConnectionId = ref("");
+const clouds = ref([]);
+let cloudRefreshVersion = 0;
+let appDisposed = false;
+async function refreshClouds() {
+  if (!loggedIn.value || interfaceLocked.value) return;
+  const version = ++cloudRefreshVersion;
+  try {
+    const catalog = await cloud.list();
+    if (appDisposed || version !== cloudRefreshVersion || !loggedIn.value || interfaceLocked.value) return;
+    clouds.value = catalog.connections || [];
+    if (workspaceView.value === "cloud" && !clouds.value.some((drive) => String(drive.id) === activeCloudConnectionId.value)) openHome();
+  } catch (error) { if (!appDisposed && version === cloudRefreshVersion) handleFailure(error); }
+}
 let lastInterfaceActivity = Date.now();
 const interfaceLocked = ref(false);
 const unlockPassword = ref("");
 const unlockingInterface = ref(false);
 const unlockInput = ref(null);
+watch(() => loggedIn.value && !interfaceLocked.value, (ready) => {
+  if (ready) void refreshClouds();
+  else { cloudRefreshVersion++; clouds.value = []; }
+});
 
 async function lockInterface() {
   if (!loggedIn.value || interfaceLocked.value) return;
@@ -213,6 +231,8 @@ function clearTransfer(transferId) {
 }
 
 onMounted(async () => {
+  window.addEventListener("peerdav:cloud-changed", refreshClouds);
+  eventUnlisten.push(() => window.removeEventListener("peerdav:cloud-changed", refreshClouds));
   void bindWindowState();
   const configureShortcuts = async () => {
     if (interfaceLocked.value) return;
@@ -291,6 +311,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  appDisposed = true; cloudRefreshVersion++;
   for (const unlisten of eventUnlisten) {
     unlisten();
   }
@@ -822,6 +843,14 @@ async function syncPeers() {
   }
 }
 
+function openCloud(drive) {
+  activeCloudConnectionId.value = String(drive.id);
+  activePeerId.value = "";
+  activePeerSnapshot.value = null;
+  workspaceView.value = "cloud";
+  syncRoute();
+}
+
 function openPeer(peer) {
   activePeerId.value = peer.id;
   activePeerSnapshot.value = peer;
@@ -834,6 +863,7 @@ function closePeer() {
 }
 
 function openHome() {
+  activeCloudConnectionId.value = "";
   activePeerId.value = "";
   activePeerSnapshot.value = null;
   settingsTab.value = "general";
@@ -1143,6 +1173,9 @@ provide(
       <div v-else class="workspace">
         <AppRail
           :peers="onlinePeers"
+          :clouds="clouds"
+          :active-cloud-id="activeCloudConnectionId"
+          @open-cloud="openCloud"
           :active-peer-id="activePeerId"
           :active-view="workspaceView"
           @open-home="openHome"
@@ -1152,7 +1185,7 @@ provide(
         <div
           class="workspace-content"
           :class="{
-            'workspace-content--browser': workspaceView === 'peer',
+            'workspace-content--browser': workspaceView === 'peer' || workspaceView === 'cloud',
             'workspace-content--fluid': workspaceView === 'home',
           }"
         >
