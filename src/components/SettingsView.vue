@@ -59,14 +59,33 @@ function clearShortcut(field) {
   saveGeneralSettings();
 }
 
-const settingsTabs = [
-  { name: "general", label: "settings.tabGeneral" },
-  { name: "shares", label: "settings.tabShares" },
-  { name: "clients", label: "settings.tabClients" },
-  { name: "service", label: "settings.tabService" },
-  { name: "account", label: "settings.tabAccount" },
-  { name: "cloud", label: "settings.tabCloud" },
+/* 设置导航分两级：顶层项与「局域网」分组。分组本身只是标题，不可点选，
+   其子项仍是各面板；tab 值沿用 general/shares/clients/service/account/cloud，
+   以匹配路由 #/settings/<tab> 与既有测试。顺序即侧栏自上而下的呈现顺序。 */
+const settingsNav = [
+  { name: "general", label: "settings.tabGeneral", icon: "general" },
+  {
+    groupId: "lan",
+    groupLabel: "settings.groupLan",
+    items: [
+      { name: "shares", label: "settings.tabShares", icon: "shares" },
+      { name: "clients", label: "settings.tabClients", icon: "clients" },
+      { name: "service", label: "settings.tabService", icon: "service" },
+    ],
+  },
+  { name: "cloud", label: "settings.tabCloud", icon: "cloud" },
+  { name: "account", label: "settings.tabAccount", icon: "account" },
 ];
+
+// 侧栏图标为静态矢量（非用户输入），用 v-html 注入 <svg> 内的 path，样式统一走描边。
+const navIcons = {
+  general: '<path d="M4 7h9" /><path d="M17 7h3" /><circle cx="15" cy="7" r="2" /><path d="M4 17h3" /><path d="M11 17h9" /><circle cx="9" cy="17" r="2" />',
+  shares: '<path d="M4 8a1.5 1.5 0 0 1 1.5-1.5h3.7l1.4 1.7h6.9A1.5 1.5 0 0 1 19 9.7v6.8A1.5 1.5 0 0 1 17.5 18h-12A1.5 1.5 0 0 1 4 16.5Z" />',
+  clients: '<circle cx="9" cy="8" r="3" /><path d="M3.5 18a5.5 5.5 0 0 1 11 0" /><path d="M16 5.6a3 3 0 0 1 0 5.8" /><path d="M17.6 18a5.5 5.5 0 0 0-2.3-4.5" />',
+  service: '<rect x="4" y="5" width="16" height="6" rx="1.6" /><rect x="4" y="13" width="16" height="6" rx="1.6" /><path d="M7.5 8h.01" /><path d="M7.5 16h.01" />',
+  cloud: '<path d="M7 18a4 4 0 0 1-1-7.9 5 5 0 0 1 9.6-1.3A4.2 4.2 0 0 1 17.5 18Z" />',
+  account: '<circle cx="12" cy="8" r="3.5" /><path d="M5.5 19a6.5 6.5 0 0 1 13 0" />',
+};
 
 const cloudData = ref({ connections: [], repositories: [], mappings: [], statuses: [], capabilities: { safeApply: false } });
 const cloudConnection = ref(blankConnection());
@@ -870,28 +889,46 @@ async function loadInitialData() {
 
 <template>
   <div class="settings-view">
-    <nav class="settings-tabbar" role="tablist" :aria-label="t('settings.title')">
-      <button
-        v-for="tab in settingsTabs"
-        :key="tab.name"
-        type="button"
-        role="tab"
-        :id="`tab-${tab.name}`"
-        class="settings-tab"
-        :class="{ 'is-active': app.settingsTab === tab.name }"
-        :aria-selected="app.settingsTab === tab.name"
-        :aria-controls="`pane-${tab.name}`"
-        @click="app.selectSettingsTab(tab.name)"
-      >
-        {{ t(tab.label) }}
-      </button>
+    <nav class="settings-nav" :aria-label="t('settings.title')">
+      <template v-for="entry in settingsNav" :key="entry.name || entry.groupId">
+        <button
+          v-if="entry.name"
+          type="button"
+          :id="`tab-${entry.name}`"
+          class="settings-tab"
+          :class="{ 'is-active': app.settingsTab === entry.name }"
+          :aria-current="app.settingsTab === entry.name ? 'true' : undefined"
+          @click="app.selectSettingsTab(entry.name)"
+        >
+          <svg class="settings-tab__icon" viewBox="0 0 24 24" aria-hidden="true" v-html="navIcons[entry.icon]" />
+          <span class="settings-tab__label">{{ t(entry.label) }}</span>
+        </button>
+        <div v-else class="settings-nav__group" role="group" :aria-labelledby="`nav-group-${entry.groupId}`">
+          <h3 class="settings-nav__group-title" :id="`nav-group-${entry.groupId}`">{{ t(entry.groupLabel) }}</h3>
+          <button
+            v-for="item in entry.items"
+            :key="item.name"
+            type="button"
+            :id="`tab-${item.name}`"
+            class="settings-tab"
+            :class="{ 'is-active': app.settingsTab === item.name }"
+            :aria-current="app.settingsTab === item.name ? 'true' : undefined"
+            @click="app.selectSettingsTab(item.name)"
+          >
+            <svg class="settings-tab__icon" viewBox="0 0 24 24" aria-hidden="true" v-html="navIcons[item.icon]" />
+            <span class="settings-tab__label">{{ t(item.label) }}</span>
+          </button>
+        </div>
+      </template>
     </nav>
+
+    <div class="settings-content">
 
       <!-- 通用面板按语义分四组：外观、系统集成、锁屏、会话。每组是「组标题 + 行式列表」，
            行内标题在左、控件在右，一条设置项一行；服务、账户面板沿用同一套语法，
            成组的数据录入也走行式列表，提交动作收在列表尾行。
            面板级动作（立即锁屏、退出登录）挂在组标题右侧的小胶囊上，不占一行。 -->
-      <section v-if="app.settingsTab === 'general'" id="pane-general" class="settings-pane" role="tabpanel" aria-labelledby="tab-general">
+      <section v-if="app.settingsTab === 'general'" id="pane-general" class="settings-pane" role="region" aria-labelledby="tab-general">
         <div class="settings-group">
           <h3 class="group-title">{{ t("settings.groupAppearance") }}</h3>
           <div class="settings-rows">
@@ -1047,7 +1084,7 @@ async function loadInitialData() {
         v-if="app.settingsTab === 'service'"
         id="pane-service"
         class="settings-pane"
-        role="tabpanel"
+        role="region"
         aria-labelledby="tab-service"
       >
         <div class="settings-group">
@@ -1150,7 +1187,7 @@ async function loadInitialData() {
         v-if="app.settingsTab === 'shares'"
         id="pane-shares"
         class="settings-pane"
-        role="tabpanel"
+        role="region"
         aria-labelledby="tab-shares"
       >
         <div class="settings-group">
@@ -1391,7 +1428,7 @@ async function loadInitialData() {
         v-if="app.settingsTab === 'clients'"
         id="pane-clients"
         class="settings-pane"
-        role="tabpanel"
+        role="region"
         aria-labelledby="tab-clients"
       >
         <div class="client-roles">
@@ -1751,7 +1788,7 @@ async function loadInitialData() {
         </div>
       </section>
 
-      <section v-if="app.settingsTab === 'cloud'" id="pane-cloud" class="settings-pane cloud-pane" role="tabpanel" aria-labelledby="tab-cloud">
+      <section v-if="app.settingsTab === 'cloud'" id="pane-cloud" class="settings-pane cloud-pane" role="region" aria-labelledby="tab-cloud">
         <CloudSettings />
       </section>
 
@@ -1759,7 +1796,7 @@ async function loadInitialData() {
         v-if="app.settingsTab === 'account'"
         id="pane-account"
         class="settings-pane"
-        role="tabpanel"
+        role="region"
         aria-labelledby="tab-account"
       >
         <form class="settings-group" @submit.prevent="changeAdminPassword">
@@ -1811,6 +1848,7 @@ async function loadInitialData() {
           <p class="settings-group__footnote">{{ t("vault.keyFileHint") }}</p>
         </div>
       </section>
+    </div>
   </div>
 </template>
 
@@ -1826,34 +1864,91 @@ html[data-theme="dark"] .tray-icon-preview--mono {
   filter: invert(1);
 }
 .settings-view {
-  max-width: 920px;
+  display: flex;
+  align-items: flex-start;
+  gap: 28px;
+  max-width: 1040px;
   margin: 0 auto;
 }
 
-.settings-tabbar {
+/* 左侧导航沿用设置页既有的圆角描边容器语言；sticky 让长面板滚动时导航常驻。 */
+.settings-nav {
+  position: sticky;
+  top: 0;
+  flex: none;
+  width: 208px;
+  box-sizing: border-box;
   display: flex;
-  width: fit-content;
-  margin: 8px auto 18px;
-  padding: 4px;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
   border: 1px solid var(--app-border);
   border-radius: 13px;
   background: color-mix(in oklab, var(--app-surface-2) 74%, transparent);
 }
 
+.settings-nav__group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+}
+
+/* 局域网子项整体右移 5px，选中背景块随之与顶层项错开，分组层级一眼可辨。 */
+.settings-nav__group .settings-tab {
+  margin-left: 5px;
+}
+
+.settings-nav__group + .settings-tab {
+  margin-top: 4px;
+}
+
+.settings-nav__group-title {
+  margin: 4px 10px 2px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--app-text-muted);
+}
+
 .settings-tab {
-  border: 0;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  border: 1px solid transparent;
   border-radius: 9px;
-  padding: 8px 50px;
+  padding: 8px 10px;
   background: transparent;
   color: var(--app-text-secondary);
   font: inherit;
   font-size: 13px;
   font-weight: 600;
+  text-align: start;
   cursor: pointer;
   transition:
     background 0.15s ease,
     color 0.15s ease,
-    box-shadow 0.15s ease;
+    border-color 0.15s ease;
+}
+
+.settings-tab__icon {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.settings-tab__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .settings-tab:hover {
@@ -1861,10 +1956,62 @@ html[data-theme="dark"] .tray-icon-preview--mono {
   background: var(--app-surface-3);
 }
 
+/* 选中态与 AppRail 当前项一致：主色文字 + 主色描边 + 浅底，不铺满主色块。 */
 .settings-tab.is-active {
-  color: #fff;
-  background: var(--el-color-primary);
-  box-shadow: 0 2px 8px color-mix(in oklab, var(--el-color-primary) 38%, transparent);
+  color: var(--el-color-primary);
+  border-color: color-mix(in oklab, var(--el-color-primary) 45%, transparent);
+  background: color-mix(in oklab, var(--el-color-primary) 12%, transparent);
+}
+
+.settings-tab:focus-visible {
+  outline: 2px solid var(--el-color-primary);
+  outline-offset: 1px;
+}
+
+.settings-content {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+@media (max-width: 680px) {
+  .settings-view {
+    flex-direction: column;
+    gap: 18px;
+  }
+
+  .settings-nav {
+    position: static;
+    width: auto;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .settings-nav__group {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 2px;
+    margin-top: 0;
+  }
+
+  .settings-nav__group .settings-tab {
+    margin-left: 0;
+  }
+
+  .settings-nav__group + .settings-tab {
+    margin-top: 0;
+  }
+
+  .settings-nav__group-title {
+    width: 100%;
+    margin: 2px 10px 0;
+  }
+
+  .settings-tab {
+    width: auto;
+  }
 }
 
 .settings-pane {

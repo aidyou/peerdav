@@ -1723,7 +1723,7 @@ describe("settings information architecture", () => {
     const labels = wrapper
       .findAll(".settings-tab")
       .map((tab) => tab.text());
-    expect(labels).toEqual(["通用", "共享", "客户端", "服务", "账户", "网盘"]);
+    expect(labels).toEqual(["通用", "共享目录", "客户端", "服务", "网盘", "账户"]);
     expect(wrapper.find("#pane-general").exists()).toBe(true);
     expect(wrapper.find("#pane-clients").exists()).toBe(false);
 
@@ -1841,7 +1841,7 @@ describe("settings information architecture", () => {
     expect(wrapper.findAll(".list-skeleton")).toHaveLength(0);
     expect(wrapper.findAll(".client-empty")).toHaveLength(2);
 
-    await clickButton(wrapper, "共享");
+    await clickButton(wrapper, "共享目录");
     await flushPromises();
     expect(wrapper.findAll(".list-skeleton")).toHaveLength(0);
     const shareEmpty = wrapper.find("#pane-shares .share-empty");
