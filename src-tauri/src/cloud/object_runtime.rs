@@ -76,6 +76,7 @@ mod tests {
         mutations: AtomicUsize,
         probes: AtomicUsize,
         behavior: AtomicUsize,
+        preview_chunks: Arc<AtomicUsize>,
     }
     impl ObjectStore for FakeStore {
         fn scope(&self) -> Option<ObjectStoreScope> {
@@ -136,6 +137,20 @@ mod tests {
             Box::pin(async move {
                 self.stats.fetch_add(1, Ordering::SeqCst);
                 self.reads.fetch_add(1, Ordering::SeqCst);
+                let preview_size = match key {
+                    "preview/small.md" => Some(6),
+                    "preview/large.bin" => Some(crate::types::MAX_PREVIEW_BYTES + 1),
+                    "preview/lines.txt" => Some((crate::types::MAX_PREVIEW_LINES as u64 + 1) * 2),
+                    "preview/lying.bin" | "preview/invalid.txt" | "preview/image.png" => Some(1),
+                    _ => None,
+                };
+                if let Some(size) = preview_size {
+                    return Ok(ObjectMetadata {
+                        key: key.into(),
+                        size,
+                        etag: None,
+                    });
+                }
                 if key == "data/file" {
                     Ok(ObjectMetadata {
                         key: key.into(),
@@ -149,12 +164,30 @@ mod tests {
         }
         fn get<'a>(
             &'a self,
-            _: &'a str,
+            key: &'a str,
             _: Option<std::ops::Range<u64>>,
         ) -> BoxFuture<'a, Result<ObjectStream, CloudError>> {
             Box::pin(async move {
                 self.reads.fetch_add(1, Ordering::SeqCst);
-                Ok(crate::cloud::bytes_stream(bytes::Bytes::from_static(b"x")))
+                if key == "preview/lying.bin" {
+                    let counter = Arc::clone(&self.preview_chunks);
+                    let body = stream::iter([crate::types::MAX_PREVIEW_BYTES as usize, 1, 1])
+                        .map(move |size| {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            Ok(bytes::Bytes::from(vec![0; size]))
+                        })
+                        .boxed();
+                    return Ok(body);
+                }
+                let bytes = match key {
+                    "preview/small.md" => b"hello\n".to_vec(),
+                    "preview/lines.txt" => "x\n"
+                        .repeat(crate::types::MAX_PREVIEW_LINES + 1)
+                        .into_bytes(),
+                    "preview/invalid.txt" | "preview/image.png" => vec![0xff],
+                    _ => b"x".to_vec(),
+                };
+                Ok(crate::cloud::bytes_stream(bytes::Bytes::from(bytes)))
             })
         }
         fn put<'a>(
@@ -286,6 +319,109 @@ mod tests {
         f.runtime.object_discover("connection", "").await?;
         Ok(())
     }
+    #[tokio::test]
+    async fn cloud_object_preview_text_and_binary() -> Result<(), TestError> {
+        let f = fixture().await?;
+        f.runtime.resume()?;
+        let payload = f
+            .runtime
+            .object_preview("connection", "preview/small.md")
+            .await?;
+        assert_eq!(payload.file_name, "small.md");
+        assert_eq!(payload.encoding, "utf8");
+        assert_eq!(payload.mime, "text/markdown");
+        assert_eq!(payload.data, "hello\n");
+        assert_eq!(payload.size, 6);
+        for (key, mime) in [
+            ("preview/invalid.txt", "application/octet-stream"),
+            ("preview/image.png", "image/png"),
+        ] {
+            let payload = f.runtime.object_preview("connection", key).await?;
+            assert_eq!(payload.encoding, "base64");
+            assert_eq!(payload.mime, mime);
+            assert_eq!(payload.data, "/w==");
+        }
+        assert_eq!(f.store.stats.load(Ordering::SeqCst), 3);
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), 6);
+        assert_eq!(f.store.mutations.load(Ordering::SeqCst), 0);
+        assert_eq!(f.store.probes.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cloud_object_preview_stat_rejects_large_before_get() -> Result<(), TestError> {
+        let f = fixture().await?;
+        f.runtime.resume()?;
+        let error = f
+            .runtime
+            .object_preview("connection", "preview/large.bin")
+            .await
+            .expect_err("oversized metadata must reject preview");
+        assert_eq!(error.code, "PEER_PREVIEW_TOO_LARGE");
+        assert_eq!(
+            error.context,
+            Some(serde_json::json!({
+                "size": crate::types::MAX_PREVIEW_BYTES + 1,
+                "limit": crate::types::MAX_PREVIEW_BYTES,
+            }))
+        );
+        // reads includes stat: exactly one read proves get was never called.
+        assert_eq!(f.store.stats.load(Ordering::SeqCst), 1);
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(f.store.mutations.load(Ordering::SeqCst), 0);
+        assert_eq!(f.store.probes.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cloud_object_preview_stops_stream_with_inaccurate_size() -> Result<(), TestError> {
+        let f = fixture().await?;
+        f.runtime.resume()?;
+        let error = f
+            .runtime
+            .object_preview("connection", "preview/lying.bin")
+            .await
+            .expect_err("stream must enforce preview limit independently of stat");
+        assert_eq!(error.code, "PEER_PREVIEW_TOO_LARGE");
+        assert_eq!(
+            error.context,
+            Some(serde_json::json!({
+                "size": crate::types::MAX_PREVIEW_BYTES + 1,
+                "limit": crate::types::MAX_PREVIEW_BYTES,
+            }))
+        );
+        assert_eq!(f.store.stats.load(Ordering::SeqCst), 1);
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), 2);
+        assert_eq!(f.store.preview_chunks.load(Ordering::SeqCst), 2);
+        assert_eq!(f.store.mutations.load(Ordering::SeqCst), 0);
+        assert_eq!(f.store.probes.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cloud_object_preview_rejects_excess_lines() -> Result<(), TestError> {
+        let f = fixture().await?;
+        f.runtime.resume()?;
+        let error = f
+            .runtime
+            .object_preview("connection", "preview/lines.txt")
+            .await
+            .expect_err("too many lines must reject preview");
+        assert_eq!(error.code, "PEER_PREVIEW_TOO_MANY_LINES");
+        assert_eq!(
+            error.context,
+            Some(serde_json::json!({
+                "lines": crate::types::MAX_PREVIEW_LINES + 1,
+                "limit": crate::types::MAX_PREVIEW_LINES,
+            }))
+        );
+        assert_eq!(f.store.stats.load(Ordering::SeqCst), 1);
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), 2);
+        assert_eq!(f.store.mutations.load(Ordering::SeqCst), 0);
+        assert_eq!(f.store.probes.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn prepare_reuses_identity_and_skips_completed_discovery() -> Result<(), TestError> {
         let f = fixture().await?;
@@ -1121,6 +1257,41 @@ impl CloudRuntime {
             session_token: connection.config.session_token,
         })
     }
+    pub async fn object_preview(
+        &self,
+        connection_id: &str,
+        key: &str,
+    ) -> Result<crate::types::PreviewPayload, AppError> {
+        self.object_admit()?;
+        let _permit = self.network.read().await;
+        let session = self.object_session(connection_id).await?;
+        let limit = crate::types::MAX_PREVIEW_BYTES;
+        let metadata = session.store.stat(key).await.map_err(app)?;
+        if metadata.size > limit {
+            return Err(DomainError::PreviewTooLarge {
+                size: metadata.size,
+                limit,
+            }
+            .into());
+        }
+        let mut stream = session.store.get(key, None).await.map_err(app)?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(app)?;
+            let size = (bytes.len() as u64).saturating_add(chunk.len() as u64);
+            if size > limit {
+                return Err(DomainError::PreviewTooLarge { size, limit }.into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let file_name = key
+            .rsplit('/')
+            .find(|part| !part.is_empty())
+            .unwrap_or("object")
+            .to_owned();
+        crate::peer::preview_payload(file_name, bytes).map_err(AppError::from)
+    }
+
     pub async fn object_list(
         &self,
         connection_id: &str,

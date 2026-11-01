@@ -2395,52 +2395,15 @@ impl PeerManager {
             .await
             .map_err(|error| map_dav_error("preview file", error, &display))?;
         ensure_status(response.status(), "preview file", &display)?;
-        let mut bytes =
-            read_response_limited(response, self.limits.max_preview_bytes, "preview file")
-                .await
-                .map_err(|error| match error {
-                    DomainError::TransferTooLarge { size, limit } => {
-                        DomainError::PreviewTooLarge { size, limit }
-                    }
-                    other => other,
-                })?;
-        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let mime = mime_for(&file_name).to_owned();
-        let text_preview = is_text_file(&file_name);
-
-        if text_preview {
-            match String::from_utf8(bytes) {
-                Ok(text) => {
-                    let lines = text.lines().count();
-                    if lines > MAX_PREVIEW_LINES {
-                        return Err(DomainError::PreviewTooManyLines {
-                            lines,
-                            limit: MAX_PREVIEW_LINES,
-                        });
-                    }
-                    return Ok(PreviewPayload {
-                        file_name,
-                        mime,
-                        encoding: "utf8".to_owned(),
-                        data: text,
-                        size,
-                    });
+        let bytes = read_response_limited(response, self.limits.max_preview_bytes, "preview file")
+            .await
+            .map_err(|error| match error {
+                DomainError::TransferTooLarge { size, limit } => {
+                    DomainError::PreviewTooLarge { size, limit }
                 }
-                Err(error) => bytes = error.into_bytes(),
-            }
-        }
-
-        Ok(PreviewPayload {
-            file_name,
-            mime: if text_preview {
-                "application/octet-stream".to_owned()
-            } else {
-                mime
-            },
-            encoding: "base64".to_owned(),
-            data: base64::engine::general_purpose::STANDARD.encode(bytes),
-            size,
-        })
+                other => other,
+            })?;
+        preview_payload(file_name, bytes)
     }
 
     /// Downloads to a controlled temporary directory and records a baseline.
@@ -3674,6 +3637,49 @@ async fn hash_file(path: &Path) -> Result<[u8; 32], DomainError> {
         hasher.update(&buffer[..read]);
     }
     Ok(hasher.finalize().into())
+}
+
+pub(crate) fn preview_payload(
+    file_name: String,
+    mut bytes: Vec<u8>,
+) -> Result<PreviewPayload, DomainError> {
+    let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let mime = mime_for(&file_name).to_owned();
+    let text_preview = is_text_file(&file_name);
+
+    if text_preview {
+        match String::from_utf8(bytes) {
+            Ok(text) => {
+                let lines = text.lines().count();
+                if lines > MAX_PREVIEW_LINES {
+                    return Err(DomainError::PreviewTooManyLines {
+                        lines,
+                        limit: MAX_PREVIEW_LINES,
+                    });
+                }
+                return Ok(PreviewPayload {
+                    file_name,
+                    mime,
+                    encoding: "utf8".to_owned(),
+                    data: text,
+                    size,
+                });
+            }
+            Err(error) => bytes = error.into_bytes(),
+        }
+    }
+
+    Ok(PreviewPayload {
+        file_name,
+        mime: if text_preview {
+            "application/octet-stream".to_owned()
+        } else {
+            mime
+        },
+        encoding: "base64".to_owned(),
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        size,
+    })
 }
 
 fn mime_for(file_name: &str) -> &'static str {

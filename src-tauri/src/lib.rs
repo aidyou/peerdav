@@ -304,6 +304,7 @@ pub fn run() {
                     cloud::cloud_commands::cloud_sync,
                     cloud::object_commands::cloud_object_select_bucket,
                     cloud::object_commands::cloud_object_list,
+                    cloud::object_commands::cloud_object_preview,
                     cloud::object_commands::cloud_object_prepare,
                     cloud::object_commands::cloud_object_discover,
                     cloud::object_commands::cloud_object_register_physical_identity,
