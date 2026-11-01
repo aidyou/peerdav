@@ -47,6 +47,7 @@ export const cloud = Object.freeze({
 export const cloudObjects = Object.freeze({
   selectBucket: (connectionId, bucket) => invoke("cloud_object_select_bucket", { connectionId, bucket }),
   list: ({ connectionId, prefix, next = null }) => invoke("cloud_object_list", { connectionId, prefix, next }),
+  preview: ({ connectionId, key }) => invoke("cloud_object_preview", { connectionId, key }),
   discover: ({ connectionId, prefix }) => invoke("cloud_object_discover", { connectionId, prefix }),
   prepare: ({ connectionId }) => invoke("cloud_object_prepare", { connectionId }),
   selectLocal: ({ connectionId, direction }) => invoke("cloud_object_select_local", { connectionId, direction }),

@@ -4,16 +4,26 @@ import { cloud, cloudObjects, objectChildren } from "../lib/cloud";
 import { confirmAction } from "../lib/confirm";
 import { useAppContext } from "../lib/appContext";
 import FileGlyph from "./FileGlyph.vue";
-import { fileKind } from "../lib/fileKinds";
+import FilePreviewDialog from "./FilePreviewDialog.vue";
+import { canPreview, fileKind, fileKindKey } from "../lib/fileKinds";
+import { formatBytes } from "../lib/format";
+import {
+  MAX_PREVIEW_BYTES,
+  previewFormat as detectPreviewFormat,
+} from "../lib/textPreview";
 import { errorStrategy, normalizeAppError } from "../lib/invoke";
 import CloudSyncDrives from "./CloudSyncDrives.vue";
 import { t } from "../lib/i18n";
+
+const props = defineProps({ connectionId: { type: String, required: true } });
 const app = useAppContext();
+
 const view = ref("files");
 const activeDriveId = ref("");
 const catalogDrives = ref([]);
 const buckets = ref([]);
 const activeBucket = ref("");
+
 // View modes mirror the LAN browser: icons, list, columns and gallery.
 const VIEW_STORAGE_KEY = "peerdav.cloudView";
 const VIEW_MODES = ["icons", "list", "columns", "gallery"];
@@ -29,13 +39,20 @@ function setViewMode(mode) {
   viewMode.value = mode;
   try { globalThis.localStorage?.setItem(VIEW_STORAGE_KEY, mode); } catch { /* a disabled storage must not block switching views */ }
   if (mode === "columns") columnStack.value = [];
+  if (mode === "gallery" && galleryFile.value && previewKey.value !== galleryFile.value.key && canPreview(galleryFile.value)) {
+    void previewEntry(galleryFile.value);
+  }
 }
+
 // Column view drills into subdirectories without leaving the current folder:
 // the first column is always the current directory, the stack holds deeper ones.
 const columnStack = ref([]);
-const columns = computed(() => [{ prefix: prefix.value, entries: children.value, loading: false }, ...columnStack.value]);
+const columns = computed(() => [
+  { prefix: prefix.value, entries: entries.value, loading: false },
+  ...columnStack.value,
+]);
 async function openColumn(item, level) {
-  if (!item.directory) { selectEntry(item); return; }
+  if (!item.isDir) { selectEntry(item); return; }
   columnStack.value = columnStack.value.slice(0, level);
   const column = reactive({ prefix: item.key, entries: [], loading: true });
   columnStack.value.push(column);
@@ -43,29 +60,67 @@ async function openColumn(item, level) {
   try {
     const page = await cloudObjects.list({ connectionId: scope.connectionId, prefix: item.key, next: null });
     if (!valid(scope)) return;
-    column.entries = objectChildren(page.objects, item.key);
+    column.entries = toEntries(objectChildren(page.objects, item.key));
   } catch (cause) { fail(cause, scope); }
   finally { column.loading = false; }
 }
-const galleryEntries = computed(() => children.value.filter((item) => !item.directory && fileKind({ isDir: false, name: item.name }) === "image"));
-// objectChildren keeps the trailing slash on folder names; the file views trim
+
+// `objectChildren` keeps the trailing slash on folder names; every view trims
 // it, and FileGlyph/fileKind speak `isDir` rather than `directory`.
-function displayName(item) { return item.directory ? item.name.replace(/\/$/, "") : item.name; }
-function glyphEntry(item) { return { isDir: item.directory, name: item.name }; }
+function displayName(item) {
+  return item.directory ? item.name.replace(/\/+$/, "") : item.name;
+}
+function toEntries(list) {
+  return list.map((item) => ({
+    key: item.key,
+    name: displayName(item),
+    isDir: item.directory === true,
+    size: item.size,
+    etag: item.etag ?? null,
+    protected: item.protected === true,
+  }));
+}
+const entries = computed(() => toEntries(children.value));
+
+function isSelected(item) { return selectedEntry.value?.key === item.key; }
+function entryKind(item) { return t(fileKindKey(fileKind(item))); }
+function formatSize(item) {
+  if (!item || item.isDir) return "—";
+  return formatBytes(item.size);
+}
+function glyph(item) {
+  return item ?? { isDir: true, name: "" };
+}
+
 let catalogVersion = 0;
 const drives = computed(() => catalogDrives.value.map((item, index) => ({ ...item, label: t("drive.number", { number: index + 1 }) })));
-function openManagement(id = "") { activeDriveId.value = id; view.value = "management"; }
+function openManagement(id = "") {
+  closePreview();
+  selectedEntry.value = null;
+  activeDriveId.value = id;
+  view.value = "management";
+}
 // Selecting a bucket is like opening a drive: the session is rebound to that
-// bucket and browsing restarts at its root.
+// bucket and browsing restarts at its root. The previous listing stays visible
+// until the backend confirms the switch, so a failure never blanks the view.
 async function selectBucket(bucket) {
   if (busy.value || loading.value) return;
-  activeBucket.value = bucket; activeDriveId.value = ""; view.value = "files";
-  requestId++; prefix.value = ""; root.value = ""; objects.value = []; next.value = null; complete.value = false;
-  protectedRoot.value = false; busy.value = false; partial.value = null; error.value = null; prepared.value = false; preparationError.value = null; selectedEntry.value = null; columnStack.value = [];
-  const scope = current();
+  const previousBucket = activeBucket.value;
+  activeBucket.value = bucket;
+  activeDriveId.value = "";
+  view.value = "files";
+  requestId++;
   try { await cloudObjects.selectBucket(props.connectionId, bucket); }
-  catch (cause) { fail(cause, scope); return; }
-  if (!valid(scope) || disposed) return;
+  catch (cause) {
+    activeBucket.value = previousBucket;
+    app.handleFailure(cause);
+    void load();
+    return;
+  }
+  if (disposed) return;
+  prefix.value = ""; root.value = ""; objects.value = []; next.value = null; complete.value = false;
+  protectedRoot.value = false; busy.value = false; partial.value = null; error.value = null; prepared.value = false; preparationError.value = null; selectedEntry.value = null; columnStack.value = [];
+  clearPreview();
   void prepare();
   void load();
 }
@@ -92,7 +147,6 @@ async function refreshCatalog() {
   }
 }
 
-const props = defineProps({ connectionId: { type: String, required: true } });
 const connections = ref([]);
 const prefix = ref("");
 const root = ref("");
@@ -117,10 +171,98 @@ const visibleError = computed(() => preparationError.value || error.value);
 const failureStrategy = computed(() => visibleError.value ? errorStrategy(visibleError.value) : null);
 const transfers = ref([]);
 const partial = ref(null);
-// PeerBrowser-style selection: the file row only selects; download and delete
-// live in the bottom action bar so rows stay readable.
+
+// PeerBrowser-style selection: a row click only selects; a double click opens
+// a folder or previews a file. Download and delete live in the bottom bar.
 const selectedEntry = ref(null);
-function selectEntry(item) { selectedEntry.value = item; }
+function selectEntry(item) {
+  selectedEntry.value = item;
+  if (viewMode.value === "gallery" && !item.isDir && canPreview(item)
+    && (previewKey.value !== item.key || (!previewData.value && !previewLimit.value))) {
+    void previewEntry(item);
+  }
+}
+function openEntry(item) {
+  if (!item) return;
+  if (item.isDir) { navigate(item.key); return; }
+  if (canPreview(item)) void previewEntry(item);
+}
+
+// Preview state mirrors PeerBrowser: media renders inline in gallery mode,
+// everything else opens the shared full-browser preview.
+const previewOpen = ref(false);
+const previewLimit = ref(null);
+const previewData = ref(null);
+const previewKey = ref("");
+const previewTarget = computed(() => selectedEntry.value);
+const activePreview = computed(() => (
+  previewData.value && previewKey.value === selectedEntry.value?.key ? previewData.value : null
+));
+const previewSource = computed(() => {
+  if (!activePreview.value || activePreview.value.encoding !== "base64") return "";
+  return `data:${activePreview.value.mime};base64,${activePreview.value.data}`;
+});
+const isImagePreview = computed(() => Boolean(activePreview.value?.mime?.startsWith("image/")));
+const isAudioPreview = computed(() => Boolean(activePreview.value?.mime?.startsWith("audio/")));
+const isVideoPreview = computed(() => Boolean(activePreview.value?.mime?.startsWith("video/")));
+const galleryFile = computed(() => (
+  selectedEntry.value && !selectedEntry.value.isDir ? selectedEntry.value : null
+));
+
+function previewUsesDialog(entry, preview) {
+  if (viewMode.value !== "gallery") return true;
+  const mime = String(preview?.mime ?? "");
+  if (mime.startsWith("image/") || mime.startsWith("audio/") || mime.startsWith("video/")) {
+    return false;
+  }
+  return ["markdown", "table", "code", "text"].includes(detectPreviewFormat(entry));
+}
+function closePreview() {
+  previewOpen.value = false;
+  previewLimit.value = null;
+}
+function clearPreview() {
+  closePreview();
+  previewData.value = null;
+  previewKey.value = "";
+}
+async function previewEntry(entry) {
+  if (!entry || entry.isDir || busy.value || !canPreview(entry)) return;
+  selectedEntry.value = entry;
+  const key = entry.key;
+  previewKey.value = key;
+  if (Number(entry.size) > MAX_PREVIEW_BYTES) {
+    previewData.value = null;
+    previewLimit.value = {
+      code: "PEER_PREVIEW_TOO_LARGE",
+      size: Number(entry.size),
+      limit: MAX_PREVIEW_BYTES,
+    };
+    previewOpen.value = true;
+    return;
+  }
+  previewLimit.value = null;
+  previewData.value = null;
+  await operate(async (scope) => {
+    try {
+      const preview = await cloudObjects.preview({ connectionId: scope.connectionId, key });
+      if (!valid(scope) || selectedEntry.value?.key !== key) return;
+      previewData.value = preview;
+      previewKey.value = key;
+      previewOpen.value = previewUsesDialog(entry, preview);
+    } catch (cause) {
+      if (cause?.code === "PEER_PREVIEW_TOO_LARGE" || cause?.code === "PEER_PREVIEW_TOO_MANY_LINES") {
+        if (!valid(scope)) return;
+        previewKey.value = key;
+        previewLimit.value = { code: cause.code, ...(cause.context ?? {}) };
+        previewOpen.value = true;
+        return;
+      }
+      fail(cause, scope);
+    }
+  });
+}
+
 // The titlebar only exists in the app shell; without it (unit tests) the
 // Teleport stays disabled so the actions render in place.
 const titlebarActions = ref(false);
@@ -170,6 +312,14 @@ function navigate(value) {
   if (!value.startsWith(root.value)) return;
   requestId++; prefix.value = value; objects.value = []; next.value = null; complete.value = false;
   protectedRoot.value = false; busy.value = false; partial.value = null; selectedEntry.value = null; columnStack.value = [];
+  clearPreview();
+  void load();
+}
+// Refresh keeps the current listing on screen until the new page arrives, so a
+// transient network failure never looks like the folder became empty.
+function refresh() {
+  requestId++;
+  next.value = null; complete.value = false; busy.value = false; partial.value = null;
   void load();
 }
 async function operate(action) {
@@ -221,6 +371,7 @@ async function retryDownload(item) {
   await download(item, true);
 }
 async function download(item, confirmed = false) {
+  if (!item || item.isDir) return;
   await operate(async (scope) => {
     const args = { connectionId: scope.connectionId, direction: "download" };
     let selected = await cloudObjects.selectLocal(args);
@@ -292,6 +443,7 @@ watch(() => props.connectionId, () => {
   requestId++; statusVersion++; preparationVersion++; downloadTargets.value = {}; prepared.value = false; preparing.value = false; preparationError.value = null; protectedRoot.value = false; connections.value = [];
   view.value = "files"; activeDriveId.value = ""; catalogDrives.value = []; buckets.value = []; activeBucket.value = "";
   objects.value = []; transfers.value = []; partial.value = null; selectedEntry.value = null; columnStack.value = []; prefix.value = ""; root.value = ""; next.value = null; complete.value = false; busy.value = false; loading.value = false; error.value = null;
+  clearPreview();
   void prepare();
   void load();
   void refreshCatalog();
@@ -340,7 +492,7 @@ onBeforeUnmount(() => { disposed = true; requestId++; statusVersion++; clearInte
               <span class="titlebar-divider" aria-hidden="true"></span>
               <div class="view-switch" role="group" :aria-label="t('cloudBrowser.fileActions')">
                 <el-tooltip :content="t('cloudBrowser.refresh')" placement="bottom" :show-after="200" :hide-after="0" :enterable="false">
-                  <button type="button" class="view-switch__button" data-test="refresh" :aria-label="t('cloudBrowser.refresh')" :disabled="busy || loading" @click="navigate(prefix)">
+                  <button type="button" class="view-switch__button" data-test="refresh" :aria-label="t('cloudBrowser.refresh')" :disabled="busy || loading" @click="refresh">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7" /><path d="M20 5v6h-6" /></svg>
                   </button>
                 </el-tooltip>
@@ -357,76 +509,141 @@ onBeforeUnmount(() => { disposed = true; requestId++; statusVersion++; clearInte
               </div>
             </div>
           </Teleport>
-    <div class="pathbar">
-      <div class="breadcrumbs" :aria-label="t('cloudBrowser.directory')">
-        <template v-for="(crumb, index) in breadcrumbs" :key="crumb.path">
-          <span v-if="index" class="breadcrumb-sep" aria-hidden="true">›</span>
-          <button type="button" class="breadcrumb" :class="{ 'is-current': index === breadcrumbs.length - 1 }" @click="navigate(crumb.path)">{{ crumb.name }}</button>
-        </template>
-      </div>
-      <p v-if="preparing" class="pathbar-status" role="status">{{ t('cloudBrowser.checking') }}</p>
-    </div>
-    <div v-if="visibleError" role="alert" class="cloud-error" :data-error-strategy="failureStrategy">
-      <span class="cloud-error__message">{{ visibleError.message }}</span>
-      <el-button v-if="!preparing && preparationError" data-test="recheck" size="small" :disabled="busy" @click="prepare">{{ t('cloudBrowser.recheck') }}</el-button>
-    </div>
-    <p v-if="loading" role="status">{{ t('cloudBrowser.loading') }}</p>
-    <p v-if="!complete" data-test="incomplete">{{ t('cloudBrowser.incomplete') }}</p>
-    <p v-if="!loading && complete && !children.length">{{ t('cloudBrowser.empty') }}</p>
-    <div v-if="viewMode === 'icons'" class="icon-grid">
-      <button v-for="item in children" :key="item.key" type="button" class="file-tile" :class="{ 'is-selected': selectedEntry?.key === item.key }" :title="displayName(item)" @click="item.directory ? navigate(item.key) : selectEntry(item)">
-        <FileGlyph :entry="glyphEntry(item)" size="lg" />
-        <span class="file-tile__name">{{ displayName(item) }}</span>
-      </button>
-    </div>
-    <div v-else-if="viewMode === 'columns'" class="column-view">
-      <div v-for="(column, index) in columns" :key="column.prefix" class="column">
-        <button v-for="item in column.entries" :key="item.key" type="button" class="column-row" :class="{ 'is-selected': selectedEntry?.key === item.key }" :title="displayName(item)" @click="openColumn(item, index)">
-          <FileGlyph :entry="glyphEntry(item)" />
-          <span class="column-name">{{ displayName(item) }}</span>
-          <span v-if="item.directory" class="column-chevron" aria-hidden="true">›</span>
-        </button>
-        <p v-if="!column.entries.length && !column.loading" class="column-empty">{{ t('cloudBrowser.empty') }}</p>
-        <p v-if="column.loading" class="column-empty" role="status">{{ t('cloudBrowser.loading') }}</p>
-      </div>
-    </div>
-    <div v-else-if="viewMode === 'gallery'" class="gallery-view">
-      <button v-for="item in galleryEntries" :key="item.key" type="button" class="gallery-tile" :class="{ 'is-selected': selectedEntry?.key === item.key }" :title="displayName(item)" @click="selectEntry(item)">
-        <FileGlyph :entry="glyphEntry(item)" size="lg" />
-        <span class="gallery-tile__name">{{ displayName(item) }}</span>
-      </button>
-      <p v-if="!galleryEntries.length" class="gallery-empty">{{ t('cloudBrowser.galleryEmpty') }}</p>
-    </div>
-    <ul v-else class="cloud-tree" :aria-label="t('cloudBrowser.directory')">
-      <li v-for="item in children" :key="item.key" :class="{ 'is-selected': selectedEntry?.key === item.key }">
-        <el-button v-if="item.directory" class="folder-link" @click="navigate(item.key)">{{ item.name }}</el-button>
-        <button v-else type="button" class="file-row" data-test="file-row" :class="{ 'is-selected': selectedEntry?.key === item.key }" :aria-pressed="selectedEntry?.key === item.key" @click="selectEntry(item)">
-          <FileGlyph :entry="glyphEntry(item)" />
-          <span class="file-row__name">{{ item.name }}</span>
-          <span class="file-row__size">{{ t('cloudBrowser.bytes', { size: item.size }) }}</span>
-          <span v-if="item.protected" class="file-row__protected">{{ t('cloudBrowser.protected') }}</span>
-        </button>
-      </li>
-    </ul>
-    <el-button v-if="next" data-test="more" :disabled="loading" @click="load(true)">{{ t('cloudBrowser.more') }}</el-button>
-    <div v-if="selectedEntry" class="selection-bar">
-      <div class="selection-summary"><FileGlyph :entry="{ isDir: false, name: selectedEntry.name }" /><div><strong>{{ selectedEntry.name }}</strong><span>{{ t('cloudBrowser.bytes', { size: selectedEntry.size }) }}</span></div></div>
-      <div class="selection-actions">
-        <el-button data-test="download" plain :disabled="busy" @click="download(selectedEntry)">{{ t('cloudBrowser.download') }}</el-button>
-        <el-button data-test="delete-file" type="danger" plain :disabled="!canMutate || targetProtected(selectedEntry.key)" @click="remove(selectedEntry.key)">{{ t('cloudBrowser.delete') }}</el-button>
-      </div>
-    </div>
-    <div v-if="partial" role="status"><p>{{ t('cloudBrowser.deleteResult', { deleted: partial.deleted.length, failed: partial.failed.length }) }}</p><ul><li v-for="item in partial.failed" :key="item.key">{{ item.key }} · {{ item.error.message }}</li></ul></div>
-    <h3 v-if="transfers.length">{{ t('cloudBrowser.transfers') }}</h3>
-    <ul v-if="transfers.length" class="cloud-tree cloud-transfers"><li v-for="item in transfers" :key="item.transferId"><span>{{ item.key == null ? t('cloudBrowser.unknownTarget') : JSON.stringify(item.key) }}<span v-if="item.sizeHint != null"> · {{ t('cloudBrowser.bytes', { size: item.sizeHint }) }}</span> · {{ t(`cloudBrowser.${item.direction}`) }} · {{ t(`cloudBrowser.phase.${item.phase}`) }}<strong v-if="item.recoveryRequired || item.phase === 'unknown'"> · {{ t('cloudBrowser.recovery') }}</strong><span v-if="item.error"> · {{ item.error.message }}</span></span><el-button v-if="item.phase === 'failed' && item.direction === 'download' && item.error?.code === 'CLOUD_PRECONDITION' && downloadTargets[item.transferId]" :disabled="busy" @click="retryDownload(downloadTargets[item.transferId])">{{ t('cloudBrowser.retryDownload') }}</el-button><p v-if="item.phase === 'acknowledged'">{{ t('cloudBrowser.acknowledgedNotice') }}</p><el-button v-if="item.phase === 'unknown'" :disabled="busy" @click="acknowledge(item)">{{ t('cloudBrowser.acknowledge') }}</el-button><el-button v-if="item.phase === 'running'" :disabled="busy" @click="cancel(item)">{{ t('cloudBrowser.cancel') }}</el-button></li></ul>
+          <div class="pathbar">
+            <div class="breadcrumbs" :aria-label="t('cloudBrowser.directory')">
+              <template v-for="(crumb, index) in breadcrumbs" :key="crumb.path">
+                <span v-if="index" class="breadcrumb-sep" aria-hidden="true">›</span>
+                <button type="button" class="breadcrumb" :class="{ 'is-current': index === breadcrumbs.length - 1 }" @click="navigate(crumb.path)">{{ crumb.name }}</button>
+              </template>
+            </div>
+            <p v-if="preparing" class="pathbar-status" role="status">{{ t('cloudBrowser.checking') }}</p>
+          </div>
+          <div v-if="visibleError" role="alert" class="cloud-error" :data-error-strategy="failureStrategy">
+            <span class="cloud-error__message">{{ visibleError.message }}</span>
+            <el-button v-if="!preparing && preparationError" data-test="recheck" size="small" :disabled="busy" @click="prepare">{{ t('cloudBrowser.recheck') }}</el-button>
+            <el-button v-else-if="error" data-test="retry-load" size="small" :disabled="loading" @click="refresh">{{ t('cloudBrowser.retry') }}</el-button>
+          </div>
+          <p v-if="loading" role="status">{{ t('cloudBrowser.loading') }}</p>
+          <p v-if="!complete" data-test="incomplete">{{ t('cloudBrowser.incomplete') }}</p>
+          <p v-if="!loading && complete && !entries.length">{{ t('cloudBrowser.empty') }}</p>
+
+          <div v-if="viewMode === 'icons'" class="icon-grid">
+            <button v-for="item in entries" :key="item.key" type="button" class="file-tile" :class="{ 'is-selected': isSelected(item) }" :title="item.name" @click="selectEntry(item)" @dblclick="openEntry(item)">
+              <FileGlyph :entry="item" size="lg" />
+              <span class="file-tile__name">{{ item.name }}</span>
+            </button>
+          </div>
+
+          <div v-else-if="viewMode === 'list'" class="file-table-wrap">
+            <table class="file-table">
+              <thead>
+                <tr>
+                  <th scope="col">{{ t('peer.name') }}</th>
+                  <th scope="col">{{ t('peer.kind') }}</th>
+                  <th scope="col">{{ t('peer.size') }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="item in entries"
+                  :key="item.key"
+                  tabindex="0"
+                  :data-test="item.isDir ? 'folder-row' : 'file-row'"
+                  :class="{ 'is-selected': isSelected(item) }"
+                  @click="selectEntry(item)"
+                  @dblclick="openEntry(item)"
+                  @keydown.enter="openEntry(item)"
+                >
+                  <td>
+                    <span class="table-name">
+                      <FileGlyph :entry="item" />
+                      <span>{{ item.name }}</span>
+                      <span v-if="item.protected" class="table-protected">{{ t('cloudBrowser.protected') }}</span>
+                    </span>
+                  </td>
+                  <td>{{ entryKind(item) }}</td>
+                  <td>{{ formatSize(item) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div v-else-if="viewMode === 'columns'" class="column-view">
+            <div v-for="(column, index) in columns" :key="column.prefix" class="column">
+              <button v-for="item in column.entries" :key="item.key" type="button" class="column-row" :class="{ 'is-selected': isSelected(item) }" :title="item.name" @click="openColumn(item, index)" @dblclick="openEntry(item)">
+                <FileGlyph :entry="item" />
+                <span class="column-name">{{ item.name }}</span>
+                <span v-if="item.isDir" class="column-chevron" aria-hidden="true">›</span>
+              </button>
+              <p v-if="!column.entries.length && column.loading" class="column-empty" role="status">{{ t('cloudBrowser.loading') }}</p>
+              <p v-else-if="!column.entries.length" class="column-empty">{{ t('peer.emptyDir') }}</p>
+            </div>
+          </div>
+
+          <div v-else class="gallery-view">
+            <div class="gallery-stage">
+              <template v-if="galleryFile">
+                <img v-if="isImagePreview && previewSource" :src="previewSource" :alt="t('peer.previewAlt')" class="gallery-image" />
+                <audio v-else-if="isAudioPreview && previewSource" :src="previewSource" class="gallery-audio" controls preload="metadata"></audio>
+                <video v-else-if="isVideoPreview && previewSource" :src="previewSource" class="gallery-video" controls playsinline preload="metadata"></video>
+                <pre v-else-if="activePreview && activePreview.encoding === 'utf8'" class="gallery-text">{{ activePreview.data }}</pre>
+                <div v-else class="gallery-placeholder">
+                  <FileGlyph :entry="galleryFile" size="xl" />
+                  <strong>{{ galleryFile.name }}</strong>
+                  <span>{{ entryKind(galleryFile) }} · {{ formatSize(galleryFile) }}</span>
+                  <el-button v-if="canPreview(galleryFile)" type="primary" plain :disabled="busy" @click="previewEntry(galleryFile)">
+                    {{ t('peer.preview') }}
+                  </el-button>
+                </div>
+              </template>
+              <div v-else class="gallery-placeholder">
+                <FileGlyph :entry="glyph(selectedEntry)" size="xl" />
+                <strong>{{ selectedEntry ? selectedEntry.name : t('peer.selectPreview') }}</strong>
+                <span>{{ selectedEntry ? entryKind(selectedEntry) : t('peer.selectPreviewHint') }}</span>
+              </div>
+            </div>
+            <div class="gallery-strip">
+              <button v-for="item in entries" :key="item.key" type="button" class="gallery-thumb" :class="{ 'is-selected': isSelected(item) }" :title="item.name" @click="selectEntry(item)" @dblclick="openEntry(item)">
+                <FileGlyph :entry="item" />
+                <span>{{ item.name }}</span>
+              </button>
+            </div>
+          </div>
+
+          <el-button v-if="next" data-test="more" class="load-more" :disabled="loading" @click="load(true)">{{ t('cloudBrowser.more') }}</el-button>
+          <div v-if="selectedEntry" class="selection-bar">
+            <div class="selection-summary">
+              <FileGlyph :entry="selectedEntry" />
+              <div>
+                <strong>{{ selectedEntry.name }}</strong>
+                <span>{{ selectedEntry.isDir ? t('peer.folder') : formatBytes(selectedEntry.size) }}<template v-if="selectedEntry.protected"> · {{ t('cloudBrowser.protected') }}</template></span>
+              </div>
+            </div>
+            <div class="selection-actions">
+              <el-button v-if="!selectedEntry.isDir" data-test="download" plain :disabled="busy" @click="download(selectedEntry)">{{ t('cloudBrowser.download') }}</el-button>
+              <el-button data-test="delete-file" type="danger" plain :disabled="!canMutate || targetProtected(selectedEntry.key)" @click="remove(selectedEntry.key)">{{ t('cloudBrowser.delete') }}</el-button>
+            </div>
+          </div>
+          <div v-if="partial" role="status"><p>{{ t('cloudBrowser.deleteResult', { deleted: partial.deleted.length, failed: partial.failed.length }) }}</p><ul><li v-for="item in partial.failed" :key="item.key">{{ item.key }} · {{ item.error.message }}</li></ul></div>
+          <h3 v-if="transfers.length">{{ t('cloudBrowser.transfers') }}</h3>
+          <ul v-if="transfers.length" class="cloud-tree cloud-transfers"><li v-for="item in transfers" :key="item.transferId"><span>{{ item.key == null ? t('cloudBrowser.unknownTarget') : JSON.stringify(item.key) }}<span v-if="item.sizeHint != null"> · {{ t('cloudBrowser.bytes', { size: item.sizeHint }) }}</span> · {{ t(`cloudBrowser.${item.direction}`) }} · {{ t(`cloudBrowser.phase.${item.phase}`) }}<strong v-if="item.recoveryRequired || item.phase === 'unknown'"> · {{ t('cloudBrowser.recovery') }}</strong><span v-if="item.error"> · {{ item.error.message }}</span></span><el-button v-if="item.phase === 'failed' && item.direction === 'download' && item.error?.code === 'CLOUD_PRECONDITION' && downloadTargets[item.transferId]" :disabled="busy" @click="retryDownload(downloadTargets[item.transferId])">{{ t('cloudBrowser.retryDownload') }}</el-button><p v-if="item.phase === 'acknowledged'">{{ t('cloudBrowser.acknowledgedNotice') }}</p><el-button v-if="item.phase === 'unknown'" :disabled="busy" @click="acknowledge(item)">{{ t('cloudBrowser.acknowledge') }}</el-button><el-button v-if="item.phase === 'running'" :disabled="busy" @click="cancel(item)">{{ t('cloudBrowser.cancel') }}</el-button></li></ul>
         </div>
       </main>
     </div>
+    <FilePreviewDialog
+      :open="previewOpen"
+      :target="previewTarget"
+      :preview="activePreview"
+      :limit="previewLimit"
+      :busy="busy"
+      @close="closePreview"
+      @download="download(previewTarget)"
+    />
   </section>
 </template>
 
 <style scoped>
-.cloud-browser { flex: 1; min-width: 0; min-height: 0; overflow: hidden; display: flex; color: var(--app-text); }
+.cloud-browser { position: relative; flex: 1; min-width: 0; min-height: 0; overflow: hidden; display: flex; color: var(--app-text); }
 .browser-body { flex: 1; min-width: 0; min-height: 0; display: grid; grid-template-columns: 200px minmax(0, 1fr); overflow: hidden; background: var(--app-surface); }
 .browser-sidebar { min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 4px; padding: 14px 10px; overflow: auto; background: var(--app-surface-2); border-right: 1px solid var(--app-border); }
 .sidebar-identity { display: flex; flex-direction: column; gap: 4px; padding: 0 8px 16px; min-width: 0; }
@@ -444,28 +661,78 @@ onBeforeUnmount(() => { disposed = true; requestId++; statusVersion++; clearInte
 .share-link.is-active { box-shadow: inset 3px 0 var(--el-color-primary); }
 .browser-main { min-width: 0; min-height: 0; display: flex; overflow: hidden; }
 .files-view, .management-view { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 12px; padding: 16px; overflow: hidden; }
-.files-view { overflow-y: auto; }
-.files-view > :not(.cloud-tree):not(.icon-grid):not(.column-view):not(.gallery-view) { flex-shrink: 0; }
-.files-view > .cloud-tree, .files-view > .icon-grid, .files-view > .column-view, .files-view > .gallery-view { flex: 1 1 auto; min-height: 0; overflow: auto; }
-.icon-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 4px; padding: 4px; align-content: start; }
-.file-tile { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 12px 6px; border: 0; border-radius: 8px; background: transparent; color: var(--app-text); font: inherit; font-size: 12px; text-align: center; cursor: pointer; }
-.file-tile:hover, .file-tile.is-selected { background: var(--app-surface-3); }
-.file-tile__name { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.column-view { display: flex; align-items: stretch; gap: 1px; min-width: 0; background: var(--app-border); }
-.column { flex: 0 0 200px; min-width: 0; overflow-y: auto; background: var(--app-surface); padding: 6px; display: flex; flex-direction: column; gap: 2px; }
-.column-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--app-text); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; }
-.column-row:hover, .column-row.is-selected { background: var(--app-surface-3); }
-.column-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.column-chevron { flex: none; color: var(--app-text-muted); }
-.column-empty { margin: 8px; color: var(--app-text-muted); font-size: 12px; }
-.gallery-view { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; padding: 4px; align-content: start; }
-.gallery-tile { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 18px 8px; border: 1px solid var(--app-border); border-radius: 10px; background: var(--app-surface-2); color: var(--app-text); font: inherit; font-size: 12px; text-align: center; cursor: pointer; }
-.gallery-tile:hover, .gallery-tile.is-selected { background: var(--app-surface-3); border-color: var(--el-color-primary); }
-.gallery-tile__name { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.gallery-empty { color: var(--app-text-muted); font-size: 12.5px; }
-.titlebar-divider { flex: none; width: 1px; height: 16px; background: var(--app-border); }
+.files-view > :not(.file-table-wrap):not(.icon-grid):not(.column-view):not(.gallery-view):not(.cloud-transfers) { flex-shrink: 0; }
+.files-view > .file-table-wrap, .files-view > .icon-grid, .files-view > .column-view, .files-view > .gallery-view { flex: 1 1 auto; min-height: 0; }
 .files-view > .cloud-transfers { flex: 0 1 30%; }
+.load-more { flex: none; align-self: flex-start; }
 .management-content { flex: 1; min-height: 0; overflow: auto; }
+.pathbar { flex-shrink: 0; display: flex; align-items: center; gap: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--app-border); }
+.breadcrumbs { flex: 1; min-width: 0; display: flex; align-items: center; gap: 2px; overflow-x: auto; overflow-y: hidden; white-space: nowrap; scrollbar-width: none; }
+.breadcrumbs::-webkit-scrollbar { display: none; }
+.breadcrumb { flex: none; border: 0; border-radius: 6px; padding: 4px 6px; background: transparent; color: var(--app-text-muted); font: inherit; font-size: 12.5px; cursor: pointer; }
+.breadcrumb:hover { color: var(--app-text); background: var(--app-surface-2); }
+.breadcrumb.is-current { color: var(--app-text); font-weight: 600; }
+.breadcrumb-sep { flex: none; color: var(--app-text-muted); font-size: 14px; }
+.pathbar-status { flex: none; font-size: 12px; }
+.cloud-error { flex-shrink: 0; display: flex; align-items: center; gap: 10px; color: var(--el-color-danger); }
+.titlebar-divider { flex: none; width: 1px; height: 16px; background: var(--app-border); }
+
+/* File views follow PeerBrowser so folders feel the same on both sides. */
+.icon-grid { overflow: auto; align-content: start; display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 10px; }
+.file-tile { min-height: 106px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; padding: 12px 8px; border: 1px solid transparent; border-radius: 10px; background: transparent; color: var(--app-text); font: inherit; cursor: pointer; }
+.file-tile:hover { background: var(--app-surface-2); }
+.file-tile.is-selected { border-color: var(--selection-border); background: var(--selection-bg); }
+.file-tile__name { display: -webkit-box; max-width: 100%; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow-wrap: break-word; text-align: center; font-size: 12.5px; font-weight: 500; line-height: 1.35; }
+.file-table-wrap { overflow: auto; }
+.file-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.file-table th { position: sticky; top: 0; z-index: 2; padding: 7px 9px; border-bottom: 1px solid var(--app-border); background: var(--app-surface); color: var(--app-text-muted); font-size: 11.5px; font-weight: 600; text-align: left; }
+.file-table td { padding: 7px 9px; border-bottom: 1px solid color-mix(in oklab, var(--app-border) 55%, transparent); color: var(--app-text-secondary); white-space: nowrap; }
+.file-table tbody tr:last-child td { border-bottom: none; }
+.file-table tbody tr { cursor: default; }
+.file-table tbody tr:hover { background: var(--app-surface-2); }
+.file-table tbody tr.is-selected { background: var(--selection-bg); }
+.file-table tbody tr.is-selected td { border-bottom-color: color-mix(in oklab, var(--selection-border) 40%, transparent); }
+.file-table tbody tr.is-selected:last-child td { border-bottom: none; }
+.table-name { display: flex; align-items: center; gap: 8px; color: var(--app-text); }
+.table-protected { color: var(--app-text-muted); font-size: 11px; }
+.column-view { display: flex; align-items: stretch; overflow-x: auto; overflow-y: hidden; }
+.column { width: 240px; flex: none; overflow-y: auto; padding: 5px; border-right: 1px solid var(--app-border); }
+.column:last-child { border-right: 0; }
+.column-row { width: 100%; display: flex; align-items: center; gap: 7px; padding: 6px 8px; border: 0; border-radius: 7px; background: transparent; color: var(--app-text-secondary); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; }
+.column-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.column-row:hover { background: var(--app-surface-2); }
+.column-row.is-selected { color: var(--app-text); background: var(--selection-bg); }
+.column-chevron { flex: none; color: var(--app-text-muted); font-size: 15px; }
+.column-empty { margin: 8px; font-size: 12px; color: var(--app-text-muted); }
+.gallery-view { box-sizing: border-box; height: 100%; min-height: 0; display: flex; flex-direction: column; gap: 10px; }
+.gallery-stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 16px; border: 1px solid var(--app-border); border-radius: 12px; background: linear-gradient(45deg, color-mix(in oklab, var(--app-surface-2) 55%, transparent) 25%, transparent 25%, 50%, color-mix(in oklab, var(--app-surface-2) 55%, transparent) 50%, 75%, transparent 75%), var(--app-surface-3); background-size: 16px 16px; }
+.gallery-stage > * { max-width: 100%; max-height: 100%; min-width: 0; min-height: 0; }
+.gallery-image { max-width: 100%; max-height: 100%; width: auto; height: auto; object-fit: contain; border-radius: 8px; box-shadow: 0 8px 28px rgba(22, 32, 46, 0.16); }
+.gallery-audio { width: min(440px, 100%); }
+.gallery-video { max-width: 100%; max-height: 100%; width: auto; height: auto; object-fit: contain; border-radius: 8px; background: #000; box-shadow: 0 8px 28px rgba(22, 32, 46, 0.16); }
+.gallery-text { margin: 0; box-sizing: border-box; width: 100%; height: 100%; min-height: 0; max-height: none; overflow: auto; padding: 16px; border-radius: 8px; background: var(--app-surface); border: 1px solid var(--app-border); font-size: 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+.gallery-placeholder { display: flex; flex-direction: column; align-items: center; gap: 7px; color: var(--app-text-muted); text-align: center; }
+.gallery-placeholder strong { color: var(--app-text); font-size: 14px; }
+.gallery-placeholder span { font-size: 12px; }
+.gallery-strip { flex: none; display: flex; gap: 8px; overflow-x: auto; padding: 2px; }
+.gallery-thumb { width: 96px; flex: none; display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 7px 5px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--app-text-secondary); font: inherit; cursor: pointer; }
+.gallery-thumb span { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; text-align: center; }
+.gallery-thumb:hover { background: var(--app-surface-2); }
+.gallery-thumb.is-selected { border-color: var(--selection-border); background: var(--selection-bg); }
+.selection-bar { flex: none; box-sizing: border-box; min-height: 54px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px; border: 1px solid var(--app-border); border-radius: 8px; background: var(--app-surface-2); }
+.selection-summary { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.selection-summary div { display: flex; flex-direction: column; min-width: 0; }
+.selection-summary strong, .selection-summary span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.selection-summary span { font-size: 12px; color: var(--app-text-muted); }
+.selection-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.pathbar-actions { display: flex; align-items: center; gap: 8px; }
+.view-switch { display: flex; align-items: center; gap: 4px; }
+.view-switch__button { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--app-text-secondary); cursor: pointer; }
+.view-switch__button:hover:not(:disabled) { background: var(--app-surface-3); color: var(--app-text); }
+.view-switch__button.is-active { background: var(--app-surface-3); color: var(--el-color-primary); }
+.view-switch__button:disabled { opacity: 0.45; cursor: not-allowed; }
+.view-switch__button svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+
 @media (max-width: 719px) {
   .browser-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
   .browser-sidebar { flex-direction: row; align-items: center; border-right: 0; border-bottom: 1px solid var(--app-border); padding: 8px; }
@@ -480,32 +747,6 @@ onBeforeUnmount(() => { disposed = true; requestId++; statusVersion++; clearInte
 .cloud-tree { margin: 0; padding: 0; list-style: none; }
 .cloud-tree li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px; border-bottom: 1px solid var(--app-border); }
 .cloud-tree li.is-selected { background: var(--app-surface-3); }
-.pathbar { flex-shrink: 0; display: flex; align-items: center; gap: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--app-border); }
-.breadcrumbs { flex: 1; min-width: 0; display: flex; align-items: center; gap: 2px; overflow-x: auto; overflow-y: hidden; white-space: nowrap; scrollbar-width: none; }
-.breadcrumbs::-webkit-scrollbar { display: none; }
-.breadcrumb { flex: none; border: 0; border-radius: 6px; padding: 4px 6px; background: transparent; color: var(--app-text-muted); font: inherit; font-size: 12.5px; cursor: pointer; }
-.breadcrumb:hover { color: var(--app-text); background: var(--app-surface-2); }
-.breadcrumb.is-current { color: var(--app-text); font-weight: 600; }
-.breadcrumb-sep { flex: none; color: var(--app-text-muted); font-size: 14px; }
-.pathbar-status { flex: none; font-size: 12px; }
-.cloud-error { flex-shrink: 0; display: flex; align-items: center; gap: 10px; color: var(--el-color-danger); }
-.file-row { flex: 1 1 auto; display: flex; align-items: center; gap: 8px; min-width: 0; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; }
-.file-row__name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.file-row__size, .file-row__protected { flex: 0 0 auto; color: var(--app-text-muted); }
-.file-row.is-selected .file-row__name { color: var(--el-color-primary); font-weight: 600; }
-.selection-bar { flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--app-border); border-radius: 8px; background: var(--app-surface-2); }
-.selection-summary { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.selection-summary div { display: flex; flex-direction: column; min-width: 0; }
-.selection-summary strong, .selection-summary span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.selection-summary span { font-size: 12px; color: var(--app-text-muted); }
-.selection-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-.pathbar-actions { display: flex; align-items: center; gap: 8px; }
-.view-switch { display: flex; align-items: center; gap: 4px; }
-.view-switch__button { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--app-text-secondary); cursor: pointer; }
-.view-switch__button:hover:not(:disabled) { background: var(--app-surface-3); color: var(--app-text); }
-.view-switch__button.is-active { background: var(--app-surface-3); color: var(--el-color-primary); }
-.view-switch__button:disabled { opacity: 0.45; cursor: not-allowed; }
-.view-switch__button svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
 .cloud-browser span, .cloud-browser code, .cloud-browser [role=alert], .cloud-browser li { min-width: 0; overflow-wrap: anywhere; white-space: normal; }
 .cloud-browser :deep(.el-button + .el-button) { margin-left: 0; }
 .cloud-browser [role=alert] { color: var(--el-color-danger); }
