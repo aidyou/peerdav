@@ -162,10 +162,21 @@ pub(crate) async fn check_for_updates(
     manager: State<'_, UpdateManager>,
     automatic: Option<bool>,
 ) -> Result<UpdateStatus, AppError> {
-    manager
-        .check(&app, automatic.unwrap_or(false))
-        .await
-        .map_err(AppError::from)
+    let automatic = automatic.unwrap_or(false);
+    match manager.check(&app, automatic).await {
+        Ok(status) => Ok(status),
+        // A background check must not interrupt the user or spam the console.
+        // Keep the full cause chain in the app log; a manual check still
+        // reports the structured error so the user can act on it.
+        Err(error) if automatic => {
+            log::warn!(
+                "automatic update check failed: {}",
+                crate::error::error_chain(&error)
+            );
+            Ok(manager.snapshot())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[tauri::command]
