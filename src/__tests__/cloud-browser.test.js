@@ -109,7 +109,34 @@ describe("CloudBrowser", () => {
     const wrapper = await browser(); expect(wrapper.find('[data-test=incomplete]').exists()).toBe(true);
     await click(wrapper, '[data-test=more]'); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_list", { connectionId: "c1", prefix: "", next: "cursor" }); expect(wrapper.find('[data-test=incomplete]').exists()).toBe(false); expect(wrapper.findAll(".file-table tbody tr")).toHaveLength(2);
   });
-  it("does not claim an empty or complete listing after loading failure", async () => { handlers.cloud_object_list = () => { throw error("CLOUD_TRANSPORT"); }; const wrapper = await browser(); expect(wrapper.text()).toContain("Original backend reason"); expect(wrapper.text()).not.toContain(t("cloudBrowser.empty")); expect(wrapper.find('[data-test=incomplete]').exists()).toBe(true); });
+  it("does not claim an empty or complete listing after loading failure", async () => { handlers.cloud_object_list = () => { throw error("CLOUD_TRANSPORT"); }; const wrapper = await browser(); await vi.advanceTimersByTimeAsync(300); await flushPromises(); expect(wrapper.text()).toContain("Original backend reason"); expect(wrapper.text()).not.toContain(t("cloudBrowser.empty")); expect(wrapper.find("[data-test=retry-load]").exists()).toBe(true); expect(wrapper.find('[data-test=incomplete]').exists()).toBe(false); });
+  it("never flashes hint text while the first page is still loading", async () => {
+    const listing = deferred();
+    const preparation = deferred();
+    handlers.cloud_object_list = () => listing.promise;
+    handlers.cloud_object_prepare = () => preparation.promise;
+    const wrapper = await browser();
+    expect(wrapper.find('[data-test=incomplete]').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain(t("cloudBrowser.incomplete"));
+    expect(wrapper.text()).not.toContain(t("cloudBrowser.loading"));
+    expect(wrapper.find(".pathbar-status").exists()).toBe(false);
+    await vi.advanceTimersByTimeAsync(300);
+    await flushPromises();
+    expect(wrapper.find(".pathbar-status").text()).toBe(t("cloudBrowser.checking"));
+    listing.resolve(page([file]));
+    await flushPromises();
+    expect(wrapper.find('[data-test=incomplete]').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain(t("cloudBrowser.loading"));
+    preparation.resolve({ discovered: true });
+    await flushPromises();
+    expect(wrapper.find(".pathbar-status").exists()).toBe(false);
+  });
+  it("only warns about a partial listing once more objects are actually pending", async () => {
+    handlers.cloud_object_list = () => page([file], "cursor", false);
+    const wrapper = await browser();
+    expect(wrapper.find('[data-test=incomplete]').exists()).toBe(true);
+    expect(wrapper.find('[data-test=incomplete]').text()).toBe(t("cloudBrowser.incomplete"));
+  });
   it("shows true empty state only after complete listing", async () => { handlers.cloud_object_list = () => page(); const wrapper = await browser(); expect(wrapper.text()).toContain(t("cloudBrowser.empty")); });
   it("automatically checks protection and requires discovered true before edits", async () => {
     handlers.cloud_object_prepare = () => ({ physicalId: 'physical', discovered: false });
@@ -169,7 +196,7 @@ describe("CloudBrowser", () => {
   });
   it("does not execute cancelled or expired delete plans", async () => { const wrapper = await browser(); await prepare(wrapper); confirmAction.mockResolvedValue(false); await click(wrapper, '[data-test=delete-prefix]'); confirmAction.mockResolvedValue(true); handlers.cloud_object_delete_plan = () => deletePlan({ planId: "expired", expiresAtUnix: 1 }); await click(wrapper, '[data-test=delete-prefix]'); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_delete_execute")).toBe(false); expect(wrapper.text()).toContain(t('cloudBrowser.stalePlan')); });
   it("ignores stale directory page results after navigation", async () => { const late = deferred(); let count = 0; handlers.cloud_object_list = ({ prefix }) => { if (prefix) return page([{ key: "docs/new", size: 1 }]); if (++count === 1) return page([{ key: "docs/old", size: 1 }], "next", false); return late.promise; }; const wrapper = await browser(); await wrapper.find('[data-test=more]').trigger("click"); await wrapper.find("[data-test=folder-row]").trigger("dblclick"); await flushPromises(); late.resolve(page([{ key: "stale", size: 2 }])); await flushPromises(); expect(wrapper.text()).toContain("new"); expect(wrapper.text()).not.toContain("stale"); });
-  it("ignores pending preparation after a connection change", async () => { const late = deferred(); handlers.cloud_object_prepare = ({ connectionId }) => connectionId === 'c1' ? late.promise : { discovered: false }; const wrapper = await browser(); expect(wrapper.text()).toContain(t('cloudBrowser.checking')); await wrapper.setProps({ connectionId: 'c2' }); await flushPromises(); late.resolve({ discovered: true }); await flushPromises(); expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_prepare', { connectionId: 'c2' }); expect(wrapper.find('[data-test=upload]').attributes('disabled')).toBeDefined(); });
+  it("ignores pending preparation after a connection change", async () => { const late = deferred(); handlers.cloud_object_prepare = ({ connectionId }) => connectionId === 'c1' ? late.promise : { discovered: false }; const wrapper = await browser(); await vi.advanceTimersByTimeAsync(300); await flushPromises(); expect(wrapper.text()).toContain(t('cloudBrowser.checking')); await wrapper.setProps({ connectionId: 'c2' }); await flushPromises(); late.resolve({ discovered: true }); await flushPromises(); expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_prepare', { connectionId: 'c2' }); expect(wrapper.find('[data-test=upload]').attributes('disabled')).toBeDefined(); });
   it("cleans polling on unmount and ignores in-flight poll completion", async () => { const late = deferred(); handlers.cloud_object_status = () => late.promise; const wrapper = await browser(); wrapper.unmount(); late.resolve([transfer()]); await flushPromises(); await vi.advanceTimersByTimeAsync(4500); expect(nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_status")).toHaveLength(1); expect(vi.getTimerCount()).toBe(0); });
   it("does not execute a deletion confirmed after directory switch", async () => {
     handlers.cloud_object_list = () => page([{ key: "docs/a", size: 1 }]); const answer = deferred(); confirmAction.mockImplementation(() => answer.promise); const wrapper = await browser(); await prepare(wrapper); await wrapper.find('[data-test=delete-prefix]').trigger("click"); await flushPromises(); await wrapper.find("[data-test=folder-row]").trigger("dblclick"); await flushPromises(); answer.resolve(true); await flushPromises(); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_delete_execute")).toBe(false);
@@ -426,16 +453,81 @@ describe("CloudBrowser", () => {
     expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_list').length).toBeGreaterThan(listsBefore);
     expect(wrapper.find('.cloud-transfers').exists()).toBe(false);
   });
-  it("keeps the listing shape with a skeleton while a directory loads", async () => {
+  it("shows the same centered loading placeholder as the LAN browser", async () => {
     const late = deferred();
     handlers.cloud_object_list = () => late.promise;
     const wrapper = await browser();
-    expect(wrapper.find('.file-skeleton--list').exists()).toBe(true);
+    expect(wrapper.find('.file-view--placeholder').exists()).toBe(true);
+    expect(wrapper.find('.file-loading').text()).toBe(t('peer.loading'));
     expect(wrapper.find('.file-table').exists()).toBe(false);
     late.resolve(page([file]));
     await flushPromises();
-    expect(wrapper.find('.file-skeleton').exists()).toBe(false);
+    expect(wrapper.find('.file-view--placeholder').exists()).toBe(false);
     expect(wrapper.findAll('[data-test=file-row]')).toHaveLength(1);
+  });
+  it("moves the selection with arrow keys and goes up one level like the LAN browser", async () => {
+    handlers.cloud_object_list = ({ prefix }) => prefix
+      ? page([{ key: "docs/a.txt", size: 1 }])
+      : page([{ key: "docs/a.txt", size: 1 }, { key: "b.txt", size: 2 }]);
+    const wrapper = await browser();
+    const view = wrapper.find(".file-view");
+    await view.trigger("keydown", { key: "ArrowDown" });
+    expect(wrapper.find(".selection-summary").text()).toContain("docs");
+    await view.trigger("keydown", { key: "ArrowDown" });
+    expect(wrapper.find(".selection-summary").text()).toContain("b.txt");
+    await view.trigger("keydown", { key: "ArrowDown" });
+    expect(wrapper.find(".selection-summary").text()).toContain("docs");
+    await wrapper.find("[data-test=folder-row]").trigger("dblclick");
+    await flushPromises();
+    expect(wrapper.find(".breadcrumb.is-current").text()).toBe("docs");
+    await view.trigger("keydown", { key: "ArrowUp", altKey: true });
+    await flushPromises();
+    expect(wrapper.find(".breadcrumb.is-current").text()).toBe("main");
+  });
+  it("opens a folder from the column view with a single click", async () => {
+    handlers.cloud_object_list = ({ prefix }) => prefix
+      ? page([{ key: "docs/a.txt", size: 1 }])
+      : page([{ key: "docs/a.txt", size: 1 }, file]);
+    const wrapper = await browser();
+    await click(wrapper, '[aria-label="Columns"]');
+    await click(wrapper, ".column-row");
+    expect(wrapper.find(".breadcrumb.is-current").text()).toBe("docs");
+    expect(wrapper.findAll(".column")).toHaveLength(2);
+  });
+  it("reserves the selection bar in gallery view and clears a multi selection", async () => {
+    handlers.cloud_object_list = () => page([file, { key: "b.txt", size: 2 }]);
+    handlers.cloud_object_preview = () => ({ fileName: "a.txt", mime: "text/plain", encoding: "utf8", data: "x", size: 1 });
+    const wrapper = await browser();
+    await click(wrapper, '[aria-label="Gallery"]');
+    expect(wrapper.find(".selection-bar--reserved").exists()).toBe(true);
+    expect(wrapper.find(".selection-bar__hint").text()).toBe(t("peer.selectionHint"));
+    const thumbs = wrapper.findAll(".gallery-thumb");
+    await thumbs[0].trigger("click");
+    await thumbs[1].trigger("click", { ctrlKey: true });
+    expect(wrapper.find(".selection-bar--multi").exists()).toBe(true);
+    await textButton(wrapper, t("peer.clearSelection")).trigger("click");
+    expect(wrapper.find(".selection-bar--reserved").exists()).toBe(true);
+  });
+  it("offers an explicit open action for a selected folder", async () => {
+    handlers.cloud_object_list = ({ prefix }) => prefix
+      ? page([{ key: "docs/a.txt", size: 1 }])
+      : page([{ key: "docs/a.txt", size: 1 }, file]);
+    const wrapper = await browser();
+    await click(wrapper, "[data-test=folder-row]");
+    await textButton(wrapper, t("peer.open")).trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".breadcrumb.is-current").text()).toBe("docs");
+  });
+  it("shows the shortcuts panel backed by the real behaviours", async () => {
+    const wrapper = await browser();
+    expect(document.querySelector(".shortcuts-panel")).toBeNull();
+    await click(wrapper, '[aria-label="' + t("peer.shortcuts") + '"]');
+    const panel = document.querySelector(".shortcuts-panel");
+    expect(panel).not.toBeNull();
+    expect(panel.querySelectorAll(".shortcuts-panel__row")).toHaveLength(8);
+    expect(wrapper.find(".shortcuts-trigger").attributes("aria-expanded")).toBe("true");
+    await wrapper.find(".shortcuts-trigger").trigger("click");
+    expect(document.querySelector(".shortcuts-panel")).toBeNull();
   });
   it("has identical real bilingual keys and renders both locales without raw keys", async () => {
     const keys = Object.keys(en).filter((key) => key.startsWith("cloudBrowser.")); expect(keys.sort()).toEqual(Object.keys(zh).filter((key) => key.startsWith("cloudBrowser.")).sort()); for (const language of ["en", "zh-CN"]) { setLocale(language); const wrapper = await browser(); expect(wrapper.find('.sidebar-identity strong').text()).toBe('Main'); expect(wrapper.text()).not.toContain("cloudBrowser."); for (const key of keys) expect(t(key)).not.toBe(key); wrapper.unmount(); }
