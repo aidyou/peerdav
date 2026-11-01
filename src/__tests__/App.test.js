@@ -2156,24 +2156,45 @@ describe("Finder-style peer browser", () => {
     await wrapper.find(".file-tile").trigger("dblclick");
     await flushPromises();
     expect(wrapper.find(".breadcrumb.is-current").text()).toBe("sub");
-    expect(wrapper.find(".file-loading").exists()).toBe(true);
-    expect(wrapper.find(".file-loading").text()).toContain("正在加载");
-    // 加载指示必须是可识别的旋转图标（SVG 弧线），不是静态圆点。
-    expect(wrapper.find("svg.file-loading__spinner").exists()).toBe(true);
-    expect(wrapper.find(".file-loading__arc").exists()).toBe(true);
+    expect(wrapper.find('.browser-skeleton--icons').exists()).toBe(true);
+    expect(wrapper.find('.browser-skeleton').attributes('role')).toBe('status');
+    expect(wrapper.find('.browser-skeleton').attributes('aria-busy')).toBe('true');
+    expect(wrapper.find('.browser-skeleton').attributes('aria-label')).toBe('正在加载…');
+    expect(wrapper.find('.browser-skeleton .el-skeleton__item').exists()).toBe(true);
+    expect(wrapper.find('.browser-skeleton').text()).toBe('');
     expect(wrapper.find(".icon-grid").exists()).toBe(false);
 
     // 用户在慢目录返回前从地址栏返回上一级。
     await wrapper.find(".breadcrumb").trigger("click");
     await flushPromises();
     expect(wrapper.find(".icon-grid").exists()).toBe(true);
-    expect(wrapper.find(".file-loading").exists()).toBe(false);
+    expect(wrapper.find(".browser-skeleton").exists()).toBe(false);
 
     // 旧目录的迟到的结果必须不能覆盖当前根目录视图。
     resolveSub(subListing);
     await flushPromises();
     expect(wrapper.find(".breadcrumb.is-current").text()).toBe("Docs");
     expect(wrapper.findAll(".file-tile")).toHaveLength(2);
+    wrapper.unmount();
+  });
+
+  it.each(['图标', '列表', '分栏', '画廊'])("clears the file area with loading skeleton on failure in %s mode", async (label) => {
+    let rejectListing;
+    const { wrapper } = await openBrowser({
+      list_peer_dir: async ({ path }) => path === '/sub'
+        ? new Promise((resolve, reject) => { rejectListing = reject; })
+        : LISTING,
+    });
+    await wrapper.find('.file-tile').trigger('dblclick');
+    await flushPromises();
+    await wrapper.find(`button[aria-label="${label}"]`).trigger('click');
+    await flushPromises();
+    expect(wrapper.find('.file-view--placeholder .browser-skeleton').exists()).toBe(true);
+    if (label === '分栏') expect(wrapper.findAll('.file-view--placeholder .column')).toHaveLength(1);
+    rejectListing({ code: 'FS_PERMISSION_DENIED', message: 'Permission denied', detail: null, context: null });
+    await flushPromises();
+    expect(wrapper.find('.file-view--placeholder .browser-skeleton').exists()).toBe(false);
+    expect(wrapper.find('.file-empty').exists()).toBe(true);
     wrapper.unmount();
   });
 
@@ -2251,6 +2272,11 @@ describe("Finder-style peer browser", () => {
     await flushPromises();
 
     expect(columnView.scrollLeft).toBe(720);
+    expect(wrapper.findAll('.selection-actions button').some((button) => button.text() === '打开')).toBe(false);
+    expect(wrapper.findAll('.selection-actions button').some((button) => button.text() === '下载')).toBe(true);
+    await wrapper.find('button[aria-label="列表"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.findAll('.selection-actions button').some((button) => button.text() === '打开')).toBe(true);
 
     wrapper.unmount();
   });
@@ -2272,9 +2298,11 @@ describe("Finder-style peer browser", () => {
       ],
     };
     let release;
+    let failListing;
     const gate = () =>
-      new Promise((resolve) => {
+      new Promise((resolve, reject) => {
         release = resolve;
+        failListing = reject;
       });
     let pending = gate();
     const { wrapper } = await openBrowser({
@@ -2300,8 +2328,11 @@ describe("Finder-style peer browser", () => {
     expect(columns).toHaveLength(2);
     expect(columns[0].find(".column-loading").exists()).toBe(false);
     expect(columns[1].classes()).toContain("column-loading");
-    expect(columns[1].text()).toContain("正在加载…");
-    expect(columns[1].find("svg.file-loading__spinner").exists()).toBe(true);
+    expect(columns[0].find('.browser-skeleton').exists()).toBe(false);
+    expect(columns[0].text()).toContain('sub');
+    expect(columns[1].find('.browser-skeleton--columns').attributes('role')).toBe('status');
+    expect(columns[1].find('.browser-skeleton').text()).toBe('');
+    expect(columns[1].find('.el-skeleton__item').exists()).toBe(true);
     expect(wrapper.find(".column-view").attributes("aria-busy")).toBe("true");
 
     release();
@@ -2328,6 +2359,16 @@ describe("Finder-style peer browser", () => {
     await flushPromises();
     expect(wrapper.findAll(".column-loading")).toHaveLength(0);
     expect(wrapper.find(".column-view").attributes("aria-busy")).toBe("false");
+
+    pending = gate();
+    await wrapper.findAll('.column')[0].findAll('.column-row')[0].trigger('click');
+    await flushPromises();
+    expect(wrapper.find('.column-loading .browser-skeleton').exists()).toBe(true);
+    failListing({ code: 'FS_PERMISSION_DENIED', message: 'Permission denied', detail: null, context: null });
+    await flushPromises();
+    expect(wrapper.find('.column-view .browser-skeleton').exists()).toBe(false);
+    expect(wrapper.findAll('.column')[0].text()).toContain('sub');
+    expect(wrapper.find('.column-view').attributes('aria-busy')).toBe('false');
 
     wrapper.unmount();
   });

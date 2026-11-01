@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 
 import FileGlyph from "./FileGlyph.vue";
+import BrowserSkeleton from "./BrowserSkeleton.vue";
 import FilePreviewDialog from "./FilePreviewDialog.vue";
 import { useAppContext } from "../lib/appContext";
 import { confirmAction } from "../lib/confirm";
@@ -1865,17 +1866,8 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 {{ t("peer.emptyDir") }}
               </p>
             </div>
-            <div v-if="loadingColumn !== -1" class="column column-loading" role="status">
-              <svg
-                class="file-loading__spinner"
-                viewBox="0 0 24 24"
-                aria-hidden="true"
-                focusable="false"
-              >
-                <circle class="file-loading__track" cx="12" cy="12" r="9" />
-                <path class="file-loading__arc" d="M21 12a9 9 0 0 0-9-9" />
-              </svg>
-              <span>{{ t("peer.loading") }}</span>
+            <div v-if="loadingColumn !== -1" class="column column-loading">
+              <BrowserSkeleton mode="columns" />
             </div>
           </div>
 
@@ -1955,18 +1947,10 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
         <!-- 加载中先清空旧内容并给出即时反馈；失败时提示可点击地址栏重试。 -->
         <div v-else class="file-view file-view--placeholder" :aria-busy="navigating">
-          <div v-if="navigating" class="file-loading">
-            <svg
-              class="file-loading__spinner"
-              viewBox="0 0 24 24"
-              aria-hidden="true"
-              focusable="false"
-            >
-              <circle class="file-loading__track" cx="12" cy="12" r="9" />
-              <path class="file-loading__arc" d="M21 12a9 9 0 0 0-9-9" />
-            </svg>
-            <span>{{ t("peer.loading") }}</span>
+          <div v-if="navigating && viewMode === 'columns'" class="column-view">
+            <div class="column column-loading"><BrowserSkeleton mode="columns" /></div>
           </div>
+          <BrowserSkeleton v-else-if="navigating" :mode="viewMode" />
           <p v-else class="file-empty">{{ t("peer.loadFailed") }}</p>
         </div>
 
@@ -1999,6 +1983,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
           <div v-if="selectedEntries.length" class="selection-actions">
             <template v-if="selectedEntries.length === 1 && selectedEntry.isDir">
               <el-button
+                v-if="viewMode !== 'columns'"
                 type="primary"
                 :disabled="busy"
                 @click="browse(selectedEntry.path)"
@@ -2802,16 +2787,6 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   color: var(--app-text-muted);
 }
 
-/* loading 占位出现在右侧即将展开的新列位置，宽度沿用 .column。 */
-.column-loading {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  color: var(--app-text-muted);
-  font-size: 12px;
-}
-
 /* Keep the file list visible above the selection bar. */
 .gallery-view {
   box-sizing: border-box;
@@ -2963,50 +2938,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 }
 
 .file-view--placeholder {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.file-loading {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--app-text-muted);
-  font-size: 13px;
-}
-
-.file-loading__spinner {
-  width: 18px;
-  height: 18px;
-  flex: none;
-  animation: file-loading-spin 0.9s linear infinite;
-}
-
-.file-loading__track {
-  fill: none;
-  stroke: color-mix(in oklab, var(--app-border) 85%, transparent);
-  stroke-width: 2.5;
-}
-
-.file-loading__arc {
-  fill: none;
-  stroke: var(--el-color-primary, var(--app-text-secondary));
-  stroke-width: 2.5;
-  stroke-linecap: round;
-}
-
-@keyframes file-loading-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-/* 加载指示的旋转本身就是信息，减弱动效时放慢而不是静止。 */
-@media (prefers-reduced-motion: reduce) {
-  .file-loading__spinner {
-    animation-duration: 2.4s;
-  }
+  overflow: hidden;
 }
 
 .selection-bar {

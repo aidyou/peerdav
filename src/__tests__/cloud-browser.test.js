@@ -7,6 +7,7 @@ vi.mock("../lib/appContext", () => ({ useAppContext: () => app }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: nativeInvoke }));
 vi.mock("../lib/confirm", () => ({ confirmAction }));
 vi.mock("../components/CloudSyncDrives.vue", () => ({ default: { props: ['connectionId', 'focusId'], emits: ['changed'], template: '<div data-test="sync-manager">{{ connectionId }}<button data-test="catalog-changed" @click="$emit(\'changed\')">Changed</button></div>' } }));
+import cloudBrowserSource from "../components/CloudBrowser.vue?raw";
 import CloudBrowser from "../components/CloudBrowser.vue";
 import { cloudObjects, objectChildren } from "../lib/cloud";
 import { errorStrategy } from "../lib/invoke";
@@ -28,7 +29,7 @@ const transfer = (phase = "running", extra = {}) => ({ transferId: "t1", connect
 const deferred = () => { let resolve; let reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 let handlers;
 const wrappers = [];
-async function browser() { const wrapper = mount(CloudBrowser, { props: { connectionId: "c1" }, global: { stubs: { "el-button": button, "el-input": input, "el-select": select, "el-option": option, "el-dialog": dialog, "el-progress": progress, "el-tag": { template: "<span><slot /></span>" } } } }); wrappers.push(wrapper); await flushPromises(); return wrapper; }
+async function browser(mode = "list") { if (mode !== null) localStorage.setItem("peerdav.cloudView", mode); const wrapper = mount(CloudBrowser, { props: { connectionId: "c1" }, global: { stubs: { "el-button": button, "el-input": input, "el-select": select, "el-option": option, "el-dialog": dialog, "el-progress": progress, "el-tag": { template: "<span><slot /></span>" } } } }); wrappers.push(wrapper); await flushPromises(); return wrapper; }
 async function click(wrapper, selector) { await wrapper.find(selector).trigger("click"); await flushPromises(); }
 async function prepare() { await flushPromises(); }
 function textButton(wrapper, label) { return wrapper.findAll("button").find((item) => item.text() === label); }
@@ -41,6 +42,200 @@ beforeEach(() => {
 afterEach(() => { wrappers.splice(0).forEach((wrapper) => { if (wrapper.exists()) wrapper.unmount(); }); vi.useRealTimers(); });
 
 describe("CloudBrowser", () => {
+  it("defaults to icons, preserves stored modes and tolerates unavailable storage", async () => {
+    expect((await browser(null)).find('.icon-grid').exists()).toBe(true);
+    for (const mode of ['list', 'columns', 'gallery']) {
+      expect((await browser(mode)).find(`[aria-label="${t(`cloudBrowser.${mode}`)}"]`).attributes('aria-pressed')).toBe('true');
+    }
+    localStorage.setItem('peerdav.cloudView', 'invalid');
+    expect((await browser(null)).find('.icon-grid').exists()).toBe(true);
+    const read = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new Error('disabled'); });
+    const write = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('disabled'); });
+    try {
+      const wrapper = await browser(null);
+      expect(wrapper.find('.icon-grid').exists()).toBe(true);
+      await click(wrapper, '[aria-label="List"]');
+      expect(wrapper.find('.file-table').exists()).toBe(true);
+    } finally { read.mockRestore(); write.mockRestore(); }
+  });
+  it("formats the fourth list column from modified only, including missing and invalid values", async () => {
+    const seconds = 1700000000;
+    handlers.cloud_object_list = () => page([{ ...file, modified: seconds }, { key: 'b.txt', size: 1, etag: '1700000000' }, { key: 'c.txt', modified: 'invalid' }]);
+    const wrapper = await browser();
+    const values = wrapper.findAll('tbody tr').map((row) => row.findAll('td')[3].text());
+    expect(values).toEqual([new Intl.DateTimeFormat(document.documentElement.lang || undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(seconds * 1000)), '—', '—']);
+  });
+  it("falls back to created time, prefers modified and hides unusable time columns", async () => {
+    let objects = [{ ...file, modified: 'invalid', created: 0 }, { key: 'b.txt', created: null }];
+    handlers.cloud_object_list = () => page(objects);
+    const wrapper = await browser();
+    expect(wrapper.findAll('thead th')[3].text()).toBe(t('cloudBrowser.created'));
+    expect(wrapper.findAll('tbody tr')[0].findAll('td')[3].text()).not.toBe('—');
+    expect(wrapper.findAll('tbody tr')[1].findAll('td')[3].text()).toBe('—');
+    objects = [{ ...file, modified: 1700000000, created: 1600000000 }];
+    await click(wrapper, '[data-test=refresh]');
+    expect(wrapper.findAll('thead th')[3].text()).toBe(t('peer.modified'));
+    objects = [file, { key: 'b.txt', modified: null, created: ' ' }, { key: 'c.txt', modified: false, created: Infinity }, { key: 'd.txt', modified: 1e100, created: 'invalid' }];
+    await click(wrapper, '[data-test=refresh]');
+    expect(wrapper.findAll('thead th')).toHaveLength(3);
+    expect(wrapper.findAll('tbody tr').every((row) => row.findAll('td').length === 3)).toBe(true);
+  });
+  it("normalizes reverse additive selections to listing order and clears stale selection on refresh", async () => {
+    handlers.cloud_object_list = () => page([file, { key: 'b.txt', size: 2 }, { key: 'c.txt', size: 3 }]);
+    handlers.cloud_object_download_batch = ({ items }) => ({ transfers: items.map((item, index) => transfer('running', { direction: 'download', key: item.key, transferId: `t${index}` })) });
+    const wrapper = await browser();
+    const rows = wrapper.findAll('tbody tr');
+    await rows[2].trigger('click'); await rows[0].trigger('click', { ctrlKey: true });
+    expect(wrapper.find('.selection-actions [data-test=download]').classes()).toContain('el-button--primary');
+    expect(wrapper.find('.selection-actions [data-test=download]').classes()).toContain('is-plain');
+    await click(wrapper, '.selection-actions [data-test=download]');
+    expect(nativeInvoke.mock.calls.find(([name]) => name === 'cloud_object_download_batch')[1].items.map((item) => item.key)).toEqual(['a.txt', 'c.txt']);
+    await click(wrapper, '[data-test=refresh]');
+    expect(wrapper.find('.selection-bar').exists()).toBe(false);
+  });
+  it("keeps ancestor columns while loading siblings and rejects obsolete navigation results", async () => {
+    const first = deferred(); const second = deferred();
+    handlers.cloud_object_list = ({ prefix }) => prefix === 'a/' ? first.promise : prefix === 'b/' ? second.promise : page([{ key: 'a/x' }, { key: 'b/x' }]);
+    const wrapper = await browser('columns');
+    await click(wrapper, '[data-key="a/"]');
+    expect(wrapper.findAll('.column')).toHaveLength(2);
+    expect(wrapper.find('.column-loading .browser-skeleton--columns').attributes('aria-label')).toBe(t('common.loading'));
+    expect(wrapper.findAll('.column')[0].find('.browser-skeleton').exists()).toBe(false);
+    expect(wrapper.findAll('.column')[0].text()).toContain('a');
+    expect(wrapper.find('.file-view--placeholder').exists()).toBe(false);
+    expect(wrapper.find('.column-empty').exists()).toBe(false);
+    await click(wrapper, '[data-key="b/"]');
+    second.resolve(page([{ key: 'b/new.txt', size: 2 }])); await flushPromises();
+    expect(wrapper.find('.selection-summary').text()).toContain('b');
+    first.resolve(page([{ key: 'a/obsolete.txt' }])); await flushPromises();
+    expect(wrapper.find('.column-view').text()).toContain('new.txt');
+    expect(wrapper.find('.column-view').text()).not.toContain('obsolete.txt');
+    expect(nativeInvoke.mock.calls.filter(([name, args]) => name === 'cloud_object_list' && args.prefix === '')).toHaveLength(1);
+    await click(wrapper, '[data-key="b/new.txt"]');
+    expect(wrapper.find('.selection-summary').text()).toContain('new.txt');
+  });
+  it.each(['icons', 'columns', 'gallery'])("uses a %s skeleton for the first pending listing and removes it on failure", async (mode) => {
+    const listing = deferred();
+    handlers.cloud_object_list = () => listing.promise;
+    const wrapper = await browser(mode);
+    const skeleton = wrapper.find(`.browser-skeleton--${mode}`);
+    expect(skeleton.exists()).toBe(true);
+    expect(skeleton.find('[aria-hidden="true"]').exists()).toBe(true);
+    expect(skeleton.text()).toBe('');
+    if (mode === 'columns') expect(wrapper.findAll('.column')).toHaveLength(1);
+    listing.reject(error('CLOUD_TRANSPORT'));
+    await flushPromises();
+    expect(wrapper.find(`.file-view .browser-skeleton--${mode}`).exists()).toBe(false);
+    expect(wrapper.find('[role=alert]').text()).toContain('Original backend reason');
+  });
+  it("removes a failed right-column skeleton without replacing the ancestor", async () => {
+    const listing = deferred();
+    handlers.cloud_object_list = ({ prefix }) => prefix ? listing.promise : page([{ key: 'docs/file.txt' }]);
+    const wrapper = await browser('columns');
+    await click(wrapper, '[data-key="docs/"]');
+    expect(wrapper.findAll('.column')[1].find('.browser-skeleton').exists()).toBe(true);
+    listing.reject(error('CLOUD_TRANSPORT'));
+    await flushPromises();
+    expect(wrapper.find('.column-view .browser-skeleton').exists()).toBe(false);
+    expect(wrapper.findAll('.column')[0].find('[data-key="docs/"]').exists()).toBe(true);
+  });
+  it("does not restart column navigation on the second click or directory double click", async () => {
+    const listing = deferred();
+    handlers.cloud_object_list = ({ prefix }) => prefix ? listing.promise : page([{ key: 'docs/file.txt' }]);
+    const wrapper = await browser('columns');
+    const folder = wrapper.find('[data-key="docs/"]');
+    folder.element.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }));
+    await flushPromises();
+    folder.element.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 2 }));
+    await flushPromises();
+    await folder.trigger('dblclick');
+    expect(nativeInvoke.mock.calls.filter(([name, args]) => name === 'cloud_object_list' && args.prefix === 'docs/')).toHaveLength(1);
+    expect(wrapper.findAll('.column')).toHaveLength(2);
+    listing.resolve(page([{ key: 'docs/file.txt' }])); await flushPromises();
+    expect(wrapper.find('.selection-summary').text()).toContain('docs');
+    expect(textButton(wrapper, t('peer.open'))).toBeUndefined();
+    expect(wrapper.find('.selection-actions [data-test=download]').classes()).not.toContain('el-button--primary');
+    await click(wrapper, '[aria-label="List"]');
+    expect(textButton(wrapper, t('peer.open'))).toBeDefined();
+  });
+  it("shows ancestor rebuilding as loading, recovers failed ancestors and invalidates a connection switch", async () => {
+    handlers.cloud_object_list = ({ prefix }) => prefix ? page([{ key: 'docs/file.txt' }]) : page([{ key: 'docs/file.txt' }]);
+    const wrapper = await browser();
+    await wrapper.find('[data-test=folder-row]').trigger('dblclick'); await flushPromises();
+    const ancestor = deferred();
+    handlers.cloud_object_list = ({ prefix }) => prefix ? page([{ key: 'docs/file.txt' }]) : ancestor.promise;
+    await click(wrapper, '[aria-label="Columns"]');
+    expect(wrapper.find('.column-loading').exists()).toBe(true);
+    expect(wrapper.find('.column-empty').exists()).toBe(false);
+    ancestor.reject(error('CLOUD_TRANSPORT')); await flushPromises();
+    expect(wrapper.find('.column-empty').exists()).toBe(false);
+    handlers.cloud_object_list = ({ prefix }) => page([{ key: prefix ? 'docs/file.txt' : 'docs/file.txt' }]);
+    await click(wrapper, '[data-test=retry-load]');
+    expect(wrapper.findAll('.column')[0].text()).toContain('docs');
+    const obsolete = deferred(); handlers.cloud_object_list = () => obsolete.promise;
+    await click(wrapper, '[data-key="docs/"]');
+    handlers.cloud_object_list = () => page([{ key: 'other.txt' }]);
+    await wrapper.setProps({ connectionId: 'c2' }); await flushPromises();
+    obsolete.resolve(page([{ key: 'docs/stale.txt' }])); await flushPromises();
+    expect(wrapper.find('.column-view').text()).toContain('other.txt');
+    expect(wrapper.text()).not.toContain('stale.txt');
+  });
+  it.each([
+    { sizes: [7, 3], phases: ['completed', 'running'], percent: 70, bytes: '7 B / 10 B' },
+    { sizes: [0, 0], phases: ['completed', 'running'], percent: 50 },
+    { sizes: [7, 3], phases: ['failed', 'cancelled'], percent: 0, bytes: '0 B / 10 B' },
+    { sizes: [0, 0], phases: ['completed', 'completed'], percent: 100 },
+  ])("reports honest completed-byte queue progress: $phases / $sizes", async ({ sizes, phases, percent, bytes }) => {
+    handlers.cloud_object_list = () => page([{ ...file, size: sizes[0] }, { key: 'b.txt', size: sizes[1] }]);
+    handlers.cloud_object_download_batch = ({ items }) => ({ transfers: items.map((item, index) => transfer(phases[index], { transferId: `t${index}`, key: item.key, direction: 'download', error: phases[index] === 'failed' ? error('CLOUD_TRANSPORT', 'failed original') : null })), localRoot: '/target' });
+    const wrapper = await browser();
+    await wrapper.findAll('tbody tr')[0].trigger('click'); await wrapper.findAll('tbody tr')[1].trigger('click', { ctrlKey: true });
+    await click(wrapper, '.selection-actions [data-test=download]');
+    expect(wrapper.find('[role=progressbar]').attributes('aria-valuenow')).toBe(String(percent));
+    if (bytes) expect(wrapper.find('.transfer-dialog').text()).toContain(bytes);
+    expect(wrapper.findAll('.transfer-queue__name')).toHaveLength(2);
+    if (phases[0] === 'failed') {
+      expect(wrapper.findAll('.row-tag')[0].attributes('title')).toBe('failed original');
+      expect(wrapper.findAll('.row-tag')[1].text()).toBe(t('peer.downloadStatusCanceled'));
+      expect(textButton(wrapper, t('peer.cancelDownload'))).toBeUndefined();
+    }
+  });
+  it("invalidates pending ancestor rebuilds when switching buckets", async () => {
+    handlers.cloud_object_list = () => page([{ key: 'docs/file.txt' }]);
+    const wrapper = await browser();
+    await wrapper.find('[data-test=folder-row]').trigger('dblclick'); await flushPromises();
+    const ancestor = deferred();
+    handlers.cloud_object_list = ({ prefix }) => prefix ? page([{ key: 'docs/file.txt' }]) : ancestor.promise;
+    await click(wrapper, '[aria-label="Columns"]');
+    expect(wrapper.find('.column-loading').exists()).toBe(true);
+    handlers.cloud_object_list = () => page([{ key: 'photos.jpg' }]);
+    await wrapper.findAll('.bucket-link')[1].trigger('click'); await flushPromises();
+    ancestor.resolve(page([{ key: 'stale/old.txt' }])); await flushPromises();
+    expect(wrapper.findAll('.column')).toHaveLength(1);
+    expect(wrapper.find('.column-view').text()).toContain('photos.jpg');
+    expect(wrapper.text()).not.toContain('stale');
+  });
+  it("updates completed bytes from polled terminal statuses without inventing running progress", async () => {
+    handlers.cloud_object_list = () => page([file, { key: 'b.txt', size: 3 }]);
+    handlers.cloud_object_download_batch = ({ items }) => ({ transfers: items.map((item, index) => transfer('running', { transferId: `t${index}`, key: item.key, direction: 'download' })) });
+    const wrapper = await browser();
+    await wrapper.findAll('tbody tr')[0].trigger('click'); await wrapper.findAll('tbody tr')[1].trigger('click', { ctrlKey: true });
+    await click(wrapper, '.selection-actions [data-test=download]');
+    expect(wrapper.find('[role=progressbar]').attributes('aria-valuenow')).toBe('0');
+    handlers.cloud_object_status = () => [transfer('completed', { transferId: 't0', direction: 'download' }), transfer('running', { transferId: 't1', direction: 'download', key: 'b.txt', sizeHint: 3 })];
+    await vi.advanceTimersByTimeAsync(1500); await flushPromises();
+    expect(wrapper.find('[role=progressbar]').attributes('aria-valuenow')).toBe('70');
+    expect(wrapper.find('.transfer-dialog').text()).toContain('7 B / 10 B');
+  });
+  it("keeps peer queue and browser CSS contracts without broad paragraph overrides", () => {
+    expect(cloudBrowserSource).toContain('max-height: min(320px, 34vh)');
+    expect(cloudBrowserSource).toContain('overscroll-behavior: contain');
+    expect(cloudBrowserSource).toContain('.transfer-dialog { display: flex; flex-direction: column; gap: 12px; }');
+    expect(cloudBrowserSource).toContain('border-radius: 10px');
+    expect(cloudBrowserSource).not.toMatch(/\.cloud-browser p\s*[,\{]/);
+    expect(cloudBrowserSource).not.toMatch(/@media \(max-width: 480px\)\s*\{\s*\.browser-main/);
+    expect(cloudBrowserSource).toContain('display: flex; flex-direction: column; user-select: none');
+  });
   it('uses a sidebar and main pane with a persistent create/connect entry', async () => {
     const wrapper = await browser();
     expect(wrapper.find('.browser-sidebar').exists()).toBe(true); expect(wrapper.find('.browser-main').exists()).toBe(true);
@@ -122,7 +317,8 @@ describe("CloudBrowser", () => {
     expect(wrapper.find(".pathbar-status").exists()).toBe(false);
     await vi.advanceTimersByTimeAsync(300);
     await flushPromises();
-    expect(wrapper.find(".pathbar-status").text()).toBe(t("cloudBrowser.checking"));
+    expect(wrapper.find(".pathbar-status").attributes('aria-label')).toBe(t('common.loading'));
+    expect(wrapper.find(".pathbar-status").text()).toBe('');
     listing.resolve(page([file]));
     await flushPromises();
     expect(wrapper.find('[data-test=incomplete]').exists()).toBe(false);
@@ -196,7 +392,7 @@ describe("CloudBrowser", () => {
   });
   it("does not execute cancelled or expired delete plans", async () => { const wrapper = await browser(); await prepare(wrapper); confirmAction.mockResolvedValue(false); await click(wrapper, '[data-test=delete-prefix]'); confirmAction.mockResolvedValue(true); handlers.cloud_object_delete_plan = () => deletePlan({ planId: "expired", expiresAtUnix: 1 }); await click(wrapper, '[data-test=delete-prefix]'); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_delete_execute")).toBe(false); expect(wrapper.text()).toContain(t('cloudBrowser.stalePlan')); });
   it("ignores stale directory page results after navigation", async () => { const late = deferred(); let count = 0; handlers.cloud_object_list = ({ prefix }) => { if (prefix) return page([{ key: "docs/new", size: 1 }]); if (++count === 1) return page([{ key: "docs/old", size: 1 }], "next", false); return late.promise; }; const wrapper = await browser(); await wrapper.find('[data-test=more]').trigger("click"); await wrapper.find("[data-test=folder-row]").trigger("dblclick"); await flushPromises(); late.resolve(page([{ key: "stale", size: 2 }])); await flushPromises(); expect(wrapper.text()).toContain("new"); expect(wrapper.text()).not.toContain("stale"); });
-  it("ignores pending preparation after a connection change", async () => { const late = deferred(); handlers.cloud_object_prepare = ({ connectionId }) => connectionId === 'c1' ? late.promise : { discovered: false }; const wrapper = await browser(); await vi.advanceTimersByTimeAsync(300); await flushPromises(); expect(wrapper.text()).toContain(t('cloudBrowser.checking')); await wrapper.setProps({ connectionId: 'c2' }); await flushPromises(); late.resolve({ discovered: true }); await flushPromises(); expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_prepare', { connectionId: 'c2' }); expect(wrapper.find('[data-test=upload]').attributes('disabled')).toBeDefined(); });
+  it("ignores pending preparation after a connection change", async () => { const late = deferred(); handlers.cloud_object_prepare = ({ connectionId }) => connectionId === 'c1' ? late.promise : { discovered: false }; const wrapper = await browser(); await vi.advanceTimersByTimeAsync(300); await flushPromises(); expect(wrapper.find('.pathbar-status').attributes('aria-label')).toBe(t('common.loading')); await wrapper.setProps({ connectionId: 'c2' }); await flushPromises(); late.resolve({ discovered: true }); await flushPromises(); expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_prepare', { connectionId: 'c2' }); expect(wrapper.find('[data-test=upload]').attributes('disabled')).toBeDefined(); });
   it("cleans polling on unmount and ignores in-flight poll completion", async () => { const late = deferred(); handlers.cloud_object_status = () => late.promise; const wrapper = await browser(); wrapper.unmount(); late.resolve([transfer()]); await flushPromises(); await vi.advanceTimersByTimeAsync(4500); expect(nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_status")).toHaveLength(1); expect(vi.getTimerCount()).toBe(0); });
   it("does not execute a deletion confirmed after directory switch", async () => {
     handlers.cloud_object_list = () => page([{ key: "docs/a", size: 1 }]); const answer = deferred(); confirmAction.mockImplementation(() => answer.promise); const wrapper = await browser(); await prepare(wrapper); await wrapper.find('[data-test=delete-prefix]').trigger("click"); await flushPromises(); await wrapper.find("[data-test=folder-row]").trigger("dblclick"); await flushPromises(); answer.resolve(true); await flushPromises(); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_delete_execute")).toBe(false);
@@ -453,12 +649,16 @@ describe("CloudBrowser", () => {
     expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_list').length).toBeGreaterThan(listsBefore);
     expect(wrapper.find('.cloud-transfers').exists()).toBe(false);
   });
-  it("shows the same centered loading placeholder as the LAN browser", async () => {
+  it("shows an accessible list skeleton until the listing arrives", async () => {
     const late = deferred();
     handlers.cloud_object_list = () => late.promise;
     const wrapper = await browser();
     expect(wrapper.find('.file-view--placeholder').exists()).toBe(true);
-    expect(wrapper.find('.file-loading').text()).toBe(t('peer.loading'));
+    expect(wrapper.find('.browser-skeleton--list').attributes('role')).toBe('status');
+    expect(wrapper.find('.browser-skeleton').attributes('aria-busy')).toBe('true');
+    expect(wrapper.find('.browser-skeleton').attributes('aria-label')).toBe(t('common.loading'));
+    expect(wrapper.find('.browser-skeleton .el-skeleton__item').exists()).toBe(true);
+    expect(wrapper.find('.browser-skeleton').text()).toBe('');
     expect(wrapper.find('.file-table').exists()).toBe(false);
     late.resolve(page([file]));
     await flushPromises();

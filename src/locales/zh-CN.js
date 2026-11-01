@@ -669,6 +669,7 @@ export default {
   "peer.kind": "类型",
   "peer.size": "大小",
   "peer.modified": "修改时间",
+  "cloudBrowser.created": "创建时间",
   "peer.folder": "文件夹",
   "peer.image": "图片",
   "peer.pdf": "PDF",

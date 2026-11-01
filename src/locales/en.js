@@ -668,6 +668,7 @@ export default {
   "peer.kind": "Kind",
   "peer.size": "Size",
   "peer.modified": "Modified",
+  "cloudBrowser.created": "Created",
   "peer.folder": "Folder",
   "peer.image": "Image",
   "peer.pdf": "PDF",
