@@ -424,6 +424,8 @@ export default {
   "cloudBrowser.upload": "上传文件",
   "cloudBrowser.uploaded": "已上传 {key}",
   "cloudBrowser.download": "下载",
+  "cloudBrowser.downloadOverwrite": "目标位置已有同名文件，是否覆盖后继续？",
+  "cloudBrowser.noDownloadableFiles": "所选项没有可下载的文件。",
   "cloudBrowser.retryDownload": "确认覆盖并重选目标",
   "cloudBrowser.uploadOverwrite": "仅当 ETag 仍为 {etag} 时覆盖对象 {key}？",
   "cloudBrowser.downloadRetry": "后端拒绝了目标前置条件，请核对错误。是否明确允许覆盖，并重新选择目标后重试？其他前置条件不满足仍会被拒绝。",

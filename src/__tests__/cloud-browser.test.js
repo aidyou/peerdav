@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { defineComponent, h } from "vue";
 import { flushPromises, mount } from "@vue/test-utils";
 
-const { nativeInvoke, confirmAction, app } = vi.hoisted(() => ({ nativeInvoke: vi.fn(), confirmAction: vi.fn(), app: { handleFailure: vi.fn() } }));
+const { nativeInvoke, confirmAction, app } = vi.hoisted(() => ({ nativeInvoke: vi.fn(), confirmAction: vi.fn(), app: { handleFailure: vi.fn(), setNotice: vi.fn() } }));
 vi.mock("../lib/appContext", () => ({ useAppContext: () => app }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: nativeInvoke }));
 vi.mock("../lib/confirm", () => ({ confirmAction }));
@@ -18,6 +18,8 @@ const button = defineComponent({ setup(_, { slots, attrs }) { return () => h("bu
 const input = defineComponent({ props: ["modelValue"], emits: ["update:modelValue"], setup(props, { attrs, emit }) { return () => h("input", { ...attrs, value: props.modelValue, onInput: (e) => emit("update:modelValue", e.target.value) }); } });
 const select = defineComponent({ name: "CloudSelectStub", props: ["modelValue"], emits: ["update:modelValue"], setup(props, { slots, attrs, emit }) { return () => h("select", { ...attrs, value: props.modelValue, onChange: (e) => emit("update:modelValue", e.target.value) }, slots.default?.()); } });
 const option = defineComponent({ props: ["value", "label"], setup(props) { return () => h("option", { value: props.value }, props.label); } });
+const dialog = defineComponent({ props: ["modelValue", "title"], setup(props, { slots, attrs }) { return () => props.modelValue ? h("div", { ...attrs, "data-test": "dialog" }, [props.title ? h("h3", props.title) : null, slots.default?.(), slots.footer?.()]) : null; } });
+const progress = defineComponent({ props: ["percentage"], setup(props) { return () => h("div", { "data-test": "progress", "data-percentage": String(props.percentage) }); } });
 const error = (code, message = "Original backend reason") => ({ code, message, detail: "private", context: null });
 const page = (objects = [], next = null, complete = true) => ({ prefix: "", objects, next, complete, prefixProtected: false });
 const file = { key: "a.txt", size: 7, etag: "etag-1", protected: false };
@@ -26,14 +28,14 @@ const transfer = (phase = "running", extra = {}) => ({ transferId: "t1", connect
 const deferred = () => { let resolve; let reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 let handlers;
 const wrappers = [];
-async function browser() { const wrapper = mount(CloudBrowser, { props: { connectionId: "c1" }, global: { stubs: { "el-button": button, "el-input": input, "el-select": select, "el-option": option, "el-tag": { template: "<span><slot /></span>" } } } }); wrappers.push(wrapper); await flushPromises(); return wrapper; }
+async function browser() { const wrapper = mount(CloudBrowser, { props: { connectionId: "c1" }, global: { stubs: { "el-button": button, "el-input": input, "el-select": select, "el-option": option, "el-dialog": dialog, "el-progress": progress, "el-tag": { template: "<span><slot /></span>" } } } }); wrappers.push(wrapper); await flushPromises(); return wrapper; }
 async function click(wrapper, selector) { await wrapper.find(selector).trigger("click"); await flushPromises(); }
 async function prepare() { await flushPromises(); }
 function textButton(wrapper, label) { return wrapper.findAll("button").find((item) => item.text() === label); }
 beforeEach(() => {
   vi.useFakeTimers(); nativeInvoke.mockReset(); confirmAction.mockReset(); confirmAction.mockResolvedValue(true); setLocale("en");
   localStorage.removeItem("peerdav.cloudView");
-  handlers = { cloud_list: () => ({ connections: [{ id: "c1", name: "Main", bucket: "main", buckets: ["main", "photos"], prefix: "configured/" }, { id: "c2", name: "Other", bucket: "main", buckets: ["main"] }] }), cloud_object_select_bucket: () => ({}), cloud_object_list: () => page([file]), cloud_object_status: () => [], cloud_object_discover: () => ({ complete: true }), cloud_object_prepare: () => ({ physicalId: "physical", discovered: true }), cloud_object_select_local: () => ({ token: "opaque", fileName: "a.txt", localPath: "/must-not-leak" }), cloud_object_upload: () => transfer(), cloud_object_download: () => transfer("running", { direction: "download" }), cloud_object_cancel: () => transfer("cancelling"), cloud_object_recovery_acknowledge: () => transfer("acknowledged"), cloud_object_delete_plan: () => deletePlan(), cloud_object_delete_execute: () => ({ deleted: [file.key], failed: [] }) };
+  handlers = { cloud_list: () => ({ connections: [{ id: "c1", name: "Main", bucket: "main", buckets: ["main", "photos"], prefix: "configured/" }, { id: "c2", name: "Other", bucket: "main", buckets: ["main"] }] }), cloud_object_select_bucket: () => ({}), cloud_object_list: () => page([file]), cloud_object_status: () => [], cloud_object_discover: () => ({ complete: true }), cloud_object_prepare: () => ({ physicalId: "physical", discovered: true }), cloud_object_select_local: () => ({ token: "opaque", fileName: "a.txt", localPath: "/must-not-leak" }), cloud_object_upload: () => transfer(), cloud_object_download: () => transfer("running", { direction: "download" }), cloud_object_cancel: () => transfer("cancelling"), reveal_local_directory: () => ({}), cloud_object_recovery_acknowledge: () => transfer("acknowledged"), cloud_object_delete_plan: () => deletePlan(), cloud_object_delete_execute: () => ({ deleted: [file.key], failed: [] }) };
   nativeInvoke.mockImplementation(async (command, args) => { if (!handlers[command]) throw new Error(`Unexpected command ${command}`); return handlers[command](args); });
 });
 afterEach(() => { wrappers.splice(0).forEach((wrapper) => { if (wrapper.exists()) wrapper.unmount(); }); vi.useRealTimers(); });
@@ -179,11 +181,12 @@ describe("CloudBrowser", () => {
     handlers.cloud_object_status = () => [transfer()]; const wrapper = await browser(); const late = deferred(); handlers.cloud_object_status = () => late.promise; await vi.advanceTimersByTimeAsync(1500); await textButton(wrapper, t("cloudBrowser.cancel")).trigger("click"); await flushPromises(); late.resolve([transfer()]); await flushPromises(); expect(wrapper.text()).toContain(t("cloudBrowser.phase.cancelling")); expect(wrapper.text()).not.toContain(t("cloudBrowser.cancel"));
   });
   it("renders cancelled and failed terminal states without a cancellation action", async () => {
-    handlers.cloud_object_status = () => [transfer("cancelled"), transfer("failed", { transferId: "t2", error: error("CLOUD_STORAGE") })]; const wrapper = await browser(); expect(wrapper.text()).toContain(t("cloudBrowser.phase.cancelled")); expect(wrapper.text()).toContain(t("cloudBrowser.phase.failed")); expect(wrapper.text()).toContain("Original backend reason"); expect(textButton(wrapper, t("cloudBrowser.cancel"))).toBeUndefined();
+    handlers.cloud_object_status = () => [transfer("cancelled"), transfer("failed", { transferId: "t2", error: error("CLOUD_STORAGE") })]; const wrapper = await browser(); expect(wrapper.text()).not.toContain(t("cloudBrowser.phase.cancelled")); expect(wrapper.text()).toContain(t("cloudBrowser.phase.failed")); expect(wrapper.text()).toContain("Original backend reason"); expect(textButton(wrapper, t("cloudBrowser.cancel"))).toBeUndefined();
   });
   it("whitelists all object payloads and strips arbitrary paths and association fields", async () => {
+    handlers.cloud_object_download_batch = () => ({ transfers: [], localRoot: "" });
     const args = { connectionId: "c1", localToken: "opaque", key: "a", fileName: "a", path: "/secret", localPath: "/secret", extra: true };
-    await cloudObjects.upload(args); await cloudObjects.download(args); await cloudObjects.prepare(args); await cloudObjects.list(args); await cloudObjects.discover(args); await cloudObjects.selectLocal({ ...args, direction: "upload" }); await cloudObjects.deletePlan(args); await cloudObjects.deleteExecute({ ...args, planId: "p", confirmed: true }); await cloudObjects.recoveryAcknowledge({ ...args, transferId: "t1", connectionRevision: 1, confirmed: true });
+    await cloudObjects.upload(args); await cloudObjects.download(args); await cloudObjects.downloadBatch({ ...args, items: [] }); await cloudObjects.prepare(args); await cloudObjects.list(args); await cloudObjects.discover(args); await cloudObjects.selectLocal({ ...args, direction: "upload" }); await cloudObjects.deletePlan(args); await cloudObjects.deleteExecute({ ...args, planId: "p", confirmed: true }); await cloudObjects.recoveryAcknowledge({ ...args, transferId: "t1", connectionRevision: 1, confirmed: true });
     expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_recovery_acknowledge", { transferId: "t1", connectionId: "c1", connectionRevision: 1, confirmed: true });
     for (const [, payload] of nativeInvoke.mock.calls) { expect(JSON.stringify(payload)).not.toContain("/secret"); expect(payload).not.toHaveProperty("extra"); }
   });
@@ -300,6 +303,139 @@ describe("CloudBrowser", () => {
     expect(app.handleFailure).toHaveBeenCalled();
     expect(wrapper.find(".bucket-link.is-active").text()).toBe("main");
     expect(wrapper.findAll("[data-test=file-row]")).toHaveLength(1);
+  });
+  it("rebuilds every ancestor column after navigating deep", async () => {
+    handlers.cloud_object_list = ({ prefix }) => {
+      if (prefix === '') return page([{ key: 'docs/x', size: 0 }]);
+      if (prefix === 'docs/') return page([{ key: 'docs/nested/y', size: 0 }]);
+      if (prefix === 'docs/nested/') return page([{ key: 'docs/nested/c.txt', size: 3 }]);
+      return page([]);
+    };
+    const wrapper = await browser();
+    await wrapper.find('[data-test=folder-row]').trigger('dblclick');
+    await flushPromises();
+    await wrapper.find('[data-test=folder-row]').trigger('dblclick');
+    await flushPromises();
+    await click(wrapper, '[aria-label="Columns"]');
+    await flushPromises();
+    const columns = wrapper.findAll('.column');
+    expect(columns).toHaveLength(3);
+    expect(columns[0].text()).toContain('docs');
+    expect(columns[1].text()).toContain('nested');
+    expect(columns[2].text()).toContain('c.txt');
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_list', { connectionId: 'c1', prefix: '', next: null });
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_list', { connectionId: 'c1', prefix: 'docs/', next: null });
+  });
+  it("binds the backend session to the first bucket before the first listing", async () => {
+    await browser();
+    const selectIndex = nativeInvoke.mock.calls.findIndex(([name]) => name === 'cloud_object_select_bucket');
+    const listIndex = nativeInvoke.mock.calls.findIndex(([name]) => name === 'cloud_object_list');
+    expect(selectIndex).toBeGreaterThan(-1);
+    expect(listIndex).toBeGreaterThan(selectIndex);
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_select_bucket', { connectionId: 'c1', bucket: 'main' });
+    expect(nativeInvoke.mock.calls[selectIndex][1]).toEqual({ connectionId: 'c1', bucket: 'main' });
+    expect(selectIndex).toBeLessThan(listIndex);
+  });
+  it("selects multiple rows with ctrl and shift and batches their download", async () => {
+    handlers.cloud_object_list = () => page([file, { key: 'b.txt', size: 2 }, { key: 'c.txt', size: 3 }]);
+    handlers.cloud_object_download_batch = ({ items }) => ({ transfers: items.map((item, index) => transfer('running', { transferId: `t${index}`, direction: 'download', key: item.key })), localRoot: '/tmp/target' });
+    const wrapper = await browser();
+    const rows = wrapper.findAll('[data-test=file-row]');
+    await rows[0].trigger('click');
+    await rows[1].trigger('click', { ctrlKey: true });
+    expect(wrapper.find('.selection-summary').text()).toContain(t('peer.selectedCount', { count: 2 }));
+    // The range starts at the last clicked row, so b..c replaces the add-on.
+    await rows[2].trigger('click', { shiftKey: true });
+    expect(wrapper.find('.selection-summary').text()).toContain(t('peer.selectedCount', { count: 2 }));
+    await textButton(wrapper, t('cloudBrowser.download')).trigger('click');
+    await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_download_batch', {
+      connectionId: 'c1',
+      localToken: 'opaque',
+      items: [
+        { key: 'b.txt', relativePath: 'b.txt' },
+        { key: 'c.txt', relativePath: 'c.txt' },
+      ],
+      overwriteConfirmed: false,
+    });
+  });
+  it("downloads a whole folder with its relative tree in one batch", async () => {
+    handlers.cloud_object_list = ({ prefix }) => {
+      if (!prefix) return page([{ key: 'docs/a.txt', size: 1 }]);
+      if (prefix === 'docs/') return page([{ key: 'docs/a.txt', size: 1 }, { key: 'docs/deep/b.bin', size: 2 }]);
+      if (prefix === 'docs/deep/') return page([{ key: 'docs/deep/b.bin', size: 2 }]);
+      return page([]);
+    };
+    handlers.cloud_object_download_batch = ({ items }) => ({ transfers: items.map((item, index) => transfer('running', { transferId: `t${index}`, direction: 'download', key: item.key })), localRoot: '/tmp/target' });
+    const wrapper = await browser();
+    await wrapper.find('[data-test=folder-row]').trigger('click');
+    await textButton(wrapper, t('cloudBrowser.download')).trigger('click');
+    await flushPromises();
+    const batch = nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download_batch').at(-1);
+    expect(batch[1]).toEqual(expect.objectContaining({ connectionId: 'c1', localToken: 'opaque', overwriteConfirmed: false }));
+    // Folders are walked depth first, so compare the exact tree without order.
+    expect(batch[1].items).toHaveLength(2);
+    expect(batch[1].items).toEqual(expect.arrayContaining([
+      { key: 'docs/a.txt', relativePath: 'docs/a.txt' },
+      { key: 'docs/deep/b.bin', relativePath: 'docs/deep/b.bin' },
+    ]));
+  });
+  it("confirms overwriting once and replays the same batch grant", async () => {
+    handlers.cloud_object_list = () => page([file, { key: 'b.txt', size: 2 }]);
+    handlers.cloud_object_download_batch = ({ overwriteConfirmed, items }) => {
+      if (!overwriteConfirmed) throw error('TRANSFER_CONFLICT');
+      return { transfers: items.map((item) => transfer('running', { direction: 'download', key: item.key })), localRoot: '/tmp/target' };
+    };
+    const wrapper = await browser();
+    await wrapper.find('[data-test=file-row]').trigger('click');
+    await wrapper.findAll('[data-test=file-row]')[1].trigger('click', { ctrlKey: true });
+    await textButton(wrapper, t('cloudBrowser.download')).trigger('click');
+    await flushPromises();
+    expect(confirmAction).toHaveBeenCalledWith(t('cloudBrowser.downloadOverwrite'), t('cloudBrowser.download'));
+    const calls = nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download_batch');
+    expect(calls.map(([, args]) => [args.localToken, args.overwriteConfirmed])).toEqual([['opaque', false], ['opaque', true]]);
+  });
+  it("shows the download queue and reveals the finished destination", async () => {
+    handlers.cloud_object_list = () => page([file, { key: 'b.txt', size: 2 }]);
+    handlers.cloud_object_download_batch = ({ items }) => ({
+      transfers: items.map((item, index) => transfer('completed', { transferId: `t${index}`, direction: 'download', key: item.key })),
+      localRoot: '/tmp/target',
+    });
+    const wrapper = await browser();
+    await wrapper.find('[data-test=file-row]').trigger('click');
+    await wrapper.findAll('[data-test=file-row]')[1].trigger('click', { ctrlKey: true });
+    await textButton(wrapper, t('cloudBrowser.download')).trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[data-test=download-dialog]').exists()).toBe(true);
+    expect(wrapper.findAll('.download-queue li')).toHaveLength(2);
+    expect(wrapper.findAll('.download-queue li').map((item) => item.text())).toEqual([
+      expect.stringContaining(t('peer.downloadStatusDone')),
+      expect.stringContaining(t('peer.downloadStatusDone')),
+    ]);
+    await click(wrapper, '[data-test=reveal-download]');
+    expect(nativeInvoke).toHaveBeenCalledWith('reveal_local_directory', { path: '/tmp/target' });
+  });
+  it("toasts a completed upload, refreshes the folder and drops it from the list", async () => {
+    const wrapper = await browser();
+    const listsBefore = nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_list').length;
+    handlers.cloud_object_status = () => [transfer('completed', { direction: 'upload', key: 'a.txt' })];
+    await click(wrapper, '[data-test=upload]');
+    await vi.advanceTimersByTimeAsync(1500);
+    await flushPromises();
+    expect(app.setNotice).toHaveBeenCalledWith('cloudBrowser.uploaded', { key: 'a.txt' });
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_list').length).toBeGreaterThan(listsBefore);
+    expect(wrapper.find('.cloud-transfers').exists()).toBe(false);
+  });
+  it("keeps the listing shape with a skeleton while a directory loads", async () => {
+    const late = deferred();
+    handlers.cloud_object_list = () => late.promise;
+    const wrapper = await browser();
+    expect(wrapper.find('.file-skeleton--list').exists()).toBe(true);
+    expect(wrapper.find('.file-table').exists()).toBe(false);
+    late.resolve(page([file]));
+    await flushPromises();
+    expect(wrapper.find('.file-skeleton').exists()).toBe(false);
+    expect(wrapper.findAll('[data-test=file-row]')).toHaveLength(1);
   });
   it("has identical real bilingual keys and renders both locales without raw keys", async () => {
     const keys = Object.keys(en).filter((key) => key.startsWith("cloudBrowser.")); expect(keys.sort()).toEqual(Object.keys(zh).filter((key) => key.startsWith("cloudBrowser.")).sort()); for (const language of ["en", "zh-CN"]) { setLocale(language); const wrapper = await browser(); expect(wrapper.find('.sidebar-identity strong').text()).toBe('Main'); expect(wrapper.text()).not.toContain("cloudBrowser."); for (const key of keys) expect(t(key)).not.toBe(key); wrapper.unmount(); }

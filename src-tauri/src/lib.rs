@@ -311,6 +311,7 @@ pub fn run() {
                     cloud::object_commands::cloud_object_select_local,
                     cloud::object_commands::cloud_object_upload,
                     cloud::object_commands::cloud_object_download,
+                    cloud::object_commands::cloud_object_download_batch,
                     cloud::object_commands::cloud_object_delete_plan,
                     cloud::object_commands::cloud_object_delete_execute,
                     cloud::object_commands::cloud_object_cancel,

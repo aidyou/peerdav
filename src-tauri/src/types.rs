@@ -527,6 +527,13 @@ pub const MAX_REMOTE_PATH_BYTES: usize = 4096;
 pub const MAX_DIR_ENTRIES: usize = 10_000;
 /// Upper bound for the files discovered by one recursive directory download.
 pub const MAX_DIRECTORY_DOWNLOAD_FILES: usize = 10_000;
+/// Upper bound for one cloud object batch download request.
+pub const MAX_CLOUD_DOWNLOAD_BATCH: usize = 100;
+/// Concurrent object downloads inside one batch, so one folder does not open
+/// hundreds of provider streams at once.
+pub const MAX_CLOUD_DOWNLOAD_CONCURRENCY: usize = 3;
+/// Upper bound for transfer tasks kept by one cloud runtime.
+pub const MAX_CLOUD_TASKS: usize = 128;
 /// Upper bound for advertised discovery hosts.
 pub const MAX_DISCOVERY_HOSTS: usize = 16;
 pub const DISCOVERY_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(3);

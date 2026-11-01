@@ -53,6 +53,7 @@ export const cloudObjects = Object.freeze({
   selectLocal: ({ connectionId, direction }) => invoke("cloud_object_select_local", { connectionId, direction }),
   upload: ({ connectionId, localToken, key, overwriteEtag = null, overwriteConfirmed = false }) => invoke("cloud_object_upload", { connectionId, localToken, key, overwriteEtag, overwriteConfirmed }),
   download: ({ connectionId, localToken, key, fileName, overwriteConfirmed = false }) => invoke("cloud_object_download", { connectionId, localToken, key, fileName, overwriteConfirmed }),
+  downloadBatch: ({ connectionId, localToken, items, overwriteConfirmed = false }) => invoke("cloud_object_download_batch", { connectionId, localToken, items, overwriteConfirmed }),
   deletePlan: ({ connectionId, prefix }) => invoke("cloud_object_delete_plan", { connectionId, prefix }),
   deleteExecute: ({ connectionId, planId, confirmed }) => invoke("cloud_object_delete_execute", { connectionId, planId, confirmed }),
   recoveryAcknowledge: ({ transferId, connectionId, connectionRevision, confirmed }) => invoke("cloud_object_recovery_acknowledge", { transferId, connectionId, connectionRevision, confirmed }),

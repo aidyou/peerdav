@@ -423,6 +423,8 @@ export default {
   "cloudBrowser.upload": "Upload file",
   "cloudBrowser.uploaded": "Uploaded {key}",
   "cloudBrowser.download": "Download",
+  "cloudBrowser.downloadOverwrite": "Files with the same name already exist in the destination. Overwrite them and continue?",
+  "cloudBrowser.noDownloadableFiles": "The selection has no downloadable files.",
   "cloudBrowser.retryDownload": "Confirm overwrite & reselect destination",
   "cloudBrowser.uploadOverwrite": "Overwrite object {key} only if its ETag is still {etag}?",
   "cloudBrowser.downloadRetry": "The backend rejected the destination precondition. Review the error. Explicitly allow overwrite and select the destination again to retry? Other precondition failures can still be rejected.",

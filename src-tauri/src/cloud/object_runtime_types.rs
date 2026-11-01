@@ -70,6 +70,22 @@ pub struct ObjectLocalCapabilityDto {
     pub token: String,
     pub file_name: Option<String>,
 }
+/// One file inside a batch or folder download. The relative path is what the
+/// capability root sees; it never carries the bucket prefix.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ObjectDownloadItemDto {
+    pub key: String,
+    pub relative_path: String,
+}
+/// Result of one batch download. `local_root` is the folder the user just
+/// picked, so the UI can offer "reveal in folder" once the queue finishes.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectDownloadBatchDto {
+    pub transfers: Vec<ObjectTransferDto>,
+    pub local_root: String,
+}
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectTransferDto {
@@ -131,6 +147,9 @@ pub(crate) struct ObjectState {
     pub backend: Option<ObjectTestBackend>,
     pub guard: Option<super::ObjectGuard>,
     pub sessions: std::collections::HashMap<String, std::sync::Arc<ObjectSession>>,
+    /// Bucket the user explicitly selected for an open connection. Without it
+    /// every later lookup would rebuild the saved default bucket session.
+    pub active_buckets: std::collections::HashMap<String, String>,
     pub plans: std::collections::HashMap<String, (String, super::DeletePlan)>,
     pub grants: std::collections::HashMap<String, BoundGrant>,
     pub tasks: std::collections::HashMap<String, ObjectTask>,
@@ -172,6 +191,7 @@ impl ObjectState {
             backend: None,
             guard: None,
             sessions: std::collections::HashMap::new(),
+            active_buckets: std::collections::HashMap::new(),
             plans: std::collections::HashMap::new(),
             grants: std::collections::HashMap::new(),
             tasks: std::collections::HashMap::new(),

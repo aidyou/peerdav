@@ -114,6 +114,49 @@ impl PhysicalRoot {
     pub fn path(&self) -> &Path {
         &self.path
     }
+    /// A batch download hands every task its own capability handle while all of
+    /// them keep writing below the single directory the user selected.
+    pub fn try_clone(&self) -> Result<Self, ObjectServiceError> {
+        Ok(Self {
+            dir: self
+                .dir
+                .try_clone()
+                .map_err(|source| ObjectServiceError::Io { source })?,
+            path: self.path.clone(),
+        })
+    }
+    /// Whether a relative download target already exists under this capability.
+    pub fn relative_target_exists(&self, relative_path: &str) -> Result<bool, ObjectServiceError> {
+        valid_relative_path(relative_path)?;
+        let parts: Vec<&str> = relative_path.split('/').collect();
+        let (name, parents) = parts.split_last().ok_or(ObjectServiceError::InvalidKey)?;
+        let mut dir = self
+            .dir
+            .try_clone()
+            .map_err(|source| ObjectServiceError::Io { source })?;
+        for part in parents {
+            match dir.open_dir(part) {
+                Ok(next) => dir = next,
+                Err(source)
+                    if matches!(
+                        source.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    return Ok(false);
+                }
+                Err(source) => return Err(ObjectServiceError::Io { source }),
+            }
+        }
+        match dir.symlink_metadata(name) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                Err(ObjectServiceError::DestinationSymlink)
+            }
+            Ok(_) => Ok(true),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(ObjectServiceError::Io { source }),
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub struct ConfigRevision(pub String);
@@ -242,12 +285,44 @@ impl ObjectService {
             .physical_root
             .as_ref()
             .ok_or(ObjectServiceError::InvalidLocalCapability)?;
-        let metadata = self.store.stat(key).await?;
-        let stream = self.store.get(key, None).await?;
         let dir = root
             .dir
             .try_clone()
             .map_err(|source| ObjectServiceError::Io { source })?;
+        self.download_into(key, dir, file_name, cancel, overwrite)
+            .await
+    }
+    /// Downloads one object below a caller-provided relative path, creating the
+    /// nested directories the folder download needs inside the granted root.
+    pub async fn download_to_relative(
+        &self,
+        key: &str,
+        relative_path: &str,
+        cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+        overwrite: bool,
+    ) -> Result<(), ObjectServiceError> {
+        valid_key(key)?;
+        valid_relative_path(relative_path)?;
+        let root = self
+            .physical_root
+            .as_ref()
+            .ok_or(ObjectServiceError::InvalidLocalCapability)?;
+        let parts: Vec<&str> = relative_path.split('/').collect();
+        let (file_name, parents) = parts.split_last().ok_or(ObjectServiceError::InvalidKey)?;
+        let dir = open_download_parent(root, parents)?;
+        self.download_into(key, dir, file_name, cancel, overwrite)
+            .await
+    }
+    async fn download_into(
+        &self,
+        key: &str,
+        dir: cap_std::fs::Dir,
+        file_name: &str,
+        cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+        overwrite: bool,
+    ) -> Result<(), ObjectServiceError> {
+        let metadata = self.store.stat(key).await?;
+        let stream = self.store.get(key, None).await?;
         let target = Path::new(file_name);
         match dir.symlink_metadata(target) {
             Ok(meta) => {
@@ -852,6 +927,48 @@ fn valid_key(key: &str) -> Result<(), ObjectServiceError> {
     } else {
         Ok(())
     }
+}
+/// Relative download targets must stay below the granted root and mirror the
+/// object-key rules, so a crafted key can never escape the selected folder.
+pub fn valid_relative_path(path: &str) -> Result<(), ObjectServiceError> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains(['\\', '\0', ':'])
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        Err(ObjectServiceError::InvalidKey)
+    } else {
+        Ok(())
+    }
+}
+fn open_download_parent(
+    root: &PhysicalRoot,
+    parents: &[&str],
+) -> Result<cap_std::fs::Dir, ObjectServiceError> {
+    let mut dir = root
+        .dir
+        .try_clone()
+        .map_err(|source| ObjectServiceError::Io { source })?;
+    for part in parents {
+        match dir.create_dir(part) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                let meta = dir
+                    .symlink_metadata(part)
+                    .map_err(|source| ObjectServiceError::Io { source })?;
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    return Err(ObjectServiceError::InvalidLocalCapability);
+                }
+            }
+            Err(source) => return Err(ObjectServiceError::Io { source }),
+        }
+        dir = dir
+            .open_dir(part)
+            .map_err(|source| ObjectServiceError::Io { source })?;
+    }
+    Ok(dir)
 }
 pub async fn put_bounded(
     store: &dyn ObjectStore,

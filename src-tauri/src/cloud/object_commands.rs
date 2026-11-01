@@ -168,6 +168,19 @@ pub async fn cloud_object_download(
         .await
 }
 #[tauri::command]
+pub async fn cloud_object_download_batch(
+    connection_id: String,
+    local_token: String,
+    items: Vec<ObjectDownloadItemDto>,
+    overwrite_confirmed: bool,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<ObjectDownloadBatchDto, AppError> {
+    cloud
+        .0
+        .object_download_batch(&connection_id, &local_token, items, overwrite_confirmed)
+        .await
+}
+#[tauri::command]
 pub async fn cloud_object_delete_plan(
     connection_id: String,
     prefix: String,

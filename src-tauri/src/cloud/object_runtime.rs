@@ -77,12 +77,19 @@ mod tests {
         probes: AtomicUsize,
         behavior: AtomicUsize,
         preview_chunks: Arc<AtomicUsize>,
+        /// Simulates the store the runtime binds after a bucket switch.
+        bucket: std::sync::Mutex<String>,
     }
     impl ObjectStore for FakeStore {
         fn scope(&self) -> Option<ObjectStoreScope> {
+            let selected = self.bucket.lock().ok()?.clone();
             Some(ObjectStoreScope {
                 endpoint: "https://offline.invalid".into(),
-                bucket: "bucket".into(),
+                bucket: if selected.is_empty() {
+                    "bucket".into()
+                } else {
+                    selected
+                },
                 prefix: String::new(),
             })
         }
@@ -295,7 +302,7 @@ mod tests {
                         access_key: "fake-access".into(),
                         secret_key: "fake-secret".into(),
                         session_token: None,
-                        buckets: Vec::new(),
+                        buckets: vec!["alternate".into()],
                         allow_insecure_http: false,
                         proxy: ProxyMode::Direct,
                     },
@@ -317,6 +324,23 @@ mod tests {
             .object_register_identity("connection", 1, ObjectIdentityInput::New {})
             .await?;
         f.runtime.object_discover("connection", "").await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn bucket_selection_is_reused_by_later_lookups() -> Result<(), TestError> {
+        let f = fixture().await?;
+        authorize(&f).await?;
+        *f.store.bucket.lock().map_err(|_| "bucket lock")? = "alternate".into();
+        f.runtime
+            .object_select_bucket("connection", "alternate")
+            .await?;
+        let session = f.runtime.object_session("connection").await?;
+        assert_eq!(session.bucket, "alternate");
+        // Browsing after the switch must keep the selected bucket instead of
+        // rebuilding the saved default bucket session.
+        f.runtime.object_list("connection", "", None).await?;
+        let session = f.runtime.object_session("connection").await?;
+        assert_eq!(session.bucket, "alternate");
         Ok(())
     }
     #[tokio::test]
@@ -1003,6 +1027,87 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn batch_download_writes_relative_paths_and_keeps_grant_for_confirmation()
+    -> Result<(), TestError> {
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let target = f._dir.path().join("batch-target");
+        std::fs::create_dir(&target)?;
+        let token = f
+            .runtime
+            .object_grant_selected("connection", 1, &target, false)
+            .await?
+            .token;
+        let items = vec![
+            ObjectDownloadItemDto {
+                key: "data/file".into(),
+                relative_path: "one/file".into(),
+            },
+            ObjectDownloadItemDto {
+                key: "data/file".into(),
+                relative_path: "two/deep/file".into(),
+            },
+        ];
+        let transfers = f
+            .runtime
+            .object_download_batch("connection", &token, items.clone(), false)
+            .await?;
+        assert_eq!(transfers.transfers.len(), 2);
+        assert_eq!(transfers.local_root, target.to_string_lossy());
+        for transfer in &transfers.transfers {
+            assert_eq!(settled(&f, &transfer.transfer_id).await?.phase, "completed");
+        }
+        assert_eq!(std::fs::read(target.join("one/file"))?, b"x");
+        assert_eq!(std::fs::read(target.join("two/deep/file"))?, b"x");
+        // The capability token covers the whole batch and is consumed by it.
+        assert!(
+            f.runtime
+                .object_download_batch("connection", &token, items, false)
+                .await
+                .is_err()
+        );
+        let token = f
+            .runtime
+            .object_grant_selected("connection", 1, &target, false)
+            .await?
+            .token;
+        let conflict = f
+            .runtime
+            .object_download_batch(
+                "connection",
+                &token,
+                vec![ObjectDownloadItemDto {
+                    key: "data/file".into(),
+                    relative_path: "one/file".into(),
+                }],
+                false,
+            )
+            .await
+            .expect_err("existing destinations must ask for confirmation");
+        assert_eq!(conflict.code, "TRANSFER_CONFLICT");
+        // The rejected preflight must not consume the grant.
+        let transfers = f
+            .runtime
+            .object_download_batch(
+                "connection",
+                &token,
+                vec![ObjectDownloadItemDto {
+                    key: "data/file".into(),
+                    relative_path: "one/file".into(),
+                }],
+                true,
+            )
+            .await?;
+        assert_eq!(
+            settled(&f, &transfers.transfers[0].transfer_id)
+                .await?
+                .phase,
+            "completed"
+        );
+        assert_eq!(std::fs::read(target.join("one/file"))?, b"x");
+        Ok(())
+    }
+    #[tokio::test]
     async fn vault_stop_cancels_joins_and_clears_file_grants() -> Result<(), TestError> {
         let f = fixture().await?;
         authorize(&f).await?;
@@ -1105,19 +1210,8 @@ impl CloudRuntime {
         if bucket.is_empty() {
             return Err(app(CloudError::InvalidConfig("bucket is required".into())));
         }
-        let connection = self
-            .config
-            .snapshot()
-            .map_err(config_error)?
-            .connections
-            .into_iter()
-            .find(|c| c.id == connection_id)
-            .ok_or_else(|| app(CloudError::NotFound))?;
-        if connection.config.bucket != bucket
-            && !connection.config.buckets.iter().any(|item| item == bucket)
-        {
-            return Err(app(CloudError::NotFound));
-        }
+        // object_session_for validates the bucket against the saved connection
+        // and records the selection for every later lookup.
         self.object_session_for(connection_id, Some(bucket)).await?;
         Ok(())
     }
@@ -1145,9 +1239,43 @@ impl CloudRuntime {
             Some(backend) => (backend.load)()?,
             None => load()?,
         };
-        let wanted_bucket = bucket
-            .map(str::to_owned)
-            .unwrap_or_else(|| connection.config.bucket.clone());
+        let wanted_bucket = match bucket {
+            Some(selected) => {
+                if selected != connection.config.bucket
+                    && !connection
+                        .config
+                        .buckets
+                        .iter()
+                        .any(|item| item == selected)
+                {
+                    return Err(app(CloudError::NotFound));
+                }
+                state
+                    .active_buckets
+                    .insert(connection_id.to_owned(), selected.to_owned());
+                selected.to_owned()
+            }
+            None => {
+                // Keep the bucket the user switched to; only fall back to the
+                // saved bucket when the selection is gone from the config.
+                let selected = state
+                    .active_buckets
+                    .get(connection_id)
+                    .filter(|selected| {
+                        *selected == &connection.config.bucket
+                            || connection
+                                .config
+                                .buckets
+                                .iter()
+                                .any(|item| item == *selected)
+                    })
+                    .cloned();
+                if selected.is_none() {
+                    state.active_buckets.remove(connection_id);
+                }
+                selected.unwrap_or_else(|| connection.config.bucket.clone())
+            }
+        };
         if let Some(session) = state.sessions.get(connection_id) {
             if session.revision == connection.revision && session.bucket == wanted_bucket {
                 return Ok(Arc::clone(session));
@@ -1649,6 +1777,182 @@ impl CloudRuntime {
         )
         .await
     }
+    /// Downloads several objects below the folder covered by one capability
+    /// token. Each item becomes its own transfer so the UI reports per-file
+    /// progress, and relative paths let a folder download recreate its tree.
+    pub async fn object_download_batch(
+        self: &Arc<Self>,
+        connection_id: &str,
+        token: &str,
+        items: Vec<ObjectDownloadItemDto>,
+        overwrite_confirmed: bool,
+    ) -> Result<ObjectDownloadBatchDto, AppError> {
+        self.object_admit()?;
+        if items.is_empty() || items.len() > crate::types::MAX_CLOUD_DOWNLOAD_BATCH {
+            return Err(DomainError::DownloadQueueTooLarge {
+                count: items.len(),
+                limit: crate::types::MAX_CLOUD_DOWNLOAD_BATCH,
+            }
+            .into());
+        }
+        let mut relative_paths = std::collections::HashSet::new();
+        for item in &items {
+            super::object_service::valid_relative_path(&item.relative_path).map_err(app)?;
+            if !relative_paths.insert(item.relative_path.clone()) {
+                return Err(app(ObjectServiceError::InvalidKey));
+            }
+        }
+        let _lifecycle = self.object_lifecycle.lock().await;
+        let session = self.object_session(connection_id).await?;
+        let mut state = self.objects.lock().await;
+        state.prune();
+        // Conflicts are detected before the token is consumed, so the user can
+        // confirm overwriting and replay the same batch with the same grant.
+        let conflicts = {
+            let bound = state.grants.get(token).ok_or_else(state_error)?;
+            if bound.connection_id != connection_id || bound.revision != session.revision {
+                return Err(state_error());
+            }
+            let LocalGrant::Download(root) = &bound.grant else {
+                return Err(state_error());
+            };
+            items.iter().try_fold(0usize, |count, item| {
+                root.relative_target_exists(&item.relative_path)
+                    .map_err(app)
+                    .map(|exists| count + usize::from(exists))
+            })?
+        };
+        if conflicts > 0 && !overwrite_confirmed {
+            return Err(DomainError::TransferConflict {
+                path: format!("{conflicts} download destination(s) already exist"),
+            }
+            .into());
+        }
+        let bound = state.grants.remove(token).ok_or_else(state_error)?;
+        if bound.connection_id != connection_id || bound.revision != session.revision {
+            return Err(state_error());
+        }
+        let LocalGrant::Download(root) = bound.grant else {
+            return Err(state_error());
+        };
+        if state.tasks.len() + items.len() > crate::types::MAX_CLOUD_TASKS {
+            let excess = state.tasks.len() + items.len() - crate::types::MAX_CLOUD_TASKS;
+            let mut finished: Vec<(std::time::Instant, String)> = state
+                .tasks
+                .iter()
+                .filter(|(_, task)| task.handle.is_none())
+                .map(|(id, task)| (task.created, id.clone()))
+                .collect();
+            finished.sort_by_key(|(created, _)| *created);
+            for (_, id) in finished.into_iter().take(excess) {
+                state.tasks.remove(&id);
+            }
+            if state.tasks.len() + items.len() > crate::types::MAX_CLOUD_TASKS {
+                return Err(state_error());
+            }
+        }
+        let executor = tokio::runtime::Handle::try_current().map_err(|source| {
+            app(DomainError::Internal {
+                detail: source.to_string(),
+            })
+        })?;
+        let guard = state.guard.as_ref().ok_or_else(state_error)?.clone();
+        let slots = Arc::new(tokio::sync::Semaphore::new(
+            crate::types::MAX_CLOUD_DOWNLOAD_CONCURRENCY,
+        ));
+        let mut statuses = Vec::with_capacity(items.len());
+        for item in items {
+            let root = root.try_clone().map_err(app)?;
+            let id = random_id()?;
+            let status = ObjectTransferDto {
+                transfer_id: id.clone(),
+                connection_id: connection_id.to_owned(),
+                connection_revision: session.revision,
+                direction: "download".into(),
+                key: Some(item.key.clone()),
+                size_hint: None,
+                phase: "running".into(),
+                error: None,
+                recovery_required: false,
+            };
+            let cancel = Arc::new(AtomicBool::new(false));
+            state.tasks.insert(
+                id.clone(),
+                ObjectTask {
+                    created: std::time::Instant::now(),
+                    status: status.clone(),
+                    cancel: Arc::clone(&cancel),
+                    handle: None,
+                },
+            );
+            let runtime = Arc::clone(self);
+            let task_id = id.clone();
+            let key = item.key;
+            let relative_path = item.relative_path;
+            let connection = connection_id.to_owned();
+            let revision = session.revision;
+            let guard = guard.clone();
+            let store = Arc::clone(&session.store);
+            let identity = session.identity.clone();
+            let slots = Arc::clone(&slots);
+            let handle = executor.spawn(async move {
+                let slot = slots.acquire_owned().await;
+                let Ok(_slot) = slot else {
+                    runtime
+                        .object_finish(
+                            &task_id,
+                            Err(app(DomainError::Internal {
+                                detail: "cloud download queue closed".into(),
+                            })),
+                            false,
+                        )
+                        .await;
+                    return;
+                };
+                let _permit = runtime.network.read().await;
+                let operation = async {
+                    runtime.object_admit()?;
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(app(ObjectServiceError::Cancelled));
+                    }
+                    let current = runtime.object_session(&connection).await?;
+                    if current.revision != revision {
+                        return Err(app(ObjectServiceError::StaleDeletePlan));
+                    }
+                    let service =
+                        ObjectService::try_new(store, guard, identity, revision.to_string())
+                            .map_err(app)?
+                            .with_physical_root(root);
+                    service
+                        .download_to_relative(
+                            &key,
+                            &relative_path,
+                            Some(cancel),
+                            overwrite_confirmed,
+                        )
+                        .await
+                        .map_err(app)?;
+                    Ok(())
+                };
+                let result = match std::panic::AssertUnwindSafe(operation).catch_unwind().await {
+                    Ok(result) => result,
+                    Err(_) => Err(app(DomainError::Internal {
+                        detail: "Object transfer task panicked".into(),
+                    })),
+                };
+                runtime.object_finish(&task_id, result, false).await;
+            });
+            if let Some(entry) = state.tasks.get_mut(&id) {
+                entry.handle = Some(handle);
+            }
+            statuses.push(status);
+        }
+        drop(state);
+        Ok(ObjectDownloadBatchDto {
+            transfers: statuses,
+            local_root: root.path().to_string_lossy().into_owned(),
+        })
+    }
     async fn object_start_transfer(
         self: &Arc<Self>,
         connection_id: &str,
@@ -1664,7 +1968,7 @@ impl CloudRuntime {
         let session = self.object_session(connection_id).await?;
         let mut state = self.objects.lock().await;
         state.prune();
-        if state.tasks.len() >= 128 {
+        if state.tasks.len() >= crate::types::MAX_CLOUD_TASKS {
             if let Some(oldest) = state
                 .tasks
                 .iter()
@@ -1911,6 +2215,9 @@ impl CloudRuntime {
             }
             state
                 .sessions
+                .retain(|id, _| connection_id.is_some_and(|selected| id != selected));
+            state
+                .active_buckets
                 .retain(|id, _| connection_id.is_some_and(|selected| id != selected));
             state
                 .plans
