@@ -116,6 +116,7 @@ fn store(endpoint: &str, prefix: &str) -> S3Store {
         access_key: ACCESS.to_owned(),
         secret_key: SECRET.to_owned(),
         session_token: None,
+        buckets: Vec::new(),
         allow_insecure_http: true,
         proxy: ProxyMode::Direct,
     })

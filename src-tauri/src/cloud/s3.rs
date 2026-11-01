@@ -128,6 +128,7 @@ impl S3Store {
                 access_key: "test".into(),
                 secret_key: "test".into(),
                 session_token: None,
+                buckets: Vec::new(),
                 allow_insecure_http: false,
                 proxy: super::types::ProxyMode::Direct,
             },
@@ -240,7 +241,7 @@ fn body(bytes: &'static [u8]) -> ObjectStream {
     stream::once(async move { Ok(Bytes::from_static(bytes)) }).boxed()
 }
 
-fn is_private(host: Option<&str>) -> bool {
+pub(super) fn is_private(host: Option<&str>) -> bool {
     host.is_some_and(|host| {
         let host = host.trim_matches(['[', ']']);
         host == "localhost"

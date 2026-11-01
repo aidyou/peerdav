@@ -97,6 +97,8 @@ pub(crate) struct ObjectBrowseOperation {
 pub(crate) struct ObjectSession {
     pub browse: tokio::sync::Mutex<std::collections::HashMap<String, ObjectBrowseOperation>>,
     pub revision: u64,
+    /// Bucket this session is bound to; switching buckets rebuilds the session.
+    pub bucket: String,
     pub service: std::sync::Arc<super::ObjectService>,
     pub store: std::sync::Arc<dyn super::traits::ObjectStore>,
     pub identity: super::ProtectedIdentity,
@@ -133,6 +135,24 @@ pub(crate) struct ObjectState {
     pub grants: std::collections::HashMap<String, BoundGrant>,
     pub tasks: std::collections::HashMap<String, ObjectTask>,
 }
+/// Untrusted, pre-save credentials used only to prove that the address can list
+/// buckets. Nothing here is persisted; saving the connection re-validates it.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProbeBucketsInput {
+    pub endpoint: String,
+    #[serde(default)]
+    pub region: String,
+    pub access_key: String,
+    pub secret_key: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+    #[serde(default)]
+    pub proxy: super::types::ProxyMode,
+}
+
 impl ObjectState {
     pub fn prune(&mut self) {
         let now = std::time::Instant::now();

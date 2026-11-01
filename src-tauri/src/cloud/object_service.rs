@@ -367,7 +367,11 @@ impl ObjectService {
     }
     /// Query the physical scoped key without discovery or granting mutation trust.
     pub fn is_protected(&self, key: &str) -> Result<bool, ObjectServiceError> {
-        valid_prefix(key)?;
+        // A protection target is a precise key or prefix, not a folder path:
+        // unlike browse prefixes it must not carry a trailing separator.
+        if !key.is_empty() {
+            valid_key(key)?;
+        }
         Ok(self.guard.is_protected(&self.target_identity(key))?)
     }
     /// One active continuation chain per prefix. A terminal chain can be
@@ -821,10 +825,13 @@ fn now() -> u64 {
         .unwrap_or(u64::MAX)
 }
 fn valid_prefix(prefix: &str) -> Result<(), ObjectServiceError> {
-    if prefix.is_empty() {
+    // Folder prefixes carry a trailing slash (e.g. "probes/"); the store itself
+    // validates the trimmed segment, so this check must trim the same way.
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.is_empty() {
         Ok(())
     } else {
-        valid_key(prefix)
+        valid_key(trimmed)
     }
 }
 fn within_prefix(prefix: &str, key: &str) -> bool {

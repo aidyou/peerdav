@@ -18,6 +18,7 @@ pub use object_types::{
 pub mod config;
 pub mod config_types;
 mod proxy;
+pub mod service;
 pub mod runtime;
 pub mod runtime_recovery;
 pub mod runtime_root;

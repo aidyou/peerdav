@@ -38,6 +38,10 @@ pub enum CloudError {
         #[source]
         source: reqwest::Error,
     },
+    /// A service-level request (for example bucket discovery) returned a
+    /// non-success status. The provider's body is kept, truncated at the caller.
+    #[error("cloud service returned HTTP {status}: {detail}")]
+    Service { status: u16, detail: String },
     #[error("cloud storage operation failed")]
     Storage {
         #[source]
@@ -144,6 +148,10 @@ pub struct S3Config {
     pub access_key: String,
     pub secret_key: String,
     pub session_token: Option<String>,
+    /// Buckets the user picked from discovery. `bucket` remains the primary one
+    /// for legacy sync paths; an empty list falls back to `[bucket]`.
+    #[serde(default)]
+    pub buckets: Vec<String>,
     #[serde(default)]
     pub allow_insecure_http: bool,
     #[serde(default)]

@@ -521,8 +521,22 @@ impl CloudRuntime {
         self.admit()?;
         let _permit = self.network.read().await;
         self.admit()?;
-        let store = S3Store::new(self.connection(id)?.config).map_err(cloud_error)?;
-        store.verify_capabilities().await.map_err(cloud_error)?;
+        let connection = self.connection(id)?;
+        // A connection test only proves the address and credentials work. It must
+        // not probe conditional writes: many S3-compatible providers reject them
+        // even though the connection itself is perfectly usable, so listing the
+        // service's buckets is the right proof.
+        super::service::probe(
+            &connection.config.endpoint,
+            &connection.config.region,
+            &connection.config.access_key,
+            &connection.config.secret_key,
+            connection.config.session_token.as_deref(),
+            connection.config.allow_insecure_http,
+            &connection.config.proxy,
+        )
+        .await
+        .map_err(cloud_error)?;
         Ok(true)
     }
     fn connection(&self, id: &str) -> Result<CloudConnection, AppError> {

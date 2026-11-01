@@ -425,3 +425,22 @@ fn corrupted_identity_registry_and_cross_type_ciphertext_are_rejected() {
         ));
     }
 }
+
+#[test]
+fn object_keys_and_prefixes_with_spaces_are_valid() {
+    let d = tempdir().unwrap();
+    let guard = ObjectGuard::open(d.path().join("guard.db"), &[1; 32]).unwrap();
+    // Uploading "Untitled map2.png" at the bucket root builds a mutation
+    // identity whose prefix is the key itself; spaces must not be rejected.
+    let spaced_key = identity("Untitled map2.png", "space");
+    assert!(
+        !guard.is_protected(&spaced_key).unwrap(),
+        "spaced key must be a valid identity"
+    );
+    guard
+        .register(mapping("folder with space", "space-dir"))
+        .unwrap();
+    assert!(guard
+        .is_protected(&identity("folder with space/a b.png", "x"))
+        .unwrap());
+}

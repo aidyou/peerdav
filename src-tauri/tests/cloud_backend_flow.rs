@@ -89,6 +89,7 @@ impl Fixture {
             access_key: "access".into(),
             secret_key: "secret".into(),
             session_token: None,
+            buckets: Vec::new(),
             allow_insecure_http: true,
             proxy: ProxyMode::Direct,
         }
@@ -469,6 +470,7 @@ fn cloud_endpoint_credentials_and_key_validation_are_fail_closed() {
             access_key: "access".into(),
             secret_key: "secret-marker".into(),
             session_token: Some("token-marker".into()),
+            buckets: Vec::new(),
             allow_insecure_http: false,
             proxy: ProxyMode::Direct,
         }
@@ -514,6 +516,7 @@ fn runtime_connection(fixture: &Fixture) -> SaveS3Input {
         name: "fixture".into(),
         endpoint: fixture.endpoint.clone(),
         bucket: "fixture".into(),
+        buckets: Vec::new(),
         region: "us-east-1".into(),
         prefix: "runtime".into(),
         path_style: true,

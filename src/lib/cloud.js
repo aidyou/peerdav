@@ -1,6 +1,6 @@
 import { invoke } from "./invoke.js";
 
-const SAVE_FIELDS = ["id", "name", "endpoint", "bucket", "region", "prefix", "pathStyle", "accessKey", "secretKey", "sessionToken", "allowInsecureHttp", "proxy", "schedule", "clearCredentials", "clearSessionToken", "clearProxyAuth"];
+const SAVE_FIELDS = ["id", "name", "endpoint", "bucket", "buckets", "region", "prefix", "pathStyle", "accessKey", "secretKey", "sessionToken", "allowInsecureHttp", "proxy", "schedule", "clearCredentials", "clearSessionToken", "clearProxyAuth"];
 const MAPPING_FIELDS = ["connectionId", "repositoryId", "localRoot", "logicalPath", "schedule"];
 
 export function toSaveS3Input(value = {}) {
@@ -20,6 +20,8 @@ export function toSaveMappingInput(value = {}) {
 
 export const cloud = Object.freeze({
   list: () => invoke("cloud_list"),
+  probeBuckets: ({ endpoint, region = "", accessKey, secretKey, sessionToken = null, allowInsecureHttp = false, proxy = { mode: "direct" } }) => invoke("cloud_probe_buckets", { input: { endpoint, region, accessKey, secretKey, sessionToken, allowInsecureHttp, proxy } }),
+  connectionCredentials: (connectionId) => invoke("cloud_connection_credentials", { connectionId }),
   saveConnection: (input) => invoke("cloud_save_connection", { input: toSaveS3Input(input) }),
   testConnection: (connectionId) => invoke("cloud_test_connection", { connectionId }),
   deleteConnection: (connectionId) => invoke("cloud_delete_connection", { connectionId }),
@@ -43,6 +45,7 @@ export const cloud = Object.freeze({
 // Object browsing is independent of repository sync. Explicit payloads prevent
 // native paths or unrelated fields from crossing this boundary.
 export const cloudObjects = Object.freeze({
+  selectBucket: (connectionId, bucket) => invoke("cloud_object_select_bucket", { connectionId, bucket }),
   list: ({ connectionId, prefix, next = null }) => invoke("cloud_object_list", { connectionId, prefix, next }),
   discover: ({ connectionId, prefix }) => invoke("cloud_object_discover", { connectionId, prefix }),
   prepare: ({ connectionId }) => invoke("cloud_object_prepare", { connectionId }),
@@ -73,7 +76,7 @@ export function objectChildren(objects, prefix) {
 }
 
 export function blankConnection() {
-  return { id: "", name: "", endpoint: "", bucket: "", region: "", prefix: "", pathStyle: false, accessKey: "", secretKey: "", sessionToken: "", allowInsecureHttp: false, proxy: { mode: "direct" }, schedule: { enabled: false, interval: 900 }, encrypted: true, clearCredentials: false, clearSessionToken: false, clearProxyAuth: false };
+  return { id: "", name: "", endpoint: "", bucket: "", buckets: [], region: "", prefix: "", pathStyle: false, accessKey: "", secretKey: "", sessionToken: "", allowInsecureHttp: false, proxy: { mode: "direct" }, schedule: { enabled: false, interval: 900 }, encrypted: true, clearCredentials: false, clearSessionToken: false, clearProxyAuth: false };
 }
 
 export function blankMapping() {

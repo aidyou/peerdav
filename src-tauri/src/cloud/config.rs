@@ -155,7 +155,7 @@ impl CloudConfigStore {
         } else {
             input.proxy
         };
-        let config = S3Config {
+        let mut config = S3Config {
             endpoint: input.endpoint,
             bucket: input.bucket,
             region: input.region,
@@ -164,9 +164,34 @@ impl CloudConfigStore {
             access_key,
             secret_key,
             session_token,
+            buckets: input.buckets,
             allow_insecure_http: input.allow_insecure_http,
             proxy,
         };
+        // Users only provide an address; infer the region from it when omitted.
+        if config.region.trim().is_empty() {
+            let host = url::Url::parse(&config.endpoint)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .unwrap_or_default();
+            config.region = super::service::derive_region(&host);
+        }
+        // Denormalize the multi-bucket selection: `bucket` stays primary for
+        // legacy sync, while `buckets` is the ordered, de-duplicated list.
+        let mut buckets = Vec::new();
+        for bucket in config.buckets.drain(..) {
+            let bucket = bucket.trim().to_owned();
+            if !bucket.is_empty() && !buckets.contains(&bucket) {
+                buckets.push(bucket);
+            }
+        }
+        if buckets.is_empty() && !config.bucket.trim().is_empty() {
+            buckets.push(config.bucket.trim().to_owned());
+        }
+        if let Some(primary) = buckets.first() {
+            config.bucket = primary.clone();
+        }
+        config.buckets = buckets;
         validate_config(&config)?;
         let connection = CloudConnection {
             id: id.clone(),

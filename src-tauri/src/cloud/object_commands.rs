@@ -12,6 +12,15 @@ fn task_error(source: tokio::task::JoinError) -> AppError {
 }
 
 #[tauri::command]
+pub async fn cloud_object_select_bucket(
+    connection_id: String,
+    bucket: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<(), AppError> {
+    cloud.0.object_select_bucket(&connection_id, &bucket).await
+}
+
+#[tauri::command]
 pub async fn cloud_object_list(
     connection_id: String,
     prefix: String,

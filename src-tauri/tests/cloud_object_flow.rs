@@ -519,6 +519,16 @@ async fn empty_root_browse_and_confirmed_delete_work_for_ordinary_objects() {
 }
 
 #[tokio::test]
+async fn folder_prefix_with_trailing_separator_browses_like_the_store_does() {
+    // The UI navigates to folder prefixes such as "probes/"; the service must
+    // trim the trailing separator exactly like the store, not reject the key.
+    let (store, _calls) = FakeStore::new(vec![page(&["probes/abc", "probes/def"], None)]);
+    let svc = service(store, "");
+    let listed = svc.browse("probes/", None).await.unwrap();
+    assert_eq!(listed.objects.len(), 2);
+}
+
+#[tokio::test]
 async fn root_sync_marker_blocks_empty_root_delete() {
     let (store, calls) = FakeStore::new(vec![page(&["control/HEAD", "a"], None)]);
     let svc = service(store, "");
@@ -1594,6 +1604,7 @@ fn s3_scope_reports_only_configured_physical_namespace_without_network() {
         access_key: "offline-test-access".into(),
         secret_key: "offline-test-secret".into(),
         session_token: Some("offline-test-token".into()),
+        buckets: Vec::new(),
         allow_insecure_http: false,
         proxy: ProxyMode::Direct,
     })

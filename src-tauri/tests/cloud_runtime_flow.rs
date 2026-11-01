@@ -23,6 +23,7 @@ fn connection() -> SaveS3Input {
         name: "test".into(),
         endpoint: "https://s3.example".into(),
         bucket: "bucket".into(),
+        buckets: Vec::new(),
         region: "us-east-1".into(),
         prefix: String::new(),
         path_style: false,

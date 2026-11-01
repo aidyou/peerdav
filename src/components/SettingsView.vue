@@ -833,14 +833,19 @@ async function chooseVaultKey() {
   });
 }
 
+// The settings panes are gated on the first load so the page paints a skeleton
+// immediately instead of showing empty controls while the backend answers.
+// Admin data (shares/clients) is excluded: those lists keep their own
+// per-list skeletons so a slow admin call does not block the whole page.
+const settingsLoading = ref(true);
+async function loadInitialSettings() {
+  try {
+    await Promise.all([loadServiceSettings(), loadLocalNetworks(), loadLanAddress(), loadAutostart(), loadTrayIconStyle(), loadCloud()]);
+  } finally { settingsLoading.value = false; }
+}
 onMounted(() => {
-  void loadServiceSettings();
-  void loadLocalNetworks();
-  void loadLanAddress();
-  void loadAutostart();
-  void loadTrayIconStyle();
+  void loadInitialSettings();
   void loadInitialData();
-  void loadCloud();
   cloudPoll = setInterval(() => { if (app.settingsTab === "cloud") void loadCloud(); }, 15000);
   void listen("app://cloud-progress", (event) => { cloudProgress.value = event.payload; }).then((unlisten) => { cloudUnlisten = unlisten; }).catch((error) => console.error("cloud progress listener", error));
 });
@@ -923,6 +928,8 @@ async function loadInitialData() {
     </nav>
 
     <div class="settings-content">
+      <list-skeleton v-if="settingsLoading" class="settings-skeleton" :rows="8" />
+      <template v-else>
 
       <!-- 通用面板按语义分四组：外观、系统集成、锁屏、会话。每组是「组标题 + 行式列表」，
            行内标题在左、控件在右，一条设置项一行；服务、账户面板沿用同一套语法，
@@ -1323,8 +1330,8 @@ async function loadInitialData() {
               {{ t("shares.editing", { name: shareName }) }}
             </p>
             <form class="stack" @submit.prevent="saveShare">
-              <label>
-                {{ t("shares.localDir") }}
+              <label class="required">
+                <span class="label">{{ t("shares.localDir") }}</span>
                 <div class="input-with-button">
                   <el-input
                     v-model="shareRoot"
@@ -1350,8 +1357,8 @@ async function loadInitialData() {
                   :placeholder="t('shares.nameOptional')"
                 />
               </label>
-              <label>
-                {{ t("shares.allowRules") }}
+              <label class="required">
+                <span class="label">{{ t("shares.allowRules") }}</span>
                 <el-select
                   v-model="shareAllow"
                   class="rule-select"
@@ -1848,6 +1855,7 @@ async function loadInitialData() {
           <p class="settings-group__footnote">{{ t("vault.keyFileHint") }}</p>
         </div>
       </section>
+      </template>
     </div>
   </div>
 </template>
@@ -1974,6 +1982,8 @@ html[data-theme="dark"] .tray-icon-preview--mono {
   display: flex;
   flex-direction: column;
 }
+
+.settings-skeleton { flex: 1; padding: 18px 0; }
 
 @media (max-width: 680px) {
   .settings-view {
@@ -2308,6 +2318,13 @@ html[data-theme="dark"] .tray-icon-preview--mono {
 
 .share-form__warning {
   color: var(--el-color-warning);
+}
+
+/* 必填标记：红色星号紧跟标签文本，与 Element Plus 表单一致。 */
+label.required > .label::after {
+  content: "*";
+  margin-inline-start: 4px;
+  color: var(--el-color-danger, #f56c6c);
 }
 
 .share-item__title {

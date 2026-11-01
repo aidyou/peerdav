@@ -80,6 +80,7 @@ impl Fixture {
             access_key: "test".into(),
             secret_key: "test".into(),
             session_token: None,
+            buckets: Vec::new(),
             allow_insecure_http: true,
             proxy: ProxyMode::Direct,
         })

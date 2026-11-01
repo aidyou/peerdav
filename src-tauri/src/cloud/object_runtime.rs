@@ -262,6 +262,7 @@ mod tests {
                         access_key: "fake-access".into(),
                         secret_key: "fake-secret".into(),
                         session_token: None,
+                        buckets: Vec::new(),
                         allow_insecure_http: false,
                         proxy: ProxyMode::Direct,
                     },
@@ -953,6 +954,42 @@ impl CloudRuntime {
     }
     /// Caller holds the shared network permit; credentials are loaded only after admission.
     async fn object_session(&self, connection_id: &str) -> Result<Arc<ObjectSession>, AppError> {
+        self.object_session_for(connection_id, None).await
+    }
+    /// Switch the active bucket for an open connection. The session is rebuilt
+    /// with that bucket; the saved connection is unchanged.
+    pub async fn object_select_bucket(
+        &self,
+        connection_id: &str,
+        bucket: &str,
+    ) -> Result<(), AppError> {
+        self.object_admit()?;
+        let _permit = self.network.read().await;
+        let bucket = bucket.trim();
+        if bucket.is_empty() {
+            return Err(app(CloudError::InvalidConfig("bucket is required".into())));
+        }
+        let connection = self
+            .config
+            .snapshot()
+            .map_err(config_error)?
+            .connections
+            .into_iter()
+            .find(|c| c.id == connection_id)
+            .ok_or_else(|| app(CloudError::NotFound))?;
+        if connection.config.bucket != bucket
+            && !connection.config.buckets.iter().any(|item| item == bucket)
+        {
+            return Err(app(CloudError::NotFound));
+        }
+        self.object_session_for(connection_id, Some(bucket)).await?;
+        Ok(())
+    }
+    async fn object_session_for(
+        &self,
+        connection_id: &str,
+        bucket: Option<&str>,
+    ) -> Result<Arc<ObjectSession>, AppError> {
         self.object_admit()?;
         let mut state = self.objects.lock().await;
         state.prune();
@@ -972,8 +1009,11 @@ impl CloudRuntime {
             Some(backend) => (backend.load)()?,
             None => load()?,
         };
+        let wanted_bucket = bucket
+            .map(str::to_owned)
+            .unwrap_or_else(|| connection.config.bucket.clone());
         if let Some(session) = state.sessions.get(connection_id) {
-            if session.revision == connection.revision {
+            if session.revision == connection.revision && session.bucket == wanted_bucket {
                 return Ok(Arc::clone(session));
             }
         }
@@ -1002,20 +1042,21 @@ impl CloudRuntime {
             );
         }
         let guard = state.guard.as_ref().ok_or_else(state_error)?.clone();
+        let mut config = connection.config.clone();
+        config.bucket = wanted_bucket.clone();
         let identity = ProtectedIdentity {
-            endpoint: connection.config.endpoint.clone(),
-            bucket: connection.config.bucket.clone(),
-            prefix: connection.config.prefix.clone(),
+            endpoint: config.endpoint.clone(),
+            bucket: config.bucket.clone(),
+            prefix: config.prefix.clone(),
             alias: String::new(),
         };
         // Deliberately no verify_capabilities, repository join, or encrypted tree reads.
         #[cfg(not(test))]
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(super::S3Store::new(connection.config).map_err(app)?);
+        let store: Arc<dyn ObjectStore> = Arc::new(super::S3Store::new(config).map_err(app)?);
         #[cfg(test)]
         let store: Arc<dyn ObjectStore> = match &state.backend {
             Some(backend) => Arc::clone(&backend.store),
-            None => Arc::new(super::S3Store::new(connection.config).map_err(app)?),
+            None => Arc::new(super::S3Store::new(config).map_err(app)?),
         };
         let service = Arc::new(
             ObjectService::try_new(
@@ -1029,6 +1070,7 @@ impl CloudRuntime {
         let session = Arc::new(ObjectSession {
             browse: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             revision: connection.revision,
+            bucket: wanted_bucket,
             service,
             store,
             identity,
@@ -1037,6 +1079,47 @@ impl CloudRuntime {
             .sessions
             .insert(connection_id.to_owned(), Arc::clone(&session));
         Ok(session)
+    }
+    /// Validates an address and its credentials by listing buckets. This runs
+    /// before a connection is saved, so it never reads or writes configuration.
+    pub async fn probe_buckets(
+        &self,
+        input: ProbeBucketsInput,
+    ) -> Result<Vec<super::service::BucketEntry>, AppError> {
+        self.object_admit()?;
+        let _permit = self.network.read().await;
+        super::service::probe(
+            &input.endpoint,
+            &input.region,
+            &input.access_key,
+            &input.secret_key,
+            input.session_token.as_deref(),
+            input.allow_insecure_http,
+            &input.proxy,
+        )
+        .await
+        .map_err(app)
+    }
+    /// Returns saved credentials for the edit form. Requires an unlocked vault
+    /// and is intentionally separate from the redacted catalog.
+    pub fn connection_credentials(
+        &self,
+        connection_id: &str,
+    ) -> Result<super::config_types::ConnectionCredentials, AppError> {
+        self.object_admit()?;
+        let connection = self
+            .config
+            .snapshot()
+            .map_err(config_error)?
+            .connections
+            .into_iter()
+            .find(|c| c.id == connection_id)
+            .ok_or_else(|| app(CloudError::NotFound))?;
+        Ok(super::config_types::ConnectionCredentials {
+            access_key: connection.config.access_key,
+            secret_key: connection.config.secret_key,
+            session_token: connection.config.session_token,
+        })
     }
     pub async fn object_list(
         &self,
@@ -1078,7 +1161,12 @@ impl CloudRuntime {
         operation.last_token = next.map(str::to_owned);
         operation.next = page.next.clone();
         operation.complete = page.complete;
-        let prefix_protected = session.service.is_protected(&page.prefix).map_err(app)?;
+        // The browse prefix carries a trailing separator for folders; the
+        // protection query speaks precise keys, so trim it like the store does.
+        let prefix_protected = session
+            .service
+            .is_protected(page.prefix.trim_end_matches('/'))
+            .map_err(app)?;
         let objects = page
             .objects
             .into_iter()

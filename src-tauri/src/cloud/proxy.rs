@@ -42,6 +42,12 @@ fn proxy_url(raw: &str) -> Result<Url, CloudError> {
 }
 
 impl ConnectionTransport {
+    /// Shared client for service-level requests (for example bucket discovery)
+    /// that must obey the same proxy, redirect and timeout policy as object I/O.
+    pub(super) fn client(&self) -> &Client {
+        &self.0
+    }
+
     pub(super) fn new(mode: &ProxyMode) -> Result<Self, CloudError> {
         Self::with_environment(mode, |name| std::env::var(name).ok())
     }

@@ -15,6 +15,22 @@ pub async fn cloud_test_connection(
 }
 
 #[tauri::command]
+pub fn cloud_connection_credentials(
+    connection_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<super::config_types::ConnectionCredentials, AppError> {
+    cloud.0.connection_credentials(&connection_id)
+}
+
+#[tauri::command]
+pub async fn cloud_probe_buckets(
+    input: super::object_runtime_types::ProbeBucketsInput,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<Vec<super::service::BucketEntry>, AppError> {
+    cloud.0.probe_buckets(input).await
+}
+
+#[tauri::command]
 pub async fn cloud_recovery_records(
     mapping_id: String,
     cloud: tauri::State<'_, SharedCloud>,

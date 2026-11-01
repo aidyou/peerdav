@@ -7,6 +7,8 @@ const { cloud, confirmAction, openDialog, listen, app } = vi.hoisted(() => ({
     list: vi.fn(), saveConnection: vi.fn(), testConnection: vi.fn(), deleteConnection: vi.fn(),
     createRepository: vi.fn(), joinRepository: vi.fn(), saveMapping: vi.fn(), deleteMapping: vi.fn(),
     preview: vi.fn(), sync: vi.fn(), cancel: vi.fn(), recoveryRecords: vi.fn(), restore: vi.fn(),
+    probeBuckets: vi.fn(),
+    connectionCredentials: vi.fn(),
   },
   confirmAction: vi.fn(), openDialog: vi.fn(), listen: vi.fn(),
   app: { handleFailure: vi.fn(), setNotice: vi.fn(), setError: vi.fn() },
@@ -36,28 +38,35 @@ async function mountCloud(data = rows) {
   return wrapper;
 }
 
-beforeEach(() => { setLocale("zh-CN"); Object.values(cloud).forEach((fn) => fn.mockReset()); confirmAction.mockReset(); confirmAction.mockResolvedValue(true); openDialog.mockReset(); app.handleFailure.mockReset(); app.setNotice.mockReset(); app.setError.mockReset(); progressHandler = undefined; });
+beforeEach(() => { setLocale("zh-CN"); Object.values(cloud).forEach((fn) => fn.mockReset()); confirmAction.mockReset(); confirmAction.mockResolvedValue(true); openDialog.mockReset(); app.handleFailure.mockReset(); app.setNotice.mockReset(); app.setError.mockReset(); progressHandler = undefined; cloud.connectionCredentials.mockResolvedValue({ accessKey: "", secretKey: "", sessionToken: null }); });
 
 describe("CloudSettings", () => {
   it("defaults to a multi-drive list without connection or sync forms", async () => {
     const wrapper = await mountCloud();
     expect(wrapper.text()).toContain('Primary'); expect(wrapper.findAll('input')).toHaveLength(0);
-    expect(wrapper.findAll('.settings-group')).toHaveLength(0); expect(wrapper.text()).not.toMatch(/CAS|Append|Repo/);
+    expect(wrapper.findAll('.connection-editor')).toHaveLength(0); expect(wrapper.text()).not.toMatch(/CAS|Append|Repo/);
     await wrapper.find('.cloud-browse-entry').trigger('click'); expect(window.location.hash).toBe('#/cloud/c1');
     expect(cloud.sync).not.toHaveBeenCalled(); wrapper.unmount(); window.history.replaceState(null, '', window.location.pathname);
   });
   it("opens a minimal add form with collapsed advanced settings and HTTP disabled", async () => {
     const wrapper = await mountCloud(); await wrapper.find('.connection-add').trigger('click');
     expect(wrapper.find('.connection-advanced').attributes('open')).toBeUndefined();
-    expect(wrapper.find('.connection-editor').findAll('label').filter((l) => !l.element.closest('details'))).toHaveLength(4);
+    expect(wrapper.find('.connection-editor').findAll('label').filter((l) => !l.element.closest('details'))).toHaveLength(5);
     expect(wrapper.findAll('input[type="checkbox"]').every((i) => !i.element.checked)).toBe(true); wrapper.unmount();
   });
-  it("infers Qiniu into the service endpoint and keeps HTTP opt-in", async () => {
+  it("infers Qiniu into the service endpoint, probes buckets, and keeps HTTP opt-in", async () => {
+    cloud.probeBuckets.mockResolvedValue([{ name: 'peerdav' }]);
     const wrapper = await mountCloud(); await wrapper.find('.connection-add').trigger('click');
     await wrapper.find('.connection-name input').setValue('New'); await wrapper.find('.connection-url input').setValue('http://peerdav.s3.cn-east-1.qiniucs.com');
+    await wrapper.find('.connection-access-key input').setValue('AK'); await wrapper.find('.connection-secret-key input').setValue('SK');
+    await wrapper.find('.connection-probe-run').trigger('click'); await flushPromises();
+    expect(cloud.probeBuckets).toHaveBeenCalledWith(expect.objectContaining({ endpoint: 'http://s3.cn-east-1.qiniucs.com', accessKey: 'AK', secretKey: 'SK', region: 'cn-east-1', allowInsecureHttp: false }));
     await wrapper.find('.connection-save').trigger('click'); await flushPromises();
     expect(cloud.saveConnection).toHaveBeenCalledWith(expect.objectContaining({ name: 'New', endpoint: 'http://s3.cn-east-1.qiniucs.com', bucket: 'peerdav', region: 'cn-east-1', pathStyle: true, allowInsecureHttp: false }));
-    expect(wrapper.find('.connection-editor').exists()).toBe(false); wrapper.unmount();
+    // 弹窗用 v-show 隐藏叠加层而非卸载内容；离开过渡需 jsdom 泵送 rAF 才收敛，故先 settle 再判定已关闭。
+    await flushPromises();
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    expect(/display:\s*none/.test(wrapper.find('.el-overlay').attributes('style') ?? '')).toBe(true); wrapper.unmount();
   });
   it("preserves edited values and credentials when URL is unchanged", async () => {
     const wrapper = await mountCloud({ ...rows, connections: [{ id: 'c1', name: 'Primary', endpoint: 'https://custom.example', bucket: 'old', region: 'custom', prefix: 'keep', pathStyle: true, proxy: { mode: 'custom', url: 'http://proxy', username: 'secret-user', password: 'secret-pass' } }] });
@@ -65,13 +74,24 @@ describe("CloudSettings", () => {
     await wrapper.find('.connection-name input').setValue('Renamed'); await wrapper.find('.connection-save').trigger('click'); await flushPromises();
     expect(cloud.saveConnection).toHaveBeenCalledWith(expect.objectContaining({ id: 'c1', name: 'Renamed', endpoint: 'https://custom.example', bucket: 'old', region: 'custom', prefix: 'keep', pathStyle: true, accessKey: undefined, secretKey: undefined, sessionToken: undefined })); wrapper.unmount();
   });
-  it("clears stale URL inference and requests missing bucket/region for unknown URLs", async () => {
+  it("backfills saved credentials and the multi-bucket selection when editing", async () => {
+    cloud.connectionCredentials.mockResolvedValue({ accessKey: "AK", secretKey: "SK", sessionToken: "T" });
+    const wrapper = await mountCloud({ ...rows, connections: [{ id: 'c1', name: 'Primary', endpoint: 'https://s3.cn-east-1.qiniucs.com', bucket: 'alpha', buckets: ['alpha', 'beta'], region: 'cn-east-1' }] });
+    await wrapper.find('.connection-edit').trigger('click'); await flushPromises();
+    expect(wrapper.find('.connection-access-key input').element.value).toBe('AK');
+    expect(wrapper.find('.connection-secret-key input').element.value).toBe('SK');
+    expect(wrapper.find('.connection-bucket').text()).toContain('alpha');
+    expect(wrapper.find('.connection-bucket').text()).toContain('beta');
+    await wrapper.find('.connection-save').trigger('click'); await flushPromises();
+    expect(cloud.saveConnection).toHaveBeenCalledWith(expect.objectContaining({ id: 'c1', bucket: 'alpha', buckets: ['alpha', 'beta'], accessKey: 'AK', secretKey: 'SK', sessionToken: 'T' }));
+    wrapper.unmount();
+  });
+  it("clears stale URL inference and requires a probed bucket for a new address", async () => {
     const wrapper = await mountCloud(); await wrapper.find('.connection-add').trigger('click');
     await wrapper.find('.connection-url input').setValue('https://peerdav.s3.cn-east-1.qiniucs.com');
     await wrapper.find('.connection-url input').setValue('https://custom.example'); await wrapper.find('.connection-save').trigger('click');
-    expect(cloud.saveConnection).not.toHaveBeenCalled(); expect(app.setError).toHaveBeenCalledWith('drive.detailsRequired');
-    const labels = wrapper.findAll('label'); expect(labels.find((l) => l.text().includes('存储桶')).find('input').element.value).toBe('');
-    expect(wrapper.find('.connection-advanced').attributes('open')).toBeDefined(); wrapper.unmount();
+    expect(cloud.saveConnection).not.toHaveBeenCalled(); expect(app.setError).toHaveBeenCalledWith('drive.bucketRequired');
+    expect(wrapper.find('.connection-bucket').exists()).toBe(false); wrapper.unmount();
   });
   it("renders local-only removal confirmation with a red counted sync warning and cancellation is inert", async () => {
     confirmAction.mockResolvedValue(false);
@@ -93,6 +113,9 @@ describe("CloudSettings", () => {
     const wrapper = await mountCloud();
     await wrapper.find('.connection-add').trigger('click');
     await wrapper.find('.connection-url input').setValue('https://peerdav.s3.cn-east-1.qiniucs.com');
+    cloud.probeBuckets.mockResolvedValue([{ name: 'peerdav' }]);
+    await wrapper.find('.connection-access-key input').setValue('AK'); await wrapper.find('.connection-secret-key input').setValue('SK');
+    await wrapper.find('.connection-probe-run').trigger('click'); await flushPromises();
     cloud.saveConnection.mockRejectedValueOnce({ code: 'CLOUD_STORAGE', message: 'original' });
     await wrapper.find('.connection-save').trigger('click'); await flushPromises(); expect(changed).not.toHaveBeenCalled();
     await wrapper.find('.connection-save').trigger('click'); await flushPromises(); expect(changed).toHaveBeenCalledTimes(1);
@@ -102,6 +125,6 @@ describe("CloudSettings", () => {
     window.removeEventListener('peerdav:cloud-changed', changed); wrapper.unmount();
   });
   it("renders both locales", async () => {
-    const wrapper = await mountCloud(); expect(wrapper.text()).toContain('添加网盘'); setLocale('en'); await nextTick(); expect(wrapper.text()).toContain('Add cloud drive'); wrapper.unmount();
+    const wrapper = await mountCloud(); expect(wrapper.find('.connection-add').attributes('aria-label')).toBe('添加网盘'); setLocale('en'); await nextTick(); expect(wrapper.find('.connection-add').attributes('aria-label')).toBe('Add cloud drive'); wrapper.unmount();
   });
 });

@@ -222,6 +222,8 @@ pub struct SaveS3Input {
     pub name: String,
     pub endpoint: String,
     pub bucket: String,
+    #[serde(default)]
+    pub buckets: Vec<String>,
     pub region: String,
     #[serde(default)]
     pub prefix: String,
@@ -246,11 +248,20 @@ pub struct SaveS3Input {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ConnectionCredentials {
+    pub access_key: String,
+    pub secret_key: String,
+    pub session_token: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConnectionRedacted {
     pub id: String,
     pub name: String,
     pub endpoint: String,
     pub bucket: String,
+    pub buckets: Vec<String>,
     pub region: String,
     pub prefix: String,
     pub path_style: bool,
@@ -304,6 +315,11 @@ impl CloudConnection {
             name: self.name.clone(),
             endpoint: self.config.endpoint.clone(),
             bucket: self.config.bucket.clone(),
+            buckets: if self.config.buckets.is_empty() {
+                vec![self.config.bucket.clone()]
+            } else {
+                self.config.buckets.clone()
+            },
             region: self.config.region.clone(),
             prefix: self.config.prefix.clone(),
             path_style: self.config.path_style,

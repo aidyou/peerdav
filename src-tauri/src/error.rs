@@ -535,6 +535,10 @@ impl From<crate::cloud::types::CloudError> for DomainError {
             CloudError::PrefixViolation => ("CLOUD_CONFIG_INVALID", "云端对象路径不在配置范围内"),
             CloudError::Random { .. } => ("CLOUD_CONFIG_INVALID", "云存储安全随机数生成失败"),
             CloudError::Transport { .. } => ("CLOUD_TRANSPORT", "云存储传输失败"),
+            CloudError::Service { .. } => (
+                "CLOUD_SERVICE",
+                "无法从该地址获取存储桶，请核对地址与密钥 / Unable to list buckets from this address; check the address and keys",
+            ),
             CloudError::Storage { .. } => ("CLOUD_STORAGE", "云存储操作失败"),
             CloudError::Multipart { .. } => ("CLOUD_STORAGE", "云端分片上传失败"),
             CloudError::MultipartAbort { .. } => (

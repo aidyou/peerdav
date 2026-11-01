@@ -592,7 +592,7 @@ pub(super) fn canonical(mut i: ProtectedIdentity) -> Result<ProtectedIdentity, O
     if !i.prefix.is_empty()
         && i.prefix
             .split('/')
-            .any(|x| x.is_empty() || x == "." || x == ".." || x.contains(char::is_whitespace))
+            .any(|x| x.is_empty() || x == "." || x == "..")
     {
         return Err(ObjectGuardError::InvalidIdentity);
     }

@@ -57,7 +57,7 @@ describe("cloud API wrappers", () => {
   it("does not invoke directly from the wrapper module", async () => {
     expect(invoke).toBeDefined();
     expect(Object.keys(cloud)).toEqual([
-      "list", "saveConnection", "testConnection", "deleteConnection",
+      "list", "probeBuckets", "connectionCredentials", "saveConnection", "testConnection", "deleteConnection",
       "createRepository", "joinRepository", "saveMapping", "appendDiscover", "createSyncDrive", "appendCreate", "appendJoin", "appendSaveMapping", "deleteMapping",
       "preview", "sync", "cancel", "recoveryRecords", "restore", "status",
     ]);
