@@ -141,8 +141,20 @@ impl S3Store {
         }
     }
 
-    fn path(&self, key: &str) -> ObjectPath {
-        ObjectPath::from(format!("{}{}", self.config.prefix, key))
+    fn path(&self, key: &str) -> Result<ObjectPath, CloudError> {
+        // Keys are raw UTF-8, not URL paths. From encodes path parts (including
+        // literal '%'); parse preserves their identity. HTTP escaping belongs
+        // to the SDK, and listed keys must never be percent-decoded here.
+        ObjectPath::parse(format!("{}{}", self.config.prefix, key))
+            .map_err(object_store::Error::from)
+            .map_err(map_err)
+    }
+
+    fn list_prefix(&self, prefix: &str) -> Result<String, CloudError> {
+        self.path(prefix)?;
+        // Path normalizes trailing '/', but paginated S3 listing accepts a raw
+        // string prefix: retain the directory delimiter and literal characters.
+        Ok(format!("{}{}", self.config.prefix, prefix))
     }
 
     #[cfg(test)]
@@ -329,7 +341,10 @@ impl ObjectStore for S3Store {
             return stream::once(async { Err(CloudError::PrefixViolation) }).boxed();
         }
         let root = self.config.prefix.clone();
-        let path = self.path(prefix);
+        let path = match self.path(prefix) {
+            Ok(path) => path,
+            Err(error) => return stream::once(async move { Err(error) }).boxed(),
+        };
         self.backend
             .list(Some(&path))
             .map(move |result| {
@@ -395,7 +410,7 @@ impl ObjectStore for S3Store {
             let store = self.paginated.as_ref().ok_or(CloudError::Unsupported)?;
             let result = store
                 .list_paginated(
-                    Some(&self.path(prefix).to_string()),
+                    Some(&self.list_prefix(prefix)?),
                     PaginatedListOptions {
                         max_keys: Some(PAGE_LIMIT),
                         page_token: (!state.provider_token.is_empty())
@@ -457,7 +472,7 @@ impl ObjectStore for S3Store {
         Box::pin(async move {
             validate_key(key)?;
             self.backend
-                .head(&self.path(key))
+                .head(&self.path(key)?)
                 .await
                 .map(|m| Self::meta(key.into(), m))
                 .map_err(map_err)
@@ -480,7 +495,7 @@ impl ObjectStore for S3Store {
             };
             let result = self
                 .backend
-                .get_opts(&self.path(key), opts)
+                .get_opts(&self.path(key)?, opts)
                 .await
                 .map_err(map_err)?;
             Ok(result.into_stream().map_err(map_err).boxed())
@@ -516,7 +531,7 @@ impl ObjectStore for S3Store {
             let result = self
                 .backend
                 .put_opts(
-                    &self.path(key),
+                    &self.path(key)?,
                     PutPayload::from(Bytes::from(data)),
                     PutOptions {
                         mode,
@@ -559,7 +574,7 @@ impl ObjectStore for S3Store {
             let max_stream_bytes = MAX_STREAM_BYTES;
             validate_key(key)?;
             let mut upload = self
-                .begin_multipart(self.path(key))
+                .begin_multipart(self.path(key)?)
                 .await
                 .map_err(|source| CloudError::Multipart {
                     operation: "create",
@@ -703,7 +718,7 @@ impl ObjectStore for S3Store {
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), CloudError>> {
         Box::pin(async move {
             validate_key(key)?;
-            self.backend.delete(&self.path(key)).await.map_err(map_err)
+            self.backend.delete(&self.path(key)?).await.map_err(map_err)
         })
     }
 }
@@ -732,6 +747,160 @@ mod cfgtest {
             }
         });
         S3Store::test_store(backend, factory)
+    }
+
+    #[test]
+    fn raw_key_path_api_contract() {
+        // object_store 0.14.2: From encodes path parts; parse accepts raw keys.
+        assert_eq!(
+            ObjectPath::from("图片/文件 100%.txt").as_ref(),
+            "%E5%9B%BE%E7%89%87/%E6%96%87%E4%BB%B6 100%25.txt"
+        );
+        for key in ["图片/文件 100%.txt", "%E5%9B%BE%E7%89%87/a%2Fb"] {
+            assert_eq!(ObjectPath::parse(key).expect("raw path").as_ref(), key);
+        }
+    }
+
+    #[test]
+    fn raw_key_listing_prefix_and_validation() {
+        let mut store = store();
+        store.config.prefix = "资料/嵌套%2F/".into();
+        for prefix in [
+            "",
+            "图片/",
+            "space dir/",
+            "%E5%9B%BE%E7%89%87/",
+            "literal%/a%2F",
+        ] {
+            assert_eq!(
+                store.list_prefix(prefix).expect("list prefix"),
+                format!("{}{prefix}", store.config.prefix)
+            );
+        }
+        for key in [
+            "",
+            "/escape",
+            "../escape",
+            "a/../b",
+            "a/./b",
+            "a//b",
+            "a\\b",
+            "a\0b",
+            "a:b",
+        ] {
+            assert!(validate_key(key).is_err(), "accepted unsafe key {key:?}");
+        }
+        assert!(store.path("invalid\nb").is_err());
+    }
+
+    #[tokio::test]
+    async fn raw_key_backend_roundtrip() {
+        for root in ["", "资料/嵌套 空格%2F/"] {
+            let mut store = store();
+            store.config.prefix = root.into();
+            for key in [
+                "图片/中文 文件.txt",
+                "space dir/100%.txt",
+                "literal%/a%2Fb",
+                "%E5%9B%BE%E7%89%87/old%20file",
+            ] {
+                store
+                    .put(key, body(b"raw"), PutCondition::Any)
+                    .await
+                    .expect("put");
+                let raw = ObjectPath::parse(format!("{root}{key}")).expect("raw key");
+                assert_eq!(
+                    store
+                        .backend
+                        .head(&raw)
+                        .await
+                        .expect("actual stored raw key")
+                        .location,
+                    raw
+                );
+                assert_eq!(store.stat(key).await.expect("stat").key, key);
+                let bytes = store
+                    .get(key, None)
+                    .await
+                    .expect("get")
+                    .map_ok(|chunk| chunk.to_vec())
+                    .try_concat()
+                    .await
+                    .expect("read");
+                assert_eq!(bytes.as_slice(), b"raw");
+                let prefix = format!("{}/", key.split('/').next().expect("directory"));
+                let listed = store
+                    .list(&prefix)
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .expect("list directory");
+                assert_eq!(listed.len(), 1);
+                assert_eq!(listed[0].key, key);
+                store.delete(key).await.expect("delete");
+                assert!(matches!(
+                    store.backend.head(&raw).await,
+                    Err(object_store::Error::NotFound { .. })
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_key_existing_encoded_objects_remain_literal() {
+        let store = store();
+        for key in [
+            "图片/文件.txt",
+            "%E5%9B%BE%E7%89%87/%E6%96%87%E4%BB%B6.txt",
+            "图片/a%2Fb",
+        ] {
+            store
+                .backend
+                .put(
+                    &ObjectPath::parse(key).expect("raw key"),
+                    PutPayload::from_static(key.as_bytes()),
+                )
+                .await
+                .expect("seed literal provider key");
+        }
+        let listed = store
+            .list("")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("list root");
+        assert_eq!(listed.len(), 3);
+        for meta in listed {
+            let data = store
+                .get(&meta.key, None)
+                .await
+                .expect("get listed literal key")
+                .map_ok(|chunk| chunk.to_vec())
+                .try_concat()
+                .await
+                .expect("read");
+            assert_eq!(data.as_slice(), meta.key.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_key_multipart_uses_same_boundary() {
+        let mut store = store();
+        store.config.prefix = "资料/嵌套%/".into();
+        let key = "图片/文件 空格%2F.txt";
+        store
+            .upload_stream(key, body(b"multipart"))
+            .await
+            .expect("upload");
+        let raw = ObjectPath::parse(format!("{}{key}", store.config.prefix)).expect("raw path");
+        assert_eq!(
+            store
+                .backend
+                .head(&raw)
+                .await
+                .expect("multipart raw location")
+                .location,
+            raw
+        );
+        assert_eq!(store.stat(key).await.expect("stat").size, 9);
     }
 
     #[derive(Clone, Copy, Debug, Default)]
