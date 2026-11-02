@@ -225,6 +225,7 @@ enum DownloadMode {
     ChangedSize,
     CancelAtEnd(Arc<AtomicBool>),
     CommitCollision(std::path::PathBuf),
+    FileCollision(std::path::PathBuf),
     CleanupFailure(std::path::PathBuf),
 }
 
@@ -321,6 +322,11 @@ impl ObjectStore for DownloadStore {
                 }
                 DownloadMode::CommitCollision(path) => stream::once(async move {
                     std::fs::create_dir(path).unwrap();
+                    Ok(first)
+                })
+                .boxed(),
+                DownloadMode::FileCollision(path) => stream::once(async move {
+                    std::fs::write(path, b"racing writer").unwrap();
                     Ok(first)
                 })
                 .boxed(),
@@ -470,6 +476,23 @@ async fn download_commit_failure_cleans_staging_and_preserves_destination_direct
         assert!(target.is_dir());
         assert_no_staging(d.path());
     }
+}
+
+#[tokio::test]
+async fn download_racing_file_after_preflight_never_overwrites_without_confirmation() {
+    let d = tempdir().unwrap();
+    let target = d.path().join("out");
+    let root = PhysicalRoot::open(d.path()).unwrap();
+    assert!(!root.relative_target_exists("out").unwrap());
+    let (store, _) = DownloadStore::new(b"new", 3, DownloadMode::FileCollision(target.clone()));
+    assert!(matches!(
+        download_service(store, d.path())
+            .download_to("remote/object", "out", None, false)
+            .await,
+        Err(ObjectServiceError::DestinationExists)
+    ));
+    assert_eq!(std::fs::read(target).unwrap(), b"racing writer");
+    assert_no_staging(d.path());
 }
 
 #[tokio::test]

@@ -277,6 +277,10 @@ const downloadDialogOpen = ref(false);
 const downloadRoot = ref("");
 const downloadQueue = ref([]);
 const downloadCanceled = ref(false);
+const downloadActionBusy = ref(false);
+let downloadActionVersion = 0;
+const downloadClosing = ref(false);
+const dismissedDownloads = new Set();
 // Upload completions become toasts, so the transfer list never grows forever.
 const uploadNotices = new Set();
 const downloadFinishedCount = computed(() => downloadQueue.value.filter((item) => ["done", "error", "canceled"].includes(item.status)).length);
@@ -294,7 +298,8 @@ function applyDownloadStatus(transfer) {
     cancelled: "canceled",
     unknown: "error",
   }[transfer.phase] ?? "downloading";
-  item.retryable = transfer.phase === "failed" && ["CLOUD_PRECONDITION", "TRANSFER_CONFLICT"].includes(transfer.error?.code);
+  item.transfer = transfer;
+  item.retryable = transfer.phase === "failed" && !transfer.recoveryRequired;
   item.error = item.status === "canceled" ? "" : transfer.error?.message ?? "";
   if (transfer.error && item.status === "error") handleAuthenticationFailure(transfer.error);
 }
@@ -803,48 +808,64 @@ const downloadTargets = ref({});
 // rejects the whole batch and the UI can explain the limit.
 const DOWNLOAD_BATCH_LIMIT = 100;
 async function retryDownload(item) {
-  const scope = current();
-  if (!await confirmAction(t("cloudBrowser.downloadRetry"), t("cloudBrowser.download")) || !valid(scope)) return;
-  await download(item, true);
+  if (!item?.retryable || downloadRunning.value) return;
+  await download(downloadTargets.value[item.transferId] ?? { key: item.key, name: baseName(item.relativePath) }, item);
 }
-async function download(item, confirmed = false) {
-  if (!item || item.isDir) return;
-  await operate(async (scope) => {
-    const args = { connectionId: scope.connectionId, direction: "download" };
-    let selected = await cloudObjects.selectLocal(args);
-    if (!valid(scope) || !selected?.token) return;
-    const run = async (overwriteConfirmed) => {
-      if (!item.relativePath) {
-        return cloudObjects.download({ connectionId: scope.connectionId, localToken: selected.token, key: item.key, fileName: item.name, overwriteConfirmed });
-      }
-      const [transfer] = (await cloudObjects.downloadBatch({
-        connectionId: scope.connectionId,
-        localToken: selected.token,
-        items: [{ key: item.key, relativePath: item.relativePath }],
-        overwriteConfirmed,
-      })).transfers;
-      return transfer;
-    };
-    const accept = (transfer) => {
-      if (valid(scope)) {
-        const queued = downloadQueue.value.find((entry) => entry.key === item.key && entry.relativePath === item.relativePath);
-        if (queued) {
-          delete downloadTargets.value[queued.transferId];
-          queued.transferId = transfer.transferId;
-        }
-        downloadTargets.value[transfer.transferId] = { ...item };
-      }
-      remember(transfer, scope);
-    };
-    try { accept(await run(confirmed)); }
-    catch (cause) {
-      if (confirmed || !["CLOUD_PRECONDITION", "TRANSFER_CONFLICT"].includes(cause.code) || !valid(scope)) throw cause;
-      if (!await confirmAction(t("cloudBrowser.downloadRetry"), t("cloudBrowser.download")) || !valid(scope)) return;
-      selected = await cloudObjects.selectLocal(args);
-      if (!valid(scope) || !selected?.token) return;
-      error.value = null; accept(await run(true));
+async function acknowledgeDownload(transfer) {
+  if (!transfer || transfer.direction !== "download" || transfer.recoveryRequired || !["completed", "failed", "cancelled"].includes(transfer.phase)) return;
+  if (dismissedDownloads.has(transfer.transferId)) return;
+  await cloudObjects.recoveryAcknowledge({ transferId: transfer.transferId, connectionId: transfer.connectionId, connectionRevision: transfer.connectionRevision, confirmed: true });
+  dismissedDownloads.add(transfer.transferId);
+  statusVersion++;
+}
+async function closeDownloadQueue() {
+  if (downloadRunning.value || downloadActionBusy.value || downloadClosing.value) return;
+  downloadClosing.value = true;
+  const scope = current();
+  try {
+    for (const item of downloadQueue.value) {
+      await acknowledgeDownload(item.transfer);
+      for (const previous of item.previousTransfers ?? []) await acknowledgeDownload(previous);
     }
-  });
+    if (!valid(scope)) return;
+    downloadDialogOpen.value = false;
+    downloadQueue.value = [];
+    downloadTargets.value = {};
+  } catch (cause) { if (valid(scope)) app.handleFailure(cause); }
+  finally { downloadClosing.value = false; }
+}
+async function download(item, retryItem = null) {
+  if (!item || item.isDir || downloadActionBusy.value || downloadClosing.value || (downloadRunning.value && !retryItem)) return;
+  downloadActionBusy.value = true;
+  const actionVersion = ++downloadActionVersion;
+  try {
+    await operate(async (scope) => {
+      const selected = await cloudObjects.selectLocal({ connectionId: scope.connectionId, direction: "download" });
+      if (!valid(scope) || !selected?.token) return;
+      const run = async (overwriteConfirmed) => {
+        if (!item.relativePath) return cloudObjects.download({ connectionId: scope.connectionId, localToken: selected.token, key: item.key, fileName: item.name, overwriteConfirmed });
+        return (await cloudObjects.downloadBatch({ connectionId: scope.connectionId, localToken: selected.token, items: [{ key: item.key, relativePath: item.relativePath }], overwriteConfirmed })).transfers[0];
+      };
+      let transfer;
+      try { transfer = await run(false); }
+      catch (cause) {
+        if (cause?.code !== "TRANSFER_CONFLICT" || !valid(scope)) throw cause;
+        if (!await confirmAction(t("cloudBrowser.downloadOverwrite"), t("cloudBrowser.download")) || !valid(scope)) return;
+        transfer = await run(true);
+      }
+      if (!valid(scope)) return;
+      statusVersion++;
+      const queued = { transferId: transfer.transferId, key: item.key, relativePath: item.relativePath ?? item.name, size: item.size ?? null,
+        previousTransfers: retryItem ? [...(retryItem.previousTransfers ?? []), retryItem.transfer] : [] };
+      if (retryItem) downloadQueue.value.splice(downloadQueue.value.indexOf(retryItem), 1, queued);
+      else downloadQueue.value.push(queued);
+      downloadCanceled.value = false;
+      downloadTargets.value[transfer.transferId] = { ...item };
+      applyDownloadStatus(transfer);
+      downloadDialogOpen.value = true;
+      remember(transfer, scope);
+    });
+  } finally { if (actionVersion === downloadActionVersion) downloadActionBusy.value = false; }
 }
 async function collectFolderItems(prefixKey, relativeBase, scope, items) {
   let next = null;
@@ -868,7 +889,7 @@ async function collectFolderItems(prefixKey, relativeBase, scope, items) {
 // below it and every file still becomes its own visible transfer.
 async function downloadSelection() {
   const selection = selectedEntries.value.slice();
-  if (!selection.length) return;
+  if (!selection.length || downloadRunning.value || downloadActionBusy.value || downloadClosing.value) return;
   if (selection.length === 1 && !selection[0].isDir) { await download(selection[0]); return; }
   await operate(async (scope) => {
     const chosen = await cloudObjects.selectLocal({ connectionId: scope.connectionId, direction: "download" });
@@ -915,7 +936,7 @@ async function downloadSelection() {
     if (!valid(scope)) return;
     downloadCanceled.value = false;
     downloadRoot.value = localRoot || "";
-    downloadQueue.value = created.map((transfer) => {
+    downloadQueue.value.push(...created.map((transfer) => {
       const source = planned.find((candidate) => candidate.key === transfer.key);
       return {
         transferId: transfer.transferId,
@@ -925,7 +946,7 @@ async function downloadSelection() {
         status: transfer.phase === "completed" ? "done" : "downloading",
         error: transfer.error?.message ?? "",
       };
-    });
+    }));
     for (const transfer of created) applyDownloadStatus(transfer);
     downloadDialogOpen.value = true;
     for (const transfer of created) {
@@ -943,17 +964,19 @@ async function cancelDownloadQueue() {
   if (!downloadRunning.value || downloadCanceled.value) return;
   downloadCanceled.value = true;
   const active = downloadQueue.value.filter((item) => item.transferId && ["pending", "downloading"].includes(item.status));
+  const scope = current();
+  let failed = false;
   for (const item of active) {
-    item.status = "canceled";
-    try { await cloudObjects.cancel(item.transferId); }
-    catch (cause) { app.handleFailure(cause); }
+    try { remember(await cloudObjects.cancel(item.transferId), scope); }
+    catch (cause) { failed = true; app.handleFailure(cause); }
   }
+  if (valid(scope) && failed) downloadCanceled.value = false;
 }
 async function revealDownloadRoot() {
   if (!downloadRoot.value) return;
   try {
     await invoke("reveal_local_directory", { path: downloadRoot.value });
-    downloadDialogOpen.value = false;
+    await closeDownloadQueue();
   } catch (cause) { app.handleFailure(cause); }
 }
 function validDeletePlan(plan, target) {
@@ -1000,8 +1023,19 @@ async function poll() {
   try {
     const result = await cloudObjects.status();
     if (valid(scope) && version === statusVersion) {
-      const scoped = result.filter((item) => item.connectionId === scope.connectionId);
-      const queued = new Set(downloadQueue.value.map((item) => item.transferId).filter(Boolean));
+      const scoped = result.filter((item) => item.connectionId === scope.connectionId && !dismissedDownloads.has(item.transferId));
+      const uncertain = new Set(scoped.filter((item) => item.recoveryRequired || item.phase === "unknown").map((item) => item.transferId));
+      downloadQueue.value = downloadQueue.value.filter((item) => !uncertain.has(item.transferId));
+      // Recover prior-session local downloads visibly, never silently dismiss
+      // them. Unknown/recovery-required operations stay in the recovery pane.
+      for (const item of scoped) {
+        if (item.direction !== "download" || item.recoveryRequired || item.phase === "unknown" || item.phase === "acknowledged") continue;
+        if (!downloadQueue.value.some((entry) => entry.transferId === item.transferId || entry.previousTransfers?.some((old) => old?.transferId === item.transferId))) {
+          downloadQueue.value.push({ transferId: item.transferId, key: item.key, relativePath: item.key ?? "", size: item.sizeHint });
+          downloadDialogOpen.value = true;
+        }
+      }
+      const queued = new Set(downloadQueue.value.flatMap((item) => [item.transferId, ...(item.previousTransfers ?? []).map((old) => old?.transferId)]).filter(Boolean));
       let refreshAfterUpload = false;
       for (const item of scoped) {
         if (queued.has(item.transferId)) applyDownloadStatus(item);
@@ -1018,6 +1052,12 @@ async function poll() {
         }
       }
       transfers.value = scoped.filter((item) => !["completed", "cancelled"].includes(item.phase) && !queued.has(item.transferId));
+      for (const item of downloadQueue.value.filter((entry) => entry.status === "done")) {
+        for (const previous of item.previousTransfers ?? []) {
+          try { await acknowledgeDownload(previous); }
+          catch (cause) { app.handleFailure(cause); }
+        }
+      }
       if (refreshAfterUpload) refresh();
     }
   } catch (cause) {
@@ -1035,6 +1075,7 @@ async function bootstrap() {
   else { void prepare(); void load(); }
 }
 watch(() => props.connectionId, () => {
+  downloadActionVersion++; downloadActionBusy.value = false; downloadClosing.value = false;
   void cancelUploadSession();
   requestId++; statusVersion++; preparationVersion++; downloadTargets.value = {}; uploadNotices.clear(); downloadDialogOpen.value = false; downloadRoot.value = ""; downloadQueue.value = []; downloadCanceled.value = false; prepared.value = false; preparing.value = false; preparationError.value = null; protectedRoot.value = false; connections.value = [];
   view.value = "files"; activeDriveId.value = ""; catalogDrives.value = []; buckets.value = []; activeBucket.value = "";
@@ -1219,7 +1260,7 @@ onBeforeUnmount(() => {
             <p>{{ t('cloudBrowser.deleteResult', { deleted: partial.deleted.length, failed: partial.failed.length }) }}</p>
             <ul><li v-for="item in partial.failed" :key="item.key">{{ item.key }} · {{ item.error.message }}</li></ul>
           </div>
-          <ul v-if="transfers.length" class="cloud-tree cloud-transfers" :aria-label="t('cloudBrowser.transfers')"><li v-for="item in transfers" :key="item.transferId"><span>{{ item.key == null ? t('cloudBrowser.unknownTarget') : JSON.stringify(item.key) }}<span v-if="item.sizeHint != null"> · {{ t('cloudBrowser.bytes', { size: item.sizeHint }) }}</span> · {{ t(`cloudBrowser.${item.direction}`) }} · {{ t(`cloudBrowser.phase.${item.phase}`) }}<strong v-if="item.recoveryRequired || item.phase === 'unknown'"> · {{ t('cloudBrowser.recovery') }}</strong><span v-if="item.error"> · {{ item.error.message }}</span></span><el-button v-if="item.phase === 'failed' && item.direction === 'download' && ['CLOUD_PRECONDITION', 'TRANSFER_CONFLICT'].includes(item.error?.code) && downloadTargets[item.transferId]" :disabled="busy" @click="retryDownload(downloadTargets[item.transferId])">{{ t('cloudBrowser.retryDownload') }}</el-button><p v-if="item.phase === 'acknowledged'">{{ t('cloudBrowser.acknowledgedNotice') }}</p><el-button v-if="item.phase === 'unknown'" :disabled="busy" @click="acknowledge(item)">{{ t('cloudBrowser.acknowledge') }}</el-button><el-button v-if="item.phase === 'running'" :disabled="busy" @click="cancel(item)">{{ t('cloudBrowser.cancel') }}</el-button></li></ul>
+          <ul v-if="transfers.length" class="cloud-tree cloud-transfers" :aria-label="t('cloudBrowser.transfers')"><li v-for="item in transfers" :key="item.transferId"><span>{{ item.key == null ? t('cloudBrowser.unknownTarget') : JSON.stringify(item.key) }}<span v-if="item.sizeHint != null"> · {{ t('cloudBrowser.bytes', { size: item.sizeHint }) }}</span> · {{ t(`cloudBrowser.${item.direction}`) }} · {{ t(`cloudBrowser.phase.${item.phase}`) }}<strong v-if="item.recoveryRequired || item.phase === 'unknown'"> · {{ t('cloudBrowser.recovery') }}</strong><span v-if="item.error"> · {{ item.error.message }}</span></span><p v-if="item.phase === 'acknowledged'">{{ t('cloudBrowser.acknowledgedNotice') }}</p><el-button v-if="item.phase === 'unknown'" :disabled="busy" @click="acknowledge(item)">{{ t('cloudBrowser.acknowledge') }}</el-button><el-button v-if="item.phase === 'running'" :disabled="busy" @click="cancel(item)">{{ t('cloudBrowser.cancel') }}</el-button></li></ul>
         </template>
       </main>
     </div>
@@ -1238,8 +1279,8 @@ onBeforeUnmount(() => {
       @close="closeUpload" @cancel="cancelUpload" @page="loadUploadPage" @resolve="resolveUploadConflict" />
     <TransferQueueDialog :open="downloadDialogOpen" :items="downloadQueue" :running="downloadRunning" :canceling="downloadCanceled"
       :summary="downloadSummary" :root="downloadRoot" :note="t('transferQueue.cloudProgress')"
-      @cancel="cancelDownloadQueue" @close="downloadDialogOpen = false" @reveal="revealDownloadRoot"
-      @retry="retryDownload(downloadTargets[$event.transferId])" />
+      @cancel="cancelDownloadQueue" @close="closeDownloadQueue" @reveal="revealDownloadRoot"
+      @retry="retryDownload" />
   </section>
 </template>
 

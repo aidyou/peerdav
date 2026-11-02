@@ -126,7 +126,9 @@ impl PhysicalRoot {
         })
     }
     pub(crate) fn upload_directory_handle(&self) -> Result<cap_std::fs::Dir, ObjectServiceError> {
-        self.dir.try_clone().map_err(|source| ObjectServiceError::Io { source })
+        self.dir
+            .try_clone()
+            .map_err(|source| ObjectServiceError::Io { source })
     }
     /// Whether a relative download target already exists under this capability.
     pub fn relative_target_exists(&self, relative_path: &str) -> Result<bool, ObjectServiceError> {
@@ -138,23 +140,23 @@ impl PhysicalRoot {
             .try_clone()
             .map_err(|source| ObjectServiceError::Io { source })?;
         for part in parents {
-            match dir.open_dir(part) {
-                Ok(next) => dir = next,
-                Err(source)
-                    if matches!(
-                        source.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                    ) =>
-                {
-                    return Ok(false);
+            match dir.symlink_metadata(part) {
+                Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                    return Err(ObjectServiceError::InvalidLocalCapability);
                 }
+                Ok(_) => {}
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
                 Err(source) => return Err(ObjectServiceError::Io { source }),
             }
+            dir = dir
+                .open_dir(part)
+                .map_err(|source| ObjectServiceError::Io { source })?;
         }
         match dir.symlink_metadata(name) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 Err(ObjectServiceError::DestinationSymlink)
             }
+            Ok(meta) if !meta.is_file() => Err(ObjectServiceError::InvalidLocalCapability),
             Ok(_) => Ok(true),
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(source) => Err(ObjectServiceError::Io { source }),

@@ -1769,7 +1769,8 @@ mod tests {
             .object_grant_selected("connection", 1, &target, false)
             .await?
             .token;
-        let task = f
+        let reads = f.store.reads.load(Ordering::SeqCst);
+        let conflict = f
             .runtime
             .object_download(
                 "connection",
@@ -1778,21 +1779,15 @@ mod tests {
                 "file".into(),
                 false,
             )
-            .await?;
-        assert_eq!(
-            settled(&f, &task.transfer_id)
-                .await?
-                .error
-                .ok_or("expected conflict")?
-                .code,
-            "CLOUD_PRECONDITION"
-        );
+            .await
+            .expect_err("existing targets must conflict before spawning a task");
+        assert_eq!(conflict.code, "TRANSFER_CONFLICT");
+        // Declining confirmation needs no second command: no task, I/O or grant
+        // consumption took place. Confirmation must reuse this exact grant.
+        assert!(f.runtime.objects.lock().await.tasks.is_empty());
+        assert!(f.runtime.objects.lock().await.grants.contains_key(&token));
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), reads);
         assert_eq!(std::fs::read(target.join("file"))?, b"original");
-        let token = f
-            .runtime
-            .object_grant_selected("connection", 1, &target, false)
-            .await?
-            .token;
         let task = f
             .runtime
             .object_download(
@@ -1817,6 +1812,171 @@ mod tests {
                 .await
                 .is_err()
         );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn download_preflight_rejects_unsafe_grants_and_targets_without_consumption()
+    -> Result<(), TestError> {
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let target = f._dir.path().join("preflight-target");
+        std::fs::create_dir(&target)?;
+        std::fs::create_dir(target.join("directory"))?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("directory", target.join("link"))?;
+        let token = f
+            .runtime
+            .object_grant_selected("connection", 1, &target, false)
+            .await?
+            .token;
+        let reads = f.store.reads.load(Ordering::SeqCst);
+        for name in ["../escape", "nested/file", "directory", "", "link"] {
+            for confirmed in [false, true] {
+                let result = f
+                    .runtime
+                    .object_download(
+                        "connection",
+                        &token,
+                        "data/file".into(),
+                        name.into(),
+                        confirmed,
+                    )
+                    .await;
+                assert!(
+                    result.is_err(),
+                    "unsafe target {name:?} must fail synchronously"
+                );
+                assert!(f.runtime.objects.lock().await.grants.contains_key(&token));
+            }
+        }
+        assert!(
+            f.runtime
+                .object_download("other", &token, "data/file".into(), "file".into(), false)
+                .await
+                .is_err()
+        );
+        f.runtime
+            .objects
+            .lock()
+            .await
+            .grants
+            .get_mut(&token)
+            .ok_or("grant missing")?
+            .revision = 0;
+        assert!(
+            f.runtime
+                .object_download(
+                    "connection",
+                    &token,
+                    "data/file".into(),
+                    "file".into(),
+                    false
+                )
+                .await
+                .is_err()
+        );
+        f.runtime
+            .objects
+            .lock()
+            .await
+            .grants
+            .get_mut(&token)
+            .ok_or("grant missing")?
+            .revision = 1;
+        assert!(
+            f.runtime
+                .object_upload("connection", &token, "data/file".into(), None, false)
+                .await
+                .is_err()
+        );
+        assert!(f.runtime.objects.lock().await.grants.contains_key(&token));
+        assert!(f.runtime.objects.lock().await.tasks.is_empty());
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), reads);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn download_terminal_acknowledge_is_explicit_identity_checked_and_local()
+    -> Result<(), TestError> {
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let target = f._dir.path().join("ack-target");
+        std::fs::create_dir(&target)?;
+        let token = f
+            .runtime
+            .object_grant_selected("connection", 1, &target, false)
+            .await?
+            .token;
+        let task = f
+            .runtime
+            .object_download(
+                "connection",
+                &token,
+                "data/file".into(),
+                "file".into(),
+                false,
+            )
+            .await?;
+        assert_eq!(settled(&f, &task.transfer_id).await?.phase, "completed");
+        let reads = f.store.reads.load(Ordering::SeqCst);
+        for (connection, revision, confirmed) in [
+            ("connection", 1, false),
+            ("other", 1, true),
+            ("connection", 2, true),
+        ] {
+            assert!(
+                f.runtime
+                    .object_recovery_acknowledge(&task.transfer_id, connection, revision, confirmed)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                f.runtime
+                    .objects
+                    .lock()
+                    .await
+                    .tasks
+                    .contains_key(&task.transfer_id)
+            );
+        }
+        {
+            let mut state = f.runtime.objects.lock().await;
+            let entry = state
+                .tasks
+                .get_mut(&task.transfer_id)
+                .ok_or("task missing")?;
+            entry.status.phase = "running".into();
+        }
+        assert!(
+            f.runtime
+                .object_recovery_acknowledge(&task.transfer_id, "connection", 1, true)
+                .await
+                .is_err()
+        );
+        f.runtime
+            .objects
+            .lock()
+            .await
+            .tasks
+            .get_mut(&task.transfer_id)
+            .ok_or("task missing")?
+            .status
+            .phase = "cancelled".into();
+        assert_eq!(
+            f.runtime
+                .object_recovery_acknowledge(&task.transfer_id, "connection", 1, true)
+                .await?
+                .phase,
+            "acknowledged"
+        );
+        assert!(
+            !f.runtime
+                .objects
+                .lock()
+                .await
+                .tasks
+                .contains_key(&task.transfer_id)
+        );
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), reads);
         Ok(())
     }
     #[tokio::test]
@@ -2774,6 +2934,28 @@ impl CloudRuntime {
         let session = self.object_session(connection_id).await?;
         let mut state = self.objects.lock().await;
         state.prune();
+        // Match batch preflight: validate a borrowed grant before consuming it
+        // or making room for a task. A declined conflict has no side effects.
+        {
+            let bound = state.grants.get(token).ok_or_else(state_error)?;
+            if bound.connection_id != connection_id || bound.revision != session.revision {
+                return Err(state_error());
+            }
+            match (&bound.grant, &file_name) {
+                (LocalGrant::Upload(_), None) => {}
+                (LocalGrant::Download(root), Some(name)) => {
+                    super::object_service::valid_relative_path(&key).map_err(app)?;
+                    super::object_service::valid_relative_path(name).map_err(app)?;
+                    if name.contains('/') {
+                        return Err(app(ObjectServiceError::InvalidKey));
+                    }
+                    if root.relative_target_exists(name).map_err(app)? && !confirmed {
+                        return Err(DomainError::TransferConflict { path: name.clone() }.into());
+                    }
+                }
+                _ => return Err(state_error()),
+            }
+        }
         if state.tasks.len() >= crate::types::MAX_CLOUD_TASKS {
             if let Some(oldest) = state
                 .tasks
@@ -3218,6 +3400,38 @@ impl CloudRuntime {
             .is_some_and(|b| matches!(b.status.phase.as_str(), "running" | "conflict"))
         {
             return Err(state_error());
+        }
+        // Downloads have no remote recovery journal. Explicit dismissal may
+        // remove only an identity-matched terminal local task; unknown/recovery
+        // records continue through the stricter upload recovery path below.
+        if let Some(task) = state.tasks.get(transfer_id) {
+            let status = &task.status;
+            if status.direction == "download"
+                && status.connection_id == connection_id
+                && status.connection_revision == connection_revision
+                && !status.recovery_required
+                && matches!(status.phase.as_str(), "completed" | "failed" | "cancelled")
+            {
+                let mut acknowledged = status.clone();
+                acknowledged.phase = "acknowledged".into();
+                if let Some(handle) = state
+                    .tasks
+                    .get_mut(transfer_id)
+                    .and_then(|task| task.handle.take())
+                {
+                    // Terminal status is published just before the task exits;
+                    // retain supervision instead of detaching that last tail.
+                    if let Err(source) = handle.await {
+                        let error = app(DomainError::Internal {
+                            detail: source.to_string(),
+                        });
+                        self.object_report(error.clone());
+                        return Err(error);
+                    }
+                }
+                state.tasks.remove(transfer_id);
+                return Ok(acknowledged);
+            }
         }
         let mut status = self
             .object_recovery_read()?

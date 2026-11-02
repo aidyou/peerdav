@@ -562,13 +562,110 @@ describe("CloudBrowser", () => {
     expect(wrapper.find('.cloud-transfers').text()).not.toContain('t1');
   });
   it("does not upload if ETag overwrite confirmation is declined", async () => { confirmAction.mockResolvedValue(false); const wrapper = await browser(); await prepare(wrapper); await click(wrapper, '[data-test=upload]'); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_upload")).toBe(false); });
-  it("downloads without overwrite then confirms and reselects a token after backend conflict", async () => {
-    let selects = 0; handlers.cloud_object_select_local = () => ({ token: `token-${++selects}` }); let attempts = 0; handlers.cloud_object_download = () => { if (++attempts === 1) throw error("CLOUD_PRECONDITION"); return transfer("running", { direction: "download" }); };
+  it("downloads through the shared dialog and confirms only stable conflicts with the same token", async () => {
+    let selects = 0; handlers.cloud_object_select_local = () => ({ token: `token-${++selects}` }); let attempts = 0; handlers.cloud_object_download = () => { if (++attempts === 1) throw error("TRANSFER_CONFLICT"); return transfer("running", { direction: "download" }); };
     const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, "Download").trigger("click"); await flushPromises();
-    const calls = nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_download"); expect(calls.map(([, args]) => [args.localToken, args.overwriteConfirmed])).toEqual([["token-1", false], ["token-2", true]]); expect(confirmAction).toHaveBeenCalledOnce();
+    const calls = nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_download"); expect(calls.map(([, args]) => [args.localToken, args.overwriteConfirmed])).toEqual([["token-1", false], ["token-1", true]]); expect(confirmAction).toHaveBeenCalledOnce();
+    expect(selects).toBe(1); expect(wrapper.find('[data-test=cancel-download]').exists()).toBe(true);
+    expect(wrapper.find('.download-queue li').attributes('data-status')).toBe('downloading');
   });
-  it("supports asynchronous failed-download precondition retry without auto overwrite", async () => {
-    handlers.cloud_object_download = () => transfer("running", { direction: "download" }); const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, "Download").trigger("click"); await flushPromises(); handlers.cloud_object_status = () => [transfer("failed", { direction: "download", error: error("CLOUD_PRECONDITION") })]; await vi.advanceTimersByTimeAsync(1500); await flushPromises(); expect(confirmAction).not.toHaveBeenCalled(); await textButton(wrapper, t("cloudBrowser.retryDownload")).trigger("click"); await flushPromises(); expect(confirmAction).toHaveBeenCalledOnce(); expect(nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_select_local")).toHaveLength(2); expect(nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_download")[1][1].overwriteConfirmed).toBe(true);
+  it("shows asynchronous download failure in the shared dialog and retries without auto overwrite", async () => {
+    let attempts = 0;
+    handlers.cloud_object_download = () => transfer("running", { direction: "download", transferId: `t${++attempts}` }); const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, "Download").trigger("click"); await flushPromises(); handlers.cloud_object_status = () => [transfer("failed", { direction: "download", error: error("CLOUD_PRECONDITION", "size changed") })]; await vi.advanceTimersByTimeAsync(1500); await flushPromises(); expect(confirmAction).not.toHaveBeenCalled();
+    expect(wrapper.find('.download-queue').text()).toContain('size changed');
+    await click(wrapper, '[data-test=retry-download]');
+    expect(confirmAction).not.toHaveBeenCalled(); expect(nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_select_local")).toHaveLength(2); expect(nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_download")[1][1].overwriteConfirmed).toBe(false);
+  });
+  it.each([false, true])('keeps pending single-download confirmation bounded and reuses its grant (%s)', async (accepted) => {
+    const answer = deferred(); confirmAction.mockImplementation(() => answer.promise);
+    handlers.cloud_object_download = ({ overwriteConfirmed }) => { if (!overwriteConfirmed) throw error('TRANSFER_CONFLICT'); return transfer('running', { direction: 'download' }); };
+    const wrapper = await browser(); await click(wrapper, '[data-test=file-row]');
+    await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
+    await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download')).toHaveLength(1);
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_select_local')).toHaveLength(1);
+    expect(wrapper.find('[data-test=cancel-download]').exists()).toBe(false);
+    answer.resolve(accepted); await flushPromises();
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download')).toHaveLength(accepted ? 2 : 1);
+    expect(confirmAction).toHaveBeenCalledOnce();
+  });
+  it('does not turn transport, symlink or size preconditions into overwrite permission', async () => {
+    handlers.cloud_object_download = () => { throw error('CLOUD_PRECONDITION', 'destination is a symlink'); };
+    const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
+    expect(confirmAction).not.toHaveBeenCalled();
+    expect(wrapper.text()).toContain('destination is a symlink');
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download')).toHaveLength(1);
+  });
+  it('ignores confirmation after the captured connection changes', async () => {
+    const answer = deferred(); confirmAction.mockImplementation(() => answer.promise);
+    handlers.cloud_object_download = () => { throw error('TRANSFER_CONFLICT'); };
+    const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
+    await wrapper.setProps({ connectionId: 'c2' }); await flushPromises(); answer.resolve(true); await flushPromises();
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download')).toHaveLength(1);
+  });
+  it('recovers failed downloads visibly, retries, acknowledges both records on explicit close and stays dismissed after remount', async () => {
+    let records = [transfer('failed', { direction: 'download', error: error('CLOUD_TRANSPORT', 'socket closed') }), transfer('unknown', { transferId: 'upload-unknown', recoveryRequired: true })];
+    handlers.cloud_object_status = () => records;
+    handlers.cloud_object_recovery_acknowledge = ({ transferId }) => { records = records.filter((item) => item.transferId !== transferId); return transfer('acknowledged', { transferId, direction: 'download' }); };
+    handlers.cloud_object_download = () => { const next = transfer('running', { transferId: 'retry', direction: 'download' }); records.push(next); return next; };
+    const wrapper = await browser();
+    expect(wrapper.find('.download-queue').text()).toContain('socket closed');
+    expect(wrapper.find('.cloud-transfers').text()).toContain(t('cloudBrowser.recovery'));
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_recovery_acknowledge')).toHaveLength(0);
+    await click(wrapper, '[data-test=retry-download]');
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_download', expect.objectContaining({ key: 'a.txt', fileName: 'a.txt', overwriteConfirmed: false }));
+    expect(wrapper.find('[data-test=close-download]').exists()).toBe(false);
+    records = records.map((item) => item.transferId === 'retry' ? { ...item, phase: 'completed' } : item);
+    await vi.advanceTimersByTimeAsync(1500); await flushPromises();
+    expect(wrapper.findAll('.download-queue li')).toHaveLength(1);
+    await click(wrapper, '[data-test=close-download]');
+    const acked = nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_recovery_acknowledge').map(([, args]) => args.transferId);
+    expect(acked).toEqual(['t1', 'retry']);
+    wrapper.unmount(); const remounted = await browser();
+    expect(remounted.find('.download-queue').exists()).toBe(false);
+    expect(remounted.find('.cloud-transfers').text()).toContain(t('cloudBrowser.recovery'));
+    expect(records.map((item) => item.transferId)).toEqual(['upload-unknown']);
+  });
+  it('keeps failed acknowledgement visible and retryable without duplicating successful dismissals', async () => {
+    handlers.cloud_object_status = () => [transfer('failed', { direction: 'download', error: error('CLOUD_TRANSPORT', 'socket closed') })];
+    let calls = 0; handlers.cloud_object_recovery_acknowledge = () => { if (++calls === 1) throw error('CLOUD_STATE', 'ack failed'); return transfer('acknowledged', { direction: 'download' }); };
+    const wrapper = await browser(); await click(wrapper, '[data-test=close-download]');
+    expect(calls).toBe(1);
+    expect(wrapper.find('.download-queue').exists()).toBe(true);
+    expect(app.handleFailure).toHaveBeenCalledWith(expect.objectContaining({ message: 'ack failed' }));
+    app.handleFailure.mockClear();
+    await click(wrapper, '[data-test=close-download]'); expect(calls).toBe(2); expect(app.handleFailure.mock.calls).toEqual([]);
+    // Element Plus retains closing DOM during its leave transition; inspect
+    // the real shared component contract, not the transient overlay shell.
+    expect(wrapper.findComponent({ name: 'TransferQueueDialog' }).props('open')).toBe(false);
+    await vi.advanceTimersByTimeAsync(1500); await flushPromises();
+    expect(wrapper.findComponent({ name: 'TransferQueueDialog' }).props('open')).toBe(false);
+    expect(wrapper.findComponent({ name: 'TransferQueueDialog' }).props('items')).toEqual([]);
+    expect(calls).toBe(2);
+  });
+  it('keeps cancelling downloads running until the backend settles', async () => {
+    let state = transfer('running', { direction: 'download' });
+    handlers.cloud_object_status = () => [state]; handlers.cloud_object_cancel = () => { state = { ...state, phase: 'cancelling' }; return state; };
+    const wrapper = await browser(); await click(wrapper, '[data-test=cancel-download]');
+    expect(wrapper.find('[data-test=close-download]').exists()).toBe(false);
+    expect(wrapper.find('.download-queue li').attributes('data-status')).toBe('downloading');
+    state = { ...state, phase: 'cancelled' }; await vi.advanceTimersByTimeAsync(1500); await flushPromises();
+    expect(wrapper.find('[data-test=close-download]').exists()).toBe(true);
+  });
+  it('never acknowledges unknown or recovery-required downloads when closing the local queue', async () => {
+    handlers.cloud_object_status = () => [transfer('unknown', { direction: 'download', transferId: 'uncertain', recoveryRequired: true }), transfer('failed', { direction: 'download', transferId: 'local', error: error('CLOUD_TRANSPORT') })];
+    const wrapper = await browser(); await click(wrapper, '[data-test=close-download]');
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_recovery_acknowledge').map(([, args]) => args.transferId)).toEqual(['local']);
+    expect(wrapper.find('.cloud-transfers').text()).toContain(t('cloudBrowser.recovery'));
+  });
+  it('does not let an old status poll resurrect a dismissed failure over a new download queue', async () => {
+    const wrapper = await browser(); const late = deferred(); handlers.cloud_object_status = () => late.promise;
+    await vi.advanceTimersByTimeAsync(1500);
+    await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
+    late.resolve([transfer('failed', { direction: 'download', transferId: 'obsolete', error: error('CLOUD_TRANSPORT', 'obsolete failure') })]); await flushPromises();
+    expect(wrapper.findAll('.download-queue li')).toHaveLength(1);
+    expect(wrapper.find('.download-queue li').attributes('data-status')).toBe('downloading');
+    expect(wrapper.text()).not.toContain('obsolete failure');
   });
   it("shows cancellation acknowledgement and unknown recovery without fake percentages", async () => {
     handlers.cloud_object_status = () => [transfer()]; const wrapper = await browser(); await textButton(wrapper, t("cloudBrowser.cancel")).trigger("click"); await flushPromises(); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_cancel", { transferId: "t1" }); expect(wrapper.text()).toContain(t("cloudBrowser.phase.cancelling")); handlers.cloud_object_status = () => [transfer("unknown", { recoveryRequired: true })]; await vi.advanceTimersByTimeAsync(1500); await flushPromises(); expect(wrapper.text()).toContain(t("cloudBrowser.phase.unknown")); expect(wrapper.text()).toContain(t("cloudBrowser.recovery")); expect(wrapper.html()).not.toContain("progressbar"); expect(wrapper.text()).not.toContain("%");
@@ -851,7 +948,10 @@ describe("CloudBrowser", () => {
     expect(wrapper.find('[data-test=retry-load]').exists()).toBe(false);
     handlers.cloud_object_download_batch = () => ({ transfers: [transfer('running', { transferId: 'new', direction: 'download', key: 'a.txt' })] });
     await click(wrapper, '[data-test=retry-download]');
-    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download_batch').at(-1)[1]).toEqual({ connectionId: 'c1', localToken: 'opaque', items: [{ key: 'a.txt', relativePath: 'a.txt' }], overwriteConfirmed: true });
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download_batch').at(-1)[1]).toEqual({ connectionId: 'c1', localToken: 'opaque', items: [{ key: 'a.txt', relativePath: 'a.txt' }], overwriteConfirmed: false });
+    // A historical async precondition is not permission to overwrite. Only a
+    // fresh synchronous TRANSFER_CONFLICT may open that confirmation.
+    expect(confirmAction).not.toHaveBeenCalled();
     expect(wrapper.findAll('.download-queue li')).toHaveLength(2);
     expect(wrapper.findAll('.download-queue li')[0].attributes('data-status')).toBe('downloading');
     handlers.cloud_object_status = () => [transfer('completed', { transferId: 'new', direction: 'download', key: 'a.txt' })];
