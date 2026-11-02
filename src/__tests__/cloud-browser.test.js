@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { defineComponent, h } from "vue";
-import { flushPromises, mount } from "@vue/test-utils";
+import { DOMWrapper, flushPromises, mount } from "@vue/test-utils";
 
 const { nativeInvoke, confirmAction, app } = vi.hoisted(() => ({ nativeInvoke: vi.fn(), confirmAction: vi.fn(), app: { handleFailure: vi.fn(), setNotice: vi.fn() } }));
 vi.mock("../lib/appContext", () => ({ useAppContext: () => app }));
@@ -27,19 +27,38 @@ const file = { key: "a.txt", size: 7, etag: "etag-1", protected: false };
 const deletePlan = (extra = {}) => ({ planId: "plan-1", expiresAtUnix: Date.now() / 1000 + 60, objectCount: 5, connectionRevision: 1, entries: Array.from({ length: 5 }, (_, i) => ({ key: `exact-${i}.txt`, size: i, etag: null })), ...extra });
 const transfer = (phase = "running", extra = {}) => ({ transferId: "t1", connectionId: "c1", connectionRevision: 1, direction: "upload", phase, key: "a.txt", sizeHint: 7, error: null, recoveryRequired: false, ...extra });
 const deferred = () => { let resolve; let reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
+const queueSummary = (phase = 'running', extra = {}) => ({ queueId: 'queue-1', backend: { backend: 's3', connectionId: 'c1' }, phase, totalFiles: 1, completedFiles: 0, skippedFiles: 0, conflict: null, error: null, ...extra });
+const uploadSummary = (phase = 'running', extra = {}) => ({ batchId: 'batch', queueId: 'batch', phase, completedFiles: 0, completedBytes: 0, skippedFiles: 0, conflict: null, ...extra });
 let handlers;
 const wrappers = [];
-async function browser(mode = "list") { if (mode !== null) localStorage.setItem("peerdav.cloudView", mode); const wrapper = mount(CloudBrowser, { props: { connectionId: "c1" }, global: { stubs: { "el-button": button, "el-input": input, "el-select": select, "el-option": option, "el-dialog": dialog, "el-progress": progress, "el-tag": { template: "<span><slot /></span>" } } } }); wrappers.push(wrapper); await flushPromises(); return wrapper; }
-async function click(wrapper, selector) { await wrapper.find(selector).trigger("click"); await flushPromises(); }
+// Conflict dialogs intentionally teleport outside the queue/browser root.
+function findInDocument(wrapper, selector) {
+  const local = wrapper.find(selector);
+  if (local.exists()) return local;
+  const node = document.querySelector(selector);
+  return node ? new DOMWrapper(node) : local;
+}
+async function browser(mode = "list") { if (mode !== null) localStorage.setItem("peerdav.cloudView", mode); const wrapper = mount(CloudBrowser, { attachTo: document.body, props: { connectionId: "c1" }, global: { stubs: { "el-button": button, "el-input": input, "el-select": select, "el-option": option, "el-dialog": dialog, "el-progress": progress, "el-tag": { template: "<span><slot /></span>" } } } }); wrappers.push(wrapper); await flushPromises(); return wrapper; }
+async function click(wrapper, selector) { await findInDocument(wrapper, selector).trigger("click"); await flushPromises(); }
 async function prepare() { await flushPromises(); }
 function textButton(wrapper, label) { return wrapper.findAll("button").find((item) => item.text() === label); }
 beforeEach(() => {
   vi.useFakeTimers(); nativeInvoke.mockReset(); confirmAction.mockReset(); confirmAction.mockResolvedValue(true); setLocale("en");
   localStorage.removeItem("peerdav.cloudView");
   handlers = { cloud_list: () => ({ connections: [{ id: "c1", name: "Main", bucket: "main", buckets: ["main", "photos"], prefix: "configured/" }, { id: "c2", name: "Other", bucket: "main", buckets: ["main"] }] }), cloud_object_select_bucket: () => ({}), cloud_object_list: () => page([file]), cloud_object_status: () => [], cloud_object_discover: () => ({ complete: true }), cloud_object_prepare: () => ({ physicalId: "physical", discovered: true }), cloud_object_select_local: () => ({ token: "opaque", fileName: "a.txt", localPath: "/must-not-leak" }), cloud_object_upload: () => transfer(), cloud_object_download: () => transfer("running", { direction: "download" }), cloud_object_cancel: () => transfer("cancelling"), reveal_local_directory: () => ({}), cloud_object_recovery_acknowledge: () => transfer("acknowledged"), cloud_object_delete_plan: () => deletePlan(), cloud_object_delete_execute: () => ({ deleted: [file.key], failed: [] }) };
+  Object.assign(handlers, {
+    transfer_select_download: () => queueSummary('selected'), transfer_start_download: () => queueSummary(),
+    transfer_status_download: () => queueSummary(), transfer_page_download: () => ({ items: [{ remotePath: 'a.txt', relativePath: 'a.txt', phase: 'running' }], nextOffset: null }),
+    transfer_resolve_download: () => null, transfer_cancel_download: () => { handlers.transfer_status_download = () => queueSummary('canceled'); },
+    transfer_release_download: () => null, transfer_reveal_download: () => null,
+    cloud_object_select_upload_directory: () => uploadSummary('selected'), cloud_object_start_upload_directory: () => uploadSummary(),
+    cloud_object_status_upload_directory: () => uploadSummary(), cloud_object_page_upload_directory: () => ({ entries: [] }),
+    cloud_object_cancel_upload_directory: () => { handlers.cloud_object_status_upload_directory = () => uploadSummary('cancelled'); },
+    cloud_object_release_upload_directory: () => null, cloud_object_resolve_upload_directory_conflict: () => null,
+  });
   nativeInvoke.mockImplementation(async (command, args) => { if (!handlers[command]) throw new Error(`Unexpected command ${command}`); return handlers[command](args); });
 });
-afterEach(() => { wrappers.splice(0).forEach((wrapper) => { if (wrapper.exists()) wrapper.unmount(); }); vi.useRealTimers(); });
+afterEach(() => { wrappers.splice(0).forEach((wrapper) => { if (wrapper.exists()) wrapper.unmount(); }); document.body.innerHTML = ''; vi.useRealTimers(); });
 
 describe("streaming directory upload", () => {
   const calls = (command) => nativeInvoke.mock.calls.filter(([name]) => name === `cloud_object_${command}_upload_directory`);
@@ -99,11 +118,14 @@ describe("streaming directory upload", () => {
   it.each(['skip', 'overwrite', 'cancel'])('requires explicit %s conflict choice and forwards the checkbox', async (decision) => {
     handlers.cloud_object_start_upload_directory = () => summary('conflict', { conflict: { conflictId: 'conflict-a', relativePath: 'tree/a.txt', key: 'target/tree/a.txt', etag: 'etag' } });
     const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
-    expect(wrapper.find('[data-test=upload-conflict]').text()).toContain('target/tree/a.txt');
+    expect(findInDocument(wrapper, '[data-test=upload-conflict]').text()).toContain('target/tree/a.txt');
     expect(confirmAction).not.toHaveBeenCalled();
-    await wrapper.find('[data-test=upload-apply-remaining]').setValue(true);
+    await findInDocument(wrapper, '[data-test=upload-apply-remaining]').setValue(true);
     await click(wrapper, `[data-test=${decision === 'cancel' ? 'upload-conflict-cancel' : `upload-${decision}`}]`);
-    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_resolve_upload_directory_conflict', { connectionId: 'c1', batchId: 'batch', conflictId: 'conflict-a', decision, applyToRemaining: true });
+    if (decision === 'cancel') {
+      expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_cancel_upload_directory', { connectionId: 'c1', batchId: 'batch' });
+      expect(calls('resolve')).toHaveLength(0);
+    } else expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_resolve_upload_directory_conflict', { connectionId: 'c1', batchId: 'batch', conflictId: 'conflict-a', decision, applyToRemaining: true });
   });
   it.each(['success', 'expired'])('keeps a new same-path conflict intact after a late %s response', async (response) => {
     const conflictA = { conflictId: 'conflict-a', relativePath: 'tree/a.txt', key: 'tree/a.txt', etag: 'etag-a' };
@@ -114,18 +136,18 @@ describe("streaming directory upload", () => {
     handlers.cloud_object_resolve_upload_directory_conflict = () => pending.promise;
     const resolutions = () => nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_resolve_upload_directory_conflict');
     const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
-    await wrapper.find('[data-test=upload-apply-remaining]').setValue(true);
+    await findInDocument(wrapper, '[data-test=upload-apply-remaining]').setValue(true);
     await vi.advanceTimersByTimeAsync(1500); await flushPromises();
-    expect(wrapper.find('[data-test=upload-apply-remaining]').element.checked).toBe(true);
+    expect(findInDocument(wrapper, '[data-test=upload-apply-remaining]').element.checked).toBe(true);
     await click(wrapper, '[data-test=upload-skip]');
     expect(resolutions()).toHaveLength(1);
     expect(resolutions()[0][1]).toEqual({ connectionId: 'c1', batchId: 'batch', conflictId: 'conflict-a', decision: 'skip', applyToRemaining: true });
     handlers.cloud_object_status_upload_directory = () => summary('conflict', { conflict: conflictB });
     await vi.advanceTimersByTimeAsync(1500); await flushPromises();
-    expect(wrapper.find('[data-test=upload-conflict]').text()).toContain('etag-b');
-    expect(wrapper.find('[data-test=upload-apply-remaining]').element.checked).toBe(false);
+    expect(findInDocument(wrapper, '[data-test=upload-conflict]').text()).toContain('etag-b');
+    expect(findInDocument(wrapper, '[data-test=upload-apply-remaining]').element.checked).toBe(false);
     for (const choice of ['upload-skip', 'upload-overwrite', 'upload-conflict-cancel']) {
-      expect(wrapper.find(`[data-test=${choice}]`).attributes('disabled')).toBeDefined();
+      expect(findInDocument(wrapper, `[data-test=${choice}]`).attributes('disabled')).toBeDefined();
       await click(wrapper, `[data-test=${choice}]`);
     }
     expect(resolutions()).toHaveLength(1);
@@ -134,8 +156,8 @@ describe("streaming directory upload", () => {
     else pending.resolve(null);
     await flushPromises();
     expect(calls('status')).toHaveLength(statusCount);
-    expect(wrapper.find('[data-test=upload-conflict]').text()).toContain('etag-b');
-    expect(wrapper.find('[data-test=upload-skip]').attributes('disabled')).toBeUndefined();
+    expect(findInDocument(wrapper, '[data-test=upload-conflict]').text()).toContain('etag-b');
+    expect(findInDocument(wrapper, '[data-test=upload-skip]').attributes('disabled')).toBeUndefined();
     expect(app.handleFailure).not.toHaveBeenCalled();
     handlers.cloud_object_resolve_upload_directory_conflict = () => null;
     await click(wrapper, '[data-test=upload-skip]');
@@ -145,7 +167,7 @@ describe("streaming directory upload", () => {
   it('disables overwrite without ETag', async () => {
     handlers.cloud_object_start_upload_directory = () => summary('conflict', { conflict: { conflictId: 'conflict-a', relativePath: 'tree/a', key: 'tree/a', etag: null } });
     const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
-    expect(wrapper.find('[data-test=upload-overwrite]').attributes('disabled')).toBeDefined();
+    expect(findInDocument(wrapper, '[data-test=upload-overwrite]').attributes('disabled')).toBeDefined();
   });
   it('cancels and joins but retains terminal browsing until explicit close', async () => {
     const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
@@ -211,12 +233,12 @@ describe("streaming directory upload", () => {
     expect(wrapper.find('[data-test=retry-load]').exists()).toBe(false);
   });
   it('does not turn a canceled download transfer into a listing retry', async () => {
-    handlers.cloud_object_download = () => transfer('cancelled', { direction: 'download', error: error('CLOUD_CANCELLED') });
+    handlers.transfer_start_download = () => queueSummary('canceled', { error: error('CLOUD_CANCELLED') });
     const wrapper = await browser(); await wrapper.find('tbody tr').trigger('click'); await click(wrapper, '[data-test=download]');
     expect(wrapper.find('.cloud-error').exists()).toBe(false); expect(app.handleFailure).not.toHaveBeenCalled();
   });
   it.each(['upload', 'upload-directory', 'download'])('silences canceled %s pickers', async (action) => {
-    handlers.cloud_object_select_local = handlers.cloud_object_select_upload_directory = () => { throw error('CLOUD_CANCELLED'); };
+    handlers.transfer_select_download = handlers.cloud_object_select_upload_directory = () => { throw error('CLOUD_CANCELLED'); };
     const wrapper = await browser(); if (action === 'download') await wrapper.find('tbody tr').trigger('click');
     await click(wrapper, `[data-test=${action}]`);
     expect(errorStrategy(error('CLOUD_CANCELLED'))).toBe('ignore');
@@ -272,7 +294,7 @@ describe("CloudBrowser", () => {
     expect(wrapper.find('.selection-actions [data-test=download]').classes()).toContain('el-button--primary');
     expect(wrapper.find('.selection-actions [data-test=download]').classes()).toContain('is-plain');
     await click(wrapper, '.selection-actions [data-test=download]');
-    expect(nativeInvoke.mock.calls.find(([name]) => name === 'cloud_object_download_batch')[1].items.map((item) => item.key)).toEqual(['a.txt', 'c.txt']);
+    expect(nativeInvoke.mock.calls.find(([name]) => name === 'transfer_select_download')[1].selection).toEqual({ mode: 'files', paths: ['a.txt', 'c.txt'] });
     await click(wrapper, '[data-test=refresh]');
     expect(wrapper.find('.selection-bar').exists()).toBe(false);
   });
@@ -370,19 +392,14 @@ describe("CloudBrowser", () => {
     { sizes: [0, 0], phases: ['completed', 'completed'], percent: 100 },
   ])("shows file statuses without inventing cloud byte progress: $phases / $sizes", async ({ sizes, phases }) => {
     handlers.cloud_object_list = () => page([{ ...file, size: sizes[0] }, { key: 'b.txt', size: sizes[1] }]);
-    handlers.cloud_object_download_batch = ({ items }) => ({ transfers: items.map((item, index) => transfer(phases[index], { transferId: `t${index}`, key: item.key, direction: 'download', error: phases[index] === 'failed' ? error('CLOUD_TRANSPORT', 'failed original') : null })), localRoot: '/target' });
+    handlers.transfer_page_download = () => ({ items: ['a.txt', 'b.txt'].map((path, index) => ({ remotePath: path, relativePath: path, phase: phases[index] === 'cancelled' ? 'canceled' : phases[index] })), nextOffset: null });
     const wrapper = await browser();
     await wrapper.findAll('tbody tr')[0].trigger('click'); await wrapper.findAll('tbody tr')[1].trigger('click', { ctrlKey: true });
     await click(wrapper, '.selection-actions [data-test=download]');
     expect(wrapper.find('[role=progressbar]').exists()).toBe(false);
-    expect(wrapper.find('.queue-note').text()).toContain('Byte progress is unavailable');
+    expect(wrapper.find('[data-test=download-dialog] [data-test=progress]').exists()).toBe(false);
     expect(wrapper.findAll('.queue-name')).toHaveLength(2);
-    if (phases[0] === 'failed') {
-      expect(wrapper.find('details').text()).toContain('failed original');
-      expect(wrapper.find('details').attributes('open')).toBeUndefined();
-      expect(wrapper.findAll('.download-queue li')[1].text()).toContain(t('peer.downloadStatusCanceled'));
-      expect(textButton(wrapper, t('peer.cancelDownload'))).toBeUndefined();
-    }
+    expect(wrapper.findAll('.download-queue li').map((row) => row.attributes('data-status'))).toEqual(phases.map((phase) => ({ completed: 'done', running: 'downloading', failed: 'error', cancelled: 'canceled' })[phase]));
   });
   it("invalidates pending ancestor rebuilds when switching buckets", async () => {
     handlers.cloud_object_list = () => page([{ key: 'docs/file.txt' }]);
@@ -406,7 +423,7 @@ describe("CloudBrowser", () => {
     await wrapper.findAll('tbody tr')[0].trigger('click'); await wrapper.findAll('tbody tr')[1].trigger('click', { ctrlKey: true });
     await click(wrapper, '.selection-actions [data-test=download]');
     expect(wrapper.find('[role=progressbar]').exists()).toBe(false);
-    handlers.cloud_object_status = () => [transfer('completed', { transferId: 't0', direction: 'download' }), transfer('running', { transferId: 't1', direction: 'download', key: 'b.txt', sizeHint: 3 })];
+    handlers.transfer_page_download = () => ({ items: [{ remotePath: 'a.txt', relativePath: 'a.txt', phase: 'completed' }, { remotePath: 'b.txt', relativePath: 'b.txt', phase: 'running' }], nextOffset: null });
     await vi.advanceTimersByTimeAsync(1500); await flushPromises();
     expect(wrapper.find('[role=progressbar]').exists()).toBe(false);
     expect(wrapper.findAll('.download-queue li')[0].attributes('data-status')).toBe('done');
@@ -547,125 +564,100 @@ describe("CloudBrowser", () => {
     expect(wrapper.find('.cloud-error__message').text()).toBe('Storage permission denied');
   });
   it("honors protected error codes and displays original message without matching text", async () => {
-    handlers.cloud_object_upload = () => { throw error("CLOUD_OBJECT_PROTECTED", "anything at all"); }; const wrapper = await browser(); await prepare(wrapper); await click(wrapper, '[data-test=upload]'); expect(wrapper.text()).toContain("anything at all"); expect(wrapper.find('[data-test=upload]').attributes("disabled")).toBeDefined(); expect(errorStrategy(error("CLOUD_DELETE_PLAN_STALE"))).toBe("retry");
+    handlers.cloud_object_select_upload_directory = () => { throw error("CLOUD_OBJECT_PROTECTED", "anything at all"); }; const wrapper = await browser(); await prepare(wrapper); await click(wrapper, '[data-test=upload]'); expect(wrapper.text()).toContain("anything at all"); expect(errorStrategy(error("CLOUD_DELETE_PLAN_STALE"))).toBe("retry");
   });
-  it("confirms same-key ETag overwrite and sends only opaque local token", async () => { const wrapper = await browser(); await prepare(wrapper); await click(wrapper, '[data-test=upload]'); expect(confirmAction).toHaveBeenCalledWith(expect.stringContaining("etag-1"), t("cloudBrowser.upload")); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_upload", { connectionId: "c1", localToken: "opaque", key: "a.txt", overwriteEtag: "etag-1", overwriteConfirmed: true }); });
-  it("uploads the selected filename directly and does not repeat preparation for folder navigation", async () => {
+  it("selects single uploads through the bounded queue and starts Ask without inferring authorization from ETag", async () => {
+    const wrapper = await browser(); await click(wrapper, '[data-test=upload]');
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_select_upload_directory', { connectionId: 'c1', prefix: '', mode: 'single' });
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_start_upload_directory', { connectionId: 'c1', batchId: 'batch', conflictPolicy: 'ask' });
+    expect(confirmAction).not.toHaveBeenCalled();
+    expect(nativeInvoke.mock.calls.some(([name]) => name === 'cloud_object_upload' || name === 'cloud_object_select_local')).toBe(false);
+  });
+  it("captures the navigated prefix for a single upload without repeating preparation", async () => {
     handlers.cloud_object_list = ({ prefix }) => prefix ? page([]) : page([{ key: 'docs/old.txt', size: 1 }]);
-    handlers.cloud_object_select_local = () => ({ token: 'selected-file', fileName: 'photo.jpg' });
-    const wrapper = await browser();
-    await wrapper.find("[data-test=folder-row]").trigger("dblclick"); await flushPromises(); await click(wrapper, '[data-test=upload]');
-    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_select_local', { connectionId: 'c1', direction: 'upload' });
-    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_upload', { connectionId: 'c1', localToken: 'selected-file', key: 'docs/photo.jpg', overwriteEtag: null, overwriteConfirmed: false });
-    expect(nativeInvoke.mock.calls.filter(([command]) => command === 'cloud_object_prepare')).toHaveLength(1);
-    expect(confirmAction).not.toHaveBeenCalled();
-    expect(wrapper.find('.cloud-transfers').text()).not.toContain('t1');
+    const wrapper = await browser(); await wrapper.find('[data-test=folder-row]').trigger('dblclick'); await flushPromises(); await click(wrapper, '[data-test=upload]');
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_select_upload_directory', { connectionId: 'c1', prefix: 'docs/', mode: 'single' });
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_prepare')).toHaveLength(1);
   });
-  it("does not upload if ETag overwrite confirmation is declined", async () => { confirmAction.mockResolvedValue(false); const wrapper = await browser(); await prepare(wrapper); await click(wrapper, '[data-test=upload]'); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_upload")).toBe(false); });
-  it("downloads through the shared dialog and confirms only stable conflicts with the same token", async () => {
-    let selects = 0; handlers.cloud_object_select_local = () => ({ token: `token-${++selects}` }); let attempts = 0; handlers.cloud_object_download = () => { if (++attempts === 1) throw error("TRANSFER_CONFLICT"); return transfer("running", { direction: "download" }); };
-    const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, "Download").trigger("click"); await flushPromises();
-    const calls = nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_download"); expect(calls.map(([, args]) => [args.localToken, args.overwriteConfirmed])).toEqual([["token-1", false], ["token-1", true]]); expect(confirmAction).toHaveBeenCalledOnce();
-    expect(selects).toBe(1); expect(wrapper.find('[data-test=cancel-download]').exists()).toBe(true);
-    expect(wrapper.find('.download-queue li').attributes('data-status')).toBe('downloading');
+  it("keeps single-upload conflicts unchecked and uses dedicated cancellation", async () => {
+    handlers.cloud_object_start_upload_directory = () => uploadSummary('conflict', { conflict: { conflictId: 'one', relativePath: 'a.txt', etag: 'v1' } });
+    const wrapper = await browser(); await click(wrapper, '[data-test=upload]');
+    expect(findInDocument(wrapper, '[data-test=upload-apply-remaining]').element.checked).toBe(false);
+    await click(wrapper, '[data-test=upload-conflict-cancel]');
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_cancel_upload_directory', { connectionId: 'c1', batchId: 'batch' });
+    expect(nativeInvoke.mock.calls.some(([name]) => name === 'cloud_object_resolve_upload_directory_conflict')).toBe(false);
   });
-  it("shows asynchronous download failure in the shared dialog and retries without auto overwrite", async () => {
-    let attempts = 0;
-    handlers.cloud_object_download = () => transfer("running", { direction: "download", transferId: `t${++attempts}` }); const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, "Download").trigger("click"); await flushPromises(); handlers.cloud_object_status = () => [transfer("failed", { direction: "download", error: error("CLOUD_PRECONDITION", "size changed") })]; await vi.advanceTimersByTimeAsync(1500); await flushPromises(); expect(confirmAction).not.toHaveBeenCalled();
-    expect(wrapper.find('.download-queue').text()).toContain('size changed');
-    await click(wrapper, '[data-test=retry-download]');
-    expect(confirmAction).not.toHaveBeenCalled(); expect(nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_select_local")).toHaveLength(2); expect(nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_download")[1][1].overwriteConfirmed).toBe(false);
-  });
-  it.each([false, true])('keeps pending single-download confirmation bounded and reuses its grant (%s)', async (accepted) => {
-    const answer = deferred(); confirmAction.mockImplementation(() => answer.promise);
-    handlers.cloud_object_download = ({ overwriteConfirmed }) => { if (!overwriteConfirmed) throw error('TRANSFER_CONFLICT'); return transfer('running', { direction: 'download' }); };
-    const wrapper = await browser(); await click(wrapper, '[data-test=file-row]');
-    await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
-    await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
-    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download')).toHaveLength(1);
-    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_select_local')).toHaveLength(1);
-    expect(wrapper.find('[data-test=cancel-download]').exists()).toBe(false);
-    answer.resolve(accepted); await flushPromises();
-    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download')).toHaveLength(accepted ? 2 : 1);
-    expect(confirmAction).toHaveBeenCalledOnce();
-  });
-  it('does not turn transport, symlink or size preconditions into overwrite permission', async () => {
-    handlers.cloud_object_download = () => { throw error('CLOUD_PRECONDITION', 'destination is a symlink'); };
+  it("downloads single files through an opaque native queue, asks twice by default and reveals the exact queue", async () => {
+    let state = queueSummary('conflict', { conflict: { conflictId: 'first', relativePath: 'a.txt' } });
+    handlers.transfer_start_download = handlers.transfer_status_download = () => state;
     const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
-    expect(confirmAction).not.toHaveBeenCalled();
-    expect(wrapper.text()).toContain('destination is a symlink');
-    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download')).toHaveLength(1);
-  });
-  it('ignores confirmation after the captured connection changes', async () => {
-    const answer = deferred(); confirmAction.mockImplementation(() => answer.promise);
-    handlers.cloud_object_download = () => { throw error('TRANSFER_CONFLICT'); };
-    const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
-    await wrapper.setProps({ connectionId: 'c2' }); await flushPromises(); answer.resolve(true); await flushPromises();
-    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download')).toHaveLength(1);
-  });
-  it('recovers failed downloads visibly, retries, acknowledges both records on explicit close and stays dismissed after remount', async () => {
-    let records = [transfer('failed', { direction: 'download', error: error('CLOUD_TRANSPORT', 'socket closed') }), transfer('unknown', { transferId: 'upload-unknown', recoveryRequired: true })];
-    handlers.cloud_object_status = () => records;
-    handlers.cloud_object_recovery_acknowledge = ({ transferId }) => { records = records.filter((item) => item.transferId !== transferId); return transfer('acknowledged', { transferId, direction: 'download' }); };
-    handlers.cloud_object_download = () => { const next = transfer('running', { transferId: 'retry', direction: 'download' }); records.push(next); return next; };
-    const wrapper = await browser();
-    expect(wrapper.find('.download-queue').text()).toContain('socket closed');
-    expect(wrapper.find('.cloud-transfers').text()).toContain(t('cloudBrowser.recovery'));
-    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_recovery_acknowledge')).toHaveLength(0);
-    await click(wrapper, '[data-test=retry-download]');
-    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_download', expect.objectContaining({ key: 'a.txt', fileName: 'a.txt', overwriteConfirmed: false }));
-    expect(wrapper.find('[data-test=close-download]').exists()).toBe(false);
-    records = records.map((item) => item.transferId === 'retry' ? { ...item, phase: 'completed' } : item);
-    await vi.advanceTimersByTimeAsync(1500); await flushPromises();
-    expect(wrapper.findAll('.download-queue li')).toHaveLength(1);
+    expect(nativeInvoke).toHaveBeenCalledWith('transfer_select_download', { backend: { backend: 's3', connectionId: 'c1' }, selection: { mode: 'single', path: 'a.txt' } });
+    expect(findInDocument(wrapper, '[data-test=download-apply-remaining]').element.checked).toBe(false);
+    state = queueSummary('conflict', { skippedFiles: 1, conflict: { conflictId: 'second', relativePath: 'b.txt' } });
+    await click(wrapper, '[data-test=download-skip]');
+    expect(nativeInvoke).toHaveBeenCalledWith('transfer_resolve_download', { queueId: 'queue-1', conflictId: 'first', decision: 'skip', applyToRemaining: false });
+    expect(findInDocument(wrapper, '[data-test=download-apply-remaining]').element.checked).toBe(false);
+    await findInDocument(wrapper, '[data-test=download-apply-remaining]').setValue(true);
+    state = queueSummary('completed', { completedFiles: 1, skippedFiles: 1 });
+    await click(wrapper, '[data-test=download-overwrite]');
+    expect(nativeInvoke).toHaveBeenCalledWith('transfer_resolve_download', { queueId: 'queue-1', conflictId: 'second', decision: 'overwrite', applyToRemaining: true });
+    await click(wrapper, '[data-test=reveal-download]');
+    expect(nativeInvoke).toHaveBeenCalledWith('transfer_reveal_download', { queueId: 'queue-1' });
     await click(wrapper, '[data-test=close-download]');
-    const acked = nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_recovery_acknowledge').map(([, args]) => args.transferId);
-    expect(acked).toEqual(['t1', 'retry']);
-    wrapper.unmount(); const remounted = await browser();
-    expect(remounted.find('.download-queue').exists()).toBe(false);
-    expect(remounted.find('.cloud-transfers').text()).toContain(t('cloudBrowser.recovery'));
-    expect(records.map((item) => item.transferId)).toEqual(['upload-unknown']);
+    expect(nativeInvoke).toHaveBeenCalledWith('transfer_release_download', { queueId: 'queue-1' });
+    expect(confirmAction).not.toHaveBeenCalled();
   });
-  it('keeps failed acknowledgement visible and retryable without duplicating successful dismissals', async () => {
-    handlers.cloud_object_status = () => [transfer('failed', { direction: 'download', error: error('CLOUD_TRANSPORT', 'socket closed') })];
-    let calls = 0; handlers.cloud_object_recovery_acknowledge = () => { if (++calls === 1) throw error('CLOUD_STATE', 'ack failed'); return transfer('acknowledged', { direction: 'download' }); };
-    const wrapper = await browser(); await click(wrapper, '[data-test=close-download]');
-    expect(calls).toBe(1);
-    expect(wrapper.find('.download-queue').exists()).toBe(true);
-    expect(app.handleFailure).toHaveBeenCalledWith(expect.objectContaining({ message: 'ack failed' }));
-    app.handleFailure.mockClear();
-    await click(wrapper, '[data-test=close-download]'); expect(calls).toBe(2); expect(app.handleFailure.mock.calls).toEqual([]);
-    // Element Plus retains closing DOM during its leave transition; inspect
-    // the real shared component contract, not the transient overlay shell.
-    expect(wrapper.findComponent({ name: 'TransferQueueDialog' }).props('open')).toBe(false);
-    await vi.advanceTimersByTimeAsync(1500); await flushPromises();
-    expect(wrapper.findComponent({ name: 'TransferQueueDialog' }).props('open')).toBe(false);
-    expect(wrapper.findComponent({ name: 'TransferQueueDialog' }).props('items')).toEqual([]);
-    expect(calls).toBe(2);
+  it('shows backend failures without turning preconditions into overwrite permission', async () => {
+    handlers.transfer_start_download = () => queueSummary('failed', { error: error('CLOUD_PRECONDITION', 'size changed') });
+    const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
+    expect(wrapper.find('[data-test=download-dialog]').text()).toContain('size changed');
+    expect(wrapper.find('[data-test=download-overwrite]').exists()).toBe(false);
+    expect(confirmAction).not.toHaveBeenCalled();
   });
-  it('keeps cancelling downloads running until the backend settles', async () => {
-    let state = transfer('running', { direction: 'download' });
-    handlers.cloud_object_status = () => [state]; handlers.cloud_object_cancel = () => { state = { ...state, phase: 'cancelling' }; return state; };
-    const wrapper = await browser(); await click(wrapper, '[data-test=cancel-download]');
+  it.each(['connection', 'bucket', 'unmount'])('releases late selected queue and never starts it after %s changes', async (change) => {
+    const selected = deferred(); handlers.transfer_select_download = () => selected.promise;
+    const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
+    if (change === 'connection') await wrapper.setProps({ connectionId: 'c2' });
+    else if (change === 'bucket') await wrapper.findAll('.bucket-link')[1].trigger('click');
+    else wrapper.unmount();
+    await flushPromises(); selected.resolve(queueSummary('selected')); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith('transfer_release_download', { queueId: 'queue-1' });
+    expect(nativeInvoke.mock.calls.some(([name]) => name === 'transfer_start_download')).toBe(false);
+  });
+  it('guards double-click selection and keeps cancellation running until native settlement', async () => {
+    const selected = deferred(); handlers.transfer_select_download = () => selected.promise;
+    const wrapper = await browser(); await click(wrapper, '[data-test=file-row]');
+    await textButton(wrapper, 'Download').trigger('click'); await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'transfer_select_download')).toHaveLength(1);
+    selected.resolve(queueSummary('selected')); await flushPromises();
+    const stopped = deferred(); handlers.transfer_cancel_download = () => stopped.promise;
+    await click(wrapper, '[data-test=cancel-download]');
     expect(wrapper.find('[data-test=close-download]').exists()).toBe(false);
-    expect(wrapper.find('.download-queue li').attributes('data-status')).toBe('downloading');
-    state = { ...state, phase: 'cancelled' }; await vi.advanceTimersByTimeAsync(1500); await flushPromises();
+    expect(wrapper.find('[data-test=cancel-download]').attributes('disabled')).toBeDefined();
+    handlers.transfer_status_download = () => queueSummary('canceled'); stopped.resolve(null); await flushPromises();
     expect(wrapper.find('[data-test=close-download]').exists()).toBe(true);
   });
-  it('never acknowledges unknown or recovery-required downloads when closing the local queue', async () => {
-    handlers.cloud_object_status = () => [transfer('unknown', { direction: 'download', transferId: 'uncertain', recoveryRequired: true }), transfer('failed', { direction: 'download', transferId: 'local', error: error('CLOUD_TRANSPORT') })];
-    const wrapper = await browser(); await click(wrapper, '[data-test=close-download]');
-    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_recovery_acknowledge').map(([, args]) => args.transferId)).toEqual(['local']);
-    expect(wrapper.find('.cloud-transfers').text()).toContain(t('cloudBrowser.recovery'));
-  });
-  it('does not let an old status poll resurrect a dismissed failure over a new download queue', async () => {
-    const wrapper = await browser(); const late = deferred(); handlers.cloud_object_status = () => late.promise;
+  it('does not let old queue polls resurrect old state after cancel and a new selection', async () => {
+    const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
+    const stale = deferred(); handlers.transfer_status_download = () => stale.promise;
     await vi.advanceTimersByTimeAsync(1500);
+    handlers.transfer_cancel_download = () => null; handlers.transfer_status_download = () => queueSummary('canceled');
+    await click(wrapper, '[data-test=cancel-download]'); await click(wrapper, '[data-test=close-download]');
+    handlers.transfer_select_download = () => queueSummary('selected', { queueId: 'queue-2' });
+    handlers.transfer_start_download = () => queueSummary('completed', { queueId: 'queue-2', completedFiles: 1 });
     await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
-    late.resolve([transfer('failed', { direction: 'download', transferId: 'obsolete', error: error('CLOUD_TRANSPORT', 'obsolete failure') })]); await flushPromises();
-    expect(wrapper.findAll('.download-queue li')).toHaveLength(1);
-    expect(wrapper.find('.download-queue li').attributes('data-status')).toBe('downloading');
+    stale.resolve(queueSummary('failed', { error: error('OLD', 'obsolete failure') })); await flushPromises();
     expect(wrapper.text()).not.toContain('obsolete failure');
+    await click(wrapper, '[data-test=reveal-download]');
+    expect(nativeInvoke).toHaveBeenLastCalledWith('transfer_reveal_download', { queueId: 'queue-2' });
+  });
+  it('retains unknown upload recovery separately without acknowledging it when closing a queue', async () => {
+    handlers.cloud_object_status = () => [transfer('unknown', { transferId: 'upload-unknown', recoveryRequired: true })];
+    handlers.transfer_start_download = () => queueSummary('completed', { completedFiles: 1 });
+    const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
+    await click(wrapper, '[data-test=close-download]');
+    expect(wrapper.find('.cloud-transfers').text()).toContain(t('cloudBrowser.recovery'));
+    expect(nativeInvoke.mock.calls.some(([name]) => name === 'cloud_object_recovery_acknowledge')).toBe(false);
   });
   it("shows cancellation acknowledgement and unknown recovery without fake percentages", async () => {
     handlers.cloud_object_status = () => [transfer()]; const wrapper = await browser(); await textButton(wrapper, t("cloudBrowser.cancel")).trigger("click"); await flushPromises(); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_cancel", { transferId: "t1" }); expect(wrapper.text()).toContain(t("cloudBrowser.phase.cancelling")); handlers.cloud_object_status = () => [transfer("unknown", { recoveryRequired: true })]; await vi.advanceTimersByTimeAsync(1500); await flushPromises(); expect(wrapper.text()).toContain(t("cloudBrowser.phase.unknown")); expect(wrapper.text()).toContain(t("cloudBrowser.recovery")); expect(wrapper.html()).not.toContain("progressbar"); expect(wrapper.text()).not.toContain("%");
@@ -716,7 +708,7 @@ describe("CloudBrowser", () => {
   it("uses prefix protection for read-only controls while allowing raw download", async () => {
     handlers.cloud_object_list = () => ({ ...page([file]), prefixProtected: true }); const wrapper = await browser();
     expect(wrapper.find('[data-test=prepare]').exists()).toBe(false); expect(wrapper.find('[data-test=upload]').attributes("disabled")).toBeDefined(); expect(wrapper.find('[data-test=delete-prefix]').attributes("disabled")).toBeDefined();
-    await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, t("cloudBrowser.download")).trigger("click"); await flushPromises(); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_download")).toBe(true);
+    await click(wrapper, '[data-test=file-row]'); await textButton(wrapper, t("cloudBrowser.download")).trigger("click"); await flushPromises(); expect(nativeInvoke.mock.calls.some(([name]) => name === "transfer_select_download")).toBe(true);
   });
   it("blocks protected single objects, ancestor-prefix deletion and protected overwrite, not downloads", async () => {
     handlers.cloud_object_list = () => page([{ ...file, protected: true }, { key: "docs/private/a", protected: true, size: 1 }, { key: "docs/public", protected: false, size: 1 }]);
@@ -724,7 +716,7 @@ describe("CloudBrowser", () => {
     await click(wrapper, '[data-test=file-row]'); expect(wrapper.find('[data-test=delete-file]').attributes("disabled")).toBeDefined();
     await click(wrapper, '[data-test=upload]'); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_upload")).toBe(false);
     expect(wrapper.find('input[aria-label="Object name (default: selected filename)"]').exists()).toBe(false);
-    await textButton(wrapper, t("cloudBrowser.download")).trigger("click"); await flushPromises(); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_download")).toBe(true);
+    await textButton(wrapper, t("cloudBrowser.download")).trigger("click"); await flushPromises(); expect(nativeInvoke.mock.calls.some(([name]) => name === "transfer_select_download")).toBe(true);
   });
   it.each(["en", "zh-CN"])("requires explicit acknowledgement and explains local-only risk in %s", async (locale) => {
     setLocale(locale); handlers.cloud_object_status = () => [transfer("unknown", { key: "uncertain/key", recoveryRequired: true })]; const wrapper = await browser();
@@ -878,14 +870,8 @@ describe("CloudBrowser", () => {
     expect(wrapper.find('.selection-summary').text()).toContain(t('peer.selectedCount', { count: 2 }));
     await textButton(wrapper, t('cloudBrowser.download')).trigger('click');
     await flushPromises();
-    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_download_batch', {
-      connectionId: 'c1',
-      localToken: 'opaque',
-      items: [
-        { key: 'b.txt', relativePath: 'b.txt' },
-        { key: 'c.txt', relativePath: 'c.txt' },
-      ],
-      overwriteConfirmed: false,
+    expect(nativeInvoke).toHaveBeenCalledWith('transfer_select_download', {
+      backend: { backend: 's3', connectionId: 'c1' }, selection: { mode: 'files', paths: ['b.txt', 'c.txt'] },
     });
   });
   it("downloads a whole folder with its relative tree in one batch", async () => {
@@ -900,84 +886,51 @@ describe("CloudBrowser", () => {
     await wrapper.find('[data-test=folder-row]').trigger('click');
     await textButton(wrapper, t('cloudBrowser.download')).trigger('click');
     await flushPromises();
-    const batch = nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download_batch').at(-1);
-    expect(batch[1]).toEqual(expect.objectContaining({ connectionId: 'c1', localToken: 'opaque', overwriteConfirmed: false }));
-    // Folders are walked depth first, so compare the exact tree without order.
-    expect(batch[1].items).toHaveLength(2);
-    expect(batch[1].items).toEqual(expect.arrayContaining([
-      { key: 'docs/a.txt', relativePath: 'docs/a.txt' },
-      { key: 'docs/deep/b.bin', relativePath: 'docs/deep/b.bin' },
-    ]));
+    expect(nativeInvoke).toHaveBeenCalledWith('transfer_select_download', { backend: { backend: 's3', connectionId: 'c1' }, selection: { mode: 'folder', path: 'docs/' } });
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_list')).toHaveLength(1);
   });
-  it("confirms overwriting once and replays the same batch grant", async () => {
+  it("applies a batch overwrite decision to the native queue without a second selection", async () => {
     handlers.cloud_object_list = () => page([file, { key: 'b.txt', size: 2 }]);
-    handlers.cloud_object_download_batch = ({ overwriteConfirmed, items }) => {
-      if (!overwriteConfirmed) throw error('TRANSFER_CONFLICT');
-      return { transfers: items.map((item) => transfer('running', { direction: 'download', key: item.key })), localRoot: '/tmp/target' };
-    };
-    const wrapper = await browser();
-    await wrapper.find('[data-test=file-row]').trigger('click');
-    await wrapper.findAll('[data-test=file-row]')[1].trigger('click', { ctrlKey: true });
-    await textButton(wrapper, t('cloudBrowser.download')).trigger('click');
-    await flushPromises();
-    expect(confirmAction).toHaveBeenCalledWith(t('cloudBrowser.downloadOverwrite'), t('cloudBrowser.download'));
-    const calls = nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download_batch');
-    expect(calls.map(([, args]) => [args.localToken, args.overwriteConfirmed])).toEqual([['opaque', false], ['opaque', true]]);
-  });
-  it('retries the failed direct download target rather than loading the listing', async () => {
-    const failure = error('CLOUD_TRANSPORT');
-    handlers.cloud_object_download = () => { throw failure; };
-    const wrapper = await browser();
-    await click(wrapper, '[data-test=file-row]'); await click(wrapper, '[data-test=download]');
-    const lists = nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_list').length;
-    const first = nativeInvoke.mock.calls.find(([name]) => name === 'cloud_object_download')[1];
-    handlers.cloud_object_download = () => transfer('completed', { direction: 'download' });
-    await click(wrapper, '[data-test=retry-load]');
-    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download').map(([, args]) => args)).toEqual([first, first]);
-    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_list')).toHaveLength(lists);
-    expect(wrapper.find('[data-test=retry-load]').exists()).toBe(false);
-  });
-  it.each(['CLOUD_PRECONDITION', 'TRANSFER_CONFLICT'])('rebinds a %s queue retry to the same relative target and new transfer', async (code) => {
-    app.handleFailure.mockClear();
-    handlers.cloud_object_list = () => page([file, { key: 'b.txt', size: 2 }]);
-    handlers.cloud_object_download_batch = ({ items }) => ({ transfers: items.map((item, index) => transfer(index ? 'completed' : 'failed', { transferId: `old-${index}`, direction: 'download', key: item.key, error: index ? null : error(code) })), localRoot: '/target' });
-    const wrapper = await browser();
-    await wrapper.findAll('[data-test=file-row]')[0].trigger('click');
-    await wrapper.findAll('[data-test=file-row]')[1].trigger('click', { ctrlKey: true });
-    await click(wrapper, '[data-test=download]');
-    expect(wrapper.find('[data-test=retry-load]').exists()).toBe(false);
-    handlers.cloud_object_download_batch = () => ({ transfers: [transfer('running', { transferId: 'new', direction: 'download', key: 'a.txt' })] });
-    await click(wrapper, '[data-test=retry-download]');
-    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download_batch').at(-1)[1]).toEqual({ connectionId: 'c1', localToken: 'opaque', items: [{ key: 'a.txt', relativePath: 'a.txt' }], overwriteConfirmed: false });
-    // A historical async precondition is not permission to overwrite. Only a
-    // fresh synchronous TRANSFER_CONFLICT may open that confirmation.
+    handlers.transfer_start_download = () => queueSummary('conflict', { conflict: { conflictId: 'batch-conflict', relativePath: 'a.txt' } });
+    const wrapper = await browser(); await wrapper.findAll('[data-test=file-row]')[0].trigger('click'); await wrapper.findAll('[data-test=file-row]')[1].trigger('click', { ctrlKey: true });
+    await click(wrapper, '[data-test=download]'); await findInDocument(wrapper, '[data-test=download-apply-remaining]').setValue(true); await click(wrapper, '[data-test=download-overwrite]');
+    expect(nativeInvoke).toHaveBeenCalledWith('transfer_resolve_download', { queueId: 'queue-1', conflictId: 'batch-conflict', decision: 'overwrite', applyToRemaining: true });
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'transfer_select_download')).toHaveLength(1);
     expect(confirmAction).not.toHaveBeenCalled();
-    expect(wrapper.findAll('.download-queue li')).toHaveLength(2);
-    expect(wrapper.findAll('.download-queue li')[0].attributes('data-status')).toBe('downloading');
-    handlers.cloud_object_status = () => [transfer('completed', { transferId: 'new', direction: 'download', key: 'a.txt' })];
-    await vi.advanceTimersByTimeAsync(1500); await flushPromises();
-    expect(wrapper.findAll('.download-queue li')[0].attributes('data-status')).toBe('done');
-    expect(wrapper.find('[data-test=retry-download]').exists()).toBe(false);
-    expect(app.handleFailure).not.toHaveBeenCalled();
+  });
+  it('reports failed direct selection without retrying the listing or implicitly overwriting', async () => {
+    const failure = error('CLOUD_TRANSPORT'); handlers.transfer_select_download = () => { throw failure; };
+    const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await click(wrapper, '[data-test=download]');
+    expect(app.handleFailure).toHaveBeenCalledWith(failure);
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_list')).toHaveLength(1);
+    expect(confirmAction).not.toHaveBeenCalled();
+  });
+  it.each(['CLOUD_PRECONDITION', 'TRANSFER_CONFLICT'])('keeps a terminal %s failure distinct from an actionable queue conflict', async (code) => {
+    handlers.transfer_start_download = () => queueSummary('failed', { error: error(code) });
+    const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await click(wrapper, '[data-test=download]');
+    expect(wrapper.find('[data-test=download-dialog]').text()).toContain('Original backend reason');
+    expect(wrapper.find('[data-test=download-overwrite]').exists()).toBe(false);
+    expect(wrapper.find('[data-test=retry-load]').exists()).toBe(false);
+    expect(confirmAction).not.toHaveBeenCalled();
+    await click(wrapper, '[data-test=close-download]');
+    expect(nativeInvoke).toHaveBeenCalledWith('transfer_release_download', { queueId: 'queue-1' });
   });
   it.each(['AUTH_INTERFACE_LOCKED', 'VAULT_LOCKED', 'AUTH_PASSWORD_CHANGE_REQUIRED'])('forwards %s from local queue failures to authentication handling', async (code) => {
     app.handleFailure.mockClear();
     handlers.cloud_object_list = () => page([file, { key: 'b.txt', size: 2 }]);
     const failure = error(code);
-    handlers.cloud_object_download_batch = ({ items }) => ({ transfers: items.map((item, index) => transfer('failed', { transferId: `auth-${index}`, direction: 'download', key: item.key, error: failure })), localRoot: '/target' });
+    handlers.transfer_start_download = () => { throw failure; };
     const wrapper = await browser();
     await wrapper.findAll('[data-test=file-row]')[0].trigger('click');
     await wrapper.findAll('[data-test=file-row]')[1].trigger('click', { ctrlKey: true });
     await click(wrapper, '[data-test=download]');
     expect(app.handleFailure).toHaveBeenCalledWith(failure);
-    expect(wrapper.find('.download-queue details').exists()).toBe(true);
+    expect(wrapper.find('[data-test=download-dialog]').text()).toContain(failure.message);
   });
   it("shows the download queue and reveals the finished destination", async () => {
     handlers.cloud_object_list = () => page([file, { key: 'b.txt', size: 2 }]);
-    handlers.cloud_object_download_batch = ({ items }) => ({
-      transfers: items.map((item, index) => transfer('completed', { transferId: `t${index}`, direction: 'download', key: item.key })),
-      localRoot: '/tmp/target',
-    });
+    handlers.transfer_start_download = () => queueSummary('completed', { totalFiles: 2, completedFiles: 2 });
+    handlers.transfer_page_download = () => ({ items: ['a.txt', 'b.txt'].map((path) => ({ remotePath: path, relativePath: path, phase: 'completed' })), nextOffset: null });
     const wrapper = await browser();
     await wrapper.find('[data-test=file-row]').trigger('click');
     await wrapper.findAll('[data-test=file-row]')[1].trigger('click', { ctrlKey: true });
@@ -990,13 +943,14 @@ describe("CloudBrowser", () => {
       expect.stringContaining(t('peer.downloadStatusDone')),
     ]);
     await click(wrapper, '[data-test=reveal-download]');
-    expect(nativeInvoke).toHaveBeenCalledWith('reveal_local_directory', { path: '/tmp/target' });
+    expect(nativeInvoke).toHaveBeenCalledWith('transfer_reveal_download', { queueId: 'queue-1' });
   });
   it("keeps real reveal errors on the global failure path", async () => {
     handlers.cloud_object_list = () => page([file, { key: 'b.txt', size: 2 }]);
     handlers.cloud_object_download_batch = ({ items }) => ({ transfers: items.map((item, index) => transfer('completed', { transferId: `t${index}`, direction: 'download', key: item.key })), localRoot: '/target' });
     const failure = error('PEER_REVEAL_FAILED', 'original reveal failure');
-    handlers.reveal_local_directory = () => { throw failure; };
+    handlers.transfer_start_download = () => queueSummary('completed');
+    handlers.transfer_reveal_download = () => { throw failure; };
     const wrapper = await browser();
     await wrapper.findAll('[data-test=file-row]')[0].trigger('click');
     await wrapper.findAll('[data-test=file-row]')[1].trigger('click', { ctrlKey: true });

@@ -241,14 +241,23 @@ pub(crate) async fn download(
     }
     output.sync_all().await.map_err(|e| io(&assembled, e))?;
     drop(output);
-    if conflict == ConflictPolicy::Fail && destination.exists() {
-        return Err(DomainError::TransferConflict {
-            path: destination.display().to_string(),
-        });
+    if conflict != ConflictPolicy::Overwrite {
+        tokio::fs::hard_link(&assembled, destination)
+            .await
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    DomainError::TransferConflict {
+                        path: destination.display().to_string(),
+                    }
+                } else {
+                    io(destination, e)
+                }
+            })?;
+    } else {
+        tokio::fs::rename(&assembled, destination)
+            .await
+            .map_err(|e| io(destination, e))?;
     }
-    tokio::fs::rename(&assembled, destination)
-        .await
-        .map_err(|e| io(destination, e))?;
     tokio::fs::remove_dir_all(&part_dir)
         .await
         .map_err(|e| io(&part_dir, e))?;
@@ -265,9 +274,25 @@ pub(crate) async fn upload(
     size: u64,
     progress: Option<UploadProgressCallback>,
     cancellation: Option<(String, tokio::sync::watch::Receiver<bool>)>,
+    conflict: ConflictPolicy,
 ) -> Result<(), DomainError> {
     let file = std::fs::File::open(local).map_err(|e| io(local, e))?;
-    upload_opened(client, remote, file, local, size, progress, cancellation).await
+    let condition = if conflict == ConflictPolicy::Overwrite {
+        core::Condition::Any
+    } else {
+        core::Condition::CreateOnly
+    };
+    upload_opened(
+        client,
+        remote,
+        file,
+        local,
+        size,
+        progress,
+        cancellation,
+        condition,
+    )
+    .await
 }
 
 /// All reads and identity checks use the already authorized open file, never its ambient pathname.
@@ -279,8 +304,19 @@ pub(crate) async fn upload_opened(
     size: u64,
     progress: Option<UploadProgressCallback>,
     cancellation: Option<(String, tokio::sync::watch::Receiver<bool>)>,
+    condition: core::Condition,
 ) -> Result<(), DomainError> {
-    return upload_core_source(client, remote, file, local, size, progress, cancellation).await;
+    upload_core_source(
+        client,
+        remote,
+        file,
+        local,
+        size,
+        progress,
+        cancellation,
+        condition,
+    )
+    .await
 }
 
 struct OpenedUploadSource {
@@ -353,6 +389,7 @@ async fn upload_core_source(
     size: u64,
     progress: Option<UploadProgressCallback>,
     cancellation: Option<(String, tokio::sync::watch::Receiver<bool>)>,
+    condition: core::Condition,
 ) -> Result<(), DomainError> {
     if crate::types::PEER_UPLOAD_COMMIT_TIMEOUT != peerdav_protocol_peerdav::session::COMMIT_TIMEOUT
         || crate::types::PEER_UPLOAD_CANCEL_TIMEOUT
@@ -395,7 +432,7 @@ async fn upload_core_source(
     }
     let request = core::SourceWriteRequest {
         entry: backend.scope().entry(path),
-        condition: core::Condition::Any,
+        condition,
         mode: core::WriteMode::Streaming,
         source: Arc::new(OpenedUploadSource {
             file: Arc::new(std::sync::Mutex::new(file)),
@@ -477,7 +514,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 socket
                     .write_all(
-                        format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        format!("HTTP/1.1 {status} Test\r\nx-peerdav-write-conditions: create-only,replace\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                             .as_bytes(),
                     )
                     .await
@@ -503,6 +540,7 @@ mod tests {
                 0,
                 None,
                 None,
+                ConflictPolicy::Fail,
             )
             .await?;
             server.await.expect("server task");
@@ -529,7 +567,7 @@ mod tests {
                 }
             }
             assert!(headers.starts_with(b"OPTIONS"));
-            probe.write_all(b"HTTP/1.1 204 No Content\r\nx-peerdav-upload-version: 2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.expect("probe response");
+            probe.write_all(b"HTTP/1.1 204 No Content\r\nx-peerdav-write-conditions: create-only,replace\r\nx-peerdav-upload-version: 2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.expect("probe response");
             let (mut stalled, _) = listener.accept().await.expect("part HEAD");
             let mut headers = Vec::new();
             loop {
@@ -581,6 +619,7 @@ mod tests {
             0,
             None,
             Some(("aa".into(), receiver)),
+            ConflictPolicy::Fail,
         );
         let canceling = async {
             observed.await.expect("request started");
@@ -617,7 +656,7 @@ mod tests {
                 if method == "HEAD" {
                     changed.set_len(4).unwrap();
                 }
-                socket.write_all(b"HTTP/1.1 204 No Content\r\nx-peerdav-upload-version: 2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                socket.write_all(b"HTTP/1.1 204 No Content\r\nx-peerdav-write-conditions: create-only,replace\r\nx-peerdav-upload-version: 2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
             }
         });
         let client = reqwest_dav::ClientBuilder::new()
@@ -633,6 +672,7 @@ mod tests {
             3,
             None,
             None,
+            core::Condition::CreateOnly,
         )
         .await;
         match result {

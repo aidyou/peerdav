@@ -1,4 +1,5 @@
 <script setup>
+import TransferConflictControls from "./TransferConflictControls.vue";
 import { computed } from "vue";
 import FileGlyph from "./FileGlyph.vue";
 import { formatBytes } from "../lib/format";
@@ -22,16 +23,8 @@ const skipped = computed(() => t("cloudBrowser.uploadSkipped", { empty: props.su
         <p v-if="summary.currentRelativePath">{{ t('cloudBrowser.uploadCurrent') }}: {{ summary.currentRelativePath }}</p>
         <p data-test="upload-skipped">{{ skipped }}</p>
         <p v-if="summary.recoveryRequired" role="alert">{{ t('cloudBrowser.uploadRecovery') }}</p>
-        <div v-if="summary.conflict" data-test="upload-conflict">
-          <p>{{ t('cloudBrowser.uploadConflict') }}: {{ summary.conflict.relativePath }}</p>
-          <p class="mono">{{ JSON.stringify(summary.conflict.key) }}<template v-if="summary.conflict.etag != null"> · ETag: {{ JSON.stringify(summary.conflict.etag) }}</template></p>
-          <label><input :checked="applyRemaining" @change="emit('update:applyRemaining', $event.target.checked)" data-test="upload-apply-remaining" type="checkbox"> {{ t('cloudBrowser.uploadApplyRemaining') }}</label>
-          <div>
-            <el-button data-test="upload-skip" :disabled="resolving" @click="emit('resolve', 'skip')">{{ t('cloudBrowser.uploadSkip') }}</el-button>
-            <el-button data-test="upload-overwrite" :disabled="resolving || !overwriteAllowed" @click="emit('resolve', 'overwrite')">{{ t('cloudBrowser.uploadOverwriteAction') }}</el-button>
-            <el-button data-test="upload-conflict-cancel" :disabled="resolving" @click="emit('resolve', 'cancel')">{{ t('common.cancel') }}</el-button>
-          </div>
-        </div>
+        <TransferConflictControls v-if="open && summary.conflict" :key="`${summary.batchId}:${summary.conflict.conflictId}`" :conflict="summary.conflict" :apply-remaining="applyRemaining" :resolving="resolving" :overwrite-allowed="overwriteAllowed"
+          @update:apply-remaining="emit('update:applyRemaining', $event)" @resolve="emit('resolve', $event)" @cancel="emit('cancel')" />
       </template>
       <p v-if="batchError" role="alert">{{ batchError }}</p>
       <p v-if="pageNotice" role="status">{{ pageNotice }}</p>

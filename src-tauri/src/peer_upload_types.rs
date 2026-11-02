@@ -16,6 +16,7 @@ pub struct PeerUploadConflict {
 #[serde(rename_all = "camelCase")]
 pub struct PeerUploadSummary {
     pub batch_id: String,
+    pub queue_id: String,
     pub peer_id: String,
     pub share_name: String,
     pub remote_dir: String,
@@ -39,6 +40,11 @@ pub(crate) struct TestUploadTransport {
     pub files: tokio::sync::Mutex<Vec<String>>,
     pub block: std::sync::atomic::AtomicBool,
 }
+pub(crate) struct PeerUploadAdapter<'a> {
+    pub manager: &'a Arc<crate::PeerManager>,
+    pub peer: &'a str,
+}
+
 pub(crate) enum SelectedRoot {
     Directory {
         root: Arc<crate::cloud::PhysicalRoot>,
@@ -65,4 +71,5 @@ pub(crate) struct PeerUploadBatch {
     pub handle: Option<tokio::task::JoinHandle<()>>,
     pub stopping: Arc<tokio::sync::Mutex<()>>,
     pub scope: String,
+    pub lifecycle: tokio_util::sync::CancellationToken,
 }

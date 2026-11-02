@@ -29,6 +29,7 @@ pub(crate) async fn execute(
         source,
         session_id,
         progress,
+        condition,
         ..
     } = request;
     let size = source.size();
@@ -48,6 +49,14 @@ pub(crate) async fn execute(
                 .map_err(|e| transport(e, Operation::Write))
         })
         .await?;
+    if probe
+        .headers()
+        .get("x-peerdav-write-conditions")
+        .and_then(|value| value.to_str().ok())
+        != Some("create-only,replace")
+    {
+        return Err(FileError::unsupported(Operation::Write));
+    }
     let streaming = probe
         .headers()
         .get("x-peerdav-upload-version")
@@ -234,6 +243,14 @@ pub(crate) async fn execute(
                 COMMIT_TIMEOUT,
             )
             .await?
+            .header(
+                "x-peerdav-write-condition",
+                match condition {
+                    Condition::CreateOnly => "create-only",
+                    Condition::Any => "replace",
+                    Condition::Match(_) => return Err(FileError::unsupported(Operation::Write)),
+                },
+            )
             .send()
             .await
             .map_err(|e| {
@@ -243,7 +260,9 @@ pub(crate) async fn execute(
             })?;
             if !response.status().is_success() {
                 let mut e = status_error(response.status(), Operation::Write);
-                e.outcome = MutationOutcome::Unknown;
+                if e.kind != FileErrorKind::Precondition {
+                    e.outcome = MutationOutcome::Unknown;
+                }
                 return Err(e);
             }
             Ok(())

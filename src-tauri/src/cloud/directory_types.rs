@@ -16,6 +16,7 @@ pub enum DirectoryConflictPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct ObjectUploadDirectoryDto {
     pub batch_id: String,
+    pub queue_id: String,
     pub connection_id: String,
     pub connection_revision: u64,
     pub bucket: String,
@@ -42,11 +43,17 @@ pub struct DirectoryConflictDto {
 }
 pub(crate) use crate::local_upload_types::{BrowseDirectory, DirectoryBrowser, DirectoryWalk};
 pub use crate::local_upload_types::{DirectoryEntryDto, DirectoryPageDto};
+pub(crate) struct S3UploadAdapter<'a> {
+    pub runtime: &'a Arc<super::runtime::CloudRuntime>,
+    pub connection: &'a str,
+}
+
 pub(crate) struct DirectoryBatch {
     pub status: ObjectUploadDirectoryDto,
     pub session: Arc<ObjectSession>,
-    pub root: Arc<super::PhysicalRoot>,
-    pub browser: Arc<tokio::sync::Mutex<DirectoryBrowser>>,
+    pub root: Option<Arc<super::PhysicalRoot>>,
+    pub files: Option<Vec<crate::local_upload_types::DirectoryFile>>,
+    pub browser: Arc<tokio::sync::Mutex<crate::peer_upload_types::PeerBrowser>>,
     pub cancel: Arc<AtomicBool>,
     pub cancel_signal: Arc<tokio::sync::Notify>,
     pub decision: Arc<tokio::sync::Notify>,
@@ -55,4 +62,5 @@ pub(crate) struct DirectoryBatch {
     // Serialize cancel/join ownership independently of worker-visible phase changes.
     pub stopping: Arc<tokio::sync::Mutex<()>>,
     pub created: std::time::Instant,
+    pub lifecycle: tokio_util::sync::CancellationToken,
 }

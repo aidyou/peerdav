@@ -11,6 +11,7 @@ import FilePreviewDialog from "./FilePreviewDialog.vue";
 import UploadBatchDialog from "./UploadBatchDialog.vue";
 import TransferQueueDialog from "./TransferQueueDialog.vue";
 import OperationErrorDialog from "./OperationErrorDialog.vue";
+import { useDownloadQueue } from "../composables/useDownloadQueue";
 import { useUploadBatch } from "../composables/useUploadBatch";
 import { cloudUploadAdapter } from "../lib/uploadBatchAdapters";
 import { canPreview, fileKind, fileKindKey } from "../lib/fileKinds";
@@ -19,7 +20,7 @@ import {
   MAX_PREVIEW_BYTES,
   previewFormat as detectPreviewFormat,
 } from "../lib/textPreview";
-import { errorStrategy, invoke, normalizeAppError } from "../lib/invoke";
+import { errorStrategy, normalizeAppError } from "../lib/invoke";
 import CloudSyncDrives from "./CloudSyncDrives.vue";
 import { t } from "../lib/i18n";
 
@@ -180,6 +181,7 @@ function openManagement(id = "") {
 async function selectBucket(bucket) {
   if (busy.value || loading.value) return;
   await cancelUploadSession();
+  await disposeDownload();
   const previousBucket = activeBucket.value;
   activeBucket.value = bucket;
   activeDriveId.value = "";
@@ -271,38 +273,17 @@ function retryFailedOperation() {
 const transfers = ref([]);
 const partial = ref(null);
 
-// Batch and folder downloads run in a dedicated queue dialog, like the LAN
-// browser: the user sees every file, can cancel the rest and reveal the target.
-const downloadDialogOpen = ref(false);
-const downloadRoot = ref("");
-const downloadQueue = ref([]);
-const downloadCanceled = ref(false);
-const downloadActionBusy = ref(false);
-let downloadActionVersion = 0;
-const downloadClosing = ref(false);
-const dismissedDownloads = new Set();
-// Upload completions become toasts, so the transfer list never grows forever.
 const uploadNotices = new Set();
-const downloadFinishedCount = computed(() => downloadQueue.value.filter((item) => ["done", "error", "canceled"].includes(item.status)).length);
-const downloadRunning = computed(() => downloadQueue.value.some((item) => ["pending", "downloading"].includes(item.status)));
-const downloadSummary = computed(() => t("peer.downloadSummary", { finished: downloadFinishedCount.value, total: downloadQueue.value.length }));
-function baseName(path) {
-  return String(path ?? "").split("/").pop() || String(path ?? "");
-}
-function applyDownloadStatus(transfer) {
-  const item = downloadQueue.value.find((entry) => entry.transferId === transfer.transferId);
-  if (!item) return;
-  item.status = {
-    completed: "done",
-    failed: "error",
-    cancelled: "canceled",
-    unknown: "error",
-  }[transfer.phase] ?? "downloading";
-  item.transfer = transfer;
-  item.retryable = transfer.phase === "failed" && !transfer.recoveryRequired;
-  item.error = item.status === "canceled" ? "" : transfer.error?.message ?? "";
-  if (transfer.error && item.status === "error") handleAuthenticationFailure(transfer.error);
-}
+const {
+  downloadDialogOpen, downloadState, downloadQueue, downloadPage, downloadRunning, downloadCanceling,
+  downloadResolving, downloadApplyRemaining, downloadPageLoading, downloadSummary, selectDownload, pollDownload,
+  loadDownloadPage, cancelDownloadQueue, resolveDownloadConflict, closeDownloadQueue, revealDownloadRoot, disposeDownload,
+} = useDownloadQueue({
+  captureScope: () => ({ connectionId: props.connectionId, bucket: activeBucket.value }),
+  scopeValid: (scope) => !disposed && scope.connectionId === props.connectionId && scope.bucket === activeBucket.value,
+  backend: ({ connectionId }) => ({ backend: "s3", connectionId }),
+  onFailure: (cause) => app.handleFailure(cause), onSelected: () => clearSelection(),
+});
 
 // PeerBrowser-style selection: a click selects, Ctrl/Cmd/Alt toggles, Shift
 // selects a range and dragging over the listing draws a marquee. A double click
@@ -768,24 +749,9 @@ function remember(transfer, scope) {
   if (!valid(scope)) return;
   statusVersion++;
   transfers.value = [...transfers.value.filter((item) => item.transferId !== transfer.transferId), transfer];
-  const queued = downloadQueue.value.some((item) => item.transferId === transfer.transferId);
-  if (queued) applyDownloadStatus(transfer);
-  else if (transfer.error && transfer.phase !== "cancelled") fail(transfer.error, scope);
+  if (transfer.error && transfer.phase !== "cancelled") fail(transfer.error, scope);
 }
-async function upload() {
-  if (!canMutate.value) return;
-  await operate(async (scope) => {
-    const selected = await cloudObjects.selectLocal({ connectionId: scope.connectionId, direction: "upload" });
-    if (!valid(scope) || !selected?.token) return;
-    if (typeof selected.fileName !== "string" || !selected.fileName) return;
-    const key = scope.prefix + selected.fileName;
-    const existing = objects.value.find((item) => item.key === key);
-    if (existing?.protected === true || protectedRoot.value) return;
-    if (existing && (!existing.etag || !await confirmAction(t("cloudBrowser.uploadOverwrite", { key, etag: existing.etag }), t("cloudBrowser.upload")))) return;
-    if (!valid(scope)) return;
-    remember(await cloudObjects.upload({ connectionId: scope.connectionId, localToken: selected.token, key, overwriteEtag: existing?.etag ?? null, overwriteConfirmed: Boolean(existing) }), scope);
-  });
-}
+function upload() { return uploadDirectory("single"); }
 // Cloud and LAN share the bounded-page session, but retain backend safety policies.
 const {
   uploadDialogOpen, uploadSummary, uploadPage, uploadRunning, uploadPageLoading,
@@ -803,181 +769,15 @@ const {
     if (prefix.value === scope.prefix) refresh();
   },
 });
-const downloadTargets = ref({});
-// Mirrors MAX_CLOUD_DOWNLOAD_BATCH so a folder walk stops before the backend
-// rejects the whole batch and the UI can explain the limit.
-const DOWNLOAD_BATCH_LIMIT = 100;
-async function retryDownload(item) {
-  if (!item?.retryable || downloadRunning.value) return;
-  await download(downloadTargets.value[item.transferId] ?? { key: item.key, name: baseName(item.relativePath) }, item);
+function download(item) {
+  if (!item || item.isDir) return;
+  return selectDownload({ mode: "single", path: item.key });
 }
-async function acknowledgeDownload(transfer) {
-  if (!transfer || transfer.direction !== "download" || transfer.recoveryRequired || !["completed", "failed", "cancelled"].includes(transfer.phase)) return;
-  if (dismissedDownloads.has(transfer.transferId)) return;
-  await cloudObjects.recoveryAcknowledge({ transferId: transfer.transferId, connectionId: transfer.connectionId, connectionRevision: transfer.connectionRevision, confirmed: true });
-  dismissedDownloads.add(transfer.transferId);
-  statusVersion++;
-}
-async function closeDownloadQueue() {
-  if (downloadRunning.value || downloadActionBusy.value || downloadClosing.value) return;
-  downloadClosing.value = true;
-  const scope = current();
-  try {
-    for (const item of downloadQueue.value) {
-      await acknowledgeDownload(item.transfer);
-      for (const previous of item.previousTransfers ?? []) await acknowledgeDownload(previous);
-    }
-    if (!valid(scope)) return;
-    downloadDialogOpen.value = false;
-    downloadQueue.value = [];
-    downloadTargets.value = {};
-  } catch (cause) { if (valid(scope)) app.handleFailure(cause); }
-  finally { downloadClosing.value = false; }
-}
-async function download(item, retryItem = null) {
-  if (!item || item.isDir || downloadActionBusy.value || downloadClosing.value || (downloadRunning.value && !retryItem)) return;
-  downloadActionBusy.value = true;
-  const actionVersion = ++downloadActionVersion;
-  try {
-    await operate(async (scope) => {
-      const selected = await cloudObjects.selectLocal({ connectionId: scope.connectionId, direction: "download" });
-      if (!valid(scope) || !selected?.token) return;
-      const run = async (overwriteConfirmed) => {
-        if (!item.relativePath) return cloudObjects.download({ connectionId: scope.connectionId, localToken: selected.token, key: item.key, fileName: item.name, overwriteConfirmed });
-        return (await cloudObjects.downloadBatch({ connectionId: scope.connectionId, localToken: selected.token, items: [{ key: item.key, relativePath: item.relativePath }], overwriteConfirmed })).transfers[0];
-      };
-      let transfer;
-      try { transfer = await run(false); }
-      catch (cause) {
-        if (cause?.code !== "TRANSFER_CONFLICT" || !valid(scope)) throw cause;
-        if (!await confirmAction(t("cloudBrowser.downloadOverwrite"), t("cloudBrowser.download")) || !valid(scope)) return;
-        transfer = await run(true);
-      }
-      if (!valid(scope)) return;
-      statusVersion++;
-      const queued = { transferId: transfer.transferId, key: item.key, relativePath: item.relativePath ?? item.name, size: item.size ?? null,
-        previousTransfers: retryItem ? [...(retryItem.previousTransfers ?? []), retryItem.transfer] : [] };
-      if (retryItem) downloadQueue.value.splice(downloadQueue.value.indexOf(retryItem), 1, queued);
-      else downloadQueue.value.push(queued);
-      downloadCanceled.value = false;
-      downloadTargets.value[transfer.transferId] = { ...item };
-      applyDownloadStatus(transfer);
-      downloadDialogOpen.value = true;
-      remember(transfer, scope);
-    });
-  } finally { if (actionVersion === downloadActionVersion) downloadActionBusy.value = false; }
-}
-async function collectFolderItems(prefixKey, relativeBase, scope, items) {
-  let next = null;
-  do {
-    const page = await cloudObjects.list({ connectionId: scope.connectionId, prefix: prefixKey, next });
-    if (!valid(scope)) return false;
-    for (const child of objectChildren(page.objects, prefixKey)) {
-      const name = displayName(child);
-      if (child.directory === true) {
-        if (!await collectFolderItems(child.key, `${relativeBase}${name}/`, scope, items)) return false;
-        continue;
-      }
-      items.push({ key: child.key, relativePath: `${relativeBase}${name}`, size: child.size });
-      if (items.length > DOWNLOAD_BATCH_LIMIT) return false;
-    }
-    next = page.next;
-  } while (next);
-  return true;
-}
-// One destination folder covers the whole selection; folders keep their tree
-// below it and every file still becomes its own visible transfer.
-async function downloadSelection() {
-  const selection = selectedEntries.value.slice();
-  if (!selection.length || downloadRunning.value || downloadActionBusy.value || downloadClosing.value) return;
-  if (selection.length === 1 && !selection[0].isDir) { await download(selection[0]); return; }
-  await operate(async (scope) => {
-    const chosen = await cloudObjects.selectLocal({ connectionId: scope.connectionId, direction: "download" });
-    if (!valid(scope) || !chosen?.token) return;
-    // `planned` keeps display metadata; the command only receives the exact
-    // `{ key, relativePath }` pairs its strict DTO accepts.
-    const planned = [];
-    for (const entry of selection) {
-      if (entry.isDir) {
-        if (!await collectFolderItems(entry.key, `${entry.name}/`, scope, planned)) break;
-      } else {
-        planned.push({ key: entry.key, relativePath: entry.name, size: entry.size });
-      }
-    }
-    if (!valid(scope)) return;
-    if (planned.length > DOWNLOAD_BATCH_LIMIT) {
-      error.value = {
-        code: "DOWNLOAD_QUEUE_TOO_LARGE",
-        message: t("errors.DOWNLOAD_QUEUE_TOO_LARGE"),
-        detail: null,
-        context: { limit: DOWNLOAD_BATCH_LIMIT },
-      };
-      return;
-    }
-    if (!planned.length) {
-      app.setNotice?.("cloudBrowser.noDownloadableFiles");
-      return;
-    }
-    const items = planned.map(({ key, relativePath }) => ({ key, relativePath }));
-    const run = (overwriteConfirmed) => cloudObjects.downloadBatch({
-      connectionId: scope.connectionId,
-      localToken: chosen.token,
-      items,
-      overwriteConfirmed,
-    });
-    let created;
-    let localRoot;
-    try { ({ transfers: created, localRoot } = await run(false)); }
-    catch (cause) {
-      if (cause?.code !== "TRANSFER_CONFLICT" || !valid(scope)) throw cause;
-      if (!await confirmAction(t("cloudBrowser.downloadOverwrite"), t("cloudBrowser.download")) || !valid(scope)) return;
-      ({ transfers: created, localRoot } = await run(true));
-    }
-    if (!valid(scope)) return;
-    downloadCanceled.value = false;
-    downloadRoot.value = localRoot || "";
-    downloadQueue.value.push(...created.map((transfer) => {
-      const source = planned.find((candidate) => candidate.key === transfer.key);
-      return {
-        transferId: transfer.transferId,
-        key: transfer.key,
-        relativePath: source?.relativePath ?? transfer.key,
-        size: source?.size ?? null,
-        status: transfer.phase === "completed" ? "done" : "downloading",
-        error: transfer.error?.message ?? "",
-      };
-    }));
-    for (const transfer of created) applyDownloadStatus(transfer);
-    downloadDialogOpen.value = true;
-    for (const transfer of created) {
-      const source = planned.find((candidate) => candidate.key === transfer.key);
-      downloadTargets.value[transfer.transferId] = {
-        key: transfer.key,
-        name: baseName(source?.relativePath ?? transfer.key),
-        relativePath: source?.relativePath,
-      };
-      remember(transfer, scope);
-    }
-  });
-}
-async function cancelDownloadQueue() {
-  if (!downloadRunning.value || downloadCanceled.value) return;
-  downloadCanceled.value = true;
-  const active = downloadQueue.value.filter((item) => item.transferId && ["pending", "downloading"].includes(item.status));
-  const scope = current();
-  let failed = false;
-  for (const item of active) {
-    try { remember(await cloudObjects.cancel(item.transferId), scope); }
-    catch (cause) { failed = true; app.handleFailure(cause); }
-  }
-  if (valid(scope) && failed) downloadCanceled.value = false;
-}
-async function revealDownloadRoot() {
-  if (!downloadRoot.value) return;
-  try {
-    await invoke("reveal_local_directory", { path: downloadRoot.value });
-    await closeDownloadQueue();
-  } catch (cause) { app.handleFailure(cause); }
+function downloadSelection() {
+  const entries = selectedEntries.value;
+  if (!entries.length) return;
+  if (entries.length === 1) return selectDownload({ mode: entries[0].isDir ? "folder" : "single", path: entries[0].key });
+  return selectDownload({ mode: "files", paths: entries.map((entry) => entry.key) });
 }
 function validDeletePlan(plan, target) {
   return plan != null && Number.isSafeInteger(plan.objectCount) && plan.objectCount >= 0 && Array.isArray(plan.entries)
@@ -1023,25 +823,12 @@ async function poll() {
   try {
     const result = await cloudObjects.status();
     if (valid(scope) && version === statusVersion) {
-      const scoped = result.filter((item) => item.connectionId === scope.connectionId && !dismissedDownloads.has(item.transferId));
-      const uncertain = new Set(scoped.filter((item) => item.recoveryRequired || item.phase === "unknown").map((item) => item.transferId));
-      downloadQueue.value = downloadQueue.value.filter((item) => !uncertain.has(item.transferId));
-      // Recover prior-session local downloads visibly, never silently dismiss
-      // them. Unknown/recovery-required operations stay in the recovery pane.
-      for (const item of scoped) {
-        if (item.direction !== "download" || item.recoveryRequired || item.phase === "unknown" || item.phase === "acknowledged") continue;
-        if (!downloadQueue.value.some((entry) => entry.transferId === item.transferId || entry.previousTransfers?.some((old) => old?.transferId === item.transferId))) {
-          downloadQueue.value.push({ transferId: item.transferId, key: item.key, relativePath: item.key ?? "", size: item.sizeHint });
-          downloadDialogOpen.value = true;
-        }
-      }
-      const queued = new Set(downloadQueue.value.flatMap((item) => [item.transferId, ...(item.previousTransfers ?? []).map((old) => old?.transferId)]).filter(Boolean));
+      const scoped = result.filter((item) => item.connectionId === scope.connectionId);
       let refreshAfterUpload = false;
       for (const item of scoped) {
-        if (queued.has(item.transferId)) applyDownloadStatus(item);
         if (item.error?.code === "CLOUD_OBJECT_PROTECTED") {
           protectedRoot.value = true;
-          if (!queued.has(item.transferId)) fail(item.error, scope);
+          fail(item.error, scope);
         }
         // A completed upload becomes one toast and leaves the list, so the
         // notification pane never grows with historical successes.
@@ -1051,13 +838,7 @@ async function poll() {
           refreshAfterUpload = true;
         }
       }
-      transfers.value = scoped.filter((item) => !["completed", "cancelled"].includes(item.phase) && !queued.has(item.transferId));
-      for (const item of downloadQueue.value.filter((entry) => entry.status === "done")) {
-        for (const previous of item.previousTransfers ?? []) {
-          try { await acknowledgeDownload(previous); }
-          catch (cause) { app.handleFailure(cause); }
-        }
-      }
+      transfers.value = scoped.filter((item) => !["completed", "cancelled", "acknowledged"].includes(item.phase));
       if (refreshAfterUpload) refresh();
     }
   } catch (cause) {
@@ -1075,9 +856,9 @@ async function bootstrap() {
   else { void prepare(); void load(); }
 }
 watch(() => props.connectionId, () => {
-  downloadActionVersion++; downloadActionBusy.value = false; downloadClosing.value = false;
+  void disposeDownload();
   void cancelUploadSession();
-  requestId++; statusVersion++; preparationVersion++; downloadTargets.value = {}; uploadNotices.clear(); downloadDialogOpen.value = false; downloadRoot.value = ""; downloadQueue.value = []; downloadCanceled.value = false; prepared.value = false; preparing.value = false; preparationError.value = null; protectedRoot.value = false; connections.value = [];
+  requestId++; statusVersion++; preparationVersion++; uploadNotices.clear(); prepared.value = false; preparing.value = false; preparationError.value = null; protectedRoot.value = false; connections.value = [];
   view.value = "files"; activeDriveId.value = ""; catalogDrives.value = []; buckets.value = []; activeBucket.value = "";
   objects.value = []; transfers.value = []; partial.value = null; prefix.value = ""; root.value = ""; next.value = null; complete.value = false; busy.value = false; loading.value = false; error.value = null;
   clearSelection();
@@ -1087,7 +868,7 @@ watch(() => props.connectionId, () => {
 }, { immediate: true });
 onMounted(() => {
   void poll();
-  timer = setInterval(() => { void pollUpload(); void poll(); }, 1500);
+  timer = setInterval(() => { void pollUpload(); void pollDownload(); void poll(); }, 1500);
   titlebarActions.value = Boolean(typeof document !== "undefined" && document.getElementById("titlebar-file-actions"));
   window.addEventListener("keydown", onModifierKeydown, true);
   window.addEventListener("keyup", onModifierKeyup, true);
@@ -1096,6 +877,7 @@ onMounted(() => {
   window.addEventListener("keydown", onShortcutsKeydown, true);
 });
 onBeforeUnmount(() => {
+  void disposeDownload();
   void cancelUploadSession();
   disposed = true; requestId++; statusVersion++; clearInterval(timer);
   clearTimeout(loadingHintTimer); clearTimeout(checkingHintTimer);
@@ -1168,7 +950,7 @@ onBeforeUnmount(() => {
                   </button>
                 </el-tooltip>
                 <el-tooltip :content="t('peer.uploadFolder')" placement="bottom" :show-after="200" :hide-after="0" :enterable="false">
-                  <button type="button" class="view-switch__button" data-test="upload-directory" :aria-label="t('peer.uploadFolder')" :disabled="!canMutate" @click="uploadDirectory">
+                  <button type="button" class="view-switch__button" data-test="upload-directory" :aria-label="t('peer.uploadFolder')" :disabled="!canMutate" @click="uploadDirectory('folder')">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5c0-.8.7-1.5 1.5-1.5h4l1.8 2H19c.8 0 1.5.7 1.5 1.5v8c0 .8-.7 1.5-1.5 1.5H5c-.8 0-1.5-.7-1.5-1.5z" /><path d="M12 17v-5M9.5 14.5 12 12l2.5 2.5" /></svg>
                   </button>
                 </el-tooltip>
@@ -1277,10 +1059,10 @@ onBeforeUnmount(() => {
       :page-loading="uploadPageLoading" :batch-error="uploadBatchError" :page-notice="uploadPageNotice"
       v-model:apply-remaining="uploadApplyRemaining" :resolving="uploadResolving" :overwrite-allowed="uploadOverwriteAllowed"
       @close="closeUpload" @cancel="cancelUpload" @page="loadUploadPage" @resolve="resolveUploadConflict" />
-    <TransferQueueDialog :open="downloadDialogOpen" :items="downloadQueue" :running="downloadRunning" :canceling="downloadCanceled"
-      :summary="downloadSummary" :root="downloadRoot" :note="t('transferQueue.cloudProgress')"
-      @cancel="cancelDownloadQueue" @close="closeDownloadQueue" @reveal="revealDownloadRoot"
-      @retry="retryDownload" />
+    <TransferQueueDialog :open="downloadDialogOpen" :items="downloadQueue" :running="downloadRunning" :canceling="downloadCanceling"
+      :summary="downloadSummary" :queue-state="downloadState" :next-offset="downloadPage.nextOffset" :page-loading="downloadPageLoading"
+      v-model:apply-remaining="downloadApplyRemaining" :resolving="downloadResolving" @resolve="resolveDownloadConflict" @page="loadDownloadPage"
+      @cancel="cancelDownloadQueue" @close="closeDownloadQueue" @reveal="revealDownloadRoot" />
   </section>
 </template>
 

@@ -1187,6 +1187,10 @@ async fn handle_request(
                 "x-peerdav-upload-version",
                 http::HeaderValue::from_static("2"),
             );
+            response.headers_mut().insert(
+                "x-peerdav-write-conditions",
+                http::HeaderValue::from_static("create-only,replace"),
+            );
             return response;
         }
         return match crate::upload::handle(
@@ -1201,6 +1205,10 @@ async fn handle_request(
         {
             Ok(status) => empty_response(status),
             Err(DomainError::TransferCanceled) => empty_response(StatusCode::CONFLICT),
+            Err(error @ DomainError::TransferConflict { .. }) => {
+                publish_error(gate.events.as_ref(), &error);
+                empty_response(StatusCode::PRECONDITION_FAILED)
+            }
             Err(error) => {
                 publish_error(gate.events.as_ref(), &error);
                 empty_response(StatusCode::BAD_REQUEST)

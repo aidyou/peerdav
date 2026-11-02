@@ -331,6 +331,8 @@ enum AuthorizationOutcome {
 /// operation re-reads the code from the vault so revocation is immediate.
 #[path = "peer_upload.rs"]
 pub(crate) mod upload_batches;
+#[path = "peer_download.rs"]
+pub(crate) mod download_adapter;
 
 pub struct PeerManager {
     vault: Arc<Vault>,
@@ -342,6 +344,7 @@ pub struct PeerManager {
     #[cfg(test)]
     upload_test_transport: Option<Arc<crate::peer_upload_types::TestUploadTransport>>,
     upload_lifecycle: Mutex<()>,
+    download_payload_lock: Mutex<()>,
     upload_epoch: std::sync::atomic::AtomicU64,
     upload_cancellations: Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
     events: Arc<dyn PeerEvents>,
@@ -441,6 +444,7 @@ impl PeerManager {
             #[cfg(test)]
             upload_test_transport: None,
             upload_lifecycle: Mutex::new(()),
+            download_payload_lock: Mutex::new(()),
             upload_epoch: std::sync::atomic::AtomicU64::new(0),
             upload_cancellations: Mutex::new(HashMap::new()),
             events,
@@ -2373,7 +2377,7 @@ impl PeerManager {
         )
         .await?;
 
-        crate::transfer::upload(&client, &remote, &local, size, progress, cancellation).await?;
+        crate::transfer::upload(&client, &remote, &local, size, progress, cancellation, conflict).await?;
 
         Ok(TransferResult {
             transferred: true,

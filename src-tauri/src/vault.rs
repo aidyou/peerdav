@@ -41,6 +41,7 @@ struct Session {
     /// Stable reason code when the configured key file could not be loaded at
     /// startup, so the UI can show a recovery path instead of a password form.
     key_error: Option<&'static str>,
+    transfer_cancel: tokio_util::sync::CancellationToken,
 }
 
 /// Process-wide vault handle. The database mutex serializes sensitive
@@ -315,6 +316,8 @@ impl Vault {
     pub fn lock(&self) -> Result<VaultStatus, DomainError> {
         {
             let mut session = self.session()?;
+            session.transfer_cancel.cancel();
+            session.transfer_cancel = tokio_util::sync::CancellationToken::new();
             session.key = None;
             session.admin = None;
             session.interface_locked = false;
@@ -453,8 +456,24 @@ impl Vault {
     pub fn lock_interface(&self) -> Result<(), DomainError> {
         let mut session = self.session()?;
         if session.admin.is_some() {
+            session.transfer_cancel.cancel();
+            session.transfer_cancel = tokio_util::sync::CancellationToken::new();
             session.interface_locked = true;
         }
+        Ok(())
+    }
+
+    pub(crate) fn transfer_cancellation(&self) -> Result<tokio_util::sync::CancellationToken, DomainError> {
+        let session = self.session()?;
+        if session.interface_locked { return Err(DomainError::InterfaceLocked); }
+        require_key(&session)?;
+        Ok(session.transfer_cancel.clone())
+    }
+
+    pub(crate) fn invalidate_transfers(&self) -> Result<(), DomainError> {
+        let mut session = self.session()?;
+        session.transfer_cancel.cancel();
+        session.transfer_cancel = tokio_util::sync::CancellationToken::new();
         Ok(())
     }
 
@@ -483,6 +502,8 @@ impl Vault {
     /// Clears the in-memory admin session without locking the vault.
     pub fn admin_logout(&self) -> Result<(), DomainError> {
         let mut session = self.session()?;
+        session.transfer_cancel.cancel();
+        session.transfer_cancel = tokio_util::sync::CancellationToken::new();
         session.admin = None;
         session.interface_locked = false;
         Ok(())

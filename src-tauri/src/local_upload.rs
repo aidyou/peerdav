@@ -6,6 +6,120 @@ use crate::local_upload_types::*;
 use crate::{AppError, DomainError};
 use cap_fs_ext::DirExt;
 
+pub(crate) async fn start_queue<A: crate::traits::UploadQueueAdapter>(adapter: &A, id: &str, policy: crate::cloud::directory_types::DirectoryConflictPolicy) -> Result<A::Status, AppError> {
+    crate::types::QueueConflictPolicy::from_upload(policy)?;
+    adapter.start(id, policy).await
+}
+
+impl crate::peer_upload_types::PeerBrowser {
+    pub(crate) fn page(&mut self, directory_token: Option<String>, cursor: Option<String>, limit: Option<usize>, active: Option<String>, completed: bool) -> Result<DirectoryPageDto, AppError> {
+        match self {
+            Self::Directory(browser) => browser.page(directory_token, cursor, limit, active, completed),
+            Self::Files { entries, token: root_token, cursor: saved } => {
+                if directory_token.as_ref().is_some_and(|t| t != root_token) { return Err(invalid()); }
+                let start = match cursor { None => 0, Some(c) => saved.as_ref().filter(|(s, _)| *s == c).map(|(_, i)| *i).ok_or_else(invalid)? };
+                let end = (start + limit.unwrap_or(100).clamp(1, 128)).min(entries.len());
+                let mut page = entries[start..end].to_vec();
+                for e in &mut page { if active.as_deref() == Some(&e.relative_path) && !completed { e.phase = "active".into(); } }
+                *saved = if end < entries.len() { Some((token()?, end)) } else { None };
+                Ok(DirectoryPageDto { directory_token: root_token.clone(), parent_token: None, relative_path: String::new(), entries: page, next_cursor: saved.as_ref().map(|(s, _)| s.clone()) })
+            }
+        }
+    }
+}
+
+pub(crate) fn open_selected_files(paths: Vec<std::path::PathBuf>) -> Result<(Vec<DirectoryFile>, crate::peer_upload_types::PeerBrowser), AppError> {
+    if paths.is_empty() || paths.len() > 128 { return Err(invalid()); }
+    let mut names = std::collections::HashSet::new();
+    let mut files = Vec::new();
+    let mut entries = Vec::new();
+    for path in paths {
+        let name = path.file_name().and_then(|s| s.to_str()).ok_or_else(invalid)?.to_owned();
+        crate::cloud::object_service::valid_relative_path(&name).map_err(|e| AppError::from(DomainError::from(e)))?;
+        if !names.insert(name.clone()) { return Err(invalid()); }
+        let parent = PhysicalRoot::open(path.parent().ok_or_else(invalid)?).map_err(|e| AppError::from(DomainError::from(e)))?;
+        let dir = parent.upload_directory_handle().map_err(|e| AppError::from(DomainError::from(e)))?;
+        let meta = dir.symlink_metadata(&name).map_err(io)?;
+        if !meta.is_file() || meta.file_type().is_symlink() { return Err(invalid()); }
+        let file = open_file_checked(&dir, &name, &meta)?;
+        let size = file.metadata().map_err(io)?.len();
+        entries.push(DirectoryEntryDto { name: name.clone(), relative_path: name.clone(), kind: "file".into(), size, directory_token: None, phase: "unscanned".into() });
+        files.push(DirectoryFile { relative: name, file, size });
+    }
+    Ok((files, crate::peer_upload_types::PeerBrowser::Files { entries, token: token()?, cursor: None }))
+}
+
+impl crate::types::QueueConflictPolicy {
+    pub(crate) fn from_upload(policy: crate::cloud::directory_types::DirectoryConflictPolicy) -> Result<Self, AppError> {
+        use crate::cloud::directory_types::DirectoryConflictPolicy as P;
+        use crate::download_types::ConflictResolution as R;
+        Ok(Self { cached: match policy {
+            P::Ask => None,
+            P::Skip => Some(R::Skip),
+            P::Overwrite => Some(R::Overwrite),
+            P::Cancel => return Err(invalid()),
+        } })
+    }
+    pub(crate) fn upload_choice(&self) -> crate::cloud::directory_types::DirectoryConflictPolicy {
+        use crate::cloud::directory_types::DirectoryConflictPolicy as P;
+        use crate::download_types::ConflictResolution as R;
+        match self.cached { None => P::Ask, Some(R::Skip) => P::Skip, Some(R::Overwrite) => P::Overwrite }
+    }
+    pub(crate) fn remember(&mut self, decision: crate::download_types::ConflictResolution, remaining: bool) {
+        if remaining { self.cached = Some(decision); }
+    }
+    pub(crate) fn resolve<T: Copy>(
+        current_id: Option<&str>, conflict_id: &str,
+        slot: &mut Option<(T, bool)>, decision: T, remaining: bool,
+    ) -> Result<(), AppError> {
+        if current_id != Some(conflict_id) || slot.is_some() { return Err(invalid()); }
+        *slot = Some((decision, remaining));
+        Ok(())
+    }
+}
+
+/// Shared queue-owned decision wait. Only a decision is cached; callers must
+/// probe each destination afresh before asking, and validate again before I/O.
+pub(crate) async fn wait_queue_conflict<C, R, F>(
+    notify: &tokio::sync::Notify,
+    cancelled: C,
+    mut resolution: R,
+    policy: &mut crate::types::QueueConflictPolicy,
+) -> Result<crate::cloud::directory_types::DirectoryConflictPolicy, AppError>
+where
+    C: std::future::Future<Output = AppError>,
+    R: FnMut() -> F,
+    F: std::future::Future<
+            Output = Result<
+                Option<(crate::cloud::directory_types::DirectoryConflictPolicy, bool)>,
+                AppError,
+            >,
+        >,
+{
+    tokio::pin!(cancelled);
+    loop {
+        // Register before reading the slot: Notify retains a wake between read
+        // and await, so a UI decision cannot be lost.
+        let notified = notify.notified();
+        tokio::select! {
+            biased;
+            error = &mut cancelled => return Err(error),
+            value = async { resolution().await } => {
+                if let Some((choice, remaining)) = value? {
+                    let next = crate::types::QueueConflictPolicy::from_upload(choice)?;
+                    if let Some(decision) = next.cached { policy.remember(decision, remaining); }
+                    return Ok(choice);
+                }
+            }
+        }
+        tokio::select! {
+            biased;
+            error = &mut cancelled => return Err(error),
+            _ = notified => {}
+        }
+    }
+}
+
 pub(crate) fn invalid() -> AppError {
     AppError::from(DomainError::from(
         ObjectServiceError::InvalidLocalCapability,
@@ -338,5 +452,53 @@ impl DirectoryBrowser {
             entries,
             next_cursor: self.cursor.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod queue_conflict_tests {
+    use super::*;
+    use crate::cloud::directory_types::DirectoryConflictPolicy as Policy;
+
+    #[tokio::test]
+    async fn resolution_matrix_caches_only_current_queue_remaining_decisions() {
+        for choice in [Policy::Skip, Policy::Overwrite] {
+            for remaining in [false, true] {
+                let notify = tokio::sync::Notify::new();
+                let mut current = crate::types::QueueConflictPolicy::default();
+                let next_queue = Policy::Ask;
+                let chosen = wait_queue_conflict(
+                    &notify,
+                    std::future::pending(),
+                    || std::future::ready(Ok(Some((choice, remaining)))),
+                    &mut current,
+                )
+                .await
+                .expect("resolved");
+                assert_eq!(chosen, choice);
+                assert_eq!(current.upload_choice(), if remaining { choice } else { Policy::Ask });
+                assert_eq!(next_queue, Policy::Ask);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_does_not_consume_or_cache_a_pending_resolution() {
+        let notify = tokio::sync::Notify::new();
+        let mut policy = crate::types::QueueConflictPolicy::default();
+        let mut read = false;
+        let result = wait_queue_conflict(
+            &notify,
+            std::future::ready(invalid()),
+            || {
+                read = true;
+                std::future::ready(Ok(Some((Policy::Overwrite, true))))
+            },
+            &mut policy,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!read);
+        assert_eq!(policy.upload_choice(), Policy::Ask);
     }
 }

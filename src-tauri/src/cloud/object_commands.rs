@@ -105,11 +105,13 @@ pub async fn cloud_object_select_local(
             )));
         }
     };
+    let picker_direction = if upload { crate::types::PickerDirection::Upload } else { crate::types::PickerDirection::Download };
     let selected = tokio::task::spawn_blocking(move || {
+        let dialog = crate::picker_prefs::dialog(&app, picker_direction);
         if upload {
-            app.dialog().file().blocking_pick_file()
+            dialog.blocking_pick_file()
         } else {
-            app.dialog().file().blocking_pick_folder()
+            dialog.blocking_pick_folder()
         }
     })
     .await
@@ -120,35 +122,43 @@ pub async fn cloud_object_select_local(
             super::ObjectServiceError::InvalidLocalCapability,
         ))
     })?;
-    cloud
+    let capability = cloud
         .0
         .object_grant_selected(&connection_id, revision, &path, upload)
-        .await
+        .await?;
+    crate::picker_prefs::remember(&cloud.0.vault, picker_direction, Some(&path), !upload);
+    Ok(capability)
 }
 #[tauri::command]
 pub async fn cloud_object_select_upload_directory(
     app: tauri::AppHandle,
     connection_id: String,
     prefix: String,
+    mode: Option<String>,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<Option<ObjectUploadDirectoryDto>, AppError> {
+    let mode = mode.unwrap_or_else(|| "folder".into());
+    if !matches!(mode.as_str(), "folder" | "files" | "single") { return Err(crate::local_upload::invalid()); }
+    let folder = mode == "folder";
+    let single = mode == "single";
     let (revision, _) = cloud.0.object_selection_scope(&connection_id).await?;
-    let selected = tokio::task::spawn_blocking(move || app.dialog().file().blocking_pick_folder())
-        .await
-        .map_err(task_error)?;
-    let Some(selected) = selected else {
-        return Ok(None);
+    let selected = tokio::task::spawn_blocking(move || {
+        let dialog = crate::picker_prefs::dialog(&app, crate::types::PickerDirection::Upload);
+        if folder { dialog.blocking_pick_folder().map(|p| vec![p]) }
+        else if single { dialog.blocking_pick_file().map(|p| vec![p]) }
+        else { dialog.blocking_pick_files() }
+    }).await.map_err(task_error)?;
+    let Some(selected) = selected else { return Ok(None); };
+    let mut paths = selected.into_iter().map(|p| p.into_path().map_err(|_| crate::local_upload::invalid())).collect::<Result<Vec<_>, _>>()?;
+    let remembered = paths.first().cloned();
+    let result = if folder {
+        let path = paths.pop().ok_or_else(crate::local_upload::invalid)?;
+        cloud.0.object_select_upload_directory(&connection_id, revision, prefix, &path).await?
+    } else {
+        cloud.0.object_select_upload_files(&connection_id, revision, prefix, paths).await?
     };
-    let path = selected.into_path().map_err(|_| {
-        AppError::from(DomainError::from(
-            super::ObjectServiceError::InvalidLocalCapability,
-        ))
-    })?;
-    cloud
-        .0
-        .object_select_upload_directory(&connection_id, revision, prefix, &path)
-        .await
-        .map(Some)
+    crate::picker_prefs::remember(&cloud.0.vault, crate::types::PickerDirection::Upload, remembered.as_deref(), folder);
+    Ok(Some(result))
 }
 #[tauri::command]
 pub async fn cloud_object_start_upload_directory(
@@ -243,16 +253,8 @@ pub async fn cloud_object_upload(
     overwrite_confirmed: bool,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<ObjectTransferDto, AppError> {
-    cloud
-        .0
-        .object_upload(
-            &connection_id,
-            &local_token,
-            key,
-            overwrite_etag,
-            overwrite_confirmed,
-        )
-        .await
+    let _ = (cloud, connection_id, local_token, key, overwrite_etag, overwrite_confirmed);
+    Err(crate::local_upload::invalid())
 }
 #[tauri::command]
 pub async fn cloud_object_download(
@@ -263,16 +265,8 @@ pub async fn cloud_object_download(
     overwrite_confirmed: bool,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<ObjectTransferDto, AppError> {
-    cloud
-        .0
-        .object_download(
-            &connection_id,
-            &local_token,
-            key,
-            file_name,
-            overwrite_confirmed,
-        )
-        .await
+    let _ = (cloud, connection_id, local_token, key, file_name, overwrite_confirmed);
+    Err(crate::local_upload::invalid())
 }
 #[tauri::command]
 pub async fn cloud_object_download_batch(
@@ -282,10 +276,8 @@ pub async fn cloud_object_download_batch(
     overwrite_confirmed: bool,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<ObjectDownloadBatchDto, AppError> {
-    cloud
-        .0
-        .object_download_batch(&connection_id, &local_token, items, overwrite_confirmed)
-        .await
+    let _ = (cloud, connection_id, local_token, items, overwrite_confirmed);
+    Err(crate::local_upload::invalid())
 }
 #[tauri::command]
 pub async fn cloud_object_delete_plan(

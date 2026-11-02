@@ -28,7 +28,32 @@ fn token() -> Result<String, AppError> {
     super::object_runtime::random_id()
 }
 
+impl crate::traits::UploadQueueAdapter for S3UploadAdapter<'_> {
+    type Status = ObjectUploadDirectoryDto;
+    fn start<'a>(&'a self, id: &'a str, policy: DirectoryConflictPolicy) -> futures_util::future::BoxFuture<'a, Result<Self::Status, AppError>> {
+        Box::pin(self.runtime.object_start_upload_directory_inner(self.connection, id, policy))
+    }
+}
+
 impl CloudRuntime {
+    pub(crate) async fn object_select_upload_files(&self, connection_id: &str, revision: u64, prefix: String, paths: Vec<std::path::PathBuf>) -> Result<ObjectUploadDirectoryDto, AppError> {
+        self.object_admit()?;
+        super::object_service::valid_prefix(&prefix).map_err(app)?;
+        if prefix.len() > MAX_UPLOAD_DIRECTORY_PATH_BYTES { return Err(invalid()); }
+        let _lifecycle = self.object_lifecycle.lock().await;
+        let _permit = self.network.read().await;
+        let session = self.object_session(connection_id).await?;
+        if session.revision != revision { return Err(invalid()); }
+        let lifecycle = self.vault.transfer_cancellation().map_err(AppError::from)?;
+        let (files, browser) = tokio::task::spawn_blocking(move || crate::local_upload::open_selected_files(paths)).await.map_err(|e| app(DomainError::Internal { detail: e.to_string() }))??;
+        let queue_id = token()?;
+        let status = ObjectUploadDirectoryDto { batch_id: queue_id.clone(), queue_id, connection_id: connection_id.into(), connection_revision: revision, bucket: session.bucket.clone(), prefix, root_name: String::new(), phase: "selected".into(), current_relative_path: None, completed_files: 0, completed_bytes: 0, skipped_files: 0, skipped_symlinks: 0, skipped_empty_directories: 0, conflict: None, error: None, recovery_required: false };
+        let mut state = self.objects.lock().await;
+        state.prune();
+        if state.upload_directories.len() >= 4 || state.local_handle_count().saturating_add(files.len()) > MAX_LOCAL_HANDLES { return Err(invalid()); }
+        state.upload_directories.insert(status.batch_id.clone(), DirectoryBatch { status: status.clone(), session, root: None, files: Some(files), browser: Arc::new(tokio::sync::Mutex::new(browser)), cancel: Arc::new(AtomicBool::new(false)), cancel_signal: Arc::new(tokio::sync::Notify::new()), decision: Arc::new(tokio::sync::Notify::new()), resolution: None, handle: None, stopping: Arc::new(tokio::sync::Mutex::new(())), created: std::time::Instant::now(), lifecycle });
+        Ok(status)
+    }
     pub(crate) async fn object_select_upload_directory(
         &self,
         connection_id: &str,
@@ -74,8 +99,10 @@ impl CloudRuntime {
             cursor: None,
             children: Vec::new(),
         };
+        let queue_id = token()?;
         let status = ObjectUploadDirectoryDto {
-            batch_id: token()?,
+            batch_id: queue_id.clone(),
+            queue_id,
             connection_id: connection_id.into(),
             connection_revision: revision,
             bucket: session.bucket.clone(),
@@ -102,8 +129,9 @@ impl CloudRuntime {
             DirectoryBatch {
                 status: status.clone(),
                 session,
-                root,
-                browser: Arc::new(tokio::sync::Mutex::new(browser)),
+                root: Some(root),
+                files: None,
+                browser: Arc::new(tokio::sync::Mutex::new(crate::peer_upload_types::PeerBrowser::Directory(browser))),
                 cancel: Arc::new(AtomicBool::new(false)),
                 cancel_signal: Arc::new(tokio::sync::Notify::new()),
                 decision: Arc::new(tokio::sync::Notify::new()),
@@ -111,6 +139,7 @@ impl CloudRuntime {
                 handle: None,
                 stopping: Arc::new(tokio::sync::Mutex::new(())),
                 created: std::time::Instant::now(),
+                lifecycle: self.vault.transfer_cancellation().map_err(AppError::from)?,
             },
         );
         Ok(status)
@@ -129,6 +158,11 @@ impl CloudRuntime {
         Ok(batch.status.clone())
     }
     pub async fn object_start_upload_directory(
+        self: &Arc<Self>, connection: &str, id: &str, policy: DirectoryConflictPolicy,
+    ) -> Result<ObjectUploadDirectoryDto, AppError> {
+        crate::local_upload::start_queue(&S3UploadAdapter { runtime: self, connection }, id, policy).await
+    }
+    async fn object_start_upload_directory_inner(
         self: &Arc<Self>,
         connection: &str,
         id: &str,
@@ -150,16 +184,18 @@ impl CloudRuntime {
         let session = self.object_session(connection).await?;
         let mut state = self.objects.lock().await;
         let batch = state.upload_directories.get_mut(id).ok_or_else(invalid)?;
-        if batch.status.connection_id != connection
+        if batch.lifecycle.is_cancelled() || batch.status.connection_id != connection
             || !Arc::ptr_eq(&batch.session, &session)
             || batch.status.phase != "selected"
         {
             return Err(invalid());
         }
         batch.status.phase = "running".into();
-        let root = Arc::clone(&batch.root);
+        let root = batch.root.clone();
+        let files = batch.files.take();
         let cancel = Arc::clone(&batch.cancel);
         let cancel_signal = Arc::clone(&batch.cancel_signal);
+        let lifecycle = batch.lifecycle.clone();
         let name = batch.status.root_name.clone();
         let prefix = batch.status.prefix.clone();
         let id = id.to_owned();
@@ -168,16 +204,28 @@ impl CloudRuntime {
             // Only pre-upload waits are interruptible. Once upload starts, keep
             // polling it so the service can cancel and clean up multipart state;
             // object_cancel_upload_directory bounds that cleanup to three seconds.
-            let operation = runtime.directory_run(
+            let run = runtime.directory_run(
                 &id,
                 root,
+                files,
                 name,
                 prefix,
                 session,
-                cancel,
-                cancel_signal,
+                Arc::clone(&cancel),
+                Arc::clone(&cancel_signal),
                 policy,
             );
+            let operation = async {
+                tokio::pin!(run);
+                tokio::select! {
+                    r = &mut run => r,
+                    _ = lifecycle.cancelled() => {
+                        cancel.store(true, Ordering::Release);
+                        cancel_signal.notify_one();
+                        run.await
+                    }
+                }
+            };
             let result = match std::panic::AssertUnwindSafe(operation).catch_unwind().await {
                 Ok(result) => result,
                 Err(_) => Err(app(DomainError::Internal {
@@ -191,45 +239,35 @@ impl CloudRuntime {
     async fn directory_run(
         &self,
         id: &str,
-        root: Arc<PhysicalRoot>,
+        root: Option<Arc<PhysicalRoot>>,
+        files: Option<Vec<crate::local_upload_types::DirectoryFile>>,
         name: String,
         prefix: String,
         session: Arc<ObjectSession>,
         cancel: Arc<AtomicBool>,
         cancel_signal: Arc<tokio::sync::Notify>,
-        mut policy: DirectoryConflictPolicy,
+        policy: DirectoryConflictPolicy,
     ) -> Result<(), AppError> {
-        let mut walk = DirectoryWalk::new(&root, name)?;
+        let mut policy = crate::types::QueueConflictPolicy::from_upload(policy)?;
+        let mut walk = root.as_ref().map(|root| DirectoryWalk::new(root, name)).transpose()?;
+        let mut files = files.unwrap_or_default().into_iter();
         loop {
             if cancel.load(Ordering::Acquire) {
                 return Err(cancelled());
             }
-            let (returned, next) = tokio::select! {
-                _ = cancel_signal.notified() => return Err(cancelled()),
-                result = tokio::task::spawn_blocking(move || {
-                    let next = walk.next_chunk();
-                    (walk, next)
-                }) => result,
-            }
-            .map_err(|e| {
-                app(DomainError::Internal {
-                    detail: e.to_string(),
-                })
-            })?;
-            walk = returned;
-            let next = next?;
-            {
+            let file = if let Some(mut current) = walk.take() {
+                let (returned, next) = tokio::task::spawn_blocking(move || {
+                    let next = current.next_chunk(); (current, next)
+                }).await.map_err(|e| app(DomainError::Internal { detail: e.to_string() }))?;
                 let mut state = self.objects.lock().await;
                 let batch = state.upload_directories.get_mut(id).ok_or_else(invalid)?;
-                batch.status.skipped_symlinks = walk.skipped_symlinks;
-                batch.status.skipped_empty_directories = walk.skipped_empty_directories;
-            }
-            let Some(file) = next else {
-                if walk.stack.is_empty() {
-                    break;
-                } else {
-                    continue;
-                }
+                batch.status.skipped_symlinks = returned.skipped_symlinks;
+                batch.status.skipped_empty_directories = returned.skipped_empty_directories;
+                let done = returned.stack.is_empty();
+                walk = Some(returned);
+                match next? { Some(file) => file, None if done => break, None => continue }
+            } else {
+                match files.next() { Some(file) => file, None => break }
             };
             let _permit = tokio::select! {
                 _ = cancel_signal.notified() => return Err(cancelled()),
@@ -270,9 +308,9 @@ impl CloudRuntime {
             if cancel.load(Ordering::Acquire) {
                 return Err(cancelled());
             }
-            let mut choice = policy;
+            let mut choice = policy.upload_choice();
             if let Some(meta) = &existing {
-                if policy == DirectoryConflictPolicy::Ask {
+                if choice == DirectoryConflictPolicy::Ask {
                     let notify = {
                         let mut state = self.objects.lock().await;
                         let batch = state.upload_directories.get_mut(id).ok_or_else(invalid)?;
@@ -285,32 +323,28 @@ impl CloudRuntime {
                         });
                         Arc::clone(&batch.decision)
                     };
-                    loop {
-                        let notified = notify.notified();
-                        if cancel.load(Ordering::Acquire) {
-                            return Err(cancelled());
-                        }
-                        let resolution = self
-                            .objects
-                            .lock()
-                            .await
-                            .upload_directories
-                            .get_mut(id)
-                            .ok_or_else(invalid)?
-                            .resolution
-                            .take();
-                        if let Some((resolved, remaining)) = resolution {
-                            choice = resolved;
-                            if remaining {
-                                policy = resolved;
+                    choice = crate::local_upload::wait_queue_conflict(
+                        &notify,
+                        async {
+                            if !cancel.load(Ordering::Acquire) {
+                                cancel_signal.notified().await;
                             }
-                            break;
-                        }
-                        tokio::select! {
-                            _ = cancel_signal.notified() => return Err(cancelled()),
-                            _ = notified => {},
-                        }
-                    }
+                            cancelled()
+                        },
+                        || async {
+                            Ok(self
+                                .objects
+                                .lock()
+                                .await
+                                .upload_directories
+                                .get_mut(id)
+                                .ok_or_else(invalid)?
+                                .resolution
+                                .take())
+                        },
+                        &mut policy,
+                    )
+                    .await?;
                 }
                 if choice == DirectoryConflictPolicy::Cancel {
                     return Err(cancelled());
@@ -450,12 +484,12 @@ impl CloudRuntime {
         remaining: bool,
     ) -> Result<(), AppError> {
         self.object_admit()?;
-        if policy == DirectoryConflictPolicy::Ask {
+        if matches!(policy, DirectoryConflictPolicy::Ask | DirectoryConflictPolicy::Cancel) {
             return Err(invalid());
         }
         let mut state = self.objects.lock().await;
         let batch = state.upload_directories.get_mut(id).ok_or_else(invalid)?;
-        if batch.status.connection_id != connection
+        if batch.lifecycle.is_cancelled() || batch.status.connection_id != connection
             || batch.status.phase != "conflict"
             || batch
                 .status
@@ -467,7 +501,10 @@ impl CloudRuntime {
         {
             return Err(invalid());
         }
-        batch.resolution = Some((policy, remaining));
+        crate::types::QueueConflictPolicy::resolve(
+            batch.status.conflict.as_ref().map(|c| c.conflict_id.as_str()),
+            conflict_id, &mut batch.resolution, policy, remaining,
+        )?;
         // Close this decision before waking the worker so duplicates cannot replace it.
         batch.status.phase = "running".into();
         batch.status.conflict = None;

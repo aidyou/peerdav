@@ -181,7 +181,9 @@ pub struct ProbeBucketsInput {
 
 impl ObjectState {
     pub fn local_handle_count(&self) -> usize {
-        self.grants.len() + self.upload_directories.len()
+        self.grants.len() + self.upload_directories.values().map(|batch| {
+            batch.files.as_ref().map_or(1, Vec::len)
+        }).sum::<usize>()
     }
     pub fn prune(&mut self) {
         let now = std::time::Instant::now();

@@ -279,6 +279,7 @@ pub(super) fn commit_upload_parts(
     size: u64,
     digest: &str,
     session: &UploadSession,
+    replace: bool,
 ) -> Result<(), DomainError> {
     use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
@@ -363,7 +364,14 @@ pub(super) fn commit_upload_parts(
                 "upload canceled",
             ));
         }
-        destination.rename(&temporary, &destination, &name)?;
+        if replace {
+            destination.rename(&temporary, &destination, &name)?;
+        } else {
+            destination.hard_link(&temporary, &destination, &name)?;
+            if let Err(error) = destination.remove_file(&temporary) {
+                log::warn!("failed to remove published upload staging link: {error}");
+            }
+        }
         *outcome = UploadOutcome::Completed;
         Ok(())
     })();
@@ -373,6 +381,11 @@ pub(super) fn commit_upload_parts(
         }
         if source.kind() == std::io::ErrorKind::Interrupted && *session.cancel.borrow() {
             return Err(DomainError::TransferCanceled);
+        }
+        if source.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(DomainError::TransferConflict {
+                path: relative.display().to_string(),
+            });
         }
         return Err(destination_error(source));
     }
@@ -518,7 +531,8 @@ mod tests {
                 parts.path(),
                 4,
                 "invalid",
-                &session
+                &session,
+                true,
             )
             .is_err()
         );
@@ -527,6 +541,22 @@ mod tests {
             b"original"
         );
         let digest = hex::encode(Sha256::digest(b"data"));
+        assert!(matches!(
+            commit_upload_parts(
+                &share,
+                Path::new("target"),
+                parts.path(),
+                4,
+                &digest,
+                &session,
+                false
+            ),
+            Err(DomainError::TransferConflict { .. })
+        ));
+        assert_eq!(
+            std::fs::read(directory.path().join("target")).expect("retained"),
+            b"original"
+        );
         commit_upload_parts(
             &share,
             Path::new("target"),
@@ -534,6 +564,7 @@ mod tests {
             4,
             &digest,
             &session,
+            true,
         )
         .expect("commit");
         assert_eq!(

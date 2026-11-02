@@ -218,6 +218,11 @@ async fn receive(
         } else {
             digest
         };
+        let replace = match get("x-peerdav-write-condition").as_deref() {
+            Some("create-only") => false,
+            Some("replace") => true,
+            _ => return Err(invalid("missing or unsupported upload write condition")),
+        };
         let share = share.clone();
         let destination = relative.to_path_buf();
         let source = directory.clone();
@@ -230,6 +235,7 @@ async fn receive(
                 size,
                 &expected_digest,
                 &session,
+                replace,
             )
         })
         .await

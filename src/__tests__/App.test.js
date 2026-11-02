@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { flushPromises, mount } from "@vue/test-utils";
+import { DOMWrapper, flushPromises, mount } from "@vue/test-utils";
 
 const { windowMock, eventHandlers, resizeHandlers } = vi.hoisted(() => {
   const eventHandlers = new Map();
@@ -1936,6 +1936,7 @@ describe("settings information architecture", () => {
 });
 
 describe("Finder-style peer browser", () => {
+  function queueSummary(phase, extra = {}) { return { queueId: 'peer-download', backend: { backend: 'peer', peerId: 'peer-1', shareId: 'share-1' }, phase, totalFiles: 1, completedFiles: 0, skippedFiles: 0, conflict: null, error: null, ...extra }; }
   function batchSummary(phase, extra = {}) {
     return { batchId: "peer-batch", phase, rootName: "docs", currentRelativePath: null,
       completedFiles: 0, completedBytes: 0, skippedFiles: 0, skippedSymlinks: 0,
@@ -2003,7 +2004,12 @@ describe("Finder-style peer browser", () => {
         data: "hello peer\n",
         size: 11,
       }),
-      download_peer_file_to: downloadTo,
+      transfer_select_download: async () => queueSummary('selected'),
+      transfer_start_download: async () => queueSummary('completed', { completedFiles: 1 }),
+      transfer_status_download: async () => queueSummary('completed', { completedFiles: 1 }),
+      transfer_page_download: async () => ({ items: [{ remotePath: '/notes.txt', relativePath: 'notes.txt', phase: 'completed' }], nextOffset: null }),
+      transfer_resolve_download: async () => {}, transfer_cancel_download: async () => {},
+      transfer_release_download: async () => {}, transfer_reveal_download: async () => {},
       peer_select_upload_batch: async () => batchSummary("selected"),
       peer_start_upload_batch: async () => batchSummary("running"),
       peer_status_upload_batch: async () => batchSummary("running"),
@@ -2499,54 +2505,17 @@ describe("Finder-style peer browser", () => {
     wrapper.unmount();
   });
 
-  it("shows download progress and the saved-file dialog", async () => {
-    let finishDownload;
-    const downloadTo = vi.fn(
-      () =>
-        new Promise((resolve) => {
-          finishDownload = resolve;
-        }),
-    );
-    const { wrapper } = await openBrowser({
-      download_peer_file_to: downloadTo,
-    });
-
-    await wrapper.findAll(".file-tile")[1].trigger("click");
-    await flushPromises();
-    await clickButton(wrapper, "下载");
-    await flushPromises();
-
-    const transferId = downloadTo.mock.calls[0][0].transferId;
-    const onProgress = eventHandlers.get("app://transfer-progress");
-    expect(typeof onProgress).toBe("function");
-    onProgress({
-      payload: {
-        transferId,
-        direction: "download",
-        fileName: "notes.txt",
-        transferred: 5,
-        total: 10,
-      },
-    });
-    await flushPromises();
-
-    expect(wrapper.text()).toContain("正在下载");
-    expect(wrapper.text()).toContain("5 B");
-    expect(wrapper.text()).toContain("10 B");
-
-    finishDownload({
-      transferred: true,
-      remotePath: "/notes.txt",
-      localPath: "/tmp/peerdav-save.txt",
-      bytes: 10,
-      skippedReason: null,
-    });
-    await flushPromises();
-
-    expect(wrapper.text()).toContain("下载完成");
-    expect(wrapper.text()).toContain("打开所在目录");
-    expect(wrapper.text()).toContain("打开文件");
-
+  it("shows a single-file native queue without invented byte progress and releases on close", async () => {
+    const release = vi.fn(async () => {}); const reveal = vi.fn(async () => {});
+    const { wrapper } = await openBrowser({ transfer_release_download: release, transfer_reveal_download: reveal });
+    await wrapper.findAll('.file-tile')[1].trigger('click'); await clickButton(wrapper, '下载'); await flushPromises();
+    expect(invoke).toHaveBeenCalledWith('transfer_select_download', { backend: { backend: 'peer', peerId: 'peer-1', shareId: 'share-1' }, selection: { mode: 'single', path: '/notes.txt' } });
+    expect(wrapper.find('[data-test=download-dialog]').text()).toContain('notes.txt');
+    expect(wrapper.find('[data-test=download-dialog] [role=progressbar]').exists()).toBe(false);
+    await wrapper.find('[data-test=reveal-download]').trigger('click'); await flushPromises();
+    expect(reveal).toHaveBeenCalledWith({ queueId: 'peer-download' });
+    await wrapper.find('[data-test=close-download]').trigger('click'); await flushPromises();
+    expect(release).toHaveBeenCalledWith({ queueId: 'peer-download' });
     wrapper.unmount();
   });
 
@@ -2565,27 +2534,18 @@ describe("Finder-style peer browser", () => {
     await clickButton(wrapper, "下载");
     await flushPromises();
 
-    expect(downloadTo).toHaveBeenCalledWith(
-      expect.objectContaining({
-        peerId: "peer-1",
-        shareId: "share-1",
-        remotePath: "/notes.txt",
-        localPath: "/tmp/peerdav-save.txt",
-        transferId: expect.any(String),
-      }),
-    );
-    expect(wrapper.text()).not.toContain("本地下载目录");
-    expect(wrapper.text()).toContain("下载完成");
-    expect(wrapper.text()).toContain("文件已保存到 /tmp/peerdav-save.txt");
+    expect(invoke).toHaveBeenCalledWith('transfer_select_download', { backend: { backend: 'peer', peerId: 'peer-1', shareId: 'share-1' }, selection: { mode: 'single', path: '/notes.txt' } });
+    expect(downloadTo).not.toHaveBeenCalled();
+    expect(wrapper.text()).not.toContain('/tmp/peerdav-save.txt');
 
     await wrapper
       .find('button[aria-label="上传文件"]')
       .trigger("click");
     await flushPromises();
 
-    expect(wrapper.find('[data-test="upload-overwrite"]').attributes("disabled")).toBeUndefined();
-    await wrapper.find('[data-test="upload-apply-remaining"]').setValue(true);
-    await wrapper.find('[data-test="upload-overwrite"]').trigger("click");
+    expect(new DOMWrapper(document.querySelector('[data-test="upload-overwrite"]')).attributes("disabled")).toBeUndefined();
+    await new DOMWrapper(document.querySelector('[data-test="upload-apply-remaining"]')).setValue(true);
+    await new DOMWrapper(document.querySelector('[data-test="upload-overwrite"]')).trigger("click");
     await flushPromises();
     expect(resolveConflict).toHaveBeenCalledWith({ peerId: "peer-1", batchId: "peer-batch",
       conflictId: "conflict-a", decision: "overwrite", applyToRemaining: true });
@@ -3145,7 +3105,7 @@ describe("Finder-style peer browser", () => {
       list_peer_dir: async () => listing,
       prepare_peer_directory_download: prepare,
       download_peer_file: downloadFile,
-      reveal_local_directory: revealLocal,
+      transfer_reveal_download: revealLocal,
     });
 
     const tiles = wrapper.findAll(".file-tile");
@@ -3160,7 +3120,7 @@ describe("Finder-style peer browser", () => {
     expect(reveal?.exists()).toBe(true);
     await reveal.trigger("click");
     await flushPromises();
-    expect(revealLocal).toHaveBeenCalledWith({ path: "/tmp/peerdav-keys" });
+    expect(revealLocal).toHaveBeenCalledWith({ queueId: 'peer-download' });
 
     // 列表模式表头固定，长列表滚动时表头不掉出视野。
     await wrapper.find('button[aria-label="列表"]').trigger("click");
@@ -3208,23 +3168,12 @@ describe("Finder-style peer browser", () => {
     await clickButton(wrapper, "下载");
     await flushPromises();
 
-    expect(prepare).toHaveBeenCalledWith({
-      peerId: "peer-1",
-      shareId: "share-1",
-      remotePath: "/sub",
-      localParent: "/tmp/peerdav-keys",
-      ignoreOptions: { respectGitignore: generalSettings.respectGitignore, patterns: generalSettings.ignorePatterns },
-      conflict: "fail",
+    expect(invoke).toHaveBeenCalledWith('transfer_select_download', {
+      backend: { backend: 'peer', peerId: 'peer-1', shareId: 'share-1' }, selection: { mode: 'files', paths: ['/sub', '/a.txt', '/b.txt'] },
     });
-    expect(downloadFile).toHaveBeenCalledTimes(2);
-    expect(downloadFile).toHaveBeenNthCalledWith(1, {
-      peerId: "peer-1", shareId: "share-1", remotePath: "/a.txt", localDir: "/tmp/peerdav-keys", conflict: "fail",
-    });
-    expect(downloadFile).toHaveBeenNthCalledWith(2, {
-      peerId: "peer-1", shareId: "share-1", remotePath: "/b.txt", localDir: "/tmp/peerdav-keys", conflict: "fail",
-    });
-    expect(wrapper.text()).toContain("下载队列");
-    expect(wrapper.text()).toContain("inner.txt");
+    expect(prepare).not.toHaveBeenCalled();
+    expect(downloadFile).not.toHaveBeenCalled();
+    expect(wrapper.text()).toContain('下载队列');
 
     // 对话框必须保持紧凑并垂直居中，否则多选深目录时会顶出屏幕无法操作。
     const dialogBody = wrapper.find(".queue-dialog");
@@ -3241,91 +3190,18 @@ describe("Finder-style peer browser", () => {
     wrapper.unmount();
   });
 
-  it("downloads a folder through the queue with aggregate progress", async () => {
-    let finishFirst;
-    const downloadTo = vi.fn((args) => {
-      if (args.remotePath === "/sub/inner.txt") {
-        return new Promise((resolve) => {
-          finishFirst = resolve;
-        });
-      }
-      return Promise.resolve({
-        transferred: true,
-        remotePath: args.remotePath,
-        localPath: args.localPath,
-        bytes: 3,
-        skippedReason: null,
-      });
-    });
-    const prepare = vi.fn(async () => ({
-      localRoot: "/tmp/downloads/sub",
-      directoryCount: 2,
-      files: [
-        {
-          remotePath: "/sub/inner.txt",
-          relativePath: "inner.txt",
-          localPath: "/tmp/downloads/sub/inner.txt",
-          size: 4,
-        },
-        {
-          remotePath: "/sub/deep/a.txt",
-          relativePath: "deep/a.txt",
-          localPath: "/tmp/downloads/sub/deep/a.txt",
-          size: 3,
-        },
-      ],
-    }));
+  it("downloads a folder through one bounded native queue with count progress", async () => {
     const { wrapper } = await openBrowser({
-      prepare_peer_directory_download: prepare,
-      download_peer_file_to: downloadTo,
+      transfer_start_download: async () => queueSummary('running', { totalFiles: 10001, completedFiles: 5000, currentRelativePath: 'sub/deep/a.txt' }),
+      transfer_page_download: async () => ({ items: [{ remotePath: '/sub/inner.txt', relativePath: 'sub/inner.txt', phase: 'completed' }], nextOffset: 100 }),
     });
-
-    await wrapper.findAll(".file-tile")[0].trigger("click");
-    await flushPromises();
-    await clickButton(wrapper, "下载");
-    await flushPromises();
-
-    expect(prepare).toHaveBeenCalledWith({
-      peerId: "peer-1",
-      shareId: "share-1",
-      remotePath: "/sub",
-      localParent: "/tmp/peerdav-keys",
-      ignoreOptions: { respectGitignore: generalSettings.respectGitignore, patterns: generalSettings.ignorePatterns },
-      conflict: "fail",
-    });
-    expect(wrapper.text()).toContain("下载队列");
-    // 本机保存目录不再展示：长路径会撑高对话框，落盘位置改由「打开所在目录」按钮承担。
-    expect(wrapper.text()).not.toContain("/tmp/downloads/sub");
-    expect(wrapper.text()).toContain("inner.txt");
-    expect(downloadTo).toHaveBeenCalledTimes(1);
-
-    const firstTransfer = downloadTo.mock.calls[0][0].transferId;
-    const onProgress = eventHandlers.get("app://transfer-progress");
-    onProgress({
-      payload: {
-        transferId: firstTransfer,
-        direction: "download",
-        fileName: "inner.txt",
-        transferred: 2,
-        total: 4,
-      },
-    });
-    await flushPromises();
-    expect(wrapper.text()).toContain("2 B / 7 B");
-
-    finishFirst({
-      transferred: true,
-      remotePath: "/sub/inner.txt",
-      localPath: "/tmp/downloads/sub/inner.txt",
-      bytes: 4,
-      skippedReason: null,
-    });
-    await vi.waitFor(() => {
-      expect(downloadTo).toHaveBeenCalledTimes(2);
-      expect(wrapper.text()).toContain("已处理 2/2 个文件");
-    });
-    expect(document.body.textContent).toContain("已下载 2 个文件。");
-
+    await wrapper.findAll('.file-tile')[0].trigger('click'); await clickButton(wrapper, '下载'); await flushPromises();
+    expect(invoke).toHaveBeenCalledWith('transfer_select_download', { backend: { backend: 'peer', peerId: 'peer-1', shareId: 'share-1' }, selection: { mode: 'folder', path: '/sub' } });
+    expect(invoke).toHaveBeenCalledWith('transfer_page_download', { queueId: 'peer-download', offset: 0, limit: 100 });
+    expect(wrapper.find('[data-test=download-dialog]').text()).toContain('5000/10001');
+    expect(wrapper.find('[data-test=download-dialog]').text()).toContain('sub/deep/a.txt');
+    expect(wrapper.findAll('.download-queue li')).toHaveLength(1);
+    expect(wrapper.find('[data-test=download-dialog] [role=progressbar]').exists()).toBe(false);
     wrapper.unmount();
   });
 
@@ -3336,13 +3212,13 @@ describe("Finder-style peer browser", () => {
         { remotePath: '/sub/a.txt', relativePath: 'a.txt', localPath: '/downloads/sub/a.txt', size: 1 },
         { remotePath: '/sub/b.txt', relativePath: 'b.txt', localPath: '/downloads/sub/b.txt', size: 1 },
       ] }),
-      download_peer_file_to: downloadTo,
+      transfer_start_download: downloadTo,
     });
     await wrapper.findAll('.file-tile')[0].trigger('click');
     await clickButton(wrapper, '下载'); await flushPromises();
     expect(downloadTo).toHaveBeenCalledTimes(1);
     if (code === 'TRANSFER_CANCELED') {
-      expect(wrapper.findAll('.download-queue li').map((row) => row.attributes('data-status'))).toEqual(['canceled', 'canceled']);
+      expect(wrapper.find('[data-test=download-dialog] [role=alert]').exists()).toBe(false);
       expect(wrapper.find('.download-queue details').exists()).toBe(false);
       expect(wrapper.find('[data-test=cancel-download]').exists()).toBe(false);
       expect(wrapper.find('[data-test=close-download]').exists()).toBe(true);
@@ -3354,55 +3230,19 @@ describe("Finder-style peer browser", () => {
     wrapper.unmount();
   });
 
-  it("asks before overwriting a local download folder", async () => {
-    const plan = {
-      localRoot: "/tmp/downloads/sub",
-      directoryCount: 1,
-      files: [
-        {
-          remotePath: "/sub/inner.txt",
-          relativePath: "inner.txt",
-          localPath: "/tmp/downloads/sub/inner.txt",
-          size: 4,
-        },
-      ],
-    };
-    const prepare = vi
-      .fn()
-      .mockRejectedValueOnce({
-        code: "TRANSFER_CONFLICT",
-        message: "目标文件已存在",
-        detail: null,
-        context: null,
-      })
-      .mockResolvedValueOnce(plan);
-    const { wrapper } = await openBrowser({
-      prepare_peer_directory_download: prepare,
-      download_peer_file_to: vi.fn(async (args) => ({
-        transferred: true,
-        remotePath: args.remotePath,
-        localPath: args.localPath,
-        bytes: 4,
-        skippedReason: null,
-      })),
-    });
-
-    await wrapper.findAll(".file-tile")[0].trigger("click");
-    await flushPromises();
-    await clickButton(wrapper, "下载");
-    await flushPromises();
-
-    expect(confirmAction).toHaveBeenCalledWith(
-      expect.stringContaining("sub"),
-      "下载",
-      expect.objectContaining({ confirmText: "覆盖", cancelText: "取消" }),
-    );
-    expect(prepare).toHaveBeenLastCalledWith(
-      expect.objectContaining({ conflict: "overwrite" }),
-    );
-    expect(wrapper.text()).toContain("已处理 1/1 个文件");
-
-    wrapper.unmount();
+  it("asks each Peer download conflict by default and cancels through the dedicated API", async () => {
+    const resolve = vi.fn(async () => {}); const cancel = vi.fn(async () => {});
+    let state = queueSummary('conflict', { conflict: { conflictId: 'one', relativePath: 'sub/a.txt' } });
+    const { wrapper } = await openBrowser({ transfer_start_download: async () => state, transfer_status_download: async () => state, transfer_resolve_download: resolve, transfer_cancel_download: cancel });
+    await wrapper.findAll('.file-tile')[0].trigger('click'); await clickButton(wrapper, '下载'); await flushPromises();
+    expect(new DOMWrapper(document.querySelector('[data-test=download-apply-remaining]')).element.checked).toBe(false);
+    state = queueSummary('conflict', { skippedFiles: 1, conflict: { conflictId: 'two', relativePath: 'sub/b.txt' } });
+    await new DOMWrapper(document.querySelector('[data-test=download-skip]')).trigger('click'); await flushPromises();
+    expect(resolve).toHaveBeenCalledWith({ queueId: 'peer-download', conflictId: 'one', decision: 'skip', applyToRemaining: false });
+    expect(new DOMWrapper(document.querySelector('[data-test=download-apply-remaining]')).element.checked).toBe(false);
+    state = queueSummary('canceled'); await new DOMWrapper(document.querySelector('[data-test=download-conflict-cancel]')).trigger('click'); await flushPromises();
+    expect(cancel).toHaveBeenCalledWith({ queueId: 'peer-download' }); expect(resolve).toHaveBeenCalledTimes(1);
+    expect(confirmAction).not.toHaveBeenCalled(); wrapper.unmount();
   });
 
   it("streams peer batch summary without totals and cancels the batch", async () => {
@@ -3871,11 +3711,10 @@ describe("admin session restore", () => {
 
   it("uses compatible selection colors in every file browser layout", () => {
     const appSource = readFileSync("src/App.vue", "utf8");
-    const browserSource = readFileSync("src/components/PeerBrowser.vue", "utf8");
+    const browserSource = readFileSync("src/components/FileManagerView.vue", "utf8");
     for (const selector of [".file-tile.is-selected", ".file-table tbody tr.is-selected", ".column-row.is-selected", ".gallery-thumb.is-selected"]) {
-      const start = browserSource.indexOf(`${selector} {`);
-      expect(start).toBeGreaterThan(-1);
-      const rule = browserSource.slice(start, browserSource.indexOf("}", start));
+      const rule = browserSource.match(/[^{}]+\{[^{}]*\}/g).find((rule) => rule.slice(0, rule.indexOf('{')).split(',').map((part) => part.trim()).includes(selector));
+      expect(rule).toBeDefined();
       expect(rule).toContain("background: var(--selection-bg);");
       expect(rule).not.toContain("color-mix");
     }

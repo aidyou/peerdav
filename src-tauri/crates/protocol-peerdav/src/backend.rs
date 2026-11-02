@@ -90,7 +90,9 @@ impl ReplayableWriteBackend for CorePeerDavBackend {
         Box::pin(async move {
             self.scope
                 .validate_entry(&request.entry, Operation::Write)?;
-            if request.condition != Condition::Any || request.mode != WriteMode::Streaming {
+            if !matches!(request.condition, Condition::Any | Condition::CreateOnly)
+                || request.mode != WriteMode::Streaming
+            {
                 return Err(FileError::unsupported(Operation::Write));
             }
             context.check(Operation::Write, MutationOutcome::NotApplied)?;

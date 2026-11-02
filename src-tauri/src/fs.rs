@@ -874,7 +874,7 @@ pub(crate) fn commit_upload(
     source: &Path,
     session: &crate::types::UploadSession,
 ) -> Result<(), DomainError> {
-    commit_upload_with(share, relative, session, |target| {
+    commit_upload_with(share, relative, session, true, |target| {
         let mut input = File::open(source)?;
         let mut buffer = vec![0u8; 1024 * 1024];
         loop {
@@ -903,9 +903,10 @@ pub(crate) fn commit_upload_parts(
     size: u64,
     digest: &str,
     session: &crate::types::UploadSession,
+    replace: bool,
 ) -> Result<(), DomainError> {
     use sha2::{Digest, Sha256};
-    commit_upload_with(share, relative, session, |target| {
+    commit_upload_with(share, relative, session, replace, |target| {
         let mut hash = Sha256::new();
         let mut buffer = vec![0u8; 1024 * 1024];
         for index in 0..size.div_ceil(crate::types::TRANSFER_PART_BYTES).max(1) {
@@ -956,8 +957,9 @@ pub(crate) fn commit_upload_parts(
     size: u64,
     digest: &str,
     session: &crate::types::UploadSession,
+    replace: bool,
 ) -> Result<(), DomainError> {
-    portable::commit_upload_parts(share, relative, directory, size, digest, session)
+    portable::commit_upload_parts(share, relative, directory, size, digest, session, replace)
 }
 
 #[cfg(unix)]
@@ -965,6 +967,7 @@ fn commit_upload_with(
     share: &ShareConfig,
     relative: &Path,
     session: &crate::types::UploadSession,
+    replace: bool,
     write: impl FnOnce(&mut File) -> std::io::Result<()>,
 ) -> Result<(), DomainError> {
     use rustix::fs::{Mode, OFlags};
@@ -1028,8 +1031,26 @@ fn commit_upload_with(
                 "upload canceled",
             ));
         }
-        rustix::fs::renameat(&resolved.parent, &temporary, &resolved.parent, &name)
+        if replace {
+            rustix::fs::renameat(&resolved.parent, &temporary, &resolved.parent, &name)
+                .map_err(std::io::Error::from)?;
+        } else {
+            // Linking publishes atomically only if the final name is absent.
+            // Unlike a preflight followed by rename, a racing creator wins safely.
+            rustix::fs::linkat(
+                &resolved.parent,
+                &temporary,
+                &resolved.parent,
+                &name,
+                rustix::fs::AtFlags::empty(),
+            )
             .map_err(std::io::Error::from)?;
+            if let Err(error) =
+                rustix::fs::unlinkat(&resolved.parent, &temporary, rustix::fs::AtFlags::empty())
+            {
+                log::warn!("failed to remove published upload staging link: {error}");
+            }
+        }
         *outcome = crate::types::UploadOutcome::Completed;
         Ok::<_, std::io::Error>(())
     })();
@@ -1041,6 +1062,11 @@ fn commit_upload_with(
         }
         if source.kind() == std::io::ErrorKind::Interrupted && *session.cancel.borrow() {
             return Err(DomainError::TransferCanceled);
+        }
+        if source.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(DomainError::TransferConflict {
+                path: relative.display().to_string(),
+            });
         }
         return Err(DomainError::Io {
             operation: "commit upload",
@@ -1154,6 +1180,59 @@ mod metadata_tests {
 mod upload_tests {
     use super::*;
     use crate::types::{UploadOutcome, UploadSession};
+
+    #[test]
+    fn create_only_commit_preserves_racing_destination_and_cleans_staging() {
+        let directory = tempfile::tempdir().expect("directory");
+        let share = ShareConfig {
+            id: "test".into(),
+            name: "test".into(),
+            root_path: directory.path().into(),
+            permissions: SharePermissions {
+                can_read: true,
+                can_write: true,
+                can_delete: true,
+            },
+            rules: Vec::new(),
+            display_rules: Vec::new(),
+            root: Arc::new(ShareRoot::open(directory.path()).expect("root")),
+        };
+        let (cancel, _) = tokio::sync::watch::channel(false);
+        let session = UploadSession {
+            cancel,
+            active: Arc::new(tokio::sync::RwLock::new(())),
+            outcome: std::sync::Mutex::new(UploadOutcome::Active),
+        };
+        let destination = directory.path().join("target");
+        let result = commit_upload_with(&share, Path::new("target"), &session, false, |file| {
+            file.write_all(b"uploaded")?;
+            // The target was absent during preflight and appears during staging.
+            std::fs::write(&destination, b"racing creator")
+        });
+        assert!(matches!(result, Err(DomainError::TransferConflict { .. })));
+        assert_eq!(
+            std::fs::read(&destination).expect("target"),
+            b"racing creator"
+        );
+        assert_eq!(
+            *session.outcome.lock().expect("outcome"),
+            UploadOutcome::Active
+        );
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("entries")
+                .count(),
+            1
+        );
+        commit_upload_with(&share, Path::new("target"), &session, true, |file| {
+            file.write_all(b"confirmed replacement")
+        })
+        .expect("explicit replacement");
+        assert_eq!(
+            std::fs::read(&destination).expect("target"),
+            b"confirmed replacement"
+        );
+    }
 
     #[test]
     fn cancel_during_staging_copy_preserves_destination_and_removes_sibling() {

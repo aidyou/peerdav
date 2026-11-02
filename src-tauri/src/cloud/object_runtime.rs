@@ -344,6 +344,38 @@ mod tests {
             events,
         })
     }
+    #[tokio::test]
+    async fn shared_download_s3_adapter_skip_overwrite_reset_and_prefix_plan() -> Result<(), TestError> {
+        use crate::{download_types::*, traits::TransferQueueAdapter};
+        let f = fixture().await?; f.runtime.resume()?;
+        let session = f.runtime.object_session("connection").await?;
+        let adapter = Arc::new(crate::download_types::S3DownloadAdapter { runtime: Arc::clone(&f.runtime), connection: "connection".into(), session });
+        let plan = adapter.plan(DownloadSelection::Folder { path: "docs".into() }).await?;
+        assert_eq!(plan.len(), 2); assert!(plan.iter().all(|i| i.remote_path.starts_with("docs/")));
+        let mixed = adapter.plan(DownloadSelection::Files { paths: vec!["docs/a".into(), "docs/nested/".into()] }).await?;
+        assert_eq!(mixed.iter().map(|i| i.relative_path.as_str()).collect::<Vec<_>>(), vec!["a", "nested/b"]);
+        assert!(adapter.plan(DownloadSelection::Single { path: "docs/".into() }).await.is_err());
+        assert!(adapter.plan(DownloadSelection::Files { paths: vec!["docs/a".into(), "docs/a".into()] }).await.is_err());
+        let dir = tempfile::tempdir()?; std::fs::create_dir_all(dir.path().join("docs/nested"))?;
+        std::fs::write(dir.path().join("a"), b"old")?; std::fs::write(dir.path().join("b"), b"old")?;
+        let queues = Arc::new(DownloadQueues::default());
+        let before = f.store.reads.load(Ordering::SeqCst);
+        for choice in [ConflictResolution::Skip, ConflictResolution::Overwrite] {
+            let q = queues.select(DownloadBackend::S3 { connection_id: "connection".into() }, DownloadSelection::Files { paths: vec!["docs/a".into(), "docs/nested/b".into()] }, super::super::PhysicalRoot::open(dir.path()).map_err(app)?, adapter.clone()).await?;
+            queues.start(&q.queue_id).await?;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop { let s = queues.status(&q.queue_id).await?; if let Some(c) = s.conflict { queues.resolve(&q.queue_id, &c.conflict_id, choice, true).await?; break; } tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
+                loop { let s = queues.status(&q.queue_id).await?; if s.phase == "completed" { break; } if s.phase == "failed" { return Err(s.error.ok_or_else(state_error)?); } tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
+                Ok::<_, AppError>(())
+            }).await??;
+            assert_eq!(queues.reveal_root(&q.queue_id).await?, dir.path().to_string_lossy());
+            if choice == ConflictResolution::Skip { assert_eq!(f.store.reads.load(Ordering::SeqCst), before + 2); }
+            queues.release(&q.queue_id).await?;
+        }
+        assert_eq!(std::fs::read(dir.path().join("a"))?, b"x");
+        f.revision.store(2, Ordering::SeqCst); assert!(adapter.validate().await.is_err());
+        Ok(())
+    }
     async fn authorize(f: &Fixture) -> Result<(), AppError> {
         f.runtime.resume()?;
         f.runtime
@@ -389,6 +421,35 @@ mod tests {
         .await?
         .map_err(Into::into)
     }
+    #[tokio::test]
+    async fn upload_files_single_queue_isolation_skip_no_payload() -> Result<(), TestError> {
+        use super::super::directory_types::DirectoryConflictPolicy as Policy;
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let a = f._dir.path().join("one");
+        let b = f._dir.path().join("two");
+        std::fs::write(&a, b"a")?;
+        std::fs::write(&b, b"b")?;
+        f.store.behavior.store(8, Ordering::SeqCst);
+        for paths in [vec![a.clone(), b], vec![a]] {
+            let count = paths.len() as u64;
+            let selected = f.runtime.object_select_upload_files("connection", 1, "data/".into(), paths).await?;
+            let page = f.runtime.object_page_upload_directory("connection", &selected.batch_id, None, None, Some(100)).await?;
+            assert_eq!(page.entries.len() as u64, count);
+            f.runtime.object_start_upload_directory("connection", &selected.batch_id, Policy::Ask).await?;
+            let conflict = directory_conflict(&f, &selected.batch_id).await?;
+            assert!(f.runtime.object_resolve_upload_directory_conflict("connection", &selected.batch_id, &conflict.conflict_id, Policy::Cancel, true).await.is_err());
+            f.runtime.object_resolve_upload_directory_conflict("connection", &selected.batch_id, &conflict.conflict_id, Policy::Skip, true).await?;
+            assert!(f.runtime.object_resolve_upload_directory_conflict("connection", &selected.batch_id, &conflict.conflict_id, Policy::Overwrite, true).await.is_err());
+            let done = directory_settled(&f, &selected.batch_id).await?;
+            assert_eq!(done.phase, "completed");
+            assert_eq!(done.skipped_files, count);
+            assert_eq!(f.store.mutations.load(Ordering::SeqCst), 0);
+            f.runtime.object_release_upload_directory("connection", &selected.batch_id).await?;
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn streaming_directory_conflict_replay_cannot_resolve_next_conflict()
     -> Result<(), TestError> {
@@ -922,15 +983,16 @@ mod tests {
             })
             .await??;
             let conflict = directory_conflict(&f, &selected.batch_id).await?;
-            f.runtime
-                .object_resolve_upload_directory_conflict(
-                    "connection",
-                    &selected.batch_id,
-                    &conflict.conflict_id,
-                    decision,
-                    true,
-                )
-                .await?;
+            if decision == Policy::Cancel {
+                assert!(f.runtime.object_resolve_upload_directory_conflict(
+                    "connection", &selected.batch_id, &conflict.conflict_id, decision, true,
+                ).await.is_err());
+                f.runtime.object_cancel_upload_directory("connection", &selected.batch_id).await?;
+            } else {
+                f.runtime.object_resolve_upload_directory_conflict(
+                    "connection", &selected.batch_id, &conflict.conflict_id, decision, true,
+                ).await?;
+            }
             let status = directory_settled(&f, &selected.batch_id).await?;
             if decision == Policy::Skip {
                 assert_eq!(status.skipped_files, 1);
@@ -3196,6 +3258,7 @@ impl CloudRuntime {
         &self,
         connection_id: Option<&str>,
     ) -> Result<(), AppError> {
+        self.vault.invalidate_transfers().map_err(AppError::from)?;
         let batches: Vec<_> = {
             let state = self.objects.lock().await;
             state

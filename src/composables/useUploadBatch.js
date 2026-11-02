@@ -42,6 +42,7 @@ export function useUploadBatch({ adapter, captureScope, scopeValid, canSelect, o
   }
   function applyUploadSummary(session, summary) {
     if (!uploadSessionValid(session)) return;
+    if (summary.conflict?.conflictId === session.resolvedConflictId) summary = { ...summary, conflict: null };
     const previousConflict = uploadSummary.value?.conflict;
     uploadSummary.value = summary;
     if (previousConflict?.conflictId !== summary.conflict?.conflictId) uploadApplyRemaining.value = false;
@@ -108,12 +109,17 @@ export function useUploadBatch({ adapter, captureScope, scopeValid, canSelect, o
   async function resolveUploadConflict(decision) {
     const session = uploadSession;
     const conflict = uploadSummary.value?.conflict;
-    if (!session || !conflict?.conflictId || uploadResolving.value || (decision === "overwrite" && !adapter.overwriteAllowed(conflict))) return;
+    if (!session || !conflict?.conflictId || !["overwrite", "skip"].includes(decision) || uploadResolving.value || session.stopping || session.resolvedConflictId === conflict.conflictId || (decision === "overwrite" && !adapter.overwriteAllowed(conflict))) return;
     uploadResolving.value = true;
     const stillCurrent = () => uploadSessionValid(session) && uploadSummary.value?.conflict?.conflictId === conflict.conflictId;
     try {
       await adapter.resolve({ ...uploadArgs(session), conflictId: conflict.conflictId, decision, applyToRemaining: uploadApplyRemaining.value });
-      if (stillCurrent()) await pollUpload(session);
+      session.resolvedConflictId = conflict.conflictId;
+      session.statusEpoch++;
+      if (stillCurrent()) {
+        applyUploadSummary(session, { ...uploadSummary.value, conflict: null });
+        await pollUpload(session);
+      }
     } catch (cause) { if (stillCurrent()) reportUploadFailure(cause); }
     finally { if (uploadSessionValid(session)) uploadResolving.value = false; }
   }

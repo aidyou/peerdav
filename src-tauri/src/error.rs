@@ -367,6 +367,7 @@ fn error_code(error: &DomainError) -> &'static str {
         DomainError::PeerFile { source, .. } => match source.kind {
             peerdav_protocol_peerdav::peerdav_file_core::FileErrorKind::InvalidInput => "PEER_INVALID_PATH",
             peerdav_protocol_peerdav::peerdav_file_core::FileErrorKind::NotFound => "PEER_REMOTE_NOT_FOUND",
+            peerdav_protocol_peerdav::peerdav_file_core::FileErrorKind::Precondition => "TRANSFER_CONFLICT",
             peerdav_protocol_peerdav::peerdav_file_core::FileErrorKind::PermissionDenied if source.status == Some(401) => "PEER_AUTHORIZATION_REJECTED",
             peerdav_protocol_peerdav::peerdav_file_core::FileErrorKind::Provider if source.status.is_none() => "PEER_PROTOCOL_ERROR",
             peerdav_protocol_peerdav::peerdav_file_core::FileErrorKind::BudgetExceeded => "TRANSFER_TOO_LARGE",
@@ -1160,6 +1161,11 @@ mod tests {
         let source = peerdav_protocol_peerdav::normalize_display_path("/../a").unwrap_err();
         let error = AppError::from(DomainError::PeerFile { operation: "path", source });
         assert_eq!(error.code, "PEER_INVALID_PATH");
+        let source = peerdav_protocol_peerdav::status_error(reqwest::StatusCode::PRECONDITION_FAILED,
+            peerdav_protocol_peerdav::peerdav_file_core::Operation::Write);
+        let error = AppError::from(DomainError::PeerFile { operation: "commit upload", source });
+        assert_eq!(error.code, "TRANSFER_CONFLICT");
+        assert_eq!(error.context.as_ref().and_then(|v| v.get("status")), Some(&json!(412)));
     }
 
     #[test]

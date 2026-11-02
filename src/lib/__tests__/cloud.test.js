@@ -55,7 +55,7 @@ describe("cloud API wrappers", () => {
     await cloudObjects.cancelUploadDirectory(args);
     await cloudObjects.releaseUploadDirectory(args);
     expect(invoke.mock.calls).toEqual([
-      ["cloud_object_select_upload_directory", { connectionId: "c", prefix: "target/" }],
+      ["cloud_object_select_upload_directory", { connectionId: "c", prefix: "target/", mode: "folder" }],
       ["cloud_object_start_upload_directory", { connectionId: "c", batchId: "batch", conflictPolicy: "ask" }],
       ["cloud_object_status_upload_directory", { connectionId: "c", batchId: "batch" }],
       ["cloud_object_page_upload_directory", { connectionId: "c", batchId: "batch", cursor: null, limit: 100 }],

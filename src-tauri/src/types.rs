@@ -4,6 +4,22 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// Backend-only native picker preferences, shared by Peer and Cloud.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PickerDirection {
+    Upload,
+    Download,
+}
+
+pub(crate) const PICKER_UPLOAD_DIRECTORY: &str = "picker.upload.directory";
+pub(crate) const PICKER_DOWNLOAD_DIRECTORY: &str = "picker.download.directory";
+
+/// Queue-local decisions. Cancellation is lifecycle control, never a cached choice.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct QueueConflictPolicy {
+    pub(crate) cached: Option<crate::download_types::ConflictResolution>,
+}
+
 /// Platform metadata and protected entries excluded from shares on every OS.
 pub(crate) const SYSTEM_IGNORED_NAMES: &[&str] = &[
     "$recycle.bin",

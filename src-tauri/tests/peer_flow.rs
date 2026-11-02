@@ -1937,6 +1937,7 @@ async fn remote_upload_cancel_cleans_parts_rejects_late_requests_and_preserves_c
     assert_eq!(
         request(reqwest::Method::PUT, "bb")
             .header("x-peerdav-commit", "1")
+            .header("x-peerdav-write-condition", "replace")
             .send()
             .await
             .expect("commit")
@@ -2023,6 +2024,7 @@ async fn upload_parts_survive_restart_and_reject_wrong_content() {
     assert!(
         request(reqwest::Method::PUT)
             .header("x-peerdav-commit", "1")
+            .header("x-peerdav-write-condition", "replace")
             .send()
             .await
             .expect("commit")
@@ -2045,6 +2047,7 @@ async fn upload_parts_survive_restart_and_reject_wrong_content() {
     assert_eq!(
         request(reqwest::Method::PUT)
             .header("x-peerdav-commit", "1")
+            .header("x-peerdav-write-condition", "replace")
             .send()
             .await
             .expect("reject wrong hash")
@@ -2119,7 +2122,9 @@ async fn streaming_upload_verifies_resumed_parts_and_final_digest() {
         reqwest::StatusCode::NO_CONTENT
     );
     for expected in [None, Some("00".repeat(32))] {
-        let mut commit = request(reqwest::Method::PUT).header("x-peerdav-commit", "1");
+        let mut commit = request(reqwest::Method::PUT)
+            .header("x-peerdav-commit", "1")
+            .header("x-peerdav-write-condition", "replace");
         if let Some(digest) = expected {
             commit = commit.header("x-peerdav-content-sha256", digest);
         }
@@ -2144,6 +2149,19 @@ async fn streaming_upload_verifies_resumed_parts_and_final_digest() {
     assert_eq!(
         request(reqwest::Method::PUT)
             .header("x-peerdav-commit", "1")
+            .header("x-peerdav-write-condition", "create-only")
+            .header("x-peerdav-content-sha256", &digest)
+            .send()
+            .await
+            .expect("create-only race")
+            .status(),
+        reqwest::StatusCode::PRECONDITION_FAILED
+    );
+    assert_eq!(std::fs::read(harness.share_root.join("stream.txt")).expect("preserved"), b"original");
+    assert_eq!(
+        request(reqwest::Method::PUT)
+            .header("x-peerdav-commit", "1")
+            .header("x-peerdav-write-condition", "replace")
             .header("x-peerdav-content-sha256", &digest)
             .send()
             .await

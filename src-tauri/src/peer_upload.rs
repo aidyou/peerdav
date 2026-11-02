@@ -7,7 +7,6 @@ use crate::local_upload_types::{
 use crate::peer_upload_types::*;
 use futures_util::FutureExt;
 use tauri::State;
-use tauri_plugin_dialog::DialogExt;
 
 fn task_error(e: tokio::task::JoinError) -> AppError {
     AppError::from(DomainError::Internal {
@@ -28,8 +27,15 @@ fn bound<'a>(
     }
     Ok(b)
 }
+impl crate::traits::UploadQueueAdapter for PeerUploadAdapter<'_> {
+    type Status = PeerUploadSummary;
+    fn start<'a>(&'a self, id: &'a str, policy: DirectoryConflictPolicy) -> futures_util::future::BoxFuture<'a, Result<Self::Status, AppError>> {
+        Box::pin(self.manager.start_upload_batch_inner(self.peer, id, policy))
+    }
+}
+
 impl PeerManager {
-    fn upload_scope(&self, peer: &str) -> Result<String, AppError> {
+    pub(super) fn upload_scope(&self, peer: &str) -> Result<String, AppError> {
         let (record, _) = self.peer_client(peer).map_err(AppError::from)?;
         let code = Zeroizing::new(
             self.vault
@@ -62,9 +68,13 @@ impl PeerManager {
         if self.upload_scope(&peer)? != scope {
             return Err(invalid());
         }
+        if !matches!(mode, "folder" | "files" | "single") { return Err(invalid()); }
+        let lifecycle = self.vault.transfer_cancellation().map_err(AppError::from)?;
         let remote = normalize_display_path(&remote).map_err(AppError::from)?;
         encode_share_path(&share, &remote).map_err(AppError::from)?;
         if paths.is_empty()
+            || paths.len() > 256
+            || (mode == "single" && paths.len() != 1)
             || (mode == "folder" && paths.len() != 1)
             || options.patterns.len() > 1024 * 1024
         {
@@ -79,12 +89,14 @@ impl PeerManager {
             let mut entries = Vec::with_capacity(paths.len());
             let mut browser = None;
             let mut root_name = String::new();
+            let mut names = std::collections::HashSet::new();
             for path in paths {
                 let name = path
                     .file_name()
                     .and_then(|s| s.to_str())
                     .ok_or_else(invalid)?
                     .to_owned();
+                if !names.insert(name.clone()) { return Err(invalid()); }
                 crate::cloud::object_service::valid_relative_path(&name)
                     .map_err(|e| AppError::from(DomainError::from(e)))?;
                 if folder {
@@ -142,8 +154,10 @@ impl PeerManager {
         })
         .await
         .map_err(task_error)??;
+        let queue_id = token()?;
         let status = PeerUploadSummary {
-            batch_id: token()?,
+            batch_id: queue_id.clone(),
+            queue_id,
             peer_id: peer,
             share_name: share,
             remote_dir: remote,
@@ -179,11 +193,17 @@ impl PeerManager {
                 handle: None,
                 stopping: Arc::new(Mutex::new(())),
                 scope,
+                lifecycle,
             },
         );
         Ok(status)
     }
     pub(crate) async fn start_upload_batch(
+        self: &Arc<Self>, peer: &str, id: &str, policy: DirectoryConflictPolicy,
+    ) -> Result<PeerUploadSummary, AppError> {
+        crate::local_upload::start_queue(&PeerUploadAdapter { manager: self, peer }, id, policy).await
+    }
+    async fn start_upload_batch_inner(
         self: &Arc<Self>,
         peer: &str,
         id: &str,
@@ -193,19 +213,27 @@ impl PeerManager {
         let scope = self.upload_scope(peer)?;
         let mut map = self.upload_batches.lock().await;
         let b = bound(&mut map, id, peer)?;
-        if b.scope != scope || b.status.phase != "selected" {
+        if b.lifecycle.is_cancelled() || b.scope != scope || b.status.phase != "selected" {
             return Err(invalid());
         }
         let roots = b.roots.take().ok_or_else(invalid)?;
         let cancel = b.cancel.subscribe();
+        let cancel_sender = b.cancel.clone();
+        let lifecycle = b.lifecycle.clone();
         let status = b.status.clone();
         let options = b.options.clone();
         let manager = Arc::clone(self);
         let id = id.to_owned();
         b.status.phase = "running".into();
         b.handle = Some(tokio::spawn(async move {
-            let operation =
-                manager.run_upload_batch(&id, roots, status, options, scope, cancel, policy);
+            let operation = async {
+                let run = manager.run_upload_batch(&id, roots, status, options, scope, cancel, policy);
+                tokio::pin!(run);
+                tokio::select! {
+                    r = &mut run => r,
+                    _ = lifecycle.cancelled() => { cancel_sender.send_replace(true); run.await }
+                }
+            };
             let result = match std::panic::AssertUnwindSafe(operation).catch_unwind().await {
                 Ok(r) => r,
                 Err(_) => Err(AppError::from(DomainError::Internal {
@@ -224,8 +252,9 @@ impl PeerManager {
         options: crate::types::IgnoreOptions,
         scope: String,
         mut cancel: tokio::sync::watch::Receiver<bool>,
-        mut policy: DirectoryConflictPolicy,
+        policy: DirectoryConflictPolicy,
     ) -> Result<(), AppError> {
+        let mut policy = crate::types::QueueConflictPolicy::from_upload(policy)?;
         for root in roots {
             if *cancel.borrow() {
                 return Err(canceled());
@@ -286,7 +315,7 @@ impl PeerManager {
         scope: &str,
         file: DirectoryFile,
         cancel: &mut tokio::sync::watch::Receiver<bool>,
-        policy: &mut DirectoryConflictPolicy,
+        policy: &mut crate::types::QueueConflictPolicy,
     ) -> Result<(), AppError> {
         if *cancel.borrow() {
             return Err(canceled());
@@ -334,12 +363,16 @@ impl PeerManager {
                 .status
                 .current_relative_path = Some(file.relative.clone());
         }
-        tokio::select! { biased; _ = cancel.changed() => return Err(canceled()), r = ensure_remote_directories(&client, &status.share_name, &directory) => r.map_err(AppError::from)? }
         let destination = tokio::select! { biased; _ = cancel.changed() => return Err(canceled()), r = resolve_remote_destination(&client, &encoded, &directory, name, ConflictPolicy::Fail) => r };
+        let mut condition = peerdav_protocol_peerdav::peerdav_file_core::Condition::CreateOnly;
         let (remote, _) = match destination {
             Ok(d) => d,
             Err(DomainError::TransferConflict { path }) => {
-                let mut choice = *policy;
+                // A collection or unsafe non-file is never a replaceable conflict,
+                // including when a cached Skip decision would avoid payload I/O.
+                let candidate = format!("{encoded}{}", encode_segment(name));
+                tokio::select! { biased; _ = cancel.changed() => return Err(canceled()), r = remote_meta(&client, &candidate, &path) => { r.map_err(AppError::from)?; } }
+                let mut choice = policy.upload_choice();
                 if choice == DirectoryConflictPolicy::Ask {
                     let decision = {
                         let mut map = self.upload_batches.lock().await;
@@ -355,24 +388,26 @@ impl PeerManager {
                         });
                         Arc::clone(&b.decision)
                     };
-                    loop {
-                        let notified = decision.notified();
-                        if *cancel.borrow() {
-                            return Err(canceled());
-                        }
-                        let resolved = {
-                            let mut map = self.upload_batches.lock().await;
-                            map.get_mut(id).ok_or_else(invalid)?.resolution.take()
-                        };
-                        if let Some((resolved, remaining)) = resolved {
-                            choice = resolved;
-                            if remaining {
-                                *policy = resolved;
+                    choice = crate::local_upload::wait_queue_conflict(
+                        &decision,
+                        async {
+                            if !*cancel.borrow() {
+                                match cancel.changed().await {
+                                    Ok(()) => {}
+                                    Err(error) => {
+                                        log::debug!("peer queue cancel sender closed: {error}")
+                                    }
+                                }
                             }
-                            break;
-                        }
-                        tokio::select! { _ = cancel.changed() => return Err(canceled()), _ = notified => {} }
-                    }
+                            canceled()
+                        },
+                        || async {
+                            let mut map = self.upload_batches.lock().await;
+                            Ok(map.get_mut(id).ok_or_else(invalid)?.resolution.take())
+                        },
+                        policy,
+                    )
+                    .await?;
                 }
                 if choice == DirectoryConflictPolicy::Cancel {
                     return Err(canceled());
@@ -386,6 +421,7 @@ impl PeerManager {
                     b.status.current_relative_path = None;
                     return Ok(());
                 }
+                condition = peerdav_protocol_peerdav::peerdav_file_core::Condition::Any;
                 tokio::select! { biased; _ = cancel.changed() => return Err(canceled()), r = resolve_remote_destination(&client, &encoded, &directory, name, ConflictPolicy::Overwrite) => r.map_err(AppError::from)? }
             }
             Err(e) => return Err(AppError::from(e)),
@@ -402,6 +438,7 @@ impl PeerManager {
             b.status.phase = "running".into();
             b.status.conflict = None;
         }
+        tokio::select! { biased; _ = cancel.changed() => return Err(canceled()), r = ensure_remote_directories(&client, &status.share_name, &directory) => r.map_err(AppError::from)? }
         crate::transfer::upload_opened(
             &client,
             &remote,
@@ -410,6 +447,7 @@ impl PeerManager {
             file.size,
             None,
             Some((id.to_owned(), cancel.clone())),
+            condition,
         )
         .await
         .map_err(AppError::from)?;
@@ -498,6 +536,7 @@ impl PeerManager {
     }
     pub(crate) async fn stop_upload_batches(&self, peer: Option<&str>) -> Result<(), AppError> {
         let _guard = self.upload_lifecycle.lock().await;
+        self.vault.invalidate_transfers().map_err(AppError::from)?;
         if peer.is_none() {
             self.upload_epoch
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -536,7 +575,7 @@ pub async fn peer_select_upload_batch(
     mode: String,
     options: Option<crate::types::IgnoreOptions>,
 ) -> Result<Option<PeerUploadSummary>, AppError> {
-    if mode != "folder" && mode != "files" {
+    if !matches!(mode.as_str(), "folder" | "files" | "single") {
         return Err(invalid());
     }
     let scope = peers.upload_scope(&peer_id)?;
@@ -549,11 +588,16 @@ pub async fn peer_select_upload_batch(
         return Err(AppError::from(DomainError::PeerAuthorizationRejected));
     }
     let folder = mode == "folder";
+    let single = mode == "single";
+    let picker_app = app.clone();
     let selected = tokio::task::spawn_blocking(move || {
+        let dialog = crate::picker_prefs::dialog(&picker_app, crate::types::PickerDirection::Upload);
         if folder {
-            app.dialog().file().blocking_pick_folder().map(|p| vec![p])
+            dialog.blocking_pick_folder().map(|p| vec![p])
+        } else if single {
+            dialog.blocking_pick_file().map(|p| vec![p])
         } else {
-            app.dialog().file().blocking_pick_files()
+            dialog.blocking_pick_files()
         }
     })
     .await
@@ -565,7 +609,8 @@ pub async fn peer_select_upload_batch(
         .into_iter()
         .map(|p| p.into_path().map_err(|_| invalid()))
         .collect::<Result<Vec<_>, _>>()?;
-    peers
+    let remembered = paths.first().cloned();
+    let result = peers
         .select_upload_batch(
             peer_id,
             share.id,
@@ -575,8 +620,13 @@ pub async fn peer_select_upload_batch(
             options.unwrap_or_default(),
             scope,
         )
-        .await
-        .map(Some)
+        .await?;
+    if let Some(vault) = tauri::Manager::try_state::<crate::commands::SharedVault>(&app) {
+        crate::picker_prefs::remember(&vault, crate::types::PickerDirection::Upload, remembered.as_deref(), folder);
+    } else {
+        log::error!("picker preference not saved: reason=vault_state_missing");
+    }
+    Ok(Some(result))
 }
 #[tauri::command]
 pub async fn peer_start_upload_batch(
@@ -688,7 +738,8 @@ fn resolve_batch_conflict(
     decision: DirectoryConflictPolicy,
     apply_to_remaining: bool,
 ) -> Result<(), AppError> {
-    if decision == DirectoryConflictPolicy::Ask
+    if b.lifecycle.is_cancelled() || *b.cancel.borrow()
+        || matches!(decision, DirectoryConflictPolicy::Ask | DirectoryConflictPolicy::Cancel)
         || b.status.phase != "conflict"
         || b.status
             .conflict
@@ -698,9 +749,12 @@ fn resolve_batch_conflict(
     {
         return Err(invalid());
     }
+    crate::types::QueueConflictPolicy::resolve(
+        b.status.conflict.as_ref().map(|c| c.conflict_id.as_str()),
+        conflict_id, &mut b.resolution, decision, apply_to_remaining,
+    )?;
     b.status.phase = "running".into();
     b.status.conflict = None;
-    b.resolution = Some((decision, apply_to_remaining));
     b.decision.notify_one();
     Ok(())
 }
@@ -770,6 +824,65 @@ mod tests {
             .expect("select")
     }
     #[tokio::test]
+    async fn peer_real_session_single_files_folder_skip_and_unsafe_no_payload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (temp, mut manager, _) = fixture();
+        Arc::get_mut(&mut manager).unwrap().upload_test_transport = None;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        manager.vault.save_peer_record(&crate::types::PeerRecord { id: "abcd".into(), label: "Peer".into(), url: format!("http://{}", listener.local_addr().unwrap()), authorization_id: None, machine_id: None, created_at: 0, last_connected_at: None }).unwrap();
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let unsafe_target = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unsafe_server = Arc::clone(&unsafe_target);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 16384];
+                let count = socket.read(&mut request).await.unwrap();
+                let first = String::from_utf8_lossy(&request[..count]).lines().next().unwrap().to_owned();
+                let path = first.split_whitespace().nth(1).unwrap().to_owned();
+                recorded.lock().await.push(first);
+                let kind = if unsafe_server.load(std::sync::atomic::Ordering::Acquire) { "<D:collection/>" } else { "" };
+                let body = format!("<D:multistatus xmlns:D=\"DAV:\"><D:response><D:href>{path}</D:href><D:propstat><D:prop><D:resourcetype>{kind}</D:resourcetype><D:getcontentlength>1</D:getcontentlength><D:getlastmodified>Mon, 02 Nov 2026 12:00:00 GMT</D:getlastmodified><D:getetag>etag</D:getetag></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>");
+                let response = format!("HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let root = temp.path().join("selected");
+        std::fs::create_dir(&root).unwrap();
+        let a = root.join("a"); let b = root.join("b");
+        std::fs::write(&a, b"a").unwrap(); std::fs::write(&b, b"b").unwrap();
+        for (mode, paths, count) in [("single", vec![a.clone()], 1), ("files", vec![a.clone(), b], 2), ("folder", vec![root], 2), ("single", vec![a], 0)] {
+            unsafe_target.store(count == 0, std::sync::atomic::Ordering::Release);
+            let selected = manager.select_upload_batch("abcd".into(), "share".into(), "/".into(), paths, mode, crate::types::IgnoreOptions::default(), manager.upload_scope("abcd").unwrap()).await.unwrap();
+            manager.start_upload_batch("abcd", &selected.batch_id, DirectoryConflictPolicy::Ask).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(4), async {
+                let mut resolved = false;
+                loop {
+                    let mut map = manager.upload_batches.lock().await;
+                    let batch = map.get_mut(&selected.batch_id).unwrap();
+                    if let Some(conflict) = batch.status.conflict.clone() {
+                        assert!(!resolved, "remaining decision must apply within this queue");
+                        resolve_batch_conflict(batch, &conflict.conflict_id, DirectoryConflictPolicy::Skip, true).unwrap();
+                        assert!(resolve_batch_conflict(batch, &conflict.conflict_id, DirectoryConflictPolicy::Overwrite, false).is_err());
+                        resolved = true;
+                    }
+                    if matches!(batch.status.phase.as_str(), "completed" | "failed") {
+                        assert_eq!(batch.status.phase, if count == 0 { "failed" } else { "completed" }, "{:?}", batch.status.error);
+                        assert_eq!(batch.status.skipped_files, count);
+                        assert_eq!(resolved, count != 0);
+                        break;
+                    }
+                    drop(map); tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            manager.release_upload_batch("abcd", &selected.batch_id).await.unwrap();
+        }
+        server.abort(); assert!(server.await.unwrap_err().is_cancelled());
+        assert!(requests.lock().await.iter().all(|r| r.starts_with("PROPFIND ")));
+    }
+
+    #[tokio::test]
     async fn peer_streaming_batch_runs_over_128_without_status_driving_and_honors_ignore() {
         let (temp, manager, mock) = fixture();
         let root = temp.path().join("root");
@@ -824,9 +937,11 @@ mod tests {
         assert_eq!(status.skipped_symlinks, 1);
         let files = mock.files.lock().await;
         assert!(files.iter().any(|f| f == "root/nested/299"));
-        assert!(!files
-            .iter()
-            .any(|f| f.ends_with("drop.log") || f.ends_with(".DS_Store") || f.ends_with("link")));
+        assert!(
+            !files.iter().any(|f| f.ends_with("drop.log")
+                || f.ends_with(".DS_Store")
+                || f.ends_with("link"))
+        );
     }
     #[tokio::test]
     async fn peer_streaming_batch_files_and_conflict_decisions_are_bounded_and_single_use() {
@@ -902,19 +1017,25 @@ mod tests {
         let root = temp.path().join("root");
         std::fs::create_dir(&root).expect("root");
         let selected = select(&manager, root.clone()).await;
-        assert!(manager
-            .cancel_upload_batch("other", &selected.batch_id)
-            .await
-            .is_err());
-        assert!(manager
-            .release_upload_batch("other", &selected.batch_id)
-            .await
-            .is_err());
-        assert!(manager
-            .upload_batches
-            .lock()
-            .await
-            .contains_key(&selected.batch_id));
+        assert!(
+            manager
+                .cancel_upload_batch("other", &selected.batch_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .release_upload_batch("other", &selected.batch_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            manager
+                .upload_batches
+                .lock()
+                .await
+                .contains_key(&selected.batch_id)
+        );
         let (first, second) = tokio::join!(
             manager.release_upload_batch("abcd", &selected.batch_id),
             manager.release_upload_batch("abcd", &selected.batch_id),
@@ -972,10 +1093,12 @@ mod tests {
             .stop_upload_batches(None)
             .await
             .expect_err("timeout error");
-        assert!(error
-            .detail
-            .as_deref()
-            .is_some_and(|detail| detail.contains("cancellation timed out")));
+        assert!(
+            error
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("cancellation timed out"))
+        );
         assert!(workers.iter().all(tokio::task::AbortHandle::is_finished));
         assert!(manager.upload_batches.lock().await.is_empty());
         manager
@@ -990,18 +1113,22 @@ mod tests {
         std::fs::create_dir(&root).expect("root");
         std::fs::write(root.join("file"), b"x").expect("file");
         let selected = select(&manager, root.clone()).await;
-        assert!(manager
-            .start_upload_batch("other", &selected.batch_id, DirectoryConflictPolicy::Ask)
-            .await
-            .is_err());
+        assert!(
+            manager
+                .start_upload_batch("other", &selected.batch_id, DirectoryConflictPolicy::Ask)
+                .await
+                .is_err()
+        );
         manager
             .vault
             .save_peer_code("abcd", "http://127.0.0.1:9", "changed")
             .expect("change");
-        assert!(manager
-            .start_upload_batch("abcd", &selected.batch_id, DirectoryConflictPolicy::Ask)
-            .await
-            .is_err());
+        assert!(
+            manager
+                .start_upload_batch("abcd", &selected.batch_id, DirectoryConflictPolicy::Ask)
+                .await
+                .is_err()
+        );
         manager
             .cancel_upload_batch("abcd", &selected.batch_id)
             .await

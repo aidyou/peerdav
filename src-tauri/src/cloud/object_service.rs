@@ -111,6 +111,84 @@ impl PhysicalRoot {
         }
         Ok(Self { dir, path })
     }
+    pub(crate) fn relative_target_identity(&self, relative: &str) -> Result<Option<String>, ObjectServiceError> {
+        if !self.relative_target_exists(relative)? { return Ok(None); }
+        let parts: Vec<_> = relative.split('/').collect();
+        let (name, parents) = parts.split_last().ok_or(ObjectServiceError::InvalidKey)?;
+        let mut dir = self.upload_directory_handle()?;
+        for part in parents {
+            use cap_fs_ext::DirExt;
+            dir = dir.open_dir_nofollow(part).map_err(|source| ObjectServiceError::Io { source })?;
+        }
+        let meta = dir.symlink_metadata(name).map_err(|source| ObjectServiceError::Io { source })?;
+        if meta.file_type().is_symlink() || !meta.is_file() { return Err(ObjectServiceError::InvalidLocalCapability); }
+        #[cfg(unix)] {
+            use cap_std::fs::MetadataExt;
+            Ok(Some(format!("{}:{}:{}:{}:{}:{}", meta.dev(), meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), meta.ctime_nsec())))
+        }
+        #[cfg(not(unix))]
+        Ok(Some(format!("{}:{:?}", meta.len(), meta.modified())))
+    }
+    pub(crate) fn download_parent(&self, relative: &str) -> Result<(cap_std::fs::Dir, String), ObjectServiceError> {
+        valid_relative_path(relative)?;
+        let parts: Vec<_> = relative.split('/').collect();
+        let (name, parents) = parts.split_last().ok_or(ObjectServiceError::InvalidKey)?;
+        Ok((open_download_parent(self, parents)?, (*name).to_owned()))
+    }
+    /// Reveal must never follow an ambient path which replaced the selected directory.
+    pub(crate) fn reveal_path(&self) -> Result<&Path, ObjectServiceError> {
+        let reopened = Self::open(&self.path)?;
+        #[cfg(unix)] {
+            use cap_std::fs::MetadataExt;
+            let a = self.dir.dir_metadata().map_err(|source| ObjectServiceError::Io { source })?;
+            let b = reopened.dir.dir_metadata().map_err(|source| ObjectServiceError::Io { source })?;
+            if a.dev() != b.dev() || a.ino() != b.ino() { return Err(ObjectServiceError::InvalidLocalCapability); }
+        }
+        #[cfg(not(unix))]
+        let _ = reopened;
+        Ok(&self.path)
+    }
+    pub(crate) fn install_download(&self, relative: &str, source: &Path, overwrite: bool, cancel: &tokio_util::sync::CancellationToken) -> Result<(), ObjectServiceError> {
+        let (dir, name) = self.download_parent(relative)?;
+        let temporary = format!(".peerdav-{}", hex::encode(rand::random::<[u8;16]>()));
+        let mut options = CapOpenOptions::new();
+        options.write(true).create_new(true);
+        let mut output = dir.open_with(&temporary, &options).map_err(|source| ObjectServiceError::Io { source })?.into_std();
+        let result = (|| {
+            let mut input = std::fs::File::open(source).map_err(|source| ObjectServiceError::Io { source })?;
+            let identity = self.relative_target_identity(relative)?;
+            use std::io::{Read, Write};
+            let mut buffer = vec![0u8; 1024 * 1024];
+            loop {
+                if cancel.is_cancelled() { return Err(ObjectServiceError::Cancelled); }
+                let count = input.read(&mut buffer).map_err(|source| ObjectServiceError::Io { source })?;
+                if count == 0 { break; }
+                output.write_all(&buffer[..count]).map_err(|source| ObjectServiceError::Io { source })?;
+            }
+            output.sync_all().map_err(|source| ObjectServiceError::Io { source })?;
+            if cancel.is_cancelled() { return Err(ObjectServiceError::Cancelled); }
+            if overwrite && self.relative_target_identity(relative)? != identity {
+                return Err(ObjectServiceError::DestinationExists);
+            }
+            // Identity comparison and rename are separate filesystem operations,
+            // not an atomic compare-and-swap on all supported platforms.
+            if overwrite {
+                match dir.symlink_metadata(&name) {
+                    Ok(m) if m.file_type().is_symlink() || !m.is_file() => return Err(ObjectServiceError::InvalidLocalCapability),
+                    Ok(_) => {},
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(source) => return Err(ObjectServiceError::Io { source }),
+                }
+                dir.rename(&temporary, &dir, &name).map_err(|source| ObjectServiceError::Io { source })?;
+            } else {
+                dir.hard_link(&temporary, &dir, &name).map_err(|source| ObjectServiceError::Io { source })?;
+                dir.remove_file(&temporary).map_err(|source| ObjectServiceError::Io { source })?;
+            }
+            Ok(())
+        })();
+        drop(output);
+        match result { Ok(()) => Ok(()), Err(e) => cleanup_staging(&dir, &temporary, e) }
+    }
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -148,8 +226,10 @@ impl PhysicalRoot {
                 Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
                 Err(source) => return Err(ObjectServiceError::Io { source }),
             }
-            dir = dir
-                .open_dir(part)
+            dir = {
+                use cap_fs_ext::DirExt;
+                dir.open_dir_nofollow(part)
+            }
                 .map_err(|source| ObjectServiceError::Io { source })?;
         }
         match dir.symlink_metadata(name) {
@@ -1000,8 +1080,10 @@ fn open_download_parent(
             }
             Err(source) => return Err(ObjectServiceError::Io { source }),
         }
-        dir = dir
-            .open_dir(part)
+        dir = {
+            use cap_fs_ext::DirExt;
+            dir.open_dir_nofollow(part)
+        }
             .map_err(|source| ObjectServiceError::Io { source })?;
     }
     Ok(dir)

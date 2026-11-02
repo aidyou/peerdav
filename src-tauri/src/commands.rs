@@ -2,8 +2,7 @@
 //! through [`AppError::from`] and never builds user-facing strings itself.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use ignore::WalkBuilder;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -12,7 +11,7 @@ use zeroize::Zeroizing;
 
 use crate::error::{AppError, DomainError};
 use crate::ignore_rules::is_builtin_ignored;
-use crate::peer::{PeerManager, TransferProgressCallback};
+use crate::peer::PeerManager;
 use crate::server::{ServerConfig, ServerController};
 use crate::sync::manager_types::SyncStatus;
 use crate::sync::traits::{BoxError, SyncEvents};
@@ -25,8 +24,8 @@ use crate::types::{
     PENDING_REQUEST_EVENT, PeerHealth, PeerInfo, PeerListing, PeerRevocationInfo, PeerShare,
     PeerStatus, PendingRequestInfo, PreviewPayload, ResetVaultResult, SERVER_BIND_META,
     SERVER_DISCOVERY_PORT_META, SERVER_ENABLED_META, SERVER_NAME_META, SERVER_PORT_META,
-    ServerStatus, ShareInfo, SharePermissions, TRANSFER_PROGRESS_EVENT, TRAY_ICON_STYLE_META,
-    TransferProgress, TransferResult, TrayIconStyle, UploadCandidate, VaultStatus,
+    ServerStatus, ShareInfo, SharePermissions, TRAY_ICON_STYLE_META,
+    TransferResult, TrayIconStyle, UploadCandidate, VaultStatus,
 };
 use crate::vault::Vault;
 
@@ -1043,17 +1042,9 @@ pub async fn download_peer_file(
     local_dir: String,
     conflict: Option<ConflictPolicy>,
 ) -> Result<TransferResult, AppError> {
-    let peers = Arc::clone(peers.inner());
-    peers
-        .download(
-            &peer_id,
-            &share_id,
-            &remote_path,
-            &local_dir,
-            conflict.unwrap_or_default(),
-        )
-        .await
-        .map_err(AppError::from)
+    // Legacy IPC is deliberately disabled: local paths cannot grant download authority.
+    let _ = (peers, peer_id, share_id, remote_path, local_dir, conflict);
+    Err(crate::local_upload::invalid())
 }
 
 #[tauri::command]
@@ -1066,18 +1057,8 @@ pub async fn prepare_peer_directory_download(
     conflict: Option<ConflictPolicy>,
     ignore_options: Option<crate::types::IgnoreOptions>,
 ) -> Result<DirectoryDownloadPlan, AppError> {
-    let peers = Arc::clone(peers.inner());
-    peers
-        .prepare_directory_download_with_options(
-            &peer_id,
-            &share_id,
-            &remote_path,
-            &local_parent,
-            conflict.unwrap_or_default(),
-            &ignore_options.unwrap_or_default(),
-        )
-        .await
-        .map_err(AppError::from)
+    let _ = (peers, peer_id, share_id, remote_path, local_parent, conflict, ignore_options);
+    Err(crate::local_upload::invalid())
 }
 
 #[tauri::command]
@@ -1090,54 +1071,8 @@ pub async fn download_peer_file_to(
     local_path: String,
     transfer_id: String,
 ) -> Result<TransferResult, AppError> {
-    let peers = Arc::clone(peers.inner());
-    let file_name = remote_path
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or("file")
-        .to_owned();
-    let last_emit = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(1)));
-    let transfer_id_for_progress = transfer_id.clone();
-    let progress: TransferProgressCallback = Arc::new(move |transferred, total| {
-        let now = Instant::now();
-        let should_emit = {
-            let Ok(mut last) = last_emit.lock() else {
-                return;
-            };
-            if transferred == total || now.duration_since(*last) >= Duration::from_millis(100) {
-                *last = now;
-                true
-            } else {
-                false
-            }
-        };
-        if !should_emit {
-            return;
-        }
-        let payload = TransferProgress {
-            transfer_id: transfer_id_for_progress.clone(),
-            direction: "download".to_owned(),
-            file_name: file_name.clone(),
-            transferred,
-            total,
-            phase: None,
-            bytes_per_second: None,
-        };
-        if let Err(error) = app.emit(TRANSFER_PROGRESS_EVENT, &payload) {
-            log::warn!("failed to emit {TRANSFER_PROGRESS_EVENT}: {error}");
-        }
-    });
-    peers
-        .download_to_with_progress(
-            &peer_id,
-            &share_id,
-            &remote_path,
-            &local_path,
-            Some(progress),
-        )
-        .await
-        .map_err(AppError::from)
+    let _ = (app, peers, peer_id, share_id, remote_path, local_path, transfer_id);
+    Err(crate::local_upload::invalid())
 }
 
 #[tauri::command]
@@ -1404,7 +1339,8 @@ async fn ensure_local_directory(path: &str) -> Result<(), AppError> {
 
 #[tauri::command]
 pub async fn begin_peer_upload(peers: State<'_, SharedPeers>) -> Result<String, AppError> {
-    Ok(peers.begin_upload().await)
+    let _ = peers;
+    Err(crate::local_upload::invalid())
 }
 
 #[tauri::command]
@@ -1427,66 +1363,8 @@ pub async fn upload_peer_file(
     conflict: Option<ConflictPolicy>,
     transfer_id: String,
 ) -> Result<TransferResult, AppError> {
-    let peers = Arc::clone(peers.inner());
-    let file_name = Path::new(&local_path)
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let state = Mutex::new((
-        None,
-        Instant::now() - Duration::from_secs(1),
-        0u64,
-        0u64,
-        0.0,
-    ));
-    let event_id = transfer_id.clone();
-    let progress: crate::types::UploadProgressCallback =
-        Arc::new(move |phase, transferred, total, sent| {
-            let Ok(mut state) = state.lock() else {
-                return;
-            };
-            let now = Instant::now();
-            let elapsed = now.duration_since(state.1).as_secs_f64();
-            let changed = state.0 != Some(phase);
-            if !changed && elapsed < 0.1 && transferred != total {
-                return;
-            }
-            if changed {
-                state.2 = sent;
-                state.3 = 0;
-                state.4 = 0.0;
-            } else if phase == crate::types::UploadPhase::Uploading && elapsed > 0.0 {
-                state.4 = sent.saturating_sub(state.2) as f64 / elapsed;
-            }
-            state.0 = Some(phase);
-            state.1 = now;
-            state.2 = sent.max(state.2);
-            state.3 = transferred.max(state.3);
-            let payload = TransferProgress {
-                transfer_id: event_id.clone(),
-                direction: "upload".to_owned(),
-                file_name: file_name.clone(),
-                transferred: state.3.min(total),
-                total,
-                phase: Some(phase),
-                bytes_per_second: Some(state.4),
-            };
-            if let Err(error) = app.emit(TRANSFER_PROGRESS_EVENT, &payload) {
-                log::warn!("failed to emit {TRANSFER_PROGRESS_EVENT}: {error}");
-            }
-        });
-    peers
-        .upload_with_progress(
-            &peer_id,
-            &share_id,
-            &local_path,
-            &remote_dir,
-            conflict.unwrap_or_default(),
-            &transfer_id,
-            progress,
-        )
-        .await
-        .map_err(AppError::from)
+    let _ = (app, peers, peer_id, share_id, local_path, remote_dir, conflict, transfer_id);
+    Err(crate::local_upload::invalid())
 }
 
 #[tauri::command]

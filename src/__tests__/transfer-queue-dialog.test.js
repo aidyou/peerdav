@@ -3,6 +3,7 @@ import { mount, DOMWrapper } from '@vue/test-utils';
 const click = async (selector) => { await new DOMWrapper(document.querySelector(selector)).trigger('click'); };
 import { nextTick, defineComponent, h } from 'vue';
 import { ElButton, ElDialog } from 'element-plus';
+import TransferConflictControls from '../components/TransferConflictControls.vue';
 import TransferQueueDialog from '../components/TransferQueueDialog.vue';
 import OperationErrorDialog from '../components/OperationErrorDialog.vue';
 import { setLocale } from '../lib/i18n';
@@ -16,6 +17,18 @@ const render = (component, props) => {
 };
 afterEach(() => { wrappers.splice(0).forEach(w => w.unmount()); document.body.innerHTML = ''; });
 describe('mounted transfer dialogs', () => {
+  it.each(['upload', 'download'])('uses the same explicit conflict controls and dedicated cancellation for %s with actual Element Plus', async (direction) => {
+    const resolve = vi.fn(); const cancel = vi.fn(); const apply = vi.fn();
+    render(TransferConflictControls, { direction, conflict: { conflictId: 'c', relativePath: 'a.txt' }, overwriteAllowed: true, onResolve: resolve, onCancel: cancel, 'onUpdate:applyRemaining': apply });
+    await nextTick();
+    expect(document.querySelector(`[data-test=${direction}-apply-remaining]`).checked).toBe(false);
+    await new DOMWrapper(document.querySelector(`[data-test=${direction}-apply-remaining]`)).setValue(true);
+    expect(apply).toHaveBeenCalledWith(true);
+    await click(`[data-test=${direction}-overwrite]`); expect(resolve).toHaveBeenCalledWith('overwrite');
+    await click(`[data-test=${direction}-skip]`); expect(resolve).toHaveBeenCalledWith('skip');
+    await click(`[data-test=${direction}-conflict-cancel]`); expect(cancel).toHaveBeenCalledTimes(1);
+    expect(resolve).not.toHaveBeenCalledWith('cancel');
+  });
   it('proves the real dialog button emit chain independently', async () => {
     const events = [];
     const Probe = defineComponent({ emits: ['retry'], setup(_, { emit }) { return () => h(ElDialog, { modelValue: true }, { footer: () => h(ElButton, { 'data-test': 'probe', onClick: () => emit('retry') }, () => 'Retry') }); } });

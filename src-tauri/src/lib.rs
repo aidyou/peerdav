@@ -7,6 +7,10 @@ mod commands;
 mod crypto;
 mod db;
 mod discovery;
+pub mod download_types;
+mod download;
+mod download_commands;
+mod s3_download;
 mod error;
 pub mod file_manager;
 mod fs;
@@ -20,6 +24,7 @@ mod peer;
 mod local_upload;
 mod local_upload_types;
 mod peer_upload_types;
+mod picker_prefs;
 mod policy;
 mod server;
 pub mod sync;
@@ -36,7 +41,7 @@ pub use error::{AppError, DomainError};
 pub use peer::{PeerLimits, PeerManager};
 pub use policy::{PeerContext, PolicyDecision, evaluate_rules};
 pub use server::{ServerConfig, ServerController};
-pub use traits::{PeerEvents, ServerEvents};
+pub use traits::{PeerEvents, ServerEvents, TransferQueueAdapter};
 pub use types::{
     ACCESS_GRANT_TTL, ACCESS_PROTOCOL, ACCESS_REQUEST_HEADER, ACCESS_STATUS_PATH,
     AccessRequestStatus, AccessRule, AccessStatusResponse, AdminLoginResult, ApprovePendingResult,
@@ -48,7 +53,7 @@ pub use types::{
     PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT, PeerAccessRequest, PeerEntry, PeerHealth,
     PeerInfo, PeerListing, PeerRevocationInfo, PeerShare, PeerStatus, PendingRequestInfo,
     PreviewPayload, RuleKind, RuleMatcher, ServerStatus, ShareInfo, SharePermissions,
-    TransferResult, UploadPhase, VaultStatus,
+    TransferResult, TransferProgress, TRANSFER_PROGRESS_EVENT, UploadPhase, VaultStatus,
 };
 pub use vault::Vault;
 
@@ -140,6 +145,7 @@ pub fn run() {
             if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                 window::restore(&window, &vault)?;
             }
+            app.manage(Arc::new(download_types::DownloadQueues::default()));
             app.manage(cloud::runtime_types::SharedCloud(cloud));
             app.manage(Arc::clone(&vault) as SharedVault);
             app.manage(server as SharedServer);
@@ -216,6 +222,14 @@ pub fn run() {
             }
             let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool> =
                 Box::new(tauri::generate_handler![
+                    download_commands::transfer_select_download,
+                    download_commands::transfer_start_download,
+                    download_commands::transfer_status_download,
+                    download_commands::transfer_page_download,
+                    download_commands::transfer_resolve_download,
+                    download_commands::transfer_cancel_download,
+                    download_commands::transfer_release_download,
+                    download_commands::transfer_reveal_download,
                     updater::manager::update_status,
                     updater::manager::check_for_updates,
                     updater::manager::install_update,

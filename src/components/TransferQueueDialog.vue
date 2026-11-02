@@ -1,4 +1,5 @@
 <script setup>
+import TransferConflictControls from "./TransferConflictControls.vue";
 import FileGlyph from "./FileGlyph.vue";
 import { formatBytes } from "../lib/format";
 import { statusTagTone } from "../lib/tagTone";
@@ -6,9 +7,10 @@ import { t } from "../lib/i18n";
 defineProps({ open: Boolean, items: { type: Array, default: () => [] }, running: Boolean, canceling: Boolean,
   summary: { type: String, default: "" }, root: { type: String, default: "" },
   percentage: { type: Number, default: null }, transferred: { type: Number, default: null }, total: { type: Number, default: null },
-  note: { type: String, default: "" },
+  note: { type: String, default: "" }, queueState: { type: Object, default: null }, applyRemaining: Boolean, resolving: Boolean,
+  nextOffset: { type: Number, default: null }, pageLoading: Boolean,
 });
-const emit = defineEmits(["close", "cancel", "reveal", "retry"]);
+const emit = defineEmits(["close", "cancel", "reveal", "retry", "resolve", "page", "update:applyRemaining"]);
 const statusKey = { pending: "Pending", downloading: "Downloading", done: "Done", canceled: "Canceled", error: "Error" };
 const name = (path) => String(path || "").split("/").pop();
 </script>
@@ -18,6 +20,11 @@ const name = (path) => String(path || "").split("/").pop();
     :show-close="!running" :close-on-click-modal="false" :close-on-press-escape="!running" data-test="download-dialog">
     <div class="queue-dialog">
       <p role="status">{{ summary }}</p>
+      <p v-if="queueState">{{ t('cloudBrowser.uploadSkip') }}: {{ queueState.skippedFiles }} · {{ queueState.currentRelativePath }}</p>
+      <p v-if="queueState?.error" role="alert">{{ queueState.error.message }}</p>
+      <TransferConflictControls v-if="open && queueState?.conflict" :key="`${queueState.queueId}:${queueState.conflict.conflictId}`" direction="download" :conflict="queueState.conflict" :apply-remaining="applyRemaining" :resolving="resolving || canceling" overwrite-allowed
+        @update:apply-remaining="emit('update:applyRemaining', $event)" @resolve="emit('resolve', $event)" @cancel="emit('cancel')" />
+      <el-button v-if="nextOffset != null" :disabled="pageLoading" data-test="download-next" @click="emit('page', nextOffset)">{{ t('cloudBrowser.uploadNextPage') }}</el-button>
       <el-progress v-if="percentage != null" :percentage="percentage" :stroke-width="6" />
       <p v-if="transferred != null">{{ formatBytes(transferred) }}<template v-if="total != null"> / {{ formatBytes(total) }}</template></p>
       <ul class="transfer-queue download-queue">
@@ -34,7 +41,7 @@ const name = (path) => String(path || "").split("/").pop();
     </div>
     <template #footer>
       <el-button v-if="running" data-test="cancel-download" plain :disabled="canceling" @click="emit('cancel')">{{ t(canceling ? 'peer.cancelingDownload' : 'peer.cancelDownload') }}</el-button>
-      <template v-else><el-button v-if="root" plain data-test="reveal-download" @click="emit('reveal')">{{ t('peer.revealInFolder') }}</el-button>
+      <template v-else><el-button v-if="root || queueState?.queueId" plain data-test="reveal-download" @click="emit('reveal')">{{ t('peer.revealInFolder') }}</el-button>
         <el-button type="primary" data-test="close-download" @click="emit('close')">{{ t('common.close') }}</el-button></template>
     </template>
   </el-dialog>

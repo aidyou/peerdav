@@ -102,6 +102,9 @@ async fn resumable_write_contract_v1_v2_resume_and_unknown_cleanup() {
                     };
                     assert!(headers.contains(&format!("{header}: {digest}")));
                 }
+                if method == "PUT" {
+                    assert!(headers.contains("x-peerdav-write-condition: replace"));
+                }
                 if fail_commit && method == "PUT" {
                     continue;
                 }
@@ -110,7 +113,7 @@ async fn resumable_write_contract_v1_v2_resume_and_unknown_cleanup() {
                 } else {
                     204
                 };
-                socket.write_all(format!("HTTP/1.1 {status} Test\r\nx-peerdav-upload-version: {version}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\nx-peerdav-write-conditions: create-only,replace\r\nx-peerdav-upload-version: {version}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
             }
         });
         let backend =
@@ -163,7 +166,10 @@ async fn resumable_unsupported_conditions_rejected_before_source_or_network() {
     )
     .unwrap();
     for (condition, mode) in [
-        (Condition::CreateOnly, WriteMode::Streaming),
+        (
+            Condition::Match(Revision::new("revision")),
+            WriteMode::Streaming,
+        ),
         (Condition::Any, WriteMode::BoundedAtomic { max_bytes: 3 }),
     ] {
         let error = backend

@@ -24,6 +24,25 @@ function setup(overrides = {}) {
 }
 
 describe("shared upload batch session", () => {
+  it('asks again unchecked for a second conflict and resets a new queue to Ask', async () => {
+    const first = { conflictId: 'first', relativePath: 'a.txt' };
+    const second = { conflictId: 'second', relativePath: 'b.txt' };
+    const { batch, adapter } = setup({ start: vi.fn(async () => summary('conflict', { conflict: first })) });
+    await batch.selectUpload('single');
+    expect(batch.uploadApplyRemaining.value).toBe(false);
+    adapter.status.mockResolvedValueOnce(summary('conflict', { conflict: second, skippedFiles: 1 }));
+    await batch.resolveUploadConflict('skip');
+    expect(adapter.resolve).toHaveBeenLastCalledWith({ peerId: 'peer', batchId: 'batch', conflictId: 'first', decision: 'skip', applyToRemaining: false });
+    expect(batch.uploadApplyRemaining.value).toBe(false);
+    expect(batch.uploadSummary.value.skippedFiles).toBe(1);
+    batch.uploadApplyRemaining.value = true;
+    adapter.status.mockResolvedValueOnce(summary('completed', { completedFiles: 1, skippedFiles: 1 }));
+    await batch.resolveUploadConflict('overwrite');
+    expect(adapter.resolve).toHaveBeenLastCalledWith({ peerId: 'peer', batchId: 'batch', conflictId: 'second', decision: 'overwrite', applyToRemaining: true });
+    await batch.closeUpload(); await batch.selectUpload('files');
+    expect(batch.uploadApplyRemaining.value).toBe(false);
+    expect(adapter.start).toHaveBeenLastCalledWith({ peerId: 'peer', batchId: 'batch', conflictPolicy: 'ask' });
+  });
   it("freezes selection destination while remote browsing continues", async () => {
     const picker = deferred();
     const { batch, adapter, scope } = setup({ select: vi.fn(() => picker.promise) });

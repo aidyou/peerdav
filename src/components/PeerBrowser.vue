@@ -4,7 +4,7 @@ import UploadBatchDialog from "./UploadBatchDialog.vue";
 import TransferQueueDialog from "./TransferQueueDialog.vue";
 import { useUploadBatch } from "../composables/useUploadBatch";
 import { peerUploadAdapter } from "../lib/uploadBatchAdapters";
-import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { useDownloadQueue } from "../composables/useDownloadQueue";
 
 import FileGlyph from "./FileGlyph.vue";
 import { selectionForClick } from "../lib/fileManagerAdapters";
@@ -16,7 +16,7 @@ import { canPreview, fileKind, fileKindKey, isReadableText } from "../lib/fileKi
 import { t } from "../lib/i18n";
 import { formatBytes } from "../lib/format";
 import { generalSettings } from "../lib/general";
-import { errorStrategy, normalizeAppError, toUserMessage } from "../lib/invoke";
+import { normalizeAppError } from "../lib/invoke";
 import {
   MAX_PREVIEW_BYTES,
   previewFormat as detectPreviewFormat,
@@ -59,20 +59,8 @@ const selectedEntry = ref(null);
 const selectedEntries = ref([]);
 const selectionAnchor = ref(null);
 const marquee = ref(null);
-const batchConflict = ref("fail");
-let batchConflictResolved = false;
 let marqueeStart = null;
 let suppressClick = false;
-const downloadOpen = ref(false);
-const downloadName = ref("");
-const downloadTransferId = ref("");
-const downloadDialogOpen = ref(false);
-const downloadRoot = ref("");
-const downloadQueue = ref([]);
-const downloadRunning = ref(false);
-const downloadCanceled = ref(false);
-const savedOpen = ref(false);
-const savedPath = ref("");
 let browserDisposed = false;
 let uploadPollTimer;
 const canMutate = computed(() => Boolean(activeShare.value?.permissions?.canWrite) && !busy.value && !uploadRunning.value);
@@ -92,12 +80,23 @@ const {
     if (peerPath.value === scope.remoteDir) void loadPath(scope.remoteDir);
   },
 });
-onMounted(() => { uploadPollTimer = setInterval(() => { void pollUpload(); }, 1500); });
-watch([() => props.peer.id, activeShareId], () => { void cancelUploadSession(); }, { flush: "sync" });
+const {
+  downloadDialogOpen, downloadState, downloadQueue, downloadPage, downloadRunning, downloadCanceling,
+  downloadResolving, downloadApplyRemaining, downloadPageLoading, downloadSummary, selectDownload, pollDownload,
+  loadDownloadPage, cancelDownloadQueue, resolveDownloadConflict, closeDownloadQueue, revealDownloadRoot, disposeDownload,
+} = useDownloadQueue({
+  captureScope: () => ({ peerId: props.peer.id, shareId: activeShareId.value }),
+  scopeValid: (scope) => !browserDisposed && scope.peerId === props.peer.id && scope.shareId === activeShareId.value,
+  backend: (scope) => ({ backend: "peer", ...scope }),
+  onFailure: (cause) => app.handleFailure(cause), onSelected: () => clearSelection(),
+});
+onMounted(() => { uploadPollTimer = setInterval(() => { void pollUpload(); void pollDownload(); }, 1500); });
+watch([() => props.peer.id, activeShareId], () => { void cancelUploadSession(); void disposeDownload(); }, { flush: "sync" });
 
 onBeforeUnmount(() => {
   browserDisposed = true;
   clearInterval(uploadPollTimer);
+  void disposeDownload();
   void cancelUploadSession();
   window.removeEventListener("keydown", onModifierKeydown, true);
   window.removeEventListener("keyup", onModifierKeyup, true);
@@ -126,67 +125,6 @@ const peerNotice = computed(() => {
   if (!peerNoticeState.value) return "";
   return t(peerNoticeState.value.key, peerNoticeState.value.params);
 });
-
-const activeTransfer = computed(
-  () => app.transfers?.[downloadTransferId.value] ?? null,
-);
-
-const downloadPercent = computed(() => {
-  const transfer = activeTransfer.value;
-  if (!transfer?.total) return 0;
-  return Math.min(100, Math.round((transfer.transferred / transfer.total) * 100));
-});
-
-const downloadFinished = computed(
-  () =>
-    downloadQueue.value.filter(
-      (item) => !["pending", "downloading"].includes(item.status),
-    ).length,
-);
-
-const downloadTotalBytes = computed(() =>
-  downloadQueue.value.reduce(
-    (total, item) => total + (Number(item.size) || 0),
-    0,
-  ),
-);
-
-const downloadTransferredBytes = computed(() => {
-  let transferred = downloadQueue.value
-    .filter((item) => item.status === "done")
-    .reduce(
-      (total, item) => total + (Number(item.bytes ?? item.size) || 0),
-      0,
-    );
-  const current = downloadQueue.value.find(
-    (item) => item.status === "downloading",
-  );
-  if (current && activeTransfer.value) {
-    transferred += Number(activeTransfer.value.transferred) || 0;
-  }
-  return transferred;
-});
-
-const downloadQueuePercent = computed(() => {
-  if (!downloadQueue.value.length) return 0;
-  if (downloadQueue.value.every((item) => item.status === "done")) return 100;
-  if (downloadTotalBytes.value > 0 && downloadQueue.value.every((item) => item.size != null && Number.isFinite(Number(item.size)))) {
-    return Math.min(
-      100,
-      Math.round(
-        (downloadTransferredBytes.value / downloadTotalBytes.value) * 100,
-      ),
-    );
-  }
-  return null;
-});
-
-const downloadSummary = computed(() =>
-  t("peer.downloadSummary", {
-    finished: downloadFinished.value,
-    total: downloadQueue.value.length,
-  }),
-);
 
 const breadcrumbs = computed(() => {
   const crumbs = [
@@ -351,15 +289,7 @@ function reset() {
   navigationToken += 1;
   navigating.value = false;
   loadFailed.value = false;
-  downloadOpen.value = false;
-  downloadTransferId.value = "";
-  downloadDialogOpen.value = false;
-  downloadRoot.value = "";
-  downloadQueue.value = [];
-  downloadRunning.value = false;
-  downloadCanceled.value = false;
-  savedOpen.value = false;
-  savedPath.value = "";
+  void disposeDownload();
   void cancelUploadSession();
 }
 
@@ -812,297 +742,17 @@ async function loadColumn(entry, index) {
   }
 }
 
-function newTransferId() {
-  return globalThis.crypto?.randomUUID?.() ?? `transfer-${Date.now()}-${Math.random()}`;
-}
-
-function baseName(path) {
-  return String(path).split(/[\\/]/).pop() || path;
-}
-
-async function downloadEntry(entry) {
+function downloadEntry(entry) {
   if (!entry || entry.isDir || busy.value) return;
-  await run(async () => {
-    const target = await saveDialog({
-      title: t("peer.saveAs"),
-      defaultPath: entry.name,
-    });
-    if (!target) return;
-    // 下载已开始，选中状态不应残留在已下载的条目上。
-    clearSelection();
-
-    const transferId = newTransferId();
-    downloadTransferId.value = transferId;
-    downloadName.value = entry.name;
-    downloadOpen.value = true;
-    app.clearTransfer(transferId);
-
-    try {
-      const result = await app.invoke("download_peer_file_to", {
-        peerId: props.peer.id,
-        shareId: activeShareId.value,
-        remotePath: entry.path,
-        localPath: target,
-        transferId,
-      });
-      savedPath.value = result.localPath || target;
-      savedOpen.value = true;
-    } finally {
-      app.clearTransfer(transferId);
-      downloadTransferId.value = "";
-      downloadOpen.value = false;
-    }
-  });
+  return selectDownload({ mode: "single", path: entry.path });
 }
-
-function markRemainingDownloadCanceled() {
-  for (const item of downloadQueue.value) {
-    if (item.status === "pending") {
-      item.status = "canceled";
-    }
-  }
-}
-
-async function processDownloadQueue() {
-  let completed = 0;
-  for (const item of downloadQueue.value) {
-    if (downloadCanceled.value) {
-      if (item.status === "pending") item.status = "canceled";
-      continue;
-    }
-    if (item.status !== "pending") continue;
-
-    item.status = "downloading";
-    const transferId = newTransferId();
-    downloadTransferId.value = transferId;
-    app.clearTransfer(transferId);
-    try {
-      const result = item.localDir
-        ? await app.invoke("download_peer_file", {
-            peerId: props.peer.id,
-            shareId: activeShareId.value,
-            remotePath: item.remotePath,
-            localDir: item.localDir,
-            conflict: batchConflict.value,
-          })
-        : await app.invoke("download_peer_file_to", {
-            peerId: props.peer.id,
-            shareId: activeShareId.value,
-            remotePath: item.remotePath,
-            localPath: item.localPath,
-            transferId,
-          });
-      item.status = "done";
-      item.bytes = result.bytes;
-      completed += 1;
-    } catch (error) {
-      const conflict = item.localDir && normalizeAppError(error).code === "TRANSFER_CONFLICT";
-      if (conflict) {
-        const policy = await ensureBatchConflictPolicy(baseName(item.relativePath));
-        if (policy) {
-          try {
-            const result = await app.invoke("download_peer_file", {
-              peerId: props.peer.id,
-              shareId: activeShareId.value,
-              remotePath: item.remotePath,
-              localDir: item.localDir,
-              conflict: policy,
-            });
-            item.status = "done";
-            item.bytes = result.bytes;
-            completed += 1;
-            continue;
-          } catch (retryError) {
-            item.status = normalizeAppError(retryError).code === "TRANSFER_CANCELED" ? "canceled" : "error";
-            item.error = item.status === "canceled" ? "" : toUserMessage(retryError);
-            if (["interface-lock", "unlock", "initialize", "change-admin"].includes(errorStrategy(retryError))) app.handleFailure(retryError);
-            markRemainingDownloadCanceled();
-            break;
-          }
-        }
-        item.status = "canceled";
-        markRemainingDownloadCanceled();
-        break;
-      }
-      if (normalizeAppError(error).code === "TRANSFER_CANCELED") {
-        item.status = "canceled";
-        downloadCanceled.value = true;
-        markRemainingDownloadCanceled();
-        break;
-      }
-      item.status = "error";
-      item.error = toUserMessage(error);
-      if (["interface-lock", "unlock", "initialize", "change-admin"].includes(errorStrategy(error))) app.handleFailure(error);
-      markRemainingDownloadCanceled();
-      break;
-    } finally {
-      app.clearTransfer(transferId);
-      if (downloadTransferId.value === transferId) {
-        downloadTransferId.value = "";
-      }
-    }
-  }
-  downloadRunning.value = false;
-  if (!downloadCanceled.value && completed > 0) {
-    app.setNotice("peer.downloadFinished", { count: completed });
-  }
-}
-
-function cancelDownloadQueue() {
-  if (!downloadRunning.value || downloadCanceled.value) return;
-  downloadCanceled.value = true;
-  markRemainingDownloadCanceled();
-}
-
-async function downloadDirectory(entry) {
+function downloadDirectory(entry) {
   if (!entry?.isDir || busy.value) return;
-  await run(async () => {
-    const selected = await openDialog({
-      title: t("peer.pickDownloadFolder"),
-      multiple: false,
-      directory: true,
-    });
-    const localParent = typeof selected === "string" ? selected : "";
-    if (!localParent) return;
-    // 下载已开始，选中状态不应残留在已下载的条目上。
-    clearSelection();
-
-    const request = (conflict) =>
-      app.invoke("prepare_peer_directory_download", {
-        peerId: props.peer.id,
-        shareId: activeShareId.value,
-        remotePath: entry.path,
-        localParent,
-        ignoreOptions: { respectGitignore: generalSettings.respectGitignore, patterns: generalSettings.ignorePatterns },
-        conflict,
-      });
-
-    let plan;
-    try {
-      plan = await request("fail");
-    } catch (error) {
-      if (normalizeAppError(error).code !== "TRANSFER_CONFLICT") throw error;
-      const overwrite = await confirmAction(
-        t("peer.overwriteDirectoryConfirm", { name: entry.name }),
-        t("peer.download"),
-        {
-          confirmText: t("peer.overwrite"),
-          cancelText: t("confirm.cancel"),
-        },
-      );
-      if (!overwrite) return;
-      plan = await request("overwrite");
-    }
-
-    if (!plan.files.length) {
-      app.setNotice("peer.downloadEmptyDirectory", {
-        count: plan.directoryCount,
-        path: plan.localRoot,
-      });
-      return;
-    }
-
-    downloadRoot.value = plan.localRoot;
-    downloadQueue.value = plan.files.map((file) => ({
-      ...file,
-      status: "pending",
-      error: "",
-      bytes: null,
-    }));
-    downloadCanceled.value = false;
-    downloadRunning.value = true;
-    downloadDialogOpen.value = true;
-    await processDownloadQueue();
-  });
+  return selectDownload({ mode: "folder", path: entry.path });
 }
-
-// 批量下载同时包含文件与目录：目录用 prepare 展开成文件清单，单个文件直接
-// 下载到同一目标目录。后端没有混合批量的单一命令，这里在前端编排成一个队列。
-async function ensureBatchConflictPolicy(name) {
-  if (batchConflictResolved) return batchConflict.value === "overwrite" ? "overwrite" : null;
-  const overwrite = await confirmAction(
-    t("peer.overwriteBatchConfirm", { name }),
-    t("peer.overwrite"),
-    { confirmText: t("peer.overwrite"), cancelText: t("confirm.cancel") },
-  );
-  batchConflict.value = overwrite ? "overwrite" : "fail";
-  batchConflictResolved = true;
-  return overwrite ? "overwrite" : null;
-}
-
-function buildPrepareRequest(entry, localParent, conflict) {
-  return app.invoke("prepare_peer_directory_download", {
-    peerId: props.peer.id,
-    shareId: activeShareId.value,
-    remotePath: entry.path,
-    localParent,
-    ignoreOptions: {
-      respectGitignore: generalSettings.respectGitignore,
-      patterns: generalSettings.ignorePatterns,
-    },
-    conflict,
-  });
-}
-
-async function downloadBatch(entries) {
+function downloadBatch(entries) {
   if (!entries.length || busy.value) return;
-  await run(async () => {
-    const selected = await openDialog({
-      title: t("peer.pickDownloadFolder"),
-      multiple: false,
-      directory: true,
-    });
-    const localParent = typeof selected === "string" ? selected : "";
-    if (!localParent) return;
-    // 下载已开始，选中状态不应残留在已下载的条目上。
-    clearSelection();
-
-    batchConflict.value = "fail";
-    batchConflictResolved = false;
-    const items = [];
-    let aborted = false;
-    for (const entry of entries) {
-      if (entry.isDir) {
-        let plan;
-        try {
-          plan = await buildPrepareRequest(entry, localParent, batchConflict.value);
-        } catch (error) {
-          if (normalizeAppError(error).code !== "TRANSFER_CONFLICT") throw error;
-          const policy = await ensureBatchConflictPolicy(entry.name);
-          if (!policy) {
-            aborted = true;
-            break;
-          }
-          plan = await buildPrepareRequest(entry, localParent, policy);
-        }
-        items.push(
-          ...plan.files.map((file) => ({ ...file, status: "pending", error: "", bytes: null })),
-        );
-      } else {
-        items.push({
-          remotePath: entry.path,
-          localDir: localParent,
-          relativePath: entry.name,
-          size: entry.size,
-          status: "pending",
-          error: "",
-          bytes: null,
-        });
-      }
-    }
-
-    if (aborted) return;
-    if (!items.length) {
-      app.setNotice("peer.downloadEmptySelection", {});
-      return;
-    }
-    downloadRoot.value = localParent;
-    downloadQueue.value = items;
-    downloadCanceled.value = false;
-    downloadRunning.value = true;
-    downloadDialogOpen.value = true;
-    await processDownloadQueue();
-  });
+  return selectDownload({ mode: "files", paths: entries.map((entry) => entry.path) });
 }
 
 function downloadSelected() {
@@ -1115,38 +765,6 @@ function downloadSelected() {
     return;
   }
   void downloadBatch(entries);
-}
-
-async function revealSavedFile() {
-  if (!savedPath.value) return;
-  try {
-    await app.invoke("reveal_local_file", { path: savedPath.value });
-    savedOpen.value = false;
-  } catch (error) {
-    app.handleFailure(error);
-  }
-}
-
-// 批量/目录下载完成后打开本地根目录，与单文件下载的入口保持一致。
-// 根目录是文件夹，reveal_local_file 只接受普通文件，因此用目录版命令。
-async function revealDownloadRoot() {
-  if (!downloadRoot.value) return;
-  try {
-    await app.invoke("reveal_local_directory", { path: downloadRoot.value });
-    downloadDialogOpen.value = false;
-  } catch (error) {
-    app.handleFailure(error);
-  }
-}
-
-async function openSavedFile() {
-  if (!savedPath.value) return;
-  try {
-    await app.invoke("open_local_file", { path: savedPath.value });
-    savedOpen.value = false;
-  } catch (error) {
-    app.handleFailure(error);
-  }
 }
 
 function chooseUploadFiles() { return selectUpload("files"); }
@@ -1687,53 +1305,10 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
       </main>
     </div>
 
-    <el-dialog
-      v-model="downloadOpen"
-      :title="t('peer.downloading')"
-      width="420"
-      :show-close="false"
-      :close-on-click-modal="false"
-      :close-on-press-escape="false"
-    >
-      <div class="transfer-dialog">
-        <p class="transfer-dialog__name">{{ downloadName }}</p>
-        <el-progress
-          :percentage="downloadPercent"
-          :indeterminate="!activeTransfer?.total"
-          :stroke-width="8"
-        />
-        <p class="hint">
-          <template v-if="activeTransfer">
-            {{ formatBytes(activeTransfer.transferred) }}
-            <template v-if="activeTransfer.total">
-              / {{ formatBytes(activeTransfer.total) }}
-            </template>
-          </template>
-          <template v-else>{{ t("peer.preparingDownload") }}</template>
-        </p>
-      </div>
-    </el-dialog>
-
-    <TransferQueueDialog :open="downloadDialogOpen" :items="downloadQueue" :running="downloadRunning" :canceling="downloadCanceled"
-      :summary="downloadSummary" :root="downloadRoot" :percentage="downloadQueuePercent" :transferred="downloadTransferredBytes" :total="downloadTotalBytes"
-      :note="t('transferQueue.peerCancel')" @cancel="cancelDownloadQueue" @close="downloadDialogOpen = false" @reveal="revealDownloadRoot" />
-
-    <el-dialog
-      v-model="savedOpen"
-      :title="t('peer.downloadComplete')"
-      width="480"
-      :close-on-click-modal="false"
-    >
-      <p class="saved-path">{{ t("peer.savedTo", { path: savedPath }) }}</p>
-      <template #footer>
-        <el-button plain @click="revealSavedFile">
-          {{ t("peer.revealInFolder") }}
-        </el-button>
-        <el-button type="primary" @click="openSavedFile">
-          {{ t("peer.openFile") }}
-        </el-button>
-      </template>
-    </el-dialog>
+    <TransferQueueDialog :open="downloadDialogOpen" :items="downloadQueue" :running="downloadRunning" :canceling="downloadCanceling"
+      :summary="downloadSummary" :queue-state="downloadState" :next-offset="downloadPage.nextOffset" :page-loading="downloadPageLoading"
+      v-model:apply-remaining="downloadApplyRemaining" :resolving="downloadResolving" @resolve="resolveDownloadConflict" @page="loadDownloadPage"
+      @cancel="cancelDownloadQueue" @close="closeDownloadQueue" @reveal="revealDownloadRoot" />
 
     <UploadBatchDialog :open="uploadDialogOpen" :summary="uploadSummary" :page="uploadPage" :running="uploadRunning"
       :page-loading="uploadPageLoading" :batch-error="uploadBatchError" :page-notice="uploadPageNotice"

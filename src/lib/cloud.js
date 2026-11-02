@@ -50,7 +50,7 @@ export const cloudObjects = Object.freeze({
   preview: ({ connectionId, key }) => invoke("cloud_object_preview", { connectionId, key }),
   discover: ({ connectionId, prefix }) => invoke("cloud_object_discover", { connectionId, prefix }),
   prepare: ({ connectionId }) => invoke("cloud_object_prepare", { connectionId }),
-  selectUploadDirectory: ({ connectionId, prefix }) => invoke("cloud_object_select_upload_directory", { connectionId, prefix }),
+  selectUploadDirectory: ({ connectionId, prefix, mode = "folder" }) => invoke("cloud_object_select_upload_directory", { connectionId, prefix, mode }),
   startUploadDirectory: ({ connectionId, batchId, conflictPolicy = "ask" }) => invoke("cloud_object_start_upload_directory", { connectionId, batchId, conflictPolicy }),
   statusUploadDirectory: ({ connectionId, batchId }) => invoke("cloud_object_status_upload_directory", { connectionId, batchId }),
   pageUploadDirectory: ({ connectionId, batchId, directoryToken, cursor = null, limit = 100 }) => invoke("cloud_object_page_upload_directory", { connectionId, batchId, ...(directoryToken == null ? {} : { directoryToken }), cursor, limit }),
