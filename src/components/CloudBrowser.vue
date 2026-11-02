@@ -282,7 +282,7 @@ const {
   captureScope: () => ({ connectionId: props.connectionId, bucket: activeBucket.value }),
   scopeValid: (scope) => !disposed && scope.connectionId === props.connectionId && scope.bucket === activeBucket.value,
   backend: ({ connectionId }) => ({ backend: "s3", connectionId }),
-  onFailure: (cause) => app.handleFailure(cause), onSelected: () => clearSelection(),
+  onFailure: (cause) => app.handleFailure(cause),
 });
 
 // PeerBrowser-style selection: a click selects, Ctrl/Cmd/Alt toggles, Shift
@@ -328,8 +328,13 @@ function selectSingle(item) {
   }
 }
 // 选择栏与 LAN 浏览器一致：选中目录时提供显式「打开」，多选时可就地清除选择。
-function openSelection() {
-  if (selectedEntry.value?.isDir) navigate(selectedEntry.value.key);
+function runSelectionAction(action) {
+  const entries = selectedEntries.value.slice();
+  clearSelection();
+  if (entries.length) return action(entries);
+}
+function openSelection(entries) {
+  if (entries[0]?.isDir) navigate(entries[0].key);
 }
 // WebKitGTK can drop modifier bits from click after mousedown is handled, so the
 // pointer and held-key state are trusted alongside the click event.
@@ -773,8 +778,7 @@ function download(item) {
   if (!item || item.isDir) return;
   return selectDownload({ mode: "single", path: item.key });
 }
-function downloadSelection() {
-  const entries = selectedEntries.value;
+function downloadSelection(entries) {
   if (!entries.length) return;
   if (entries.length === 1) return selectDownload({ mode: entries[0].isDir ? "folder" : "single", path: entries[0].key });
   return selectDownload({ mode: "files", paths: entries.map((entry) => entry.key) });
@@ -1022,7 +1026,7 @@ onBeforeUnmount(() => {
               </template>
             </FileManagerView>
           </div>
-          <div v-if="selectedEntries.length || viewMode === 'gallery'" class="selection-bar" :class="{ 'selection-bar--reserved': !selectedEntries.length, 'selection-bar--multi': selectedEntries.length > 1 }">
+          <div v-if="selectedEntries.length" class="selection-bar" :class="{ 'selection-bar--reserved': !selectedEntries.length, 'selection-bar--multi': selectedEntries.length > 1 }">
             <div v-if="selectedEntries.length" class="selection-summary">
               <FileGlyph :entry="selectionGlyph" />
               <div>
@@ -1033,9 +1037,9 @@ onBeforeUnmount(() => {
             </div>
             <p v-else class="selection-bar__hint">{{ t('peer.selectionHint') }}</p>
             <div v-if="selectedEntries.length" class="selection-actions">
-              <el-button v-if="viewMode !== 'columns' && selectedEntries.length === 1 && selectedEntry.isDir" type="primary" :disabled="busy" @click="openSelection">{{ t('peer.open') }}</el-button>
-              <el-button data-test="download" :type="selectedEntries.length > 1 ? 'primary' : undefined" plain :disabled="busy" @click="downloadSelection">{{ t('cloudBrowser.download') }}</el-button>
-              <el-button v-if="selectedEntries.length === 1" data-test="delete-file" type="danger" plain :disabled="!canMutate || targetProtected(selectedEntry.key)" @click="remove(selectedEntry.key)">{{ t('cloudBrowser.delete') }}</el-button>
+              <el-button v-if="viewMode !== 'columns' && selectedEntries.length === 1 && selectedEntry.isDir" type="primary" :disabled="busy" @click="runSelectionAction(openSelection)">{{ t('peer.open') }}</el-button>
+              <el-button data-test="download" :type="selectedEntries.length > 1 ? 'primary' : undefined" plain :disabled="busy" @click="runSelectionAction(downloadSelection)">{{ t('cloudBrowser.download') }}</el-button>
+              <el-button v-if="selectedEntries.length === 1" data-test="delete-file" type="danger" plain :disabled="!canMutate || targetProtected(selectedEntry.key)" @click="runSelectionAction(([entry]) => remove(entry.key))">{{ t('cloudBrowser.delete') }}</el-button>
             </div>
           </div>
           <div v-if="partial" class="browser-notice" role="status">

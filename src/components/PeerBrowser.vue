@@ -88,7 +88,7 @@ const {
   captureScope: () => ({ peerId: props.peer.id, shareId: activeShareId.value }),
   scopeValid: (scope) => !browserDisposed && scope.peerId === props.peer.id && scope.shareId === activeShareId.value,
   backend: (scope) => ({ backend: "peer", ...scope }),
-  onFailure: (cause) => app.handleFailure(cause), onSelected: () => clearSelection(),
+  onFailure: (cause) => app.handleFailure(cause),
 });
 onMounted(() => { uploadPollTimer = setInterval(() => { void pollUpload(); void pollDownload(); }, 1500); });
 watch([() => props.peer.id, activeShareId], () => { void cancelUploadSession(); void disposeDownload(); }, { flush: "sync" });
@@ -755,8 +755,13 @@ function downloadBatch(entries) {
   return selectDownload({ mode: "files", paths: entries.map((entry) => entry.path) });
 }
 
-function downloadSelected() {
-  const entries = selectedEntries.value;
+function runSelectionAction(action) {
+  const entries = selectedEntries.value.slice();
+  clearSelection();
+  if (entries.length) return action(entries);
+}
+
+function downloadSelected(entries = selectedEntries.value) {
   if (!entries.length || busy.value) return;
   if (entries.length === 1) {
     const entry = entries[0];
@@ -1217,7 +1222,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
         </div>
 
         <div
-          v-if="selectedEntries.length || viewMode === 'gallery'"
+          v-if="selectedEntries.length"
           class="selection-bar"
           :class="{
             'selection-bar--reserved': !selectedEntries.length,
@@ -1248,28 +1253,28 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 v-if="viewMode !== 'columns'"
                 type="primary"
                 :disabled="busy"
-                @click="browse(selectedEntry.path)"
+                @click="runSelectionAction(([entry]) => browse(entry.path))"
               >
                 {{ t("peer.open") }}
               </el-button>
-              <el-button plain :disabled="busy" @click="downloadDirectory(selectedEntry)">
+              <el-button plain :disabled="busy" @click="runSelectionAction(([entry]) => downloadDirectory(entry))">
                 {{ t("peer.download") }}
               </el-button>
             </template>
             <template v-else-if="selectedEntries.length === 1">
-              <el-button plain :disabled="busy" @click="downloadEntry(selectedEntry)">
+              <el-button plain :disabled="busy" @click="runSelectionAction(([entry]) => downloadEntry(entry))">
                 {{ t("peer.download") }}
               </el-button>
               <el-button
                 v-if="isReadableText(selectedEntry)"
                 plain
                 :disabled="busy"
-                @click="editEntry(selectedEntry)"
+                @click="runSelectionAction(([entry]) => editEntry(entry))"
               >
                 {{ t("peer.edit") }}
               </el-button>
             </template>
-            <el-button v-else type="primary" plain :disabled="busy" @click="downloadSelected">
+            <el-button v-else type="primary" plain :disabled="busy" @click="runSelectionAction(downloadSelected)">
               {{ t("peer.download") }}
             </el-button>
             <el-button
@@ -1277,7 +1282,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
               type="danger"
               plain
               :disabled="busy"
-              @click="deleteEntry(selectedEntry)"
+              @click="runSelectionAction(([entry]) => deleteEntry(entry))"
             >
               {{ t("common.delete") }}
             </el-button>

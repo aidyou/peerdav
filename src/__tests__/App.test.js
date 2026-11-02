@@ -2027,6 +2027,53 @@ describe("Finder-style peer browser", () => {
     return { wrapper, downloadTo };
   }
 
+  it.each(['icons', 'gallery'].flatMap((view) => ['single', 'files'].map((mode) => [view, mode])))('selection-bar in %s captures %s download and clears before picker cancellation', async (view, mode) => {
+    let settle;
+    const pending = new Promise((resolve) => { settle = resolve; });
+    const { wrapper } = await openBrowser({ transfer_select_download: () => pending });
+    if (view === 'gallery') {
+      await wrapper.find('button[aria-label="画廊"]').trigger('click');
+      await flushPromises();
+    }
+    const entrySelector = view === 'gallery' ? '.gallery-thumb' : '.file-tile';
+    await wrapper.find(`${entrySelector}[data-path="${mode === 'single' ? '/notes.txt' : '/sub'}"]`).trigger('click');
+    if (mode === 'files') await wrapper.find(`${entrySelector}[data-path="/notes.txt"]`).trigger('click', { ctrlKey: true });
+    await flushPromises();
+    await wrapper.find('.selection-actions button').trigger('click');
+    expect(wrapper.find('.selection-bar').exists()).toBe(false);
+    expect(wrapper.findAll(`${entrySelector}.is-selected`)).toHaveLength(0);
+    expect(invoke).toHaveBeenCalledWith('transfer_select_download', {
+      backend: { backend: 'peer', peerId: 'peer-1', shareId: 'share-1' },
+      selection: mode === 'single' ? { mode, path: '/notes.txt' } : { mode, paths: ['/sub', '/notes.txt'] },
+    });
+    settle(null); await flushPromises();
+    expect(wrapper.find('.selection-bar').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it.each(['打开', '下载', '外部编辑', '删除'])('selection-bar clears immediately for %s without losing its target', async (label) => {
+    let settle;
+    const pending = new Promise((resolve) => { settle = resolve; });
+    const folder = label === '打开' || label === '下载';
+    const { wrapper } = await openBrowser({
+      list_peer_shares: async () => [{ ...SHARE, permissions: { ...SHARE.permissions, canDelete: true } }],
+      transfer_select_download: () => pending,
+      prepare_peer_external_edit: () => pending,
+    });
+    if (label === '删除') confirmAction.mockImplementationOnce(() => pending);
+    await wrapper.findAll('.file-tile')[folder ? 0 : 1].trigger('click');
+    await wrapper.findAll('.selection-actions button').find((button) => button.text() === label).trigger('click');
+    expect(wrapper.find('.selection-actions').exists()).toBe(false);
+    expect(wrapper.findAll('.file-tile.is-selected')).toHaveLength(0);
+    if (label === '下载') expect(invoke).toHaveBeenCalledWith('transfer_select_download', { backend: { backend: 'peer', peerId: 'peer-1', shareId: 'share-1' }, selection: { mode: 'folder', path: '/sub' } });
+    if (label === '外部编辑') expect(invoke).toHaveBeenCalledWith('prepare_peer_external_edit', { peerId: 'peer-1', shareId: 'share-1', remotePath: '/notes.txt' });
+    if (label === '打开') expect(invoke).toHaveBeenCalledWith('list_peer_dir', { peerId: 'peer-1', shareId: 'share-1', path: '/sub' });
+    settle(label === '删除' ? false : null); await flushPromises();
+    if (label === '删除') expect(invoke.mock.calls.some(([name]) => name === 'delete_peer_entry')).toBe(false);
+    expect(wrapper.find('.selection-actions').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
   it("switches between icons, list, columns and gallery views", async () => {
     const { wrapper } = await openBrowser();
     expect(wrapper.findComponent({ name: 'FileManagerView' }).exists()).toBe(true);
@@ -2091,8 +2138,7 @@ describe("Finder-style peer browser", () => {
     });
     await wrapper.find('button[aria-label="画廊"]').trigger("click");
     await flushPromises();
-    expect(wrapper.find(".selection-bar--reserved").exists()).toBe(true);
-    expect(wrapper.find(".selection-bar__hint").text()).toBe("选择一个文件或目录以查看操作。");
+    expect(wrapper.find(".selection-bar").exists()).toBe(false);
     const main = wrapper.find(".browser-main");
     const gallery = wrapper.find(".gallery-view");
     const thumbs = wrapper.findAll(".gallery-thumb");

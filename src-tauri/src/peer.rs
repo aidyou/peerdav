@@ -883,31 +883,28 @@ impl PeerManager {
     /// approved automatically. The returned request id is used to claim the
     /// code after an administrator approves the request.
     ///
-    /// 请求同时带上本机机器码：服务端按机器码而不是 IP 识别申请方，所以换网段、
-    /// 重新分配地址之后仍然是同一条申请，不会在对方控台里变成一台新设备。
+    /// Requests carry a device name; the server identifies the requesting host.
     pub async fn request_access(&self, url: &str) -> Result<PeerAccessRequest, DomainError> {
         let url = normalize_peer_url(url)?;
         let request_id = random_hex(16);
         let endpoint = format!("{url}{CATALOG_PATH}");
         let response = tokio::time::timeout(
             HEALTH_TIMEOUT,
-            with_machine_id(
-                self.agent_for(&url)?
-                    .get(endpoint)
-                    .header(ACCESS_REQUEST_HEADER, &request_id)
-                    .header(
-                        "x-peerdav-device-name",
-                        percent_encoding::utf8_percent_encode(
-                            &self
-                                .vault
-                                .get_setting(crate::types::SERVER_NAME_META)?
-                                .unwrap_or_else(|| "PeerDav".into()),
-                            percent_encoding::NON_ALPHANUMERIC,
-                        )
-                        .to_string(),
-                    ),
-            )
-            .send(),
+            self.agent_for(&url)?
+                .get(endpoint)
+                .header(ACCESS_REQUEST_HEADER, &request_id)
+                .header(
+                    "x-peerdav-device-name",
+                    percent_encoding::utf8_percent_encode(
+                        &self
+                            .vault
+                            .get_setting(crate::types::SERVER_NAME_META)?
+                            .unwrap_or_else(|| "PeerDav".into()),
+                        percent_encoding::NON_ALPHANUMERIC,
+                    )
+                    .to_string(),
+                )
+                .send(),
         )
         .await
         .map_err(|_| DomainError::PeerRequest {
@@ -969,12 +966,10 @@ impl PeerManager {
         let endpoint = format!("{url}{ACCESS_STATUS_PATH}");
         let response = tokio::time::timeout(
             HEALTH_TIMEOUT,
-            with_machine_id(
-                self.agent_for(&url)?
-                    .delete(endpoint)
-                    .header(ACCESS_REQUEST_HEADER, request_id),
-            )
-            .send(),
+            self.agent_for(&url)?
+                .delete(endpoint)
+                .header(ACCESS_REQUEST_HEADER, request_id)
+                .send(),
         )
         .await
         .map_err(|_| DomainError::PeerRequest {
@@ -1287,12 +1282,10 @@ impl PeerManager {
             }
             let response = tokio::time::timeout(
                 HEALTH_TIMEOUT,
-                with_machine_id(
-                    self.agent_for(&url)?
-                        .get(&endpoint)
-                        .header(ACCESS_REQUEST_HEADER, request_id),
-                )
-                .send(),
+                self.agent_for(&url)?
+                    .get(&endpoint)
+                    .header(ACCESS_REQUEST_HEADER, request_id)
+                    .send(),
             )
             .await
             .map_err(|_| DomainError::PeerRequest {
@@ -1772,13 +1765,11 @@ impl PeerManager {
         let endpoint = format!("{}{AUTHORIZATION_PATH}", normalize_peer_url(url)?);
         let response = tokio::time::timeout(
             HEALTH_TIMEOUT,
-            with_machine_id(
-                self.agent_for(url)?
-                    .post(endpoint)
-                    .basic_auth(CLIENT_USERNAME, Some(code))
-                    .header(CLIENT_ID_HEADER, client_id),
-            )
-            .send(),
+            self.agent_for(url)?
+                .post(endpoint)
+                .basic_auth(CLIENT_USERNAME, Some(code))
+                .header(CLIENT_ID_HEADER, client_id)
+                .send(),
         )
         .await
         .map_err(|_| DomainError::PeerRequest {
@@ -2707,12 +2698,6 @@ fn build_client(agent: &reqwest::Client, host: &str, auth: Auth) -> Result<Clien
         })
 }
 
-/// 给 PeerDav 协议请求带上本机机器码。取不到机器码时不加这个头：服务端会把
-/// 申请身份退回 IP，老行为保持不变，而不是拒绝请求。
-fn with_machine_id(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    builder
-}
-
 async fn catalog(client: &Client) -> Result<CatalogResponse, DomainError> {
     let response = client
         .start_request(reqwest::Method::GET, CATALOG_PATH)
@@ -3290,9 +3275,16 @@ struct RemoteMeta {
 static READ_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
 
 fn next_read_generation(counter: &AtomicU64) -> Result<u64, DomainError> {
-    counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
-        .map(|previous| previous + 1)
-        .map_err(|_| DomainError::Internal { detail: "peer read admission generation exhausted".into() })
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1).ok_or_else(|| DomainError::Internal {
+            detail: "peer read admission generation exhausted".into(),
+        })?;
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(next),
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 fn read_context(max_bytes: u64, max_entries: NonZeroUsize) -> OperationContext {
@@ -3753,6 +3745,11 @@ mod tests {
 
     #[test]
     fn read_admission_nonce_is_monotonic_and_fails_closed_at_overflow() {
+        let counter = AtomicU64::new(0);
+        assert_eq!(next_read_generation(&counter).expect("first generation"), 1);
+        assert_eq!(next_read_generation(&counter).expect("next generation"), 2);
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+
         let counter = AtomicU64::new(u64::MAX - 1);
         assert_eq!(next_read_generation(&counter).expect("last generation"), u64::MAX);
         assert!(next_read_generation(&counter).is_err());

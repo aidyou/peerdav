@@ -60,6 +60,53 @@ beforeEach(() => {
 });
 afterEach(() => { wrappers.splice(0).forEach((wrapper) => { if (wrapper.exists()) wrapper.unmount(); }); document.body.innerHTML = ''; vi.useRealTimers(); });
 
+describe("selection-bar action reset", () => {
+  it.each(['list', 'gallery'].flatMap((view) => ['single', 'folder', 'files'].map((mode) => [view, mode])))('captures %s %s downloads before clearing, including picker cancellation', async (view, mode) => {
+    handlers.cloud_object_list = () => page(mode === 'folder' ? [{ key: 'docs/a.txt' }] : [file, { key: 'b.txt', size: 2 }]);
+    const pending = deferred();
+    handlers.transfer_select_download = () => pending.promise;
+    const wrapper = await browser(view);
+    const entrySelector = view === 'gallery' ? '.gallery-thumb' : 'tbody tr';
+    await wrapper.findAll(entrySelector)[0].trigger('click');
+    if (mode === 'files') await wrapper.findAll(entrySelector)[1].trigger('click', { ctrlKey: true });
+    await flushPromises();
+    await wrapper.find('.selection-actions [data-test=download]').trigger('click');
+    expect(wrapper.find('.selection-bar').exists()).toBe(false);
+    expect(wrapper.findAll(`${entrySelector}.is-selected`)).toHaveLength(0);
+    expect(nativeInvoke).toHaveBeenCalledWith('transfer_select_download', {
+      backend: { backend: 's3', connectionId: 'c1' },
+      selection: mode === 'files' ? { mode, paths: ['a.txt', 'b.txt'] } : { mode, path: mode === 'folder' ? 'docs/' : 'a.txt' },
+    });
+    pending.resolve(null); await flushPromises();
+    expect(wrapper.find('.selection-bar').exists()).toBe(false);
+  });
+  it('clears before delete planning and leaves cancellation unselected', async () => {
+    const pending = deferred();
+    handlers.cloud_object_delete_plan = () => pending.promise;
+    confirmAction.mockResolvedValue(false);
+    const wrapper = await browser();
+    await wrapper.find('[data-test=file-row]').trigger('click');
+    await wrapper.find('[data-test=delete-file]').trigger('click');
+    expect(wrapper.find('.selection-actions').exists()).toBe(false);
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_delete_plan', { connectionId: 'c1', prefix: 'a.txt' });
+    pending.resolve(deletePlan({ objectCount: 1, entries: [{ key: 'a.txt', size: 7, etag: null }] }));
+    await flushPromises();
+    expect(confirmAction).toHaveBeenCalled();
+    expect(nativeInvoke.mock.calls.some(([name]) => name === 'cloud_object_delete_execute')).toBe(false);
+    expect(wrapper.find('.selection-actions').exists()).toBe(false);
+  });
+  it('clears folder selection before opening with the captured key', async () => {
+    handlers.cloud_object_list = () => page([{ key: 'docs/a.txt' }]);
+    const wrapper = await browser();
+    await wrapper.find('[data-test=folder-row]').trigger('click');
+    const pending = deferred(); handlers.cloud_object_list = () => pending.promise;
+    await textButton(wrapper, t('peer.open')).trigger('click');
+    expect(wrapper.find('.selection-actions').exists()).toBe(false);
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_list', { connectionId: 'c1', prefix: 'docs/', next: null });
+    pending.resolve(page([])); await flushPromises();
+  });
+});
+
 describe("streaming directory upload", () => {
   const calls = (command) => nativeInvoke.mock.calls.filter(([name]) => name === `cloud_object_${command}_upload_directory`);
   const summary = (phase = 'running', extra = {}) => ({ batchId: 'batch', connectionId: 'c1', connectionRevision: 1, bucket: 'main', prefix: '', rootName: 'tree', phase, currentRelativePath: null, completedFiles: 0, completedBytes: 0, skippedFiles: 0, skippedSymlinks: 1, skippedEmptyDirectories: 2, conflict: null, error: null, recoveryRequired: false, ...extra });
@@ -627,7 +674,11 @@ describe("CloudBrowser", () => {
   it('guards double-click selection and keeps cancellation running until native settlement', async () => {
     const selected = deferred(); handlers.transfer_select_download = () => selected.promise;
     const wrapper = await browser(); await click(wrapper, '[data-test=file-row]');
-    await textButton(wrapper, 'Download').trigger('click'); await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
+    await textButton(wrapper, 'Download').trigger('click');
+    expect(textButton(wrapper, 'Download')).toBeUndefined();
+    // A deliberate reselection while the picker is pending still cannot open a second picker.
+    await click(wrapper, '[data-test=file-row]');
+    await textButton(wrapper, 'Download').trigger('click'); await flushPromises();
     expect(nativeInvoke.mock.calls.filter(([name]) => name === 'transfer_select_download')).toHaveLength(1);
     selected.resolve(queueSummary('selected')); await flushPromises();
     const stopped = deferred(); handlers.transfer_cancel_download = () => stopped.promise;
@@ -1016,19 +1067,18 @@ describe("CloudBrowser", () => {
     expect(wrapper.find(".breadcrumb.is-current").text()).toBe("docs");
     expect(wrapper.findAll(".column")).toHaveLength(2);
   });
-  it("reserves the selection bar in gallery view and clears a multi selection", async () => {
+  it("hides the selection bar in gallery view without a selection and after clearing a multi selection", async () => {
     handlers.cloud_object_list = () => page([file, { key: "b.txt", size: 2 }]);
     handlers.cloud_object_preview = () => ({ fileName: "a.txt", mime: "text/plain", encoding: "utf8", data: "x", size: 1 });
     const wrapper = await browser();
     await click(wrapper, '[aria-label="Gallery"]');
-    expect(wrapper.find(".selection-bar--reserved").exists()).toBe(true);
-    expect(wrapper.find(".selection-bar__hint").text()).toBe(t("peer.selectionHint"));
+    expect(wrapper.find(".selection-bar").exists()).toBe(false);
     const thumbs = wrapper.findAll(".gallery-thumb");
     await thumbs[0].trigger("click");
     await thumbs[1].trigger("click", { ctrlKey: true });
     expect(wrapper.find(".selection-bar--multi").exists()).toBe(true);
     await textButton(wrapper, t("peer.clearSelection")).trigger("click");
-    expect(wrapper.find(".selection-bar--reserved").exists()).toBe(true);
+    expect(wrapper.find(".selection-bar").exists()).toBe(false);
   });
   it("offers an explicit open action for a selected folder", async () => {
     handlers.cloud_object_list = ({ prefix }) => prefix
