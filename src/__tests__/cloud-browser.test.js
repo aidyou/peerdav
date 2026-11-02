@@ -41,6 +41,189 @@ beforeEach(() => {
 });
 afterEach(() => { wrappers.splice(0).forEach((wrapper) => { if (wrapper.exists()) wrapper.unmount(); }); vi.useRealTimers(); });
 
+describe("streaming directory upload", () => {
+  const calls = (command) => nativeInvoke.mock.calls.filter(([name]) => name === `cloud_object_${command}_upload_directory`);
+  const summary = (phase = 'running', extra = {}) => ({ batchId: 'batch', connectionId: 'c1', connectionRevision: 1, bucket: 'main', prefix: '', rootName: 'tree', phase, currentRelativePath: null, completedFiles: 0, completedBytes: 0, skippedFiles: 0, skippedSymlinks: 1, skippedEmptyDirectories: 2, conflict: null, error: null, recoveryRequired: false, ...extra });
+  const entry = (name, kind = 'file') => ({ name, relativePath: `tree/${name}`, kind, size: 7, directoryToken: kind === 'directory' ? 'child' : null, phase: 'unscanned' });
+  const directPage = (entries = [entry('a.txt'), entry('deep', 'directory')], extra = {}) => ({ directoryToken: 'root', parentToken: null, relativePath: 'tree', entries, nextCursor: null, ...extra });
+  beforeEach(() => {
+    app.handleFailure.mockClear(); app.setNotice.mockClear();
+    handlers.cloud_object_select_upload_directory = () => summary('selected');
+    handlers.cloud_object_start_upload_directory = () => summary();
+    handlers.cloud_object_status_upload_directory = () => summary();
+    handlers.cloud_object_page_upload_directory = () => directPage();
+    handlers.cloud_object_cancel_upload_directory = () => { handlers.cloud_object_status_upload_directory = () => summary('cancelled'); };
+    handlers.cloud_object_release_upload_directory = () => null;
+    handlers.cloud_object_resolve_upload_directory_conflict = () => null;
+  });
+  it('starts ask after the first direct page, replaces pages, enters and returns up', async () => {
+    handlers.cloud_object_page_upload_directory = ({ directoryToken, cursor }) => directoryToken === 'child'
+      ? directPage([entry('nested.txt')], { directoryToken: 'child', parentToken: 'root', relativePath: 'tree/deep' })
+      : cursor ? directPage([entry('last.txt')]) : directPage(undefined, { nextCursor: 'next' });
+    const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
+    expect(calls('start')[0][1]).toEqual({ connectionId: 'c1', batchId: 'batch', conflictPolicy: 'ask' });
+    expect(nativeInvoke.mock.calls.findIndex(([name]) => name === 'cloud_object_page_upload_directory')).toBeLessThan(nativeInvoke.mock.calls.findIndex(([name]) => name === 'cloud_object_start_upload_directory'));
+    expect(wrapper.find('[data-test=upload-dialog]').text()).not.toContain('nested.txt');
+    await click(wrapper, '[data-test=upload-enter]');
+    expect(wrapper.find('[data-test=upload-dialog]').text()).toContain('nested.txt');
+    expect(wrapper.findAll('[data-test=upload-dialog] li')).toHaveLength(1);
+    await click(wrapper, '[data-test=upload-up]');
+    await click(wrapper, '[data-test=upload-next]');
+    expect(calls('page').at(-1)[1]).toEqual({ connectionId: 'c1', batchId: 'batch', directoryToken: 'root', cursor: 'next', limit: 100 });
+    expect(wrapper.find('[data-test=upload-dialog]').text()).toContain('last.txt');
+    expect(wrapper.find('[data-test=upload-dialog]').text()).not.toContain('a.txt');
+  });
+  it('resets expired cursors without retaining old rows or showing a global error', async () => {
+    let count = 0;
+    handlers.cloud_object_page_upload_directory = () => { if (++count === 2) throw error('CLOUD_DIRECTORY_CURSOR_RESET'); return directPage([entry(count === 1 ? 'old' : 'new')], { nextCursor: 'next' }); };
+    const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
+    await click(wrapper, '[data-test=upload-next]');
+    expect(calls('page').at(-1)[1]).toEqual({ connectionId: 'c1', batchId: 'batch', cursor: null, limit: 100 });
+    expect(wrapper.find('[data-test=upload-dialog]').text()).toContain(t('cloudBrowser.uploadCursorReset'));
+    expect(wrapper.find('[data-test=upload-dialog]').text()).toContain('new');
+    expect(app.handleFailure).not.toHaveBeenCalled();
+  });
+  it('shows more than 100 completed files without total, percentage, accumulated rows or per-file notices', async () => {
+    const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
+    handlers.cloud_object_status_upload_directory = () => summary('completed', { completedFiles: 10001, completedBytes: 70007 });
+    await vi.advanceTimersByTimeAsync(4500); await flushPromises();
+    expect(wrapper.find('[data-test=upload-summary]').text()).toContain('10001');
+    expect(wrapper.find('[data-test=upload-dialog] [data-test=progress]').exists()).toBe(false);
+    expect(wrapper.find('[data-test=upload-dialog]').text()).not.toContain('%');
+    expect(wrapper.findAll('[data-test=upload-dialog] li')).toHaveLength(2);
+    expect(wrapper.findAll('[data-test=upload-dialog] li').every((row) => row.attributes('data-status') === 'unscanned')).toBe(true);
+    expect(app.setNotice).toHaveBeenCalledTimes(1);
+    expect(calls('release')).toHaveLength(0);
+    await click(wrapper, '[data-test=close-upload]'); expect(calls('release')).toHaveLength(1);
+  });
+  it.each(['skip', 'overwrite', 'cancel'])('requires explicit %s conflict choice and forwards the checkbox', async (decision) => {
+    handlers.cloud_object_start_upload_directory = () => summary('conflict', { conflict: { conflictId: 'conflict-a', relativePath: 'tree/a.txt', key: 'target/tree/a.txt', etag: 'etag' } });
+    const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
+    expect(wrapper.find('[data-test=upload-conflict]').text()).toContain('target/tree/a.txt');
+    expect(confirmAction).not.toHaveBeenCalled();
+    await wrapper.find('[data-test=upload-apply-remaining]').setValue(true);
+    await click(wrapper, `[data-test=${decision === 'cancel' ? 'upload-conflict-cancel' : `upload-${decision}`}]`);
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_resolve_upload_directory_conflict', { connectionId: 'c1', batchId: 'batch', conflictId: 'conflict-a', decision, applyToRemaining: true });
+  });
+  it.each(['success', 'expired'])('keeps a new same-path conflict intact after a late %s response', async (response) => {
+    const conflictA = { conflictId: 'conflict-a', relativePath: 'tree/a.txt', key: 'tree/a.txt', etag: 'etag-a' };
+    const conflictB = { ...conflictA, conflictId: 'conflict-b', etag: 'etag-b' };
+    handlers.cloud_object_start_upload_directory = () => summary('conflict', { conflict: conflictA });
+    handlers.cloud_object_status_upload_directory = handlers.cloud_object_start_upload_directory;
+    const pending = deferred();
+    handlers.cloud_object_resolve_upload_directory_conflict = () => pending.promise;
+    const resolutions = () => nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_resolve_upload_directory_conflict');
+    const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
+    await wrapper.find('[data-test=upload-apply-remaining]').setValue(true);
+    await vi.advanceTimersByTimeAsync(1500); await flushPromises();
+    expect(wrapper.find('[data-test=upload-apply-remaining]').element.checked).toBe(true);
+    await click(wrapper, '[data-test=upload-skip]');
+    expect(resolutions()).toHaveLength(1);
+    expect(resolutions()[0][1]).toEqual({ connectionId: 'c1', batchId: 'batch', conflictId: 'conflict-a', decision: 'skip', applyToRemaining: true });
+    handlers.cloud_object_status_upload_directory = () => summary('conflict', { conflict: conflictB });
+    await vi.advanceTimersByTimeAsync(1500); await flushPromises();
+    expect(wrapper.find('[data-test=upload-conflict]').text()).toContain('etag-b');
+    expect(wrapper.find('[data-test=upload-apply-remaining]').element.checked).toBe(false);
+    for (const choice of ['upload-skip', 'upload-overwrite', 'upload-conflict-cancel']) {
+      expect(wrapper.find(`[data-test=${choice}]`).attributes('disabled')).toBeDefined();
+      await click(wrapper, `[data-test=${choice}]`);
+    }
+    expect(resolutions()).toHaveLength(1);
+    const statusCount = calls('status').length;
+    if (response === 'expired') pending.reject(error('CLOUD_DIRECTORY_CONFLICT_EXPIRED'));
+    else pending.resolve(null);
+    await flushPromises();
+    expect(calls('status')).toHaveLength(statusCount);
+    expect(wrapper.find('[data-test=upload-conflict]').text()).toContain('etag-b');
+    expect(wrapper.find('[data-test=upload-skip]').attributes('disabled')).toBeUndefined();
+    expect(app.handleFailure).not.toHaveBeenCalled();
+    handlers.cloud_object_resolve_upload_directory_conflict = () => null;
+    await click(wrapper, '[data-test=upload-skip]');
+    expect(resolutions()).toHaveLength(2);
+    expect(resolutions()[1][1]).toEqual({ connectionId: 'c1', batchId: 'batch', conflictId: 'conflict-b', decision: 'skip', applyToRemaining: false });
+  });
+  it('disables overwrite without ETag', async () => {
+    handlers.cloud_object_start_upload_directory = () => summary('conflict', { conflict: { conflictId: 'conflict-a', relativePath: 'tree/a', key: 'tree/a', etag: null } });
+    const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
+    expect(wrapper.find('[data-test=upload-overwrite]').attributes('disabled')).toBeDefined();
+  });
+  it('cancels and joins but retains terminal browsing until explicit close', async () => {
+    const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
+    await click(wrapper, '[data-test=cancel-upload]');
+    expect(calls('cancel')).toHaveLength(1); expect(calls('release')).toHaveLength(0);
+    expect(wrapper.find('[data-test=close-upload]').exists()).toBe(true);
+    expect(app.handleFailure).not.toHaveBeenCalled();
+  });
+  it.each(['connection', 'bucket', 'unmount'])('releases late picker and start responses on %s changes', async (change) => {
+    for (const stage of ['select', 'start']) {
+      const pending = deferred(); handlers[`cloud_object_${stage}_upload_directory`] = () => pending.promise;
+      const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
+      if (change === 'connection') await wrapper.setProps({ connectionId: 'c2' });
+      else if (change === 'bucket') await wrapper.findAll('.bucket-link')[1].trigger('click');
+      else wrapper.unmount();
+      await flushPromises(); pending.resolve(summary(stage === 'select' ? 'selected' : 'running')); await flushPromises();
+      expect(calls('release').at(-1)[1]).toEqual({ connectionId: 'c1', batchId: 'batch' });
+      if (stage === 'start') expect(calls('cancel').length).toBeGreaterThan(0);
+      handlers.cloud_object_select_upload_directory = () => summary('selected');
+    }
+  });
+  it('ignores an old running poll after cancellation and never overlaps status requests', async () => {
+    const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
+    const pending = deferred(); let count = 0;
+    handlers.cloud_object_status_upload_directory = () => ++count === 1 ? pending.promise : summary('cancelled');
+    handlers.cloud_object_cancel_upload_directory = () => null;
+    await vi.advanceTimersByTimeAsync(1500);
+    await wrapper.find('[data-test=cancel-upload]').trigger('click'); await flushPromises();
+    expect(calls('status')).toHaveLength(1);
+    pending.resolve(summary()); await flushPromises();
+    expect(wrapper.find('[data-test=close-upload]').exists()).toBe(true);
+    expect(wrapper.find('[data-test=cancel-upload]').exists()).toBe(false);
+  });
+  it.each(['connection', 'bucket', 'unmount'])('cancels and releases a running batch on %s change', async (change) => {
+    const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
+    if (change === 'connection') await wrapper.setProps({ connectionId: 'c2' });
+    else if (change === 'bucket') await wrapper.findAll('.bucket-link')[1].trigger('click');
+    else wrapper.unmount();
+    await flushPromises(); expect(calls('cancel')).toHaveLength(1); expect(calls('release')).toHaveLength(1);
+  });
+  it('keeps batch polling independent from remote navigation and suppresses overlapping polls', async () => {
+    handlers.cloud_object_list = ({ prefix }) => page(prefix ? [] : [{ key: 'other/file.txt' }]);
+    const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
+    await wrapper.find('[data-test=folder-row]').trigger('dblclick'); await flushPromises();
+    const pending = deferred(); handlers.cloud_object_status_upload_directory = () => pending.promise;
+    await vi.advanceTimersByTimeAsync(4500); expect(calls('status')).toHaveLength(1);
+    pending.resolve(summary('completed', { completedFiles: 250 })); await flushPromises();
+    expect(wrapper.find('[data-test=upload-summary]').text()).toContain('250');
+    expect(calls('start')).toHaveLength(1);
+  });
+  it('displays terminal failure and recovery without duplicating backend error events', async () => {
+    handlers.cloud_object_start_upload_directory = () => summary('failed', { error: error('CLOUD_TRANSPORT', 'upload failed'), recoveryRequired: true });
+    handlers.cloud_object_status_upload_directory = handlers.cloud_object_start_upload_directory;
+    const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
+    expect(wrapper.find('[data-test=upload-dialog]').text()).toContain('upload failed');
+    expect(wrapper.find('[data-test=upload-dialog]').text()).toContain(t('cloudBrowser.uploadRecovery'));
+    expect(app.handleFailure).not.toHaveBeenCalled(); expect(calls('release')).toHaveLength(0);
+  });
+  it('reports real IPC failure but not cancellation', async () => {
+    handlers.cloud_object_start_upload_directory = () => { throw error('CLOUD_TRANSPORT'); };
+    const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
+    expect(app.handleFailure).toHaveBeenCalledTimes(1);
+    expect(wrapper.find('[data-test=retry-load]').exists()).toBe(false);
+  });
+  it('does not turn a canceled download transfer into a listing retry', async () => {
+    handlers.cloud_object_download = () => transfer('cancelled', { direction: 'download', error: error('CLOUD_CANCELLED') });
+    const wrapper = await browser(); await wrapper.find('tbody tr').trigger('click'); await click(wrapper, '[data-test=download]');
+    expect(wrapper.find('.cloud-error').exists()).toBe(false); expect(app.handleFailure).not.toHaveBeenCalled();
+  });
+  it.each(['upload', 'upload-directory', 'download'])('silences canceled %s pickers', async (action) => {
+    handlers.cloud_object_select_local = handlers.cloud_object_select_upload_directory = () => { throw error('CLOUD_CANCELLED'); };
+    const wrapper = await browser(); if (action === 'download') await wrapper.find('tbody tr').trigger('click');
+    await click(wrapper, `[data-test=${action}]`);
+    expect(errorStrategy(error('CLOUD_CANCELLED'))).toBe('ignore');
+    expect(wrapper.find('.cloud-error').exists()).toBe(false); expect(app.handleFailure).not.toHaveBeenCalled();
+  });
+});
+
 describe("CloudBrowser", () => {
   it("defaults to icons, preserves stored modes and tolerates unavailable storage", async () => {
     expect((await browser(null)).find('.icon-grid').exists()).toBe(true);
@@ -185,18 +368,19 @@ describe("CloudBrowser", () => {
     { sizes: [0, 0], phases: ['completed', 'running'], percent: 50 },
     { sizes: [7, 3], phases: ['failed', 'cancelled'], percent: 0, bytes: '0 B / 10 B' },
     { sizes: [0, 0], phases: ['completed', 'completed'], percent: 100 },
-  ])("reports honest completed-byte queue progress: $phases / $sizes", async ({ sizes, phases, percent, bytes }) => {
+  ])("shows file statuses without inventing cloud byte progress: $phases / $sizes", async ({ sizes, phases }) => {
     handlers.cloud_object_list = () => page([{ ...file, size: sizes[0] }, { key: 'b.txt', size: sizes[1] }]);
     handlers.cloud_object_download_batch = ({ items }) => ({ transfers: items.map((item, index) => transfer(phases[index], { transferId: `t${index}`, key: item.key, direction: 'download', error: phases[index] === 'failed' ? error('CLOUD_TRANSPORT', 'failed original') : null })), localRoot: '/target' });
     const wrapper = await browser();
     await wrapper.findAll('tbody tr')[0].trigger('click'); await wrapper.findAll('tbody tr')[1].trigger('click', { ctrlKey: true });
     await click(wrapper, '.selection-actions [data-test=download]');
-    expect(wrapper.find('[role=progressbar]').attributes('aria-valuenow')).toBe(String(percent));
-    if (bytes) expect(wrapper.find('.transfer-dialog').text()).toContain(bytes);
-    expect(wrapper.findAll('.transfer-queue__name')).toHaveLength(2);
+    expect(wrapper.find('[role=progressbar]').exists()).toBe(false);
+    expect(wrapper.find('.queue-note').text()).toContain('Byte progress is unavailable');
+    expect(wrapper.findAll('.queue-name')).toHaveLength(2);
     if (phases[0] === 'failed') {
-      expect(wrapper.findAll('.row-tag')[0].attributes('title')).toBe('failed original');
-      expect(wrapper.findAll('.row-tag')[1].text()).toBe(t('peer.downloadStatusCanceled'));
+      expect(wrapper.find('details').text()).toContain('failed original');
+      expect(wrapper.find('details').attributes('open')).toBeUndefined();
+      expect(wrapper.findAll('.download-queue li')[1].text()).toContain(t('peer.downloadStatusCanceled'));
       expect(textButton(wrapper, t('peer.cancelDownload'))).toBeUndefined();
     }
   });
@@ -221,11 +405,12 @@ describe("CloudBrowser", () => {
     const wrapper = await browser();
     await wrapper.findAll('tbody tr')[0].trigger('click'); await wrapper.findAll('tbody tr')[1].trigger('click', { ctrlKey: true });
     await click(wrapper, '.selection-actions [data-test=download]');
-    expect(wrapper.find('[role=progressbar]').attributes('aria-valuenow')).toBe('0');
+    expect(wrapper.find('[role=progressbar]').exists()).toBe(false);
     handlers.cloud_object_status = () => [transfer('completed', { transferId: 't0', direction: 'download' }), transfer('running', { transferId: 't1', direction: 'download', key: 'b.txt', sizeHint: 3 })];
     await vi.advanceTimersByTimeAsync(1500); await flushPromises();
-    expect(wrapper.find('[role=progressbar]').attributes('aria-valuenow')).toBe('70');
-    expect(wrapper.find('.transfer-dialog').text()).toContain('7 B / 10 B');
+    expect(wrapper.find('[role=progressbar]').exists()).toBe(false);
+    expect(wrapper.findAll('.download-queue li')[0].attributes('data-status')).toBe('done');
+    expect(wrapper.findAll('.download-queue li')[1].attributes('data-status')).toBe('downloading');
   });
   it("keeps peer queue and browser CSS contracts without broad paragraph overrides", () => {
     expect(cloudBrowserSource).toContain('max-height: min(320px, 34vh)');
@@ -286,6 +471,7 @@ describe("CloudBrowser", () => {
   it("switches between icons, list, columns and gallery views", async () => {
     handlers.cloud_object_list = ({ prefix }) => prefix === "docs/" ? page([{ key: "docs/b.txt", size: 2 }]) : page([{ key: "docs/a.txt", size: 1 }, { key: "photo.jpg", size: 4 }]);
     const wrapper = await browser();
+    expect(wrapper.findComponent({ name: 'FileManagerView' }).exists()).toBe(true);
     expect(wrapper.find(".file-table").exists()).toBe(true);
     await click(wrapper, '[aria-label="Icons"]');
     expect(wrapper.findAll(".file-tile")).toHaveLength(2);
@@ -352,7 +538,7 @@ describe("CloudBrowser", () => {
     handlers.cloud_object_prepare = () => { throw error('CLOUD_STORAGE', 'Storage permission denied'); };
     const wrapper = await browser();
     expect(wrapper.find('.cloud-error__message').text()).toBe('Storage permission denied');
-    expect(wrapper.text()).not.toContain('CLOUD_STORAGE');
+    expect(wrapper.text()).toContain('CLOUD_STORAGE');
     expect(wrapper.find('[data-test=upload]').attributes('disabled')).toBeDefined();
     expect(wrapper.find('[data-test=delete-prefix]').attributes('disabled')).toBeDefined();
     await click(wrapper, '[data-test=file-row]');
@@ -462,7 +648,30 @@ describe("CloudBrowser", () => {
     handlers.cloud_object_status = () => [transfer("unknown")]; await vi.advanceTimersByTimeAsync(1500); const answer = deferred(); confirmAction.mockImplementation(() => answer.promise); await textButton(wrapper, t("cloudBrowser.acknowledge")).trigger("click"); await flushPromises(); await wrapper.setProps({ connectionId: "c2" }); await flushPromises(); answer.resolve(true); await flushPromises(); expect(nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_recovery_acknowledge")).toHaveLength(1);
   });
   it("shows stop timeout guidance without hiding the original error", async () => {
-    handlers.cloud_object_status = () => [transfer()]; handlers.cloud_object_cancel = () => { throw error("CLOUD_OBJECT_STOP_TIMEOUT"); }; const wrapper = await browser(); await textButton(wrapper, t("cloudBrowser.cancel")).trigger("click"); await flushPromises(); expect(wrapper.text()).toContain("Original backend reason"); expect(wrapper.find('.cloud-error__message').text()).toBe('Original backend reason'); expect(wrapper.text()).not.toContain('CLOUD_OBJECT_STOP_TIMEOUT'); expect(errorStrategy(error("CLOUD_OBJECT_STOP_TIMEOUT"))).toBe("show");
+    handlers.cloud_object_status = () => [transfer()]; handlers.cloud_object_cancel = () => { throw error("CLOUD_OBJECT_STOP_TIMEOUT"); }; const wrapper = await browser(); await textButton(wrapper, t("cloudBrowser.cancel")).trigger("click"); await flushPromises(); expect(wrapper.text()).toContain("Original backend reason"); expect(wrapper.find('.cloud-error__message').text()).toBe('Original backend reason'); expect(wrapper.text()).toContain('CLOUD_OBJECT_STOP_TIMEOUT'); expect(errorStrategy(error("CLOUD_OBJECT_STOP_TIMEOUT"))).toBe("show");
+  });
+  // IPC contract guard only: backend prefix validation is covered by Rust tests.
+  it.each([false, true])("keeps docs/ through folder deletion and waits for confirmation (%s)", async (accepted) => {
+    const entries = [{ key: "docs/a", size: 1, etag: "etag" }, { key: "docs/nested/b", size: 1, etag: "etag" }];
+    handlers.cloud_object_list = ({ prefix }) => page(prefix === "docs/" ? entries : [...entries, { key: "docs-sibling/keep", size: 1 }]);
+    handlers.cloud_object_delete_plan = ({ connectionId, prefix }) => {
+      expect(connectionId).toBe("c1");
+      expect(prefix).toBe("docs/");
+      return deletePlan({ objectCount: entries.length, entries });
+    };
+    const answer = deferred();
+    confirmAction.mockImplementation(() => answer.promise);
+    const executions = () => nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_delete_execute");
+    const wrapper = await browser();
+    await wrapper.find('[data-key="docs/"]').trigger("dblclick"); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_list", { connectionId: "c1", prefix: "docs/", next: null });
+    await click(wrapper, "[data-test=delete-prefix]");
+    expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_delete_plan", { connectionId: "c1", prefix: "docs/" });
+    expect(confirmAction).toHaveBeenCalledTimes(1);
+    expect(executions()).toHaveLength(0);
+    answer.resolve(accepted); await flushPromises();
+    expect(executions()).toHaveLength(accepted ? 1 : 0);
+    if (accepted) expect(executions()[0][1]).toEqual({ connectionId: "c1", planId: "plan-1", confirmed: true });
   });
   it("renders PeerBrowser-style list headers and hides trailing folder slashes", async () => {
     handlers.cloud_object_list = () => page([{ key: "docs/a", size: 1 }, file]);
@@ -618,6 +827,51 @@ describe("CloudBrowser", () => {
     const calls = nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download_batch');
     expect(calls.map(([, args]) => [args.localToken, args.overwriteConfirmed])).toEqual([['opaque', false], ['opaque', true]]);
   });
+  it('retries the failed direct download target rather than loading the listing', async () => {
+    const failure = error('CLOUD_TRANSPORT');
+    handlers.cloud_object_download = () => { throw failure; };
+    const wrapper = await browser();
+    await click(wrapper, '[data-test=file-row]'); await click(wrapper, '[data-test=download]');
+    const lists = nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_list').length;
+    const first = nativeInvoke.mock.calls.find(([name]) => name === 'cloud_object_download')[1];
+    handlers.cloud_object_download = () => transfer('completed', { direction: 'download' });
+    await click(wrapper, '[data-test=retry-load]');
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download').map(([, args]) => args)).toEqual([first, first]);
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_list')).toHaveLength(lists);
+    expect(wrapper.find('[data-test=retry-load]').exists()).toBe(false);
+  });
+  it.each(['CLOUD_PRECONDITION', 'TRANSFER_CONFLICT'])('rebinds a %s queue retry to the same relative target and new transfer', async (code) => {
+    app.handleFailure.mockClear();
+    handlers.cloud_object_list = () => page([file, { key: 'b.txt', size: 2 }]);
+    handlers.cloud_object_download_batch = ({ items }) => ({ transfers: items.map((item, index) => transfer(index ? 'completed' : 'failed', { transferId: `old-${index}`, direction: 'download', key: item.key, error: index ? null : error(code) })), localRoot: '/target' });
+    const wrapper = await browser();
+    await wrapper.findAll('[data-test=file-row]')[0].trigger('click');
+    await wrapper.findAll('[data-test=file-row]')[1].trigger('click', { ctrlKey: true });
+    await click(wrapper, '[data-test=download]');
+    expect(wrapper.find('[data-test=retry-load]').exists()).toBe(false);
+    handlers.cloud_object_download_batch = () => ({ transfers: [transfer('running', { transferId: 'new', direction: 'download', key: 'a.txt' })] });
+    await click(wrapper, '[data-test=retry-download]');
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_download_batch').at(-1)[1]).toEqual({ connectionId: 'c1', localToken: 'opaque', items: [{ key: 'a.txt', relativePath: 'a.txt' }], overwriteConfirmed: true });
+    expect(wrapper.findAll('.download-queue li')).toHaveLength(2);
+    expect(wrapper.findAll('.download-queue li')[0].attributes('data-status')).toBe('downloading');
+    handlers.cloud_object_status = () => [transfer('completed', { transferId: 'new', direction: 'download', key: 'a.txt' })];
+    await vi.advanceTimersByTimeAsync(1500); await flushPromises();
+    expect(wrapper.findAll('.download-queue li')[0].attributes('data-status')).toBe('done');
+    expect(wrapper.find('[data-test=retry-download]').exists()).toBe(false);
+    expect(app.handleFailure).not.toHaveBeenCalled();
+  });
+  it.each(['AUTH_INTERFACE_LOCKED', 'VAULT_LOCKED', 'AUTH_PASSWORD_CHANGE_REQUIRED'])('forwards %s from local queue failures to authentication handling', async (code) => {
+    app.handleFailure.mockClear();
+    handlers.cloud_object_list = () => page([file, { key: 'b.txt', size: 2 }]);
+    const failure = error(code);
+    handlers.cloud_object_download_batch = ({ items }) => ({ transfers: items.map((item, index) => transfer('failed', { transferId: `auth-${index}`, direction: 'download', key: item.key, error: failure })), localRoot: '/target' });
+    const wrapper = await browser();
+    await wrapper.findAll('[data-test=file-row]')[0].trigger('click');
+    await wrapper.findAll('[data-test=file-row]')[1].trigger('click', { ctrlKey: true });
+    await click(wrapper, '[data-test=download]');
+    expect(app.handleFailure).toHaveBeenCalledWith(failure);
+    expect(wrapper.find('.download-queue details').exists()).toBe(true);
+  });
   it("shows the download queue and reveals the finished destination", async () => {
     handlers.cloud_object_list = () => page([file, { key: 'b.txt', size: 2 }]);
     handlers.cloud_object_download_batch = ({ items }) => ({
@@ -637,6 +891,20 @@ describe("CloudBrowser", () => {
     ]);
     await click(wrapper, '[data-test=reveal-download]');
     expect(nativeInvoke).toHaveBeenCalledWith('reveal_local_directory', { path: '/tmp/target' });
+  });
+  it("keeps real reveal errors on the global failure path", async () => {
+    handlers.cloud_object_list = () => page([file, { key: 'b.txt', size: 2 }]);
+    handlers.cloud_object_download_batch = ({ items }) => ({ transfers: items.map((item, index) => transfer('completed', { transferId: `t${index}`, direction: 'download', key: item.key })), localRoot: '/target' });
+    const failure = error('PEER_REVEAL_FAILED', 'original reveal failure');
+    handlers.reveal_local_directory = () => { throw failure; };
+    const wrapper = await browser();
+    await wrapper.findAll('[data-test=file-row]')[0].trigger('click');
+    await wrapper.findAll('[data-test=file-row]')[1].trigger('click', { ctrlKey: true });
+    await click(wrapper, '[data-test=download]');
+    app.handleFailure.mockClear();
+    await click(wrapper, '[data-test=reveal-download]');
+    expect(app.handleFailure).toHaveBeenCalledWith(failure);
+    expect(wrapper.find('[data-test=download-dialog]').exists()).toBe(true);
   });
   it("toasts a completed upload, refreshes the folder and drops it from the list", async () => {
     const wrapper = await browser();

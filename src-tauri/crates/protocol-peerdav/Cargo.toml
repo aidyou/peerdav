@@ -1,0 +1,19 @@
+[package]
+name = "peerdav-protocol-peerdav"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+peerdav-file-core = { path = "../file-core" }
+futures-util = "0.3"
+bytes = "1"
+sha2 = "0.10"
+hex = "0.4"
+percent-encoding = "2"
+reqwest = { version = "0.13", default-features = false, features = ["stream"] }
+reqwest_dav = { version = "0.3.3", default-features = false }
+tokio = { version = "1", features = ["time", "macros"] }
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "rt", "io-util"] }

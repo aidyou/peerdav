@@ -200,6 +200,7 @@ pub async fn lock_vault(
     cloud: State<'_, SharedCloud>,
     peers: State<'_, SharedPeers>,
 ) -> Result<VaultStatus, AppError> {
+    peers.stop_upload_batches(None).await?;
     cloud.0.stop_and_clear().await?;
     let vault = Arc::clone(vault.inner());
     let status = run_blocking(move || vault.lock()).await?;
@@ -1014,8 +1015,7 @@ pub async fn list_peer_dir(
 ) -> Result<PeerListing, AppError> {
     let peers = Arc::clone(peers.inner());
     let path = path.unwrap_or_else(|| "/".to_owned());
-    peers
-        .list_dir(&peer_id, &share_id, &path)
+    crate::file_manager::peer_list(&peers, &peer_id, &share_id, &path)
         .await
         .map_err(AppError::from)
 }
@@ -1497,8 +1497,7 @@ pub async fn preview_peer_file(
     remote_path: String,
 ) -> Result<PreviewPayload, AppError> {
     let peers = Arc::clone(peers.inner());
-    peers
-        .preview(&peer_id, &share_id, &remote_path)
+    crate::file_manager::peer_preview(&peers, &peer_id, &share_id, &remote_path)
         .await
         .map_err(AppError::from)
 }

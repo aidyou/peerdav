@@ -1,9 +1,14 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import UploadBatchDialog from "./UploadBatchDialog.vue";
+import TransferQueueDialog from "./TransferQueueDialog.vue";
+import { useUploadBatch } from "../composables/useUploadBatch";
+import { peerUploadAdapter } from "../lib/uploadBatchAdapters";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 
 import FileGlyph from "./FileGlyph.vue";
-import BrowserSkeleton from "./BrowserSkeleton.vue";
+import { selectionForClick } from "../lib/fileManagerAdapters";
+import FileManagerView from "./FileManagerView.vue";
 import FilePreviewDialog from "./FilePreviewDialog.vue";
 import { useAppContext } from "../lib/appContext";
 import { confirmAction } from "../lib/confirm";
@@ -11,8 +16,7 @@ import { canPreview, fileKind, fileKindKey, isReadableText } from "../lib/fileKi
 import { t } from "../lib/i18n";
 import { formatBytes } from "../lib/format";
 import { generalSettings } from "../lib/general";
-import { normalizeAppError, toUserMessage } from "../lib/invoke";
-import { statusTagTone } from "../lib/tagTone";
+import { errorStrategy, normalizeAppError, toUserMessage } from "../lib/invoke";
 import {
   MAX_PREVIEW_BYTES,
   previewFormat as detectPreviewFormat,
@@ -69,57 +73,37 @@ const downloadRunning = ref(false);
 const downloadCanceled = ref(false);
 const savedOpen = ref(false);
 const savedPath = ref("");
-const uploadDialogOpen = ref(false);
-const uploadQueue = ref([]);
-const uploadRunning = ref(false);
-const uploadCanceled = ref(false);
-const uploadTransferId = ref("");
-const uploadClock = ref(Date.now());
-let uploadClockTimer;
 let browserDisposed = false;
-watch(uploadRunning, (running) => {
-  clearInterval(uploadClockTimer);
-  if (running) {
-    uploadClockTimer = setInterval(() => { uploadClock.value = Date.now(); }, 500);
-  }
+let uploadPollTimer;
+const canMutate = computed(() => Boolean(activeShare.value?.permissions?.canWrite) && !busy.value && !uploadRunning.value);
+const {
+  uploadDialogOpen, uploadSummary, uploadPage, uploadRunning, uploadPageLoading,
+  uploadBatchError, uploadPageNotice, uploadApplyRemaining, uploadResolving, uploadOverwriteAllowed,
+  selectUpload, loadUploadPage, pollUpload, cancelUpload, closeUpload, resolveUploadConflict, cancelUploadSession,
+} = useUploadBatch({
+  adapter: peerUploadAdapter,
+  captureScope: () => ({ peerId: props.peer.id, shareName: activeShare.value.name, shareId: activeShareId.value,
+    remoteDir: peerPath.value, options: { respectGitignore: generalSettings.respectGitignore, patterns: generalSettings.ignorePatterns } }),
+  scopeValid: (scope) => !browserDisposed && scope.peerId === props.peer.id && scope.shareId === activeShareId.value,
+  canSelect: () => canMutate.value,
+  onFailure: (cause) => app.handleFailure(cause),
+  onCompleted: (summary, scope) => {
+    app.setNotice("peer.uploadFinished", { count: summary.completedFiles });
+    if (peerPath.value === scope.remoteDir) void loadPath(scope.remoteDir);
+  },
 });
-const currentUpload = computed(() =>
-  uploadQueue.value.find((item) => item.status === "uploading"),
-);
-const uploadTransfer = computed(
-  () => app.transfers?.[uploadTransferId.value] ?? null,
-);
-const uploadPhase = computed(() => uploadTransfer.value?.phase ?? "hashing");
-const uploadFilePercent = computed(() => {
-  const progress = uploadTransfer.value;
-  if (!progress?.total) return 0;
-  return Math.min(100, Math.floor((progress.transferred / progress.total) * 100));
-});
-const uploadSpeed = computed(() => {
-  const progress = uploadTransfer.value;
-  if (
-    uploadPhase.value !== "uploading" ||
-    !progress?.updatedAt ||
-    uploadClock.value - progress.updatedAt > 2000
-  ) return 0;
-  return progress.bytesPerSecond || 0;
-});
+onMounted(() => { uploadPollTimer = setInterval(() => { void pollUpload(); }, 1500); });
+watch([() => props.peer.id, activeShareId], () => { void cancelUploadSession(); }, { flush: "sync" });
 
 onBeforeUnmount(() => {
   browserDisposed = true;
-  uploadCanceled.value = true;
-  clearInterval(uploadClockTimer);
+  clearInterval(uploadPollTimer);
+  void cancelUploadSession();
   window.removeEventListener("keydown", onModifierKeydown, true);
   window.removeEventListener("keyup", onModifierKeyup, true);
   window.removeEventListener("blur", resetHeldModifiers);
   window.removeEventListener("mousedown", onShortcutsOutsideMousedown, true);
   window.removeEventListener("keydown", onShortcutsKeydown, true);
-  if (uploadTransferId.value && uploadRunning.value) {
-    void app.invoke("cancel_peer_upload", {
-      transferId: uploadTransferId.value,
-    }).catch(app.handleFailure);
-  }
-  app.clearTransfer?.(uploadTransferId.value);
 });
 
 const activeShare = computed(
@@ -186,7 +170,7 @@ const downloadTransferredBytes = computed(() => {
 const downloadQueuePercent = computed(() => {
   if (!downloadQueue.value.length) return 0;
   if (downloadQueue.value.every((item) => item.status === "done")) return 100;
-  if (downloadTotalBytes.value > 0) {
+  if (downloadTotalBytes.value > 0 && downloadQueue.value.every((item) => item.size != null && Number.isFinite(Number(item.size)))) {
     return Math.min(
       100,
       Math.round(
@@ -194,40 +178,13 @@ const downloadQueuePercent = computed(() => {
       ),
     );
   }
-  return Math.round(
-    (downloadFinished.value / downloadQueue.value.length) * 100,
-  );
+  return null;
 });
 
 const downloadSummary = computed(() =>
   t("peer.downloadSummary", {
     finished: downloadFinished.value,
     total: downloadQueue.value.length,
-  }),
-);
-
-const uploadFinished = computed(
-  () =>
-    uploadQueue.value.filter(
-      (item) => !["pending", "uploading"].includes(item.status),
-    ).length,
-);
-
-const uploadPercent = computed(() => {
-  if (!uploadQueue.value.length) return 0;
-  const total = uploadQueue.value.reduce((sum, item) => sum + (Number(item.size) || 0), 0);
-  const finished = uploadQueue.value.filter((item) => item.status === "done")
-    .reduce((sum, item) => sum + (Number(item.size) || 0), 0);
-  const current = currentUpload.value && ["uploading", "committing", "completed"].includes(uploadPhase.value)
-    ? Number(uploadTransfer.value?.transferred) || 0 : 0;
-  if (uploadQueue.value.every((item) => item.status === "done")) return 100;
-  return total ? Math.min(99, Math.floor(((finished + current) / total) * 100)) : 0;
-});
-
-const uploadSummary = computed(() =>
-  t("peer.uploadSummary", {
-    finished: uploadFinished.value,
-    total: uploadQueue.value.length,
   }),
 );
 
@@ -403,10 +360,7 @@ function reset() {
   downloadCanceled.value = false;
   savedOpen.value = false;
   savedPath.value = "";
-  uploadDialogOpen.value = false;
-  uploadQueue.value = [];
-  uploadRunning.value = false;
-  uploadCanceled.value = false;
+  void cancelUploadSession();
 }
 
 const navigating = ref(false);
@@ -620,23 +574,11 @@ function selectEntry(entry, event) {
   pointerModifiers.meta = false;
   pointerModifiers.alt = false;
   pointerModifiers.shift = false;
-  const listing = peerListing.value?.entries ?? [];
-  if (ranged && selectionAnchor.value) {
-    const from = listing.findIndex((item) => item.path === selectionAnchor.value);
-    const to = listing.findIndex((item) => item.path === entry.path);
-    if (from !== -1 && to !== -1) {
-      const [start, end] = from < to ? [from, to] : [to, from];
-      setSelection(listing.slice(start, end + 1));
-      return;
-    }
-  }
-  if (additive) {
-    const added = !isSelected(entry);
-    const next = added
-      ? [...selectedEntries.value, entry]
-      : selectedEntries.value.filter((item) => item.path !== entry.path);
-    setSelection(listing.filter((item) => next.some((other) => other.path === item.path)));
-    if (added) selectionAnchor.value = entry.path;
+  const result = selectionForClick({ entries: peerListing.value?.entries ?? [], selection: selectedEntries.value,
+    anchor: selectionAnchor.value, entry, identityField: "path", additive, ranged });
+  if (result) {
+    setSelection(result.selection);
+    selectionAnchor.value = result.anchor;
     return;
   }
   selectSingle(entry);
@@ -878,15 +820,6 @@ function baseName(path) {
   return String(path).split(/[\\/]/).pop() || path;
 }
 
-function remoteDirFor(relativePath) {
-  const parts = String(relativePath).split("/");
-  parts.pop();
-  const relativeDir = parts.join("/");
-  if (!relativeDir) return peerPath.value;
-  const base = peerPath.value === "/" ? "" : peerPath.value.replace(/\/+$/, "");
-  return `${base}/${relativeDir}`;
-}
-
 async function downloadEntry(entry) {
   if (!entry || entry.isDir || busy.value) return;
   await run(async () => {
@@ -928,17 +861,6 @@ function markRemainingDownloadCanceled() {
       item.status = "canceled";
     }
   }
-}
-
-function downloadStatusText(item) {
-  const key = {
-    pending: "peer.downloadStatusPending",
-    downloading: "peer.downloadStatusDownloading",
-    done: "peer.downloadStatusDone",
-    canceled: "peer.downloadStatusCanceled",
-    error: "peer.downloadStatusError",
-  }[item.status];
-  return key ? t(key) : "";
 }
 
 async function processDownloadQueue() {
@@ -991,10 +913,10 @@ async function processDownloadQueue() {
             completed += 1;
             continue;
           } catch (retryError) {
-            item.status = "error";
-            item.error = toUserMessage(retryError);
+            item.status = normalizeAppError(retryError).code === "TRANSFER_CANCELED" ? "canceled" : "error";
+            item.error = item.status === "canceled" ? "" : toUserMessage(retryError);
+            if (["interface-lock", "unlock", "initialize", "change-admin"].includes(errorStrategy(retryError))) app.handleFailure(retryError);
             markRemainingDownloadCanceled();
-            app.handleFailure(retryError);
             break;
           }
         }
@@ -1002,10 +924,16 @@ async function processDownloadQueue() {
         markRemainingDownloadCanceled();
         break;
       }
+      if (normalizeAppError(error).code === "TRANSFER_CANCELED") {
+        item.status = "canceled";
+        downloadCanceled.value = true;
+        markRemainingDownloadCanceled();
+        break;
+      }
       item.status = "error";
       item.error = toUserMessage(error);
+      if (["interface-lock", "unlock", "initialize", "change-admin"].includes(errorStrategy(error))) app.handleFailure(error);
       markRemainingDownloadCanceled();
-      app.handleFailure(error);
       break;
     } finally {
       app.clearTransfer(transferId);
@@ -1221,188 +1149,8 @@ async function openSavedFile() {
   }
 }
 
-async function chooseUploadFiles() {
-  if (!activeShareId.value || busy.value) return;
-  await run(async () => {
-    const selected = await openDialog({
-      title: t("peer.pickUploadFiles"),
-      multiple: true,
-      directory: false,
-    });
-    const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
-    if (paths.length) await prepareUploadQueue(paths);
-  });
-}
-
-async function chooseUploadFolder() {
-  if (!activeShareId.value || busy.value) return;
-  await run(async () => {
-    const selected = await openDialog({
-      title: t("peer.pickUploadFolder"),
-      multiple: false,
-      directory: true,
-    });
-    const paths = typeof selected === "string" ? [selected] : [];
-    if (paths.length) await prepareUploadQueue(paths);
-  });
-}
-
-async function prepareUploadQueue(paths) {
-  const candidates = await app.invoke("collect_upload_paths", {
-    paths,
-    ignoreOptions: { respectGitignore: generalSettings.respectGitignore, patterns: generalSettings.ignorePatterns },
-  });
-  if (!candidates.length) {
-    app.setNotice("peer.noUploadFiles");
-    return;
-  }
-  uploadQueue.value = candidates.map((candidate) => ({
-    ...candidate,
-    status: "pending",
-    error: "",
-  }));
-  uploadCanceled.value = false;
-  uploadRunning.value = true;
-  uploadDialogOpen.value = true;
-  await processUploadQueue();
-}
-
-function markRemainingCanceled() {
-  for (const item of uploadQueue.value) {
-    if (item.status === "pending") {
-      item.status = "canceled";
-    }
-  }
-}
-
-async function uploadQueueItem(item, remoteDir, conflict) {
-  const transferId = await app.invoke("begin_peer_upload");
-  uploadTransferId.value = transferId;
-  app.setTransferProgress({
-    transferId,
-    direction: "upload",
-    phase: "hashing",
-    transferred: 0,
-    total: item.size,
-    bytesPerSecond: 0,
-  }, true);
-  try {
-    if (uploadCanceled.value) await app.invoke("cancel_peer_upload", { transferId });
-    return await app.invoke("upload_peer_file", {
-      peerId: props.peer.id,
-      shareId: activeShareId.value,
-      localPath: item.localPath,
-      remoteDir,
-      conflict,
-      transferId,
-    });
-  } finally {
-    app.clearTransfer?.(transferId);
-    if (uploadTransferId.value === transferId) uploadTransferId.value = "";
-  }
-}
-
-async function processUploadQueue() {
-  let completed = 0;
-  for (const item of uploadQueue.value) {
-    if (uploadCanceled.value) {
-      if (item.status === "pending") item.status = "canceled";
-      continue;
-    }
-    if (item.status !== "pending") continue;
-
-    item.status = "uploading";
-    const remoteDir = remoteDirFor(item.relativePath);
-    try {
-      await uploadQueueItem(item, remoteDir, "fail");
-      item.status = "done";
-      completed += 1;
-    } catch (error) {
-      const normalized = normalizeAppError(error);
-      if (normalized.code === "TRANSFER_CANCELED") {
-        item.status = "canceled";
-        markRemainingCanceled();
-        break;
-      }
-      if (normalized.code !== "TRANSFER_CONFLICT") {
-        item.status = "error";
-        item.error = toUserMessage(normalized);
-        markRemainingCanceled();
-        app.handleFailure(error);
-        break;
-      }
-
-      const overwrite = await confirmAction(
-        t("peer.overwriteConfirm", { name: baseName(item.relativePath) }),
-        t("peer.upload"),
-        {
-          confirmText: t("peer.overwrite"),
-          cancelText: t("peer.skip"),
-        },
-      );
-      if (uploadCanceled.value) {
-        item.status = "canceled";
-        continue;
-      }
-      if (!overwrite) {
-        item.status = "skipped";
-        continue;
-      }
-      try {
-        await uploadQueueItem(item, remoteDir, "overwrite");
-        item.status = "done";
-        completed += 1;
-      } catch (retryError) {
-        if (normalizeAppError(retryError).code === "TRANSFER_CANCELED") {
-          item.status = "canceled";
-          markRemainingCanceled();
-          break;
-        }
-        item.status = "error";
-        item.error = toUserMessage(retryError);
-        markRemainingCanceled();
-        app.handleFailure(retryError);
-        break;
-      }
-    }
-  }
-  uploadRunning.value = false;
-  if (browserDisposed) return;
-  await loadPath(peerPath.value);
-  if (!uploadCanceled.value && completed > 0) {
-    app.setNotice("peer.uploadFinished", { count: completed });
-  }
-}
-
-async function cancelUploadQueue() {
-  if (!uploadRunning.value || uploadCanceled.value) return;
-  uploadCanceled.value = true;
-  markRemainingCanceled();
-  const transferId = uploadTransferId.value;
-  if (!transferId) return;
-  try {
-    await app.invoke("cancel_peer_upload", { transferId });
-  } catch (error) {
-    uploadCanceled.value = false;
-    app.handleFailure(error);
-  }
-}
-
-function uploadStatusText(item) {
-  if (item.status === "uploading") {
-    return t({ hashing: "peer.uploadHashing", committing: "peer.uploadCommitting",
-      completed: "peer.uploadCommitting", uploading: "peer.uploadStatusUploading" }[uploadPhase.value]);
-  }
-  const key = {
-    pending: "peer.uploadStatusPending",
-    uploading: "peer.uploadStatusUploading",
-    done: "peer.uploadStatusDone",
-    skipped: "peer.uploadStatusSkipped",
-    canceled: "peer.uploadStatusCanceled",
-    error: "peer.uploadStatusError",
-  }[item.status];
-  return key ? t(key) : "";
-}
+function chooseUploadFiles() { return selectUpload("files"); }
+function chooseUploadFolder() { return selectUpload("folder"); }
 
 function previewUsesDialog(entry, preview) {
   if (viewMode.value !== "gallery") return true;
@@ -1706,7 +1454,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                   type="button"
                   class="view-switch__button"
                   :aria-label="t('peer.uploadFiles')"
-                  :disabled="busy || !activeShareId"
+                  :disabled="!canMutate"
                   @click="chooseUploadFiles"
                 >
                   <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1727,7 +1475,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                   type="button"
                   class="view-switch__button"
                   :aria-label="t('peer.uploadFolder')"
-                  :disabled="busy || !activeShareId"
+                  :disabled="!canMutate"
                   @click="chooseUploadFolder"
                 >
                   <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1785,94 +1533,12 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
           @mousedown="onFileViewMousedown"
         >
           <div v-if="marquee" class="marquee" :style="marqueeStyle"></div>
-          <div v-if="viewMode === 'icons'" class="icon-grid">
-            <button
-              v-for="entry in peerListing.entries"
-              :key="entry.path"
-              type="button"
-              class="file-tile"
-              :data-path="entry.path"
-              :class="{ 'is-selected': isSelected(entry) }"
-              @click="selectEntry(entry, $event)"
-              @dblclick="openEntry(entry)"
-            >
-              <FileGlyph :entry="entry" size="lg" />
-              <span class="file-tile__name" :title="entry.name">{{ entry.name }}</span>
-            </button>
-          </div>
-
-          <div v-else-if="viewMode === 'list'" class="file-table-wrap">
-            <table class="file-table">
-            <thead>
-              <tr>
-                <th scope="col">{{ t("peer.name") }}</th>
-                <th scope="col">{{ t("peer.kind") }}</th>
-                <th scope="col">{{ t("peer.size") }}</th>
-                <th scope="col">{{ t("peer.modified") }}</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="entry in peerListing.entries"
-                :key="entry.path"
-                tabindex="0"
-                :data-path="entry.path"
-                :class="{ 'is-selected': isSelected(entry) }"
-                @click="selectEntry(entry, $event)"
-                @dblclick="openEntry(entry)"
-                @keydown.enter="openEntry(entry)"
-              >
-                <td>
-                  <span class="table-name">
-                    <FileGlyph :entry="entry" />
-                    <span>{{ entry.name }}</span>
-                  </span>
-                </td>
-                <td>{{ entryKind(entry) }}</td>
-                <td>{{ formatSize(entry) }}</td>
-                <td>{{ formatModified(entry.modified) }}</td>
-              </tr>
-            </tbody>
-            </table>
-          </div>
-
-          <div
-            v-else-if="viewMode === 'columns'"
-            class="column-view"
-            ref="columnViewEl"
-            :aria-busy="loadingColumn !== -1 ? 'true' : 'false'"
-            @wheel="scrollColumnView"
-          >
-            <div
-              v-for="(column, index) in visibleColumns"
-              :key="column.path"
-              class="column"
-            >
-              <button
-                v-for="entry in column.entries"
-                :key="entry.path"
-                type="button"
-                class="column-row"
-                :data-path="entry.path"
-                :class="{ 'is-selected': isSelected(entry) }"
-                @click="loadColumn(entry, index)"
-                @dblclick="previewEntry(entry)"
-              >
-                <FileGlyph :entry="entry" />
-                <span class="column-name">{{ entry.name }}</span>
-                <span v-if="entry.isDir" class="column-chevron">›</span>
-              </button>
-              <p v-if="!column.entries.length" class="column-empty">
-                {{ t("peer.emptyDir") }}
-              </p>
-            </div>
-            <div v-if="loadingColumn !== -1" class="column column-loading">
-              <BrowserSkeleton mode="columns" />
-            </div>
-          </div>
-
-          <div v-else class="gallery-view" data-testid="gallery-view">
-            <div class="gallery-stage">
+          <FileManagerView :entries="peerListing.entries" :mode="viewMode" :selection="selectedEntries"
+            :columns="visibleColumns" :column-loading="loadingColumn !== -1" :append-loading-column="loadingColumn !== -1"
+            :partial="!!peerListing.truncated" time-column="modified" :entry-kind="entryKind" :format-size="formatSize" :format-modified="formatModified"
+            @select="selectEntry" @activate="openEntry" @column-select="(entry, event, column, index) => loadColumn(entry, index)"
+            @preview="previewEntry" @column-element="columnViewEl = $event" @column-wheel="scrollColumnView">
+            <template #gallery-preview>
               <template v-if="galleryFile">
                 <img
                   v-if="isImagePreview && peerPreviewSource"
@@ -1922,35 +1588,13 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 <strong>{{ t("peer.selectPreview") }}</strong>
                 <span>{{ t("peer.selectPreviewHint") }}</span>
               </div>
-            </div>
-            <div class="gallery-strip">
-              <button
-                v-for="entry in peerListing.entries"
-                :key="entry.path"
-                type="button"
-                class="gallery-thumb"
-                :data-path="entry.path"
-                :class="{ 'is-selected': isSelected(entry) }"
-                @click="selectEntry(entry, $event)"
-                @dblclick="openEntry(entry)"
-              >
-                <FileGlyph :entry="entry" />
-                <span>{{ entry.name }}</span>
-              </button>
-            </div>
-          </div>
-
-          <p v-if="!peerListing.entries.length" class="file-empty">
-            {{ t("peer.emptyDir") }}
-          </p>
+            </template>
+          </FileManagerView>
         </div>
 
         <!-- 加载中先清空旧内容并给出即时反馈；失败时提示可点击地址栏重试。 -->
         <div v-else class="file-view file-view--placeholder" :aria-busy="navigating">
-          <div v-if="navigating && viewMode === 'columns'" class="column-view">
-            <div class="column column-loading"><BrowserSkeleton mode="columns" /></div>
-          </div>
-          <BrowserSkeleton v-else-if="navigating" :mode="viewMode" />
+          <FileManagerView v-if="navigating" :mode="viewMode" loading :entry-kind="entryKind" :format-size="formatSize" />
           <p v-else class="file-empty">{{ t("peer.loadFailed") }}</p>
         </div>
 
@@ -2070,72 +1714,9 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
       </div>
     </el-dialog>
 
-    <el-dialog
-      v-model="downloadDialogOpen"
-      :title="t('peer.downloadQueue')"
-      width="560"
-      align-center
-      :show-close="!downloadRunning"
-      :close-on-click-modal="false"
-      :close-on-press-escape="false"
-    >
-      <div class="transfer-dialog">
-        <p class="hint">{{ downloadSummary }}</p>
-        <el-progress :percentage="downloadQueuePercent" :stroke-width="8" />
-        <p v-if="downloadTotalBytes" class="hint">
-          {{ formatBytes(downloadTransferredBytes) }} /
-          {{ formatBytes(downloadTotalBytes) }}
-        </p>
-        <ul class="transfer-queue">
-          <li
-            v-for="item in downloadQueue"
-            :key="item.remotePath"
-          >
-            <div class="transfer-queue__name">
-              <FileGlyph
-                :entry="{
-                  isDir: false,
-                  name: item.relativePath,
-                  contentType: null,
-                }"
-              />
-              <div>
-                <strong>{{ baseName(item.relativePath) }}</strong>
-                <span>{{ item.relativePath }} · {{ formatBytes(item.size) }}</span>
-              </div>
-            </div>
-            <el-tag
-              class="row-tag"
-              :type="statusTagTone(item.status)"
-              effect="plain"
-              round
-              size="small"
-              :title="item.error || undefined"
-            >
-              {{ downloadStatusText(item) }}
-            </el-tag>
-          </li>
-        </ul>
-      </div>
-      <template #footer>
-        <el-button
-          v-if="downloadRunning"
-          plain
-          :disabled="downloadCanceled"
-          @click="cancelDownloadQueue"
-        >
-          {{ downloadCanceled ? t("peer.cancelingDownload") : t("peer.cancelDownload") }}
-        </el-button>
-        <template v-else>
-          <el-button v-if="downloadRoot" plain @click="revealDownloadRoot">
-            {{ t("peer.revealInFolder") }}
-          </el-button>
-          <el-button type="primary" @click="downloadDialogOpen = false">
-            {{ t("common.close") }}
-          </el-button>
-        </template>
-      </template>
-    </el-dialog>
+    <TransferQueueDialog :open="downloadDialogOpen" :items="downloadQueue" :running="downloadRunning" :canceling="downloadCanceled"
+      :summary="downloadSummary" :root="downloadRoot" :percentage="downloadQueuePercent" :transferred="downloadTransferredBytes" :total="downloadTotalBytes"
+      :note="t('transferQueue.peerCancel')" @cancel="cancelDownloadQueue" @close="downloadDialogOpen = false" @reveal="revealDownloadRoot" />
 
     <el-dialog
       v-model="savedOpen"
@@ -2154,84 +1735,10 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
       </template>
     </el-dialog>
 
-    <el-dialog
-      v-model="uploadDialogOpen"
-      :title="t('peer.uploadQueue')"
-      width="560"
-      align-center
-      :show-close="!uploadRunning"
-      :close-on-click-modal="false"
-      :close-on-press-escape="false"
-    >
-      <div class="transfer-dialog">
-        <p class="hint">{{ uploadSummary }}</p>
-        <el-progress :percentage="uploadPercent" :stroke-width="8" />
-        <div v-if="currentUpload" class="upload-current">
-          <strong>{{ baseName(currentUpload.relativePath) }}</strong>
-          <p class="hint" role="status">
-            {{ uploadStatusText(currentUpload) }}
-            <template v-if="uploadTransfer && uploadPhase !== 'committing' && uploadPhase !== 'completed'">
-              · {{ uploadFilePercent }}%
-            </template>
-          </p>
-          <el-progress
-            :percentage="uploadFilePercent"
-            :indeterminate="!uploadTransfer || uploadPhase === 'committing' || uploadPhase === 'completed'"
-            :show-text="false"
-            :aria-label="baseName(currentUpload.relativePath)"
-            :stroke-width="6"
-          />
-          <p v-if="uploadPhase === 'committing' || uploadPhase === 'completed'" class="hint">{{ t("peer.uploadCommitHint") }}</p>
-          <p v-if="uploadTransfer" class="hint upload-current__metrics">
-            {{ formatBytes(uploadTransfer.transferred) }} / {{ formatBytes(uploadTransfer.total) }}
-            <span v-if="uploadPhase === 'uploading'"> · {{ formatBytes(uploadSpeed) }}/s</span>
-          </p>
-        </div>
-        <ul class="transfer-queue">
-          <li
-            v-for="(item, index) in uploadQueue"
-            :key="`${item.localPath}-${index}`"
-          >
-            <div class="transfer-queue__name">
-              <FileGlyph
-                :entry="{
-                  isDir: false,
-                  name: item.relativePath,
-                  contentType: null,
-                }"
-              />
-              <div>
-                <strong>{{ baseName(item.relativePath) }}</strong>
-                <span>{{ item.relativePath }} · {{ formatBytes(item.size) }}</span>
-              </div>
-            </div>
-            <el-tag
-              class="row-tag"
-              :type="statusTagTone(item.status)"
-              effect="plain"
-              round
-              size="small"
-              :title="item.error || undefined"
-            >
-              {{ uploadStatusText(item) }}
-            </el-tag>
-          </li>
-        </ul>
-      </div>
-      <template #footer>
-        <el-button
-          v-if="uploadRunning"
-          plain
-          :disabled="uploadCanceled"
-          @click="cancelUploadQueue"
-        >
-          {{ uploadCanceled ? t("peer.cancelingUpload") : t("peer.cancelUpload") }}
-        </el-button>
-        <el-button v-else type="primary" @click="uploadDialogOpen = false">
-          {{ t("common.close") }}
-        </el-button>
-      </template>
-    </el-dialog>
+    <UploadBatchDialog :open="uploadDialogOpen" :summary="uploadSummary" :page="uploadPage" :running="uploadRunning"
+      :page-loading="uploadPageLoading" :batch-error="uploadBatchError" :page-notice="uploadPageNotice"
+      v-model:apply-remaining="uploadApplyRemaining" :resolving="uploadResolving" :overwrite-allowed="uploadOverwriteAllowed"
+      @close="closeUpload" @cancel="cancelUpload" @page="loadUploadPage" @resolve="resolveUploadConflict" />
 
     <FilePreviewDialog
       :open="previewOpen"
@@ -2569,6 +2076,8 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 /* Keep the pathbar and selection bar fixed; each view owns its scrolling region. */
 .browser-main > .file-view {
   flex: 1;
+  display: flex;
+  flex-direction: column;
   min-height: 0;
   overflow: hidden;
 }
@@ -2600,231 +2109,6 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   border: 1px solid var(--el-color-primary);
   border-radius: 4px;
   background: color-mix(in oklab, var(--el-color-primary) 14%, transparent);
-}
-
-.browser-main > .file-view > .icon-grid,
-.browser-main > .file-view > .file-table-wrap,
-.browser-main > .file-view > .column-view,
-.browser-main > .file-view > .gallery-view {
-  height: 100%;
-  min-height: 0;
-}
-
-.icon-grid {
-  overflow: auto;
-  align-content: start;
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
-  gap: 10px;
-}
-
-.file-tile {
-  min-height: 106px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  padding: 12px 8px;
-  border: 1px solid transparent;
-  border-radius: 10px;
-  background: transparent;
-  color: var(--app-text);
-  font: inherit;
-  cursor: pointer;
-}
-
-.file-tile:hover {
-  background: var(--app-surface-2);
-}
-
-.file-tile.is-selected {
-  border-color: var(--selection-border);
-  background: var(--selection-bg);
-}
-
-/* 图标视图优先保证名称可读：允许折两行，超出才省略；类型标签不再占用行高。 */
-.file-tile__name {
-  display: -webkit-box;
-  max-width: 100%;
-  overflow: hidden;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
-  overflow-wrap: break-word;
-  text-align: center;
-  font-size: 12.5px;
-  font-weight: 500;
-  line-height: 1.35;
-}
-
-.file-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12.5px;
-}
-
-.file-table th {
-  position: sticky;
-  top: 0;
-  z-index: 2;
-  padding: 7px 9px;
-  border-bottom: 1px solid var(--app-border);
-  background: var(--app-surface);
-  color: var(--app-text-muted);
-  font-size: 11.5px;
-  font-weight: 600;
-  text-align: left;
-}
-
-.file-table td {
-  padding: 7px 9px;
-  /* 普通行分隔线保持很浅，最后一行不画线；选中行的边线单独定义。 */
-  border-bottom: 1px solid color-mix(in oklab, var(--app-border) 55%, transparent);
-  color: var(--app-text-secondary);
-  white-space: nowrap;
-}
-
-.file-table tbody tr:last-child td {
-  border-bottom: none;
-}
-
-.file-table tbody tr {
-  cursor: default;
-}
-
-.file-table tbody tr:hover {
-  background: var(--app-surface-2);
-}
-
-.file-table tbody tr.is-selected {
-  background: var(--selection-bg);
-}
-
-/* 选中行在浅色底上仍能分辨行界：用主色淡边线独立定义，
-   不去加深普通行的浅色分隔线。 */
-.file-table tbody tr.is-selected td {
-  border-bottom-color: color-mix(in oklab, var(--selection-border) 40%, transparent);
-}
-
-.file-table tbody tr.is-selected:last-child td {
-  border-bottom: none;
-}
-
-.table-name {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--app-text);
-}
-
-.file-table-wrap {
-  overflow: auto;
-}
-
-.column-view {
-  display: flex;
-  align-items: stretch;
-  /* 横向必须可滚：目录一深就会被裁掉，程序滚到最右后用户要能滚回左侧列。 */
-  overflow-x: auto;
-  overflow-y: hidden;
-}
-
-.column {
-  width: 240px;
-  flex: none;
-  overflow-y: auto;
-  padding: 5px;
-  border-right: 1px solid var(--app-border);
-}
-
-.column:last-child {
-  border-right: 0;
-}
-
-.column-row {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 6px 8px;
-  border: 0;
-  border-radius: 7px;
-  background: transparent;
-  color: var(--app-text-secondary);
-  font: inherit;
-  font-size: 12.5px;
-  text-align: left;
-  cursor: pointer;
-}
-
-.column-name {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.column-row:hover {
-  background: var(--app-surface-2);
-}
-
-.column-row.is-selected {
-  color: var(--app-text);
-  background: var(--selection-bg);
-}
-
-.column-chevron {
-  flex: none;
-  color: var(--app-text-muted);
-  font-size: 15px;
-}
-
-.column-empty {
-  margin: 8px;
-  font-size: 12px;
-  color: var(--app-text-muted);
-}
-
-/* Keep the file list visible above the selection bar. */
-.gallery-view {
-  box-sizing: border-box;
-  height: 100%;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.gallery-stage {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 16px;
-  border: 1px solid var(--app-border);
-  border-radius: 12px;
-  background:
-    linear-gradient(
-      45deg,
-      color-mix(in oklab, var(--app-surface-2) 55%, transparent) 25%,
-      transparent 25%,
-      50%,
-      color-mix(in oklab, var(--app-surface-2) 55%, transparent) 50%,
-      75%,
-      transparent 75%
-    ),
-    var(--app-surface-3);
-  background-size: 16px 16px;
-}
-
-.gallery-stage > * {
-  max-width: 100%;
-  max-height: 100%;
-  min-width: 0;
-  min-height: 0;
 }
 
 .gallery-image {
@@ -2886,48 +2170,6 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
 .gallery-placeholder span {
   font-size: 12px;
-}
-
-.gallery-strip {
-  flex: none;
-  display: flex;
-  gap: 8px;
-  overflow-x: auto;
-  padding: 2px;
-}
-
-.gallery-thumb {
-  width: 96px;
-  flex: none;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 4px;
-  padding: 7px 5px;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--app-text-secondary);
-  font: inherit;
-  cursor: pointer;
-}
-
-.gallery-thumb span {
-  width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11px;
-  text-align: center;
-}
-
-.gallery-thumb:hover {
-  background: var(--app-surface-2);
-}
-
-.gallery-thumb.is-selected {
-  border-color: var(--selection-border);
-  background: var(--selection-bg);
 }
 
 .file-empty {
@@ -3035,18 +2277,6 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   flex-direction: column;
   gap: 12px;
 }
-
-.upload-current {
-  display: grid;
-  gap: 8px;
-  padding: 12px;
-  border: 1px solid var(--app-border);
-  border-radius: 10px;
-  overflow-wrap: anywhere;
-}
-
-.upload-current p { margin: 0; }
-.upload-current__metrics { font-variant-numeric: tabular-nums; }
 
 .transfer-dialog__name {
   margin: 0;

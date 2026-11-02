@@ -4,8 +4,15 @@ import { cloud, cloudObjects, objectChildren } from "../lib/cloud";
 import { confirmAction } from "../lib/confirm";
 import { useAppContext } from "../lib/appContext";
 import FileGlyph from "./FileGlyph.vue";
+import { selectionForClick } from "../lib/fileManagerAdapters";
+import FileManagerView from "./FileManagerView.vue";
 import BrowserSkeleton from "./BrowserSkeleton.vue";
 import FilePreviewDialog from "./FilePreviewDialog.vue";
+import UploadBatchDialog from "./UploadBatchDialog.vue";
+import TransferQueueDialog from "./TransferQueueDialog.vue";
+import OperationErrorDialog from "./OperationErrorDialog.vue";
+import { useUploadBatch } from "../composables/useUploadBatch";
+import { cloudUploadAdapter } from "../lib/uploadBatchAdapters";
 import { canPreview, fileKind, fileKindKey } from "../lib/fileKinds";
 import { formatBytes } from "../lib/format";
 import {
@@ -14,7 +21,6 @@ import {
 } from "../lib/textPreview";
 import { errorStrategy, invoke, normalizeAppError } from "../lib/invoke";
 import CloudSyncDrives from "./CloudSyncDrives.vue";
-import { statusTagTone } from "../lib/tagTone";
 import { t } from "../lib/i18n";
 
 const props = defineProps({ connectionId: { type: String, required: true } });
@@ -77,7 +83,7 @@ async function rebuildColumns() {
       level.entries = toEntries(objectChildren(page.objects, level.prefix));
       level.complete = page.complete === true && page.next == null;
     } catch (cause) {
-      if (version === columnVersion && valid(scope)) { level.failed = true; fail(cause, scope); }
+      if (version === columnVersion && valid(scope)) { level.failed = true; fail(cause, scope, rebuildColumns); }
     } finally {
       level.loading = false;
     }
@@ -132,8 +138,6 @@ function toEntries(list) {
 const entries = computed(() => toEntries(children.value));
 // A navigation empties the listing; show a mode-aware skeleton instead of a blank pane.
 const showLoading = computed(() => viewMode.value !== "columns" && loading.value && !entries.value.length && !visibleError.value);
-// 空目录只有一屏提示，不去渲染空的表格/网格；分栏视图仍需保留空列。
-const emptyListing = computed(() => !entries.value.length && complete.value && viewMode.value !== "columns");
 // 只有确实拿到部分结果时才提示列表不完整；初次加载与加载失败分别由加载态、错误区表达。
 const incompleteListing = computed(() => !complete.value && (next.value != null || objects.value.length > 0));
 
@@ -175,6 +179,7 @@ function openManagement(id = "") {
 // until the backend confirms the switch, so a failure never blanks the view.
 async function selectBucket(bucket) {
   if (busy.value || loading.value) return;
+  await cancelUploadSession();
   const previousBucket = activeBucket.value;
   activeBucket.value = bucket;
   activeDriveId.value = "";
@@ -256,7 +261,13 @@ const connectionHost = computed(() => {
   try { return new URL(endpoint).host || endpoint; } catch { return endpoint; }
 });
 const visibleError = computed(() => preparationError.value || error.value);
-const failureStrategy = computed(() => visibleError.value ? errorStrategy(visibleError.value) : null);
+const retryOperation = ref(null);
+function closeOperationError() { error.value = null; preparationError.value = null; retryOperation.value = null; }
+function retryFailedOperation() {
+  const retry = preparationError.value ? prepare : retryOperation.value;
+  closeOperationError();
+  if (retry) void retry();
+}
 const transfers = ref([]);
 const partial = ref(null);
 
@@ -269,29 +280,8 @@ const downloadCanceled = ref(false);
 // Upload completions become toasts, so the transfer list never grows forever.
 const uploadNotices = new Set();
 const downloadFinishedCount = computed(() => downloadQueue.value.filter((item) => ["done", "error", "canceled"].includes(item.status)).length);
-const downloadDoneCount = computed(() => downloadQueue.value.filter((item) => item.status === "done").length);
 const downloadRunning = computed(() => downloadQueue.value.some((item) => ["pending", "downloading"].includes(item.status)));
-const downloadTransferredBytes = computed(() => downloadQueue.value.reduce((total, item) => total + (item.status === "done" ? Number(item.size) || 0 : 0), 0));
-// Cloud status has no byte-progress field: only completed files count as transferred.
-const downloadPercent = computed(() => {
-  if (!downloadQueue.value.length) return 0;
-  if (downloadDoneCount.value === downloadQueue.value.length) return 100;
-  return Math.round(downloadTotalBytes.value > 0
-    ? downloadTransferredBytes.value / downloadTotalBytes.value * 100
-    : downloadDoneCount.value / downloadQueue.value.length * 100);
-});
-const downloadTotalBytes = computed(() => downloadQueue.value.reduce((total, item) => total + (Number(item.size) || 0), 0));
 const downloadSummary = computed(() => t("peer.downloadSummary", { finished: downloadFinishedCount.value, total: downloadQueue.value.length }));
-function downloadStatusText(item) {
-  const key = {
-    pending: "peer.downloadStatusPending",
-    downloading: "peer.downloadStatusDownloading",
-    done: "peer.downloadStatusDone",
-    canceled: "peer.downloadStatusCanceled",
-    error: "peer.downloadStatusError",
-  }[item.status];
-  return key ? t(key) : "";
-}
 function baseName(path) {
   return String(path ?? "").split("/").pop() || String(path ?? "");
 }
@@ -304,7 +294,9 @@ function applyDownloadStatus(transfer) {
     cancelled: "canceled",
     unknown: "error",
   }[transfer.phase] ?? "downloading";
-  item.error = transfer.error?.message ?? "";
+  item.retryable = transfer.phase === "failed" && ["CLOUD_PRECONDITION", "TRANSFER_CONFLICT"].includes(transfer.error?.code);
+  item.error = item.status === "canceled" ? "" : transfer.error?.message ?? "";
+  if (transfer.error && item.status === "error") handleAuthenticationFailure(transfer.error);
 }
 
 // PeerBrowser-style selection: a click selects, Ctrl/Cmd/Alt toggles, Shift
@@ -381,24 +373,11 @@ function selectEntry(item, event) {
   const ranged = Boolean(event?.shiftKey || pointerModifiers.shift || heldModifiers.shift);
   pointerModifiers.ctrl = false; pointerModifiers.meta = false;
   pointerModifiers.alt = false; pointerModifiers.shift = false;
-  if (ranged && selectionAnchor.value) {
-    const listing = entries.value;
-    const from = listing.findIndex((entry) => entry.key === selectionAnchor.value);
-    const to = listing.findIndex((entry) => entry.key === item.key);
-    if (from !== -1 && to !== -1) {
-      const [start, end] = from < to ? [from, to] : [to, from];
-      setSelection(listing.slice(start, end + 1));
-      return;
-    }
-  }
-  if (additive) {
-    if (isSelected(item)) {
-      setSelection(selectedEntries.value.filter((entry) => entry.key !== item.key));
-    } else {
-      const keys = new Set([...selectedEntries.value.map((entry) => entry.key), item.key]);
-      setSelection(entries.value.filter((entry) => keys.has(entry.key)));
-      selectionAnchor.value = item.key;
-    }
+  const result = selectionForClick({ entries: entries.value, selection: selectedEntries.value,
+    anchor: selectionAnchor.value, entry: item, identityField: "key", additive, ranged });
+  if (result) {
+    setSelection(result.selection);
+    selectionAnchor.value = result.anchor;
     return;
   }
   selectSingle(item);
@@ -712,11 +691,16 @@ watch(entries, () => {
 });
 const hasProtectedObjects = computed(() => objects.value.some((item) => item.protected === true));
 const targetProtected = (target) => protectedRoot.value || objects.value.some((item) => item.protected === true && item.key.startsWith(target));
-const canMutate = computed(() => prepared.value && !preparing.value && !protectedRoot.value && !busy.value && !loading.value);
+const canMutate = computed(() => prepared.value && !preparing.value && !protectedRoot.value && !busy.value && !loading.value && !uploadRunning.value);
 const current = () => ({ id: requestId, connectionId: props.connectionId, prefix: prefix.value });
 const valid = (scope) => !disposed && scope.id === requestId && scope.connectionId === props.connectionId && scope.prefix === prefix.value;
-function fail(cause, scope) {
-  if (!valid(scope)) return;
+function handleAuthenticationFailure(cause) {
+  if (["interface-lock", "unlock", "initialize", "change-admin"].includes(errorStrategy(cause))) app.handleFailure(cause);
+}
+function fail(cause, scope, retry = null) {
+  if (!valid(scope) || errorStrategy(cause) === "ignore") return;
+  handleAuthenticationFailure(cause);
+  retryOperation.value = retry;
   error.value = normalizeAppError(cause);
   if (cause?.code === "CLOUD_OBJECT_PROTECTED") protectedRoot.value = true;
   if (["CLOUD_PHYSICAL_IDENTITY_UNCONFIRMED", "CLOUD_PHYSICAL_BINDING_INVALID", "CLOUD_DISCOVERY_INCOMPLETE"].includes(cause?.code)) { prepared.value = false; preparationError.value = error.value; }
@@ -732,7 +716,7 @@ async function load(more = false) {
     objects.value = [...new Map([...(more ? objects.value : []), ...page.objects].map((item) => [item.key, item])).values()];
     protectedRoot.value = protectedRoot.value || page.prefixProtected === true;
     next.value = page.next; complete.value = page.complete === true && page.next == null;
-  } catch (cause) { fail(cause, scope); }
+  } catch (cause) { fail(cause, scope, () => valid(scope) && load(more)); }
   finally { if (valid(scope)) loading.value = false; }
 }
 function navigate(value) {
@@ -757,7 +741,7 @@ function refresh() {
 async function operate(action) {
   if (busy.value) return;
   const scope = current(); busy.value = true; error.value = null;
-  try { await action(scope); } catch (cause) { fail(cause, scope); }
+  try { await action(scope); } catch (cause) { fail(cause, scope, () => valid(scope) && operate(action)); }
   finally { if (valid(scope)) busy.value = false; }
 }
 async function prepare() {
@@ -772,14 +756,16 @@ async function prepare() {
     prepared.value = result?.discovered === true;
     if (!prepared.value) preparationError.value = { code: "CLOUD_DISCOVERY_INCOMPLETE", message: t("cloudBrowser.checkIncomplete") };
   } catch (cause) {
-    if (isCurrent()) { preparationError.value = normalizeAppError(cause); if (cause?.code === "CLOUD_OBJECT_PROTECTED") protectedRoot.value = true; }
+    if (isCurrent()) { handleAuthenticationFailure(cause); preparationError.value = normalizeAppError(cause); if (cause?.code === "CLOUD_OBJECT_PROTECTED") protectedRoot.value = true; }
   } finally { if (isCurrent()) preparing.value = false; }
 }
 function remember(transfer, scope) {
   if (!valid(scope)) return;
   statusVersion++;
   transfers.value = [...transfers.value.filter((item) => item.transferId !== transfer.transferId), transfer];
-  if (transfer.error) fail(transfer.error, scope);
+  const queued = downloadQueue.value.some((item) => item.transferId === transfer.transferId);
+  if (queued) applyDownloadStatus(transfer);
+  else if (transfer.error && transfer.phase !== "cancelled") fail(transfer.error, scope);
 }
 async function upload() {
   if (!canMutate.value) return;
@@ -795,6 +781,23 @@ async function upload() {
     remember(await cloudObjects.upload({ connectionId: scope.connectionId, localToken: selected.token, key, overwriteEtag: existing?.etag ?? null, overwriteConfirmed: Boolean(existing) }), scope);
   });
 }
+// Cloud and LAN share the bounded-page session, but retain backend safety policies.
+const {
+  uploadDialogOpen, uploadSummary, uploadPage, uploadRunning, uploadPageLoading,
+  uploadBatchError, uploadPageNotice, uploadApplyRemaining, uploadResolving, uploadOverwriteAllowed,
+  selectUpload: uploadDirectory, loadUploadPage, pollUpload, cancelUpload, closeUpload,
+  resolveUploadConflict, cancelUploadSession,
+} = useUploadBatch({
+  adapter: cloudUploadAdapter,
+  captureScope: () => ({ connectionId: props.connectionId, bucket: activeBucket.value, prefix: prefix.value }),
+  scopeValid: (scope) => !disposed && scope.connectionId === props.connectionId && scope.bucket === activeBucket.value,
+  canSelect: () => canMutate.value,
+  onFailure: (cause) => app.handleFailure(cause),
+  onCompleted: (summary, scope) => {
+    app.setNotice?.("cloudBrowser.directoryUploaded", { count: summary.completedFiles, bytes: formatBytes(summary.completedBytes) });
+    if (prefix.value === scope.prefix) refresh();
+  },
+});
 const downloadTargets = ref({});
 // Mirrors MAX_CLOUD_DOWNLOAD_BATCH so a folder walk stops before the backend
 // rejects the whole batch and the UI can explain the limit.
@@ -822,11 +825,20 @@ async function download(item, confirmed = false) {
       })).transfers;
       return transfer;
     };
-    const accept = (transfer) => { if (valid(scope)) downloadTargets.value[transfer.transferId] = { ...item }; remember(transfer, scope); };
+    const accept = (transfer) => {
+      if (valid(scope)) {
+        const queued = downloadQueue.value.find((entry) => entry.key === item.key && entry.relativePath === item.relativePath);
+        if (queued) {
+          delete downloadTargets.value[queued.transferId];
+          queued.transferId = transfer.transferId;
+        }
+        downloadTargets.value[transfer.transferId] = { ...item };
+      }
+      remember(transfer, scope);
+    };
     try { accept(await run(confirmed)); }
     catch (cause) {
       if (confirmed || !["CLOUD_PRECONDITION", "TRANSFER_CONFLICT"].includes(cause.code) || !valid(scope)) throw cause;
-      fail(cause, scope);
       if (!await confirmAction(t("cloudBrowser.downloadRetry"), t("cloudBrowser.download")) || !valid(scope)) return;
       selected = await cloudObjects.selectLocal(args);
       if (!valid(scope) || !selected?.token) return;
@@ -907,6 +919,7 @@ async function downloadSelection() {
       const source = planned.find((candidate) => candidate.key === transfer.key);
       return {
         transferId: transfer.transferId,
+        key: transfer.key,
         relativePath: source?.relativePath ?? transfer.key,
         size: source?.size ?? null,
         status: transfer.phase === "completed" ? "done" : "downloading",
@@ -992,7 +1005,10 @@ async function poll() {
       let refreshAfterUpload = false;
       for (const item of scoped) {
         if (queued.has(item.transferId)) applyDownloadStatus(item);
-        if (item.error?.code === "CLOUD_OBJECT_PROTECTED") fail(item.error, scope);
+        if (item.error?.code === "CLOUD_OBJECT_PROTECTED") {
+          protectedRoot.value = true;
+          if (!queued.has(item.transferId)) fail(item.error, scope);
+        }
         // A completed upload becomes one toast and leaves the list, so the
         // notification pane never grows with historical successes.
         if (item.direction === "upload" && item.phase === "completed" && !uploadNotices.has(item.transferId)) {
@@ -1004,7 +1020,9 @@ async function poll() {
       transfers.value = scoped.filter((item) => !["completed", "cancelled"].includes(item.phase) && !queued.has(item.transferId));
       if (refreshAfterUpload) refresh();
     }
-  } catch (cause) { if (version === statusVersion) fail(cause, scope); }
+  } catch (cause) {
+    if (version === statusVersion) fail(cause, scope);
+  }
   finally { polling = false; }
 }
 // The catalog decides which bucket exists, but the backend session must be
@@ -1017,6 +1035,7 @@ async function bootstrap() {
   else { void prepare(); void load(); }
 }
 watch(() => props.connectionId, () => {
+  void cancelUploadSession();
   requestId++; statusVersion++; preparationVersion++; downloadTargets.value = {}; uploadNotices.clear(); downloadDialogOpen.value = false; downloadRoot.value = ""; downloadQueue.value = []; downloadCanceled.value = false; prepared.value = false; preparing.value = false; preparationError.value = null; protectedRoot.value = false; connections.value = [];
   view.value = "files"; activeDriveId.value = ""; catalogDrives.value = []; buckets.value = []; activeBucket.value = "";
   objects.value = []; transfers.value = []; partial.value = null; prefix.value = ""; root.value = ""; next.value = null; complete.value = false; busy.value = false; loading.value = false; error.value = null;
@@ -1027,7 +1046,7 @@ watch(() => props.connectionId, () => {
 }, { immediate: true });
 onMounted(() => {
   void poll();
-  timer = setInterval(poll, 1500);
+  timer = setInterval(() => { void pollUpload(); void poll(); }, 1500);
   titlebarActions.value = Boolean(typeof document !== "undefined" && document.getElementById("titlebar-file-actions"));
   window.addEventListener("keydown", onModifierKeydown, true);
   window.addEventListener("keyup", onModifierKeyup, true);
@@ -1036,6 +1055,7 @@ onMounted(() => {
   window.addEventListener("keydown", onShortcutsKeydown, true);
 });
 onBeforeUnmount(() => {
+  void cancelUploadSession();
   disposed = true; requestId++; statusVersion++; clearInterval(timer);
   clearTimeout(loadingHintTimer); clearTimeout(checkingHintTimer);
   window.removeEventListener("keydown", onModifierKeydown, true);
@@ -1106,6 +1126,11 @@ onBeforeUnmount(() => {
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4" /><path d="m8 8 4-4 4 4" /><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" /></svg>
                   </button>
                 </el-tooltip>
+                <el-tooltip :content="t('peer.uploadFolder')" placement="bottom" :show-after="200" :hide-after="0" :enterable="false">
+                  <button type="button" class="view-switch__button" data-test="upload-directory" :aria-label="t('peer.uploadFolder')" :disabled="!canMutate" @click="uploadDirectory">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5c0-.8.7-1.5 1.5-1.5h4l1.8 2H19c.8 0 1.5.7 1.5 1.5v8c0 .8-.7 1.5-1.5 1.5H5c-.8 0-1.5-.7-1.5-1.5z" /><path d="M12 17v-5M9.5 14.5 12 12l2.5 2.5" /></svg>
+                  </button>
+                </el-tooltip>
                 <el-tooltip :content="t('cloudBrowser.deletePrefix')" placement="bottom" :show-after="200" :hide-after="0" :enterable="false">
                   <button type="button" class="view-switch__button" data-test="delete-prefix" :aria-label="t('cloudBrowser.deletePrefix')" :disabled="!canMutate || hasProtectedObjects" @click="remove(prefix)">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16" /><path d="M9 7V5h6v2" /><path d="M6 7l1 12h10l1-12" /></svg>
@@ -1134,80 +1159,21 @@ onBeforeUnmount(() => {
               <p class="shortcuts-panel__note">{{ t("peer.shortcutsFootnote") }}</p>
             </div>
           </Teleport>
-          <div v-if="visibleError" role="alert" class="cloud-error" :data-error-strategy="failureStrategy">
-            <span class="cloud-error__message">{{ visibleError.message }}</span>
-            <el-button v-if="!preparing && preparationError" data-test="recheck" size="small" :disabled="busy" @click="prepare">{{ t('cloudBrowser.recheck') }}</el-button>
-            <el-button v-else-if="error" data-test="retry-load" size="small" :disabled="loading" @click="refresh">{{ t('cloudBrowser.retry') }}</el-button>
-          </div>
+          <OperationErrorDialog :error="visibleError" :retryable="!!preparationError || !!retryOperation" :recheck="!!preparationError" :busy="busy || loading || preparing" @close="closeOperationError" @retry="retryFailedOperation" />
           <BrowserSkeleton v-if="loadingHint && entries.length" compact />
           <p v-if="incompleteListing" class="browser-notice" data-test="incomplete">{{ t('cloudBrowser.incomplete') }}</p>
 
           <div ref="fileViewEl" class="file-view" tabindex="0" @keydown="onFileViewKeydown" @mousedown="onFileViewMousedown">
             <div v-if="marquee" class="marquee" :style="marqueeStyle" aria-hidden="true"></div>
-            <div v-if="showLoading" class="file-view--placeholder" aria-busy="true">
-              <BrowserSkeleton :mode="viewMode" />
-            </div>
-
-            <template v-if="!showLoading">
-            <p v-if="emptyListing" class="file-empty">{{ t('cloudBrowser.empty') }}</p>
-            <div v-else-if="viewMode === 'icons'" class="icon-grid">
-            <button v-for="item in entries" :key="item.key" type="button" class="file-tile" :data-key="item.key" :class="{ 'is-selected': isSelected(item) }" :title="item.name" @click="selectEntry(item, $event)" @dblclick="openEntry(item)">
-              <FileGlyph :entry="item" size="lg" />
-              <span class="file-tile__name">{{ item.name }}</span>
-            </button>
-          </div>
-
-          <div v-else-if="viewMode === 'list'" class="file-table-wrap">
-            <table class="file-table">
-              <thead>
-                <tr>
-                  <th scope="col">{{ t('peer.name') }}</th>
-                  <th scope="col">{{ t('peer.kind') }}</th>
-                  <th scope="col">{{ t('peer.size') }}</th>
-                  <th v-if="timeColumn" scope="col">{{ t(timeColumn === 'modified' ? 'peer.modified' : 'cloudBrowser.created') }}</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr
-                  v-for="item in entries"
-                  :key="item.key"
-                  tabindex="0"
-                  :data-test="item.isDir ? 'folder-row' : 'file-row'"
-                  :data-key="item.key"
-                  :class="{ 'is-selected': isSelected(item) }"
-                  @click="selectEntry(item, $event)"
-                  @dblclick="openEntry(item)"
-                  @keydown.enter="openEntry(item)"
-                >
-                  <td>
-                    <span class="table-name">
-                      <FileGlyph :entry="item" />
-                      <span>{{ item.name }}</span>
-                      <span v-if="item.protected" class="table-protected">{{ t('cloudBrowser.protected') }}</span>
-                    </span>
-                  </td>
-                  <td>{{ entryKind(item) }}</td>
-                  <td>{{ formatSize(item) }}</td>
-                  <td v-if="timeColumn">{{ formatModified(item[timeColumn]) }}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-
-          <div v-else-if="viewMode === 'columns'" class="column-view" ref="columnViewEl" :aria-busy="columnLoading ? 'true' : 'false'" @wheel="scrollColumnView">
-            <div v-for="column in columns" :key="column.prefix" class="column" :class="{ 'column-loading': column.loading && !column.entries.length }">
-              <BrowserSkeleton v-if="column.loading && !column.entries.length" mode="columns" />
-              <button v-for="item in column.entries" :key="item.key" type="button" class="column-row" :data-key="item.key" :class="{ 'is-selected': isSelected(item) }" :title="item.name" @click="openColumn(item, $event, column)" @dblclick="previewEntry(item)">
-                <FileGlyph :entry="item" />
-                <span class="column-name">{{ item.name }}</span>
-                <span v-if="item.isDir" class="column-chevron" aria-hidden="true">›</span>
-              </button>
-              <p v-if="!column.entries.length && !column.loading && !column.failed && column.complete" class="column-empty">{{ t('peer.emptyDir') }}</p>
-            </div>
-          </div>
-
-          <div v-else class="gallery-view">
-            <div class="gallery-stage">
+            <FileManagerView :entries="entries" :mode="viewMode" :selection="selectedEntries" identity-field="key"
+              :columns="columns" column-identity-field="prefix" :column-loading="columnLoading"
+              :loading="showLoading" :complete="complete" :error="visibleError" :partial="incompleteListing"
+              :empty-label="t('cloudBrowser.empty')" :time-column="timeColumn || ''"
+              :time-label="t(timeColumn === 'modified' ? 'peer.modified' : 'cloudBrowser.created')"
+              :entry-kind="entryKind" :format-size="formatSize" :format-modified="formatModified"
+              @select="selectEntry" @activate="openEntry" @column-select="openColumn" @preview="previewEntry"
+              @column-element="columnViewEl = $event" @column-wheel="scrollColumnView">
+              <template #gallery-preview>
               <template v-if="galleryFile">
                 <img v-if="isImagePreview && previewSource" :src="previewSource" :alt="t('peer.previewAlt')" class="gallery-image" />
                 <audio v-else-if="isAudioPreview && previewSource" :src="previewSource" class="gallery-audio" controls preload="metadata"></audio>
@@ -1227,17 +1193,11 @@ onBeforeUnmount(() => {
                 <strong>{{ t('peer.selectPreview') }}</strong>
                 <span>{{ t('peer.selectPreviewHint') }}</span>
               </div>
-            </div>
-            <div class="gallery-strip">
-              <button v-for="item in entries" :key="item.key" type="button" class="gallery-thumb" :data-key="item.key" :class="{ 'is-selected': isSelected(item) }" :title="item.name" @click="selectEntry(item, $event)" @dblclick="openEntry(item)">
-                <FileGlyph :entry="item" />
-                <span>{{ item.name }}</span>
-              </button>
-            </div>
-          </div>
-
-          <el-button v-if="next" data-test="more" class="load-more" :disabled="loading" @click="load(true)">{{ t('cloudBrowser.more') }}</el-button>
-            </template>
+              </template>
+              <template #pagination>
+                <el-button v-if="next && !showLoading" data-test="more" class="load-more" :disabled="loading" @click="load(true)">{{ t('cloudBrowser.more') }}</el-button>
+              </template>
+            </FileManagerView>
           </div>
           <div v-if="selectedEntries.length || viewMode === 'gallery'" class="selection-bar" :class="{ 'selection-bar--reserved': !selectedEntries.length, 'selection-bar--multi': selectedEntries.length > 1 }">
             <div v-if="selectedEntries.length" class="selection-summary">
@@ -1272,41 +1232,14 @@ onBeforeUnmount(() => {
       @close="closePreview"
       @download="download(previewTarget)"
     />
-    <el-dialog
-      v-model="downloadDialogOpen"
-      :title="t('peer.downloadQueue')"
-      width="560"
-      align-center
-      :show-close="!downloadRunning"
-      :close-on-click-modal="false"
-      :close-on-press-escape="false"
-      data-test="download-dialog"
-    >
-      <div class="transfer-dialog download-dialog">
-        <p class="download-dialog__summary">{{ downloadSummary }}</p>
-        <el-progress :percentage="downloadPercent" :stroke-width="8" />
-        <p v-if="downloadTotalBytes" class="download-dialog__summary">{{ formatBytes(downloadTransferredBytes) }} / {{ formatBytes(downloadTotalBytes) }}</p>
-        <ul class="transfer-queue download-queue">
-          <li v-for="item in downloadQueue" :key="item.transferId || item.relativePath">
-            <div class="transfer-queue__name download-queue__name">
-              <FileGlyph :entry="{ isDir: false, name: item.relativePath }" />
-              <div>
-                <strong>{{ baseName(item.relativePath) }}</strong>
-                <span>{{ item.relativePath }}<template v-if="item.size != null"> · {{ formatBytes(item.size) }}</template></span>
-              </div>
-            </div>
-            <el-tag class="row-tag" :type="statusTagTone(item.status)" effect="plain" round size="small" :title="item.error || undefined">{{ downloadStatusText(item) }}</el-tag>
-          </li>
-        </ul>
-      </div>
-      <template #footer>
-        <el-button v-if="downloadRunning" plain :disabled="downloadCanceled" @click="cancelDownloadQueue">{{ downloadCanceled ? t('peer.cancelingDownload') : t('peer.cancelDownload') }}</el-button>
-        <template v-else>
-          <el-button v-if="downloadRoot" plain data-test="reveal-download" @click="revealDownloadRoot">{{ t('peer.revealInFolder') }}</el-button>
-          <el-button type="primary" @click="downloadDialogOpen = false">{{ t('common.close') }}</el-button>
-        </template>
-      </template>
-    </el-dialog>
+    <UploadBatchDialog :open="uploadDialogOpen" :summary="uploadSummary" :page="uploadPage" :running="uploadRunning"
+      :page-loading="uploadPageLoading" :batch-error="uploadBatchError" :page-notice="uploadPageNotice"
+      v-model:apply-remaining="uploadApplyRemaining" :resolving="uploadResolving" :overwrite-allowed="uploadOverwriteAllowed"
+      @close="closeUpload" @cancel="cancelUpload" @page="loadUploadPage" @resolve="resolveUploadConflict" />
+    <TransferQueueDialog :open="downloadDialogOpen" :items="downloadQueue" :running="downloadRunning" :canceling="downloadCanceled"
+      :summary="downloadSummary" :root="downloadRoot" :note="t('transferQueue.cloudProgress')"
+      @cancel="cancelDownloadQueue" @close="downloadDialogOpen = false" @reveal="revealDownloadRoot"
+      @retry="retryDownload(downloadTargets[$event.transferId])" />
   </section>
 </template>
 
@@ -1378,10 +1311,6 @@ onBeforeUnmount(() => {
 .browser-main > .file-view pre,
 .browser-main > .file-view input,
 .browser-main > .file-view textarea { user-select: text; -webkit-user-select: text; }
-.browser-main > .file-view > .icon-grid,
-.browser-main > .file-view > .file-table-wrap,
-.browser-main > .file-view > .column-view,
-.browser-main > .file-view > .gallery-view { flex: 1 1 auto; min-height: 0; }
 
 .marquee { position: absolute; z-index: 5; pointer-events: none; border: 1px solid var(--el-color-primary); border-radius: 4px; background: color-mix(in oklab, var(--el-color-primary) 14%, transparent); }
 .file-empty { margin: 22px 0; text-align: center; font-size: 13px; color: var(--app-text-muted); }
@@ -1400,36 +1329,7 @@ onBeforeUnmount(() => {
 .row-tag { flex: none; white-space: nowrap; }
 .load-more { flex: none; align-self: flex-start; }
 
-/* File views follow PeerBrowser so folders feel the same on both sides. */
-.icon-grid { overflow: auto; align-content: start; display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 10px; }
-.file-tile { min-height: 106px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; padding: 12px 8px; border: 1px solid transparent; border-radius: 10px; background: transparent; color: var(--app-text); font: inherit; cursor: pointer; }
-.file-tile:hover { background: var(--app-surface-2); }
-.file-tile.is-selected { border-color: var(--selection-border); background: var(--selection-bg); }
-.file-tile__name { display: -webkit-box; max-width: 100%; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow-wrap: break-word; text-align: center; font-size: 12.5px; font-weight: 500; line-height: 1.35; }
-.file-table-wrap { overflow: auto; }
-.file-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-.file-table th { position: sticky; top: 0; z-index: 2; padding: 7px 9px; border-bottom: 1px solid var(--app-border); background: var(--app-surface); color: var(--app-text-muted); font-size: 11.5px; font-weight: 600; text-align: left; }
-.file-table td { padding: 7px 9px; border-bottom: 1px solid color-mix(in oklab, var(--app-border) 55%, transparent); color: var(--app-text-secondary); white-space: nowrap; }
-.file-table tbody tr:last-child td { border-bottom: none; }
-.file-table tbody tr { cursor: default; }
-.file-table tbody tr:hover { background: var(--app-surface-2); }
-.file-table tbody tr.is-selected { background: var(--selection-bg); }
-.file-table tbody tr.is-selected td { border-bottom-color: color-mix(in oklab, var(--selection-border) 40%, transparent); }
-.file-table tbody tr.is-selected:last-child td { border-bottom: none; }
-.table-name { display: flex; align-items: center; gap: 8px; color: var(--app-text); }
-.table-protected { color: var(--app-text-muted); font-size: 11px; }
-.column-view { display: flex; align-items: stretch; overflow-x: auto; overflow-y: hidden; }
-.column { width: 240px; flex: none; overflow-y: auto; padding: 5px; border-right: 1px solid var(--app-border); }
-.column:last-child { border-right: 0; }
-.column-row { width: 100%; display: flex; align-items: center; gap: 7px; padding: 6px 8px; border: 0; border-radius: 7px; background: transparent; color: var(--app-text-secondary); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; }
-.column-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.column-row:hover { background: var(--app-surface-2); }
-.column-row.is-selected { color: var(--app-text); background: var(--selection-bg); }
-.column-chevron { flex: none; color: var(--app-text-muted); font-size: 15px; }
-.column-empty { margin: 8px; font-size: 12px; color: var(--app-text-muted); }
-.gallery-view { box-sizing: border-box; height: 100%; min-height: 0; display: flex; flex-direction: column; gap: 10px; }
-.gallery-stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 16px; border: 1px solid var(--app-border); border-radius: 12px; background: linear-gradient(45deg, color-mix(in oklab, var(--app-surface-2) 55%, transparent) 25%, transparent 25%, 50%, color-mix(in oklab, var(--app-surface-2) 55%, transparent) 50%, 75%, transparent 75%), var(--app-surface-3); background-size: 16px 16px; }
-.gallery-stage > * { max-width: 100%; max-height: 100%; min-width: 0; min-height: 0; }
+/* Provider-owned gallery preview content; view layout lives in FileManagerView. */
 .gallery-image { max-width: 100%; max-height: 100%; width: auto; height: auto; object-fit: contain; border-radius: 8px; box-shadow: 0 8px 28px rgba(22, 32, 46, 0.16); }
 .gallery-audio { width: min(440px, 100%); }
 .gallery-video { max-width: 100%; max-height: 100%; width: auto; height: auto; object-fit: contain; border-radius: 8px; background: #000; box-shadow: 0 8px 28px rgba(22, 32, 46, 0.16); }
@@ -1437,11 +1337,6 @@ onBeforeUnmount(() => {
 .gallery-placeholder { display: flex; flex-direction: column; align-items: center; gap: 7px; color: var(--app-text-muted); text-align: center; }
 .gallery-placeholder strong { color: var(--app-text); font-size: 14px; }
 .gallery-placeholder span { font-size: 12px; }
-.gallery-strip { flex: none; display: flex; gap: 8px; overflow-x: auto; padding: 2px; }
-.gallery-thumb { width: 96px; flex: none; display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 7px 5px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--app-text-secondary); font: inherit; cursor: pointer; }
-.gallery-thumb span { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; text-align: center; }
-.gallery-thumb:hover { background: var(--app-surface-2); }
-.gallery-thumb.is-selected { border-color: var(--selection-border); background: var(--selection-bg); }
 
 .selection-bar { flex: none; box-sizing: border-box; min-height: 54px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px; border: 1px solid var(--app-border); border-radius: 10px; background: var(--app-surface-2); }
 .selection-bar--reserved { border-style: dashed; background: transparent; }

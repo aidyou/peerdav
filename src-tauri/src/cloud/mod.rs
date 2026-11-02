@@ -3,6 +3,8 @@ pub mod cloud_commands;
 pub mod object_commands;
 pub mod object_guard;
 pub mod object_runtime;
+pub mod directory_types;
+pub mod directory_upload;
 pub mod object_runtime_types;
 pub mod object_service;
 pub mod object_types;

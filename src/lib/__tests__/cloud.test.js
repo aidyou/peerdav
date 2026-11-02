@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("../invoke.js", () => ({ invoke }));
 
-import { blankConnection, blankMapping, cloud, toSaveMappingInput, toSaveS3Input } from "../cloud.js";
+import { blankConnection, blankMapping, cloud, cloudObjects, toSaveMappingInput, toSaveS3Input } from "../cloud.js";
 
 describe("cloud API wrappers", () => {
   beforeEach(() => invoke.mockReset());
@@ -41,6 +41,31 @@ describe("cloud API wrappers", () => {
       ["cloud_restore", { mappingId: "m", recordId: "record", destination: "/dest" }],
       ["cloud_status"],
     ]);
+  });
+
+  it("strictly serializes directory capabilities without local paths or caller keys", async () => {
+    const args = { connectionId: "c", prefix: "target/", batchId: "batch", conflictId: "conflict-a", path: "/secret", key: "forged", relativePath: "forged" };
+    await cloudObjects.selectUploadDirectory(args);
+    await cloudObjects.startUploadDirectory(args);
+    await cloudObjects.statusUploadDirectory(args);
+    await cloudObjects.pageUploadDirectory(args);
+    await cloudObjects.pageUploadDirectory({ ...args, directoryToken: "dir", cursor: "next", limit: 128 });
+    await cloudObjects.resolveUploadDirectoryConflict({ ...args, decision: "skip" });
+    await cloudObjects.resolveUploadDirectoryConflict({ ...args, decision: "overwrite", applyToRemaining: true });
+    await cloudObjects.cancelUploadDirectory(args);
+    await cloudObjects.releaseUploadDirectory(args);
+    expect(invoke.mock.calls).toEqual([
+      ["cloud_object_select_upload_directory", { connectionId: "c", prefix: "target/" }],
+      ["cloud_object_start_upload_directory", { connectionId: "c", batchId: "batch", conflictPolicy: "ask" }],
+      ["cloud_object_status_upload_directory", { connectionId: "c", batchId: "batch" }],
+      ["cloud_object_page_upload_directory", { connectionId: "c", batchId: "batch", cursor: null, limit: 100 }],
+      ["cloud_object_page_upload_directory", { connectionId: "c", batchId: "batch", directoryToken: "dir", cursor: "next", limit: 128 }],
+      ["cloud_object_resolve_upload_directory_conflict", { connectionId: "c", batchId: "batch", conflictId: "conflict-a", decision: "skip", applyToRemaining: false }],
+      ["cloud_object_resolve_upload_directory_conflict", { connectionId: "c", batchId: "batch", conflictId: "conflict-a", decision: "overwrite", applyToRemaining: true }],
+      ["cloud_object_cancel_upload_directory", { connectionId: "c", batchId: "batch" }],
+      ["cloud_object_release_upload_directory", { connectionId: "c", batchId: "batch" }],
+    ]);
+    expect(cloudObjects.uploadDirectoryItem).toBeUndefined();
   });
 
   it("filters SaveS3Input fields and preserves explicit null id", () => {

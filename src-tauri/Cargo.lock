@@ -3596,6 +3596,8 @@ dependencies = [
  "landlock",
  "log",
  "object_store",
+ "peerdav-protocol-peerdav",
+ "peerdav-protocol-s3",
  "percent-encoding",
  "rand 0.8.8",
  "rcgen",
@@ -3621,9 +3623,60 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "url",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "peerdav-file-core"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-util",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "peerdav-protocol-peerdav"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "hex",
+ "peerdav-file-core",
+ "percent-encoding",
+ "reqwest",
+ "reqwest_dav",
+ "sha2",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "peerdav-protocol-s3"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "futures-util",
+ "hex",
+ "object_store",
+ "peerdav-file-core",
+ "rand 0.8.8",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
+ "url",
 ]
 
 [[package]]
@@ -5571,6 +5624,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

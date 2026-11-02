@@ -8,6 +8,7 @@ mod crypto;
 mod db;
 mod discovery;
 mod error;
+pub mod file_manager;
 mod fs;
 mod ignore_rules;
 mod keyfile;
@@ -16,6 +17,9 @@ mod logging;
 mod machine;
 pub mod paths;
 mod peer;
+mod local_upload;
+mod local_upload_types;
+mod peer_upload_types;
 mod policy;
 mod server;
 pub mod sync;
@@ -273,6 +277,13 @@ pub fn run() {
                     commands::open_local_file,
                     commands::reveal_local_file,
                     commands::reveal_local_directory,
+                    peer::upload_batches::peer_select_upload_batch,
+                    peer::upload_batches::peer_start_upload_batch,
+                    peer::upload_batches::peer_status_upload_batch,
+                    peer::upload_batches::peer_page_upload_batch,
+                    peer::upload_batches::peer_resolve_upload_batch,
+                    peer::upload_batches::peer_cancel_upload_batch,
+                    peer::upload_batches::peer_release_upload_batch,
                     commands::collect_upload_paths,
                     commands::begin_peer_upload,
                     commands::cancel_peer_upload,
@@ -310,6 +321,13 @@ pub fn run() {
                     cloud::object_commands::cloud_object_register_physical_identity,
                     cloud::object_commands::cloud_object_select_local,
                     cloud::object_commands::cloud_object_upload,
+                    cloud::object_commands::cloud_object_select_upload_directory,
+                    cloud::object_commands::cloud_object_start_upload_directory,
+                    cloud::object_commands::cloud_object_status_upload_directory,
+                    cloud::object_commands::cloud_object_page_upload_directory,
+                    cloud::object_commands::cloud_object_resolve_upload_directory_conflict,
+                    cloud::object_commands::cloud_object_cancel_upload_directory,
+                    cloud::object_commands::cloud_object_release_upload_directory,
                     cloud::object_commands::cloud_object_download,
                     cloud::object_commands::cloud_object_download_batch,
                     cloud::object_commands::cloud_object_delete_plan,
@@ -342,9 +360,13 @@ pub fn run() {
                             .state::<cloud::runtime_types::SharedCloud>()
                             .0
                             .clone();
+                        let peers = Arc::clone(app_handle.state::<commands::SharedPeers>().inner());
                         let task = tauri::async_runtime::spawn(async move {
                             use futures_util::FutureExt;
-                            let stopped = std::panic::AssertUnwindSafe(cloud.stop_and_clear())
+                            let stopped = std::panic::AssertUnwindSafe(async {
+                                peers.stop_upload_batches(None).await?;
+                                cloud.stop_and_clear().await
+                            })
                                 .catch_unwind()
                                 .await;
                             match stopped {

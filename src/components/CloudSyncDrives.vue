@@ -12,6 +12,8 @@ const props = defineProps({ connectionId: { type: String, required: true }, focu
 const emit = defineEmits(["changed"]);
 const app = useAppContext();
 const data = ref({ repositories: [], appendRepositories: [], mappings: [], statuses: [] });
+const createDialogOpen = ref(false);
+function closeCreateDialog() { if (busy.value) return; createDialogOpen.value = false; resetNewDrive(); }
 const mode = ref("encrypted");
 const newDrive = ref({ localRoot: "", logicalPath: "", password: "", confirmation: "" });
 const password = ref("");
@@ -60,7 +62,7 @@ async function run(operation) {
   finally { if (!disposed && scope === generation) busy.value = false; }
 }
 watch(() => props.connectionId, () => {
-  generation++; busy.value = false; resetSecrets(); resetNewDrive(); candidates.value = []; selectedCandidateKey.value = "";
+  generation++; busy.value = false; createDialogOpen.value = false; resetSecrets(); resetNewDrive(); candidates.value = []; selectedCandidateKey.value = "";
   mapping.value = { ...blankMapping(), connectionId: props.connectionId }; editingMappingId.value = null; mappingEditorOpen.value = false;
   preview.value = null; recovery.value = []; state.value = "idle";
   void run((scope) => refresh(scope));
@@ -83,7 +85,7 @@ async function create() {
       bindingError = error;
     }
     if (scope !== generation || disposed) return;
-    resetNewDrive(); await refresh(scope);
+    resetNewDrive(); createDialogOpen.value = false; await refresh(scope);
     if (scope !== generation || disposed) return;
     emit("changed");
     if (bindingError) throw bindingError;
@@ -167,8 +169,11 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
     <h3>{{ t('drive.manage') }}</h3><p class="hint">{{ t('cloud.safetyHint') }}</p>
 
     <!-- 主流程：一条路径完成「建盘 + 绑定首个本地文件夹」，其余收进高级。 -->
-    <div class="drive-create">
-      <h4>{{ t('drive.createTitle') }}</h4>
+    <el-button class="open-create-drive" type="primary" :disabled="busy" @click="createDialogOpen = true">{{ t('drive.createTitle') }}</el-button>
+    <p class="append-state" role="status">{{ t(`drive.${state}`) }}</p>
+    <el-dialog :model-value="createDialogOpen" @update:model-value="closeCreateDialog" :title="t('drive.createTitle')" width="560" align-center
+      :show-close="!busy" :close-on-click-modal="false" :close-on-press-escape="!busy" data-test="create-drive-dialog">
+    <form class="drive-create" @submit.prevent="create">
       <label class="settings-row"><span>{{ t('drive.localFolder') }}</span>
         <el-input v-model="newDrive.localRoot" class="new-drive-local" :placeholder="t('drive.chooseFolderHint')" :disabled="busy" />
         <el-button class="choose-new-root" :disabled="busy" @click="chooseNewRoot">{{ t('cloud.choose') }}</el-button>
@@ -183,14 +188,17 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
         <el-input v-model="newDrive.confirmation" class="append-confirmation" type="password" autocomplete="new-password" :disabled="busy" />
       </label>
       <p class="hint">{{ t('drive.passwordHint') }}</p>
-      <el-button class="append-create" type="primary" :disabled="!canCreate" @click="create">{{ t('drive.createAndBind') }}</el-button>
-      <p class="append-state" role="status">{{ t(`drive.${state}`) }}</p>
       <details class="create-advanced">
         <summary>{{ t('drive.createAdvanced') }}</summary>
         <label class="settings-row"><span>{{ t('cloudAppend.mode') }}</span><el-select v-model="mode" class="append-mode" :disabled="busy"><el-option value="encrypted" :label="t('cloud.encrypted')" /><el-option value="authenticated_plain" :label="t('cloudAppend.plain')" /></el-select></label>
         <p>{{ t(mode === 'encrypted' ? 'cloudAppend.encryptedHint' : 'cloudAppend.plainHint') }}</p>
       </details>
-    </div>
+    </form>
+    <template #footer>
+      <el-button class="cancel-create-drive" :disabled="busy" @click="closeCreateDialog">{{ t('common.cancel') }}</el-button>
+      <el-button class="append-create" type="primary" :disabled="!canCreate" :loading="busy" @click="create">{{ t('drive.createAndBind') }}</el-button>
+    </template>
+    </el-dialog>
 
     <!-- 高级：连接别人已经建好的同步盘。默认收起，避免干扰主流程。 -->
     <details class="drive-connect">

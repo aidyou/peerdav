@@ -10,7 +10,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openDialog }));
 vi.mock("element-plus/es", async () => {
   const { defineComponent, h } = await import("vue");
   const control = (tag) => defineComponent({ props: ["modelValue", "type", "value", "label"], emits: ["update:modelValue"], setup(p, { emit, slots, attrs }) { return () => h(tag, { ...attrs, type: p.type, value: tag === "option" ? p.value : p.modelValue, checked: p.modelValue === true, onInput: (e) => emit("update:modelValue", e.target.value), onChange: (e) => emit("update:modelValue", e.target.type === "checkbox" ? e.target.checked : e.target.value) }, tag === "input" ? undefined : tag === "option" ? p.label : tag === "select" ? [h("option", { value: "" }, "Select"), slots.default?.()] : slots.default?.()); } });
-  return { ElInput: control("input"), ElSelect: control("select"), ElOption: control("option"), ElButton: control("button"), ElSwitch: defineComponent({ props: ["modelValue"], emits: ["update:modelValue"], setup(p, { emit, attrs }) { return () => h("input", { ...attrs, type: "checkbox", checked: p.modelValue, onChange: (e) => emit("update:modelValue", e.target.checked) }); } }) };
+  return { ElDialog: defineComponent({ props: ['modelValue'], setup(p, { slots, attrs }) { return () => p.modelValue ? h('section', attrs, [slots.default?.(), slots.footer?.()]) : null; } }), ElInput: control("input"), ElSelect: control("select"), ElOption: control("option"), ElButton: control("button"), ElSwitch: defineComponent({ props: ["modelValue"], emits: ["update:modelValue"], setup(p, { emit, attrs }) { return () => h("input", { ...attrs, type: "checkbox", checked: p.modelValue, onChange: (e) => emit("update:modelValue", e.target.checked) }); } }) };
 });
 import CloudSettings from "../components/CloudSyncDrives.vue";
 import { cloud } from "../lib/cloud";
@@ -32,12 +32,29 @@ beforeEach(() => {
   nativeInvoke.mockImplementation(async (command) => command === "cloud_list" ? structuredClone(rows) : command === "cloud_append_discover" ? [anchor("one"), anchor("two", "authenticated_plain")] : command === "cloud_create_sync_drive" ? { connectionId: "c1", protocol: "append_v2", binding: { repoId: "new-repo" } } : {});
 });
 const changed = vi.fn();
-async function mountSettings() { const w = mount(CloudSettings, { props: { connectionId: "c1", onChanged: changed }, global: { stubs: { ElInput: input, ElSelect: select, ElOption: option, ElSwitch: toggle, ElButton: button } } }); await flushPromises(); return w; }
+const dialog = defineComponent({ props: ['modelValue'], setup(p, { slots, attrs }) { return () => p.modelValue ? h('section', attrs, [slots.default?.(), slots.footer?.()]) : null; } });
+async function mountSettings() { const w = mount(CloudSettings, { props: { connectionId: "c1", onChanged: changed }, global: { stubs: { ElDialog: dialog, ElInput: input, ElSelect: select, ElOption: option, ElSwitch: toggle, ElButton: button } } }); await flushPromises(); await w.find('.open-create-drive').trigger('click'); return w; }
 async function appendSettings() { const w = await mountSettings(); await w.find('.drive-connect').trigger('click'); return w; }
 async function fillPasswords(w) { await w.find(".append-password").setValue("password-123"); await w.find(".append-confirmation").setValue("password-123"); const join = w.find(".append-join-password"); if (join.exists()) await join.setValue("password-123"); }
 const saveMappingButton = (w) => w.findAll("button").filter((b) => b.text() === "Save").at(-1);
 
 describe("append settings through unified invoke", () => {
+  it('cancels the creation dialog without submitting and clears sensitive inputs', async () => {
+    const w = await mountSettings(); await w.find('.new-drive-local').setValue('/local'); await fillPasswords(w);
+    await w.find('.cancel-create-drive').trigger('click');
+    expect(w.find('[data-test=create-drive-dialog]').exists()).toBe(false);
+    expect(nativeInvoke.mock.calls.some(([c]) => c === 'cloud_create_sync_drive')).toBe(false);
+    await w.find('.open-create-drive').trigger('click'); expect(w.find('.append-password').element.value).toBe(''); w.unmount();
+  });
+  it('submits once while creation is pending and closes after successful binding', async () => {
+    const w = await mountSettings(); await w.find('.new-drive-local').setValue('/local'); await fillPasswords(w);
+    let finish; nativeInvoke.mockImplementation((c) => c === 'cloud_create_sync_drive' ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve(c === 'cloud_list' ? rows : {}));
+    await w.find('.append-create').trigger('click'); await w.find('form').trigger('submit');
+    expect(nativeInvoke.mock.calls.filter(([c]) => c === 'cloud_create_sync_drive')).toHaveLength(1);
+    expect(w.find('.cancel-create-drive').attributes('disabled')).toBeDefined();
+    finish({ binding: { repoId: 'created' } }); await flushPromises();
+    expect(w.find('[data-test=create-drive-dialog]').exists()).toBe(false); w.unmount();
+  });
   it("hides protocol controls and scopes existing drives to the open connection", async () => {
     rows.repositories.push({ id: "other", connectionId: "other", name: "Other drive" });
     const w = await mountSettings(); expect(w.find(".repository-protocol").exists()).toBe(false); expect(w.find(".mapping-protocol").exists()).toBe(false);
@@ -64,7 +81,7 @@ describe("append settings through unified invoke", () => {
     expect(app.handleFailure.mock.calls).toEqual([]);
     expect(w.find('.append-state').text()).toBe('Sync drive saved.');
     expect(changed).toHaveBeenCalledTimes(1);
-    expect(w.find(".append-password").element.value).toBe(""); expect(nativeInvoke.mock.calls.some(([c]) => c === "cloud_test_connection")).toBe(false); w.unmount();
+    expect(w.find('[data-test=create-drive-dialog]').exists()).toBe(false); expect(nativeInvoke.mock.calls.some(([c]) => c === "cloud_test_connection")).toBe(false); w.unmount();
   });
   it("requires explicit candidate selection and TOFU, resets trust when candidate changes", async () => {
     const w = await appendSettings(); await fillPasswords(w); await w.find(".append-discover").trigger("click"); await flushPromises();

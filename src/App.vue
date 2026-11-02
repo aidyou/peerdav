@@ -173,6 +173,7 @@ function setError(key, params) {
 }
 
 function setRawError(error) {
+  if (errorStrategy(error) === "ignore") return;
   // 锁屏本身已提示解锁，包含刷新后尚未恢复会话状态的阶段。
   if (errorStrategy(error) === "interface-lock") {
     interfaceLocked.value = true;

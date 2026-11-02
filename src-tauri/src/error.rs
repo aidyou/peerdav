@@ -177,6 +177,13 @@ pub enum DomainError {
         detail: String,
     },
 
+    #[error("peer file operation `{operation}` failed")]
+    PeerFile {
+        operation: &'static str,
+        #[source]
+        source: peerdav_protocol_peerdav::peerdav_file_core::FileError,
+    },
+
     #[error("remote file `{path}` was not found")]
     RemoteNotFound { path: String },
 
@@ -357,6 +364,15 @@ fn error_code(error: &DomainError) -> &'static str {
         {
             "PEER_IDENTITY_MISMATCH"
         }
+        DomainError::PeerFile { source, .. } => match source.kind {
+            peerdav_protocol_peerdav::peerdav_file_core::FileErrorKind::InvalidInput => "PEER_INVALID_PATH",
+            peerdav_protocol_peerdav::peerdav_file_core::FileErrorKind::NotFound => "PEER_REMOTE_NOT_FOUND",
+            peerdav_protocol_peerdav::peerdav_file_core::FileErrorKind::PermissionDenied if source.status == Some(401) => "PEER_AUTHORIZATION_REJECTED",
+            peerdav_protocol_peerdav::peerdav_file_core::FileErrorKind::Provider if source.status.is_none() => "PEER_PROTOCOL_ERROR",
+            peerdav_protocol_peerdav::peerdav_file_core::FileErrorKind::BudgetExceeded => "TRANSFER_TOO_LARGE",
+            peerdav_protocol_peerdav::peerdav_file_core::FileErrorKind::Transport if error_chain(source).contains("server identity does not match the paired fingerprint") => "PEER_IDENTITY_MISMATCH",
+            _ => "PEER_REQUEST_FAILED",
+        },
         DomainError::PeerRequest { .. } => "PEER_REQUEST_FAILED",
         DomainError::RemoteNotFound { .. } => "PEER_REMOTE_NOT_FOUND",
         DomainError::PeerNotFound { .. } => "PEER_NOT_FOUND",
@@ -708,6 +724,7 @@ pub(crate) fn visible_reason(detail: &str) -> String {
 
 fn frontend_reason(error: &DomainError) -> Option<String> {
     match error {
+        DomainError::PeerFile { source, .. } => std::error::Error::source(source).map(error_chain),
         DomainError::Database { source, .. } | DomainError::DatabaseOpen { source, .. } => {
             Some(source.to_string())
         }
@@ -936,6 +953,10 @@ fn error_reason(error: &DomainError) -> String {
         DomainError::PeerNotFound { .. } => {
             "未找到已保存的服务器 / The saved server was not found.".to_owned()
         }
+        DomainError::PeerFile { source, .. } => {
+            let reason = std::error::Error::source(source).map(error_chain).unwrap_or_else(|| source.to_string());
+            failure("访问远程文件失败", "Remote file operation failed", &reason)
+        }
         DomainError::PeerProtocol { detail } => failure("处理服务器响应失败", "Server response processing failed", detail),
         DomainError::RemotePathInvalid { detail } => failure("访问远程路径失败", "Remote path access failed", detail),
         DomainError::TransferCanceled => {
@@ -1058,6 +1079,10 @@ fn error_context(error: &DomainError) -> Option<Value> {
                 "multipartUploadIdKnown": false
             }))
         }
+        DomainError::PeerFile { operation, source } => Some(json!({
+            "operation": operation, "status": source.status,
+            "outcome": format!("{:?}", source.outcome), "kind": format!("{:?}", source.kind)
+        })),
         DomainError::DatabaseOpen { path, .. } => Some(json!({ "path": path })),
         DomainError::Io {
             path: Some(path), ..
@@ -1122,6 +1147,19 @@ mod tests {
                 .is_some_and(|detail| detail.contains("HTTP 403"))
         );
         assert_eq!(error.context, Some(json!({ "peerIp": "10.126.0.7" })));
+    }
+
+    #[test]
+    fn protocol_file_errors_preserve_stable_codes_status_and_source() {
+        let source = peerdav_protocol_peerdav::status_error(reqwest::StatusCode::NOT_FOUND,
+            peerdav_protocol_peerdav::peerdav_file_core::Operation::Stat);
+        let error = AppError::from(DomainError::PeerFile { operation: "stat", source });
+        assert_eq!(error.code, "PEER_REMOTE_NOT_FOUND");
+        assert_eq!(error.context.as_ref().and_then(|v| v.get("status")), Some(&json!(404)));
+        assert!(error.detail.as_deref().is_some_and(|v| v.contains("404 Not Found")));
+        let source = peerdav_protocol_peerdav::normalize_display_path("/../a").unwrap_err();
+        let error = AppError::from(DomainError::PeerFile { operation: "path", source });
+        assert_eq!(error.code, "PEER_INVALID_PATH");
     }
 
     #[test]

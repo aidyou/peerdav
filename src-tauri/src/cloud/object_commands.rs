@@ -1,3 +1,4 @@
+use super::directory_types::*;
 use super::{object_runtime_types::*, runtime_types::SharedCloud};
 use crate::{AppError, DomainError};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
@@ -27,10 +28,7 @@ pub async fn cloud_object_list(
     next: Option<String>,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<ObjectPageDto, AppError> {
-    cloud
-        .0
-        .object_list(&connection_id, &prefix, next.as_deref())
-        .await
+    crate::file_manager::cloud_list(&cloud.0, &connection_id, &prefix, next.as_deref()).await
 }
 #[tauri::command]
 pub async fn cloud_object_preview(
@@ -38,7 +36,7 @@ pub async fn cloud_object_preview(
     key: String,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<crate::types::PreviewPayload, AppError> {
-    cloud.0.object_preview(&connection_id, &key).await
+    crate::file_manager::cloud_preview(&cloud.0, &connection_id, &key).await
 }
 
 #[tauri::command]
@@ -127,6 +125,115 @@ pub async fn cloud_object_select_local(
         .object_grant_selected(&connection_id, revision, &path, upload)
         .await
 }
+#[tauri::command]
+pub async fn cloud_object_select_upload_directory(
+    app: tauri::AppHandle,
+    connection_id: String,
+    prefix: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<Option<ObjectUploadDirectoryDto>, AppError> {
+    let (revision, _) = cloud.0.object_selection_scope(&connection_id).await?;
+    let selected = tokio::task::spawn_blocking(move || app.dialog().file().blocking_pick_folder())
+        .await
+        .map_err(task_error)?;
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let path = selected.into_path().map_err(|_| {
+        AppError::from(DomainError::from(
+            super::ObjectServiceError::InvalidLocalCapability,
+        ))
+    })?;
+    cloud
+        .0
+        .object_select_upload_directory(&connection_id, revision, prefix, &path)
+        .await
+        .map(Some)
+}
+#[tauri::command]
+pub async fn cloud_object_start_upload_directory(
+    connection_id: String,
+    batch_id: String,
+    conflict_policy: Option<DirectoryConflictPolicy>,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<ObjectUploadDirectoryDto, AppError> {
+    cloud
+        .0
+        .object_start_upload_directory(
+            &connection_id,
+            &batch_id,
+            conflict_policy.unwrap_or_default(),
+        )
+        .await
+}
+#[tauri::command]
+pub async fn cloud_object_status_upload_directory(
+    connection_id: String,
+    batch_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<ObjectUploadDirectoryDto, AppError> {
+    cloud
+        .0
+        .object_status_upload_directory(&connection_id, &batch_id)
+        .await
+}
+#[tauri::command]
+pub async fn cloud_object_page_upload_directory(
+    connection_id: String,
+    batch_id: String,
+    directory_token: Option<String>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<DirectoryPageDto, AppError> {
+    cloud
+        .0
+        .object_page_upload_directory(&connection_id, &batch_id, directory_token, cursor, limit)
+        .await
+}
+#[tauri::command]
+pub async fn cloud_object_resolve_upload_directory_conflict(
+    connection_id: String,
+    batch_id: String,
+    conflict_id: String,
+    decision: DirectoryConflictPolicy,
+    apply_to_remaining: bool,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<(), AppError> {
+    cloud
+        .0
+        .object_resolve_upload_directory_conflict(
+            &connection_id,
+            &batch_id,
+            &conflict_id,
+            decision,
+            apply_to_remaining,
+        )
+        .await
+}
+#[tauri::command]
+pub async fn cloud_object_cancel_upload_directory(
+    connection_id: String,
+    batch_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<(), AppError> {
+    cloud
+        .0
+        .object_cancel_upload_directory(&connection_id, &batch_id)
+        .await
+}
+#[tauri::command]
+pub async fn cloud_object_release_upload_directory(
+    connection_id: String,
+    batch_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<(), AppError> {
+    cloud
+        .0
+        .object_release_upload_directory(&connection_id, &batch_id)
+        .await
+}
+
 #[tauri::command]
 pub async fn cloud_object_upload(
     connection_id: String,

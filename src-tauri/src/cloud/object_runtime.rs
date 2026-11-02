@@ -25,7 +25,7 @@ fn local(error: std::io::Error) -> AppError {
 fn state_error() -> AppError {
     app(ObjectServiceError::InvalidLocalCapability)
 }
-fn random_id() -> Result<String, AppError> {
+pub(crate) fn random_id() -> Result<String, AppError> {
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng
         .try_fill_bytes(&mut bytes)
@@ -75,8 +75,16 @@ mod tests {
         stats: AtomicUsize,
         mutations: AtomicUsize,
         probes: AtomicUsize,
+        deleted_keys: tokio::sync::Mutex<Vec<String>>,
+        listed_prefixes: tokio::sync::Mutex<Vec<String>>,
+        extra_objects: tokio::sync::Mutex<Vec<String>>,
         behavior: AtomicUsize,
         preview_chunks: Arc<AtomicUsize>,
+        stat_started: tokio::sync::Notify,
+        stat_release: tokio::sync::Notify,
+        upload_cleanup_started: tokio::sync::Notify,
+        upload_cleanup_release: tokio::sync::Notify,
+        upload_cleanups: AtomicUsize,
         /// Simulates the store the runtime binds after a bucket switch.
         bucket: std::sync::Mutex<String>,
     }
@@ -107,6 +115,7 @@ mod tests {
         ) -> BoxFuture<'a, Result<ObjectPage, CloudError>> {
             Box::pin(async move {
                 self.reads.fetch_add(1, Ordering::SeqCst);
+                self.listed_prefixes.lock().await.push(prefix.to_owned());
                 if self.behavior.load(Ordering::SeqCst) == 3 {
                     return Ok(ObjectPage {
                         objects: Vec::new(),
@@ -126,16 +135,14 @@ mod tests {
                         })
                     };
                 }
+                // S3 LIST uses a lexical prefix, including any trailing slash.
+                let mut keys = vec!["data/file".to_owned(), "docs/a".to_owned(),
+                    "docs/nested/b".to_owned(), "docs-sibling/keep".to_owned()];
+                keys.extend(self.extra_objects.lock().await.iter().cloned());
                 Ok(ObjectPage {
-                    objects: if prefix == "data" {
-                        vec![ObjectMetadata {
-                            key: "data/file".into(),
-                            size: 1,
-                            etag: Some("etag".into()),
-                        }]
-                    } else {
-                        Vec::new()
-                    },
+                    objects: keys.into_iter().filter(|key| key.starts_with(prefix))
+                        .map(|key| ObjectMetadata { key, size: 1, etag: Some("etag".into()) })
+                        .collect(),
                     next_token: None,
                 })
             })
@@ -144,6 +151,10 @@ mod tests {
             Box::pin(async move {
                 self.stats.fetch_add(1, Ordering::SeqCst);
                 self.reads.fetch_add(1, Ordering::SeqCst);
+                if self.behavior.load(Ordering::SeqCst) == 7 {
+                    self.stat_started.notify_one();
+                    self.stat_release.notified().await;
+                }
                 let preview_size = match key {
                     "preview/small.md" => Some(6),
                     "preview/large.bin" => Some(crate::types::MAX_PREVIEW_BYTES + 1),
@@ -158,11 +169,17 @@ mod tests {
                         etag: None,
                     });
                 }
-                if key == "data/file" {
+                if matches!(key, "data/file" | "docs/a" | "docs/nested/b")
+                    || (self.behavior.load(Ordering::SeqCst) == 8 && key.starts_with("data/"))
+                {
                     Ok(ObjectMetadata {
                         key: key.into(),
                         size: 1,
-                        etag: Some("etag".into()),
+                        etag: match self.behavior.load(Ordering::SeqCst) {
+                            5 => Some("changed".into()),
+                            6 => None,
+                            _ => Some("etag".into()),
+                        },
                     })
                 } else {
                     Err(CloudError::NotFound)
@@ -212,8 +229,9 @@ mod tests {
                 })
             })
         }
-        fn delete<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), CloudError>> {
+        fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), CloudError>> {
             Box::pin(async move {
+                self.deleted_keys.lock().await.push(key.to_owned());
                 self.mutations.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
@@ -234,9 +252,17 @@ mod tests {
                         },
                     });
                 }
-                if self.behavior.load(Ordering::SeqCst) == 2 {
+                if matches!(self.behavior.load(Ordering::SeqCst), 2 | 9 | 10) {
                     while !cancel.load(Ordering::Acquire) {
                         tokio::task::yield_now().await;
+                    }
+                    if self.behavior.load(Ordering::SeqCst) == 10 {
+                        futures_util::future::pending::<()>().await;
+                    }
+                    if self.behavior.load(Ordering::SeqCst) == 9 {
+                        self.upload_cleanup_started.notify_one();
+                        self.upload_cleanup_release.notified().await;
+                        self.upload_cleanups.fetch_add(1, Ordering::SeqCst);
                     }
                     return Err(CloudError::UploadCancelled);
                 }
@@ -326,6 +352,742 @@ mod tests {
         f.runtime.object_discover("connection", "").await?;
         Ok(())
     }
+    async fn directory_settled(
+        f: &Fixture,
+        id: &str,
+    ) -> Result<super::super::directory_types::ObjectUploadDirectoryDto, TestError> {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let status = f
+                    .runtime
+                    .object_status_upload_directory("connection", id)
+                    .await?;
+                if matches!(status.phase.as_str(), "completed" | "cancelled" | "failed") {
+                    return Ok(status);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?
+    }
+    async fn directory_conflict(
+        f: &Fixture,
+        id: &str,
+    ) -> Result<super::super::directory_types::DirectoryConflictDto, TestError> {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let status = f
+                    .runtime
+                    .object_status_upload_directory("connection", id)
+                    .await?;
+                if let Some(conflict) = status.conflict {
+                    return Ok::<_, AppError>(conflict);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?
+        .map_err(Into::into)
+    }
+    #[tokio::test]
+    async fn streaming_directory_conflict_replay_cannot_resolve_next_conflict()
+    -> Result<(), TestError> {
+        use super::super::directory_types::DirectoryConflictPolicy as Policy;
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let root = f._dir.path().join("data");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("first"), b"x")?;
+        std::fs::write(root.join("second"), b"x")?;
+        f.store.behavior.store(8, Ordering::SeqCst);
+        let selected = f
+            .runtime
+            .object_select_upload_directory("connection", 1, "".into(), &root)
+            .await?;
+        f.runtime
+            .object_start_upload_directory("connection", &selected.batch_id, Policy::Ask)
+            .await?;
+        let first = directory_conflict(&f, &selected.batch_id).await?;
+        assert!(!first.conflict_id.is_empty());
+        f.runtime
+            .object_resolve_upload_directory_conflict(
+                "connection",
+                &selected.batch_id,
+                &first.conflict_id,
+                Policy::Skip,
+                false,
+            )
+            .await?;
+        let second = directory_conflict(&f, &selected.batch_id).await?;
+        assert_ne!(first.conflict_id, second.conflict_id);
+        assert_ne!(first.key, second.key);
+        assert!(
+            f.runtime
+                .object_resolve_upload_directory_conflict(
+                    "connection",
+                    &selected.batch_id,
+                    &first.conflict_id,
+                    Policy::Overwrite,
+                    true
+                )
+                .await
+                .is_err()
+        );
+        let unchanged = f
+            .runtime
+            .object_status_upload_directory("connection", &selected.batch_id)
+            .await?;
+        assert_eq!(unchanged.phase, "conflict");
+        assert_eq!(
+            unchanged.conflict.as_ref().map(|c| &c.conflict_id),
+            Some(&second.conflict_id)
+        );
+        assert_eq!(unchanged.skipped_files, 1);
+        assert_eq!(f.store.mutations.load(Ordering::SeqCst), 0);
+        assert!(
+            f.runtime.objects.lock().await.upload_directories[&selected.batch_id]
+                .resolution
+                .is_none()
+        );
+        f.runtime
+            .object_resolve_upload_directory_conflict(
+                "connection",
+                &selected.batch_id,
+                &second.conflict_id,
+                Policy::Skip,
+                false,
+            )
+            .await?;
+        let done = directory_settled(&f, &selected.batch_id).await?;
+        assert_eq!(done.phase, "completed");
+        assert_eq!(done.skipped_files, 2);
+        assert_eq!(done.completed_files, 0);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn streaming_directory_cancel_preserves_upload_cleanup() -> Result<(), TestError> {
+        use super::super::directory_types::DirectoryConflictPolicy as Policy;
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let root = f._dir.path().join("cleanup");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("first"), b"x")?;
+        std::fs::write(root.join("second"), b"x")?;
+        f.store.behavior.store(9, Ordering::SeqCst);
+        let selected = f
+            .runtime
+            .object_select_upload_directory("connection", 1, "".into(), &root)
+            .await?;
+        f.runtime
+            .object_start_upload_directory("connection", &selected.batch_id, Policy::Overwrite)
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while f.store.mutations.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let cleanup = async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                f.store.upload_cleanup_started.notified(),
+            )
+            .await?;
+            // The lower-level upload must remain polled after observing cancellation.
+            tokio::task::yield_now().await;
+            f.store.upload_cleanup_release.notify_one();
+            Ok::<_, TestError>(())
+        };
+        let (stopped, cleaned) = tokio::join!(
+            f.runtime
+                .object_cancel_upload_directory("connection", &selected.batch_id),
+            cleanup
+        );
+        stopped?;
+        cleaned?;
+        let status = directory_settled(&f, &selected.batch_id).await?;
+        assert_eq!(status.phase, "cancelled");
+        assert!(!status.recovery_required);
+        assert_eq!(f.store.upload_cleanups.load(Ordering::SeqCst), 1);
+        assert_eq!(f.store.mutations.load(Ordering::SeqCst), 1);
+        // Directory preflight and the service's conditional-upload stat only;
+        // the second local file must never reach either stage.
+        assert_eq!(f.store.stats.load(Ordering::SeqCst), 2);
+        assert!(f.runtime.object_recovery_read()?.is_empty());
+        assert_eq!(f.events.0.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn streaming_directory_cancel_cleanup_timeout_retains_recovery() -> Result<(), TestError>
+    {
+        use super::super::directory_types::DirectoryConflictPolicy as Policy;
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let root = f._dir.path().join("timeout");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("file"), b"x")?;
+        f.store.behavior.store(10, Ordering::SeqCst);
+        let selected = f
+            .runtime
+            .object_select_upload_directory("connection", 1, "".into(), &root)
+            .await?;
+        f.runtime
+            .object_start_upload_directory("connection", &selected.batch_id, Policy::Overwrite)
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while f.store.mutations.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        f.runtime
+            .object_cancel_upload_directory("connection", &selected.batch_id)
+            .await?;
+        let status = directory_settled(&f, &selected.batch_id).await?;
+        assert_eq!(status.phase, "failed");
+        assert!(status.recovery_required);
+        assert_eq!(
+            status.error.as_ref().map(|e| e.code.as_str()),
+            Some("INTERNAL_ERROR")
+        );
+        assert_eq!(f.runtime.object_recovery_read()?.len(), 1);
+        assert_eq!(f.store.mutations.load(Ordering::SeqCst), 1);
+        assert_eq!(f.events.0.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn streaming_directory_cancel_during_stat_prevents_later_dispatch()
+    -> Result<(), TestError> {
+        use super::super::directory_types::DirectoryConflictPolicy as Policy;
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let root = f._dir.path().join("data");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("file"), b"x")?;
+        let selected = f
+            .runtime
+            .object_select_upload_directory("connection", 1, "".into(), &root)
+            .await?;
+        f.store.behavior.store(7, Ordering::SeqCst);
+        f.runtime
+            .object_start_upload_directory("connection", &selected.batch_id, Policy::Overwrite)
+            .await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            f.store.stat_started.notified(),
+        )
+        .await?;
+        let reads = f.store.reads.load(Ordering::SeqCst);
+        let (first, second) = tokio::join!(
+            f.runtime
+                .object_cancel_upload_directory("connection", &selected.batch_id),
+            f.runtime
+                .object_cancel_upload_directory("connection", &selected.batch_id),
+        );
+        first?;
+        second?;
+        f.store.stat_release.notify_one();
+        tokio::task::yield_now().await;
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), reads);
+        assert_eq!(f.store.mutations.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            directory_settled(&f, &selected.batch_id).await?.phase,
+            "cancelled"
+        );
+        assert!(
+            f.runtime.objects.lock().await.upload_directories[&selected.batch_id]
+                .handle
+                .is_none()
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn streaming_directory_conflict_accepts_only_one_pending_decision()
+    -> Result<(), TestError> {
+        use super::super::directory_types::DirectoryConflictPolicy as Policy;
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let root = f._dir.path().join("data");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("file"), b"x")?;
+        let selected = f
+            .runtime
+            .object_select_upload_directory("connection", 1, "".into(), &root)
+            .await?;
+        f.runtime
+            .object_start_upload_directory("connection", &selected.batch_id, Policy::Ask)
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if f.runtime
+                    .object_status_upload_directory("connection", &selected.batch_id)
+                    .await?
+                    .phase
+                    == "conflict"
+                {
+                    return Ok::<_, AppError>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        let conflict = directory_conflict(&f, &selected.batch_id).await?;
+        let (first, duplicate) = tokio::join!(
+            f.runtime.object_resolve_upload_directory_conflict(
+                "connection",
+                &selected.batch_id,
+                &conflict.conflict_id,
+                Policy::Skip,
+                false
+            ),
+            f.runtime.object_resolve_upload_directory_conflict(
+                "connection",
+                &selected.batch_id,
+                &conflict.conflict_id,
+                Policy::Overwrite,
+                false
+            ),
+        );
+        assert_ne!(first.is_ok(), duplicate.is_ok());
+        f.runtime
+            .object_cancel_upload_directory("connection", &selected.batch_id)
+            .await?;
+        assert!(
+            f.runtime
+                .object_resolve_upload_directory_conflict(
+                    "connection",
+                    &selected.batch_id,
+                    &conflict.conflict_id,
+                    Policy::Skip,
+                    false
+                )
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn streaming_directory_over_128_without_status_driving() -> Result<(), TestError> {
+        use super::super::directory_types::DirectoryConflictPolicy;
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let root = f._dir.path().join("many");
+        std::fs::create_dir(&root)?;
+        for n in 0..257 {
+            std::fs::write(root.join(format!("{n}")), b"x")?;
+        }
+        let reads_before_selection = f.store.reads.load(Ordering::SeqCst);
+        let selected = f
+            .runtime
+            .object_select_upload_directory("connection", 1, "dest/".into(), &root)
+            .await?;
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), reads_before_selection);
+        f.store.behavior.store(2, Ordering::SeqCst);
+        f.runtime
+            .object_start_upload_directory(
+                "connection",
+                &selected.batch_id,
+                DirectoryConflictPolicy::Overwrite,
+            )
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while f.store.mutations.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        // First stream is already running: no recursive pre-scan or per-file task registration.
+        {
+            let state = f.runtime.objects.lock().await;
+            assert!(state.tasks.is_empty());
+            assert_eq!(state.upload_directories.len(), 1);
+            assert_eq!(
+                state.upload_directories[&selected.batch_id]
+                    .status
+                    .completed_files,
+                0
+            );
+        }
+        f.runtime
+            .object_cancel_upload_directory("connection", &selected.batch_id)
+            .await?;
+        assert_eq!(
+            directory_settled(&f, &selected.batch_id).await?.phase,
+            "cancelled"
+        );
+        assert_eq!(f.events.0.load(Ordering::SeqCst), 0);
+        // The store confirms cancellation cleanup, so no unknown outcome remains.
+        assert!(
+            !directory_settled(&f, &selected.batch_id)
+                .await?
+                .recovery_required
+        );
+        assert!(f.runtime.object_recovery_read()?.is_empty());
+        f.runtime
+            .object_release_upload_directory("connection", &selected.batch_id)
+            .await?;
+        f.store.behavior.store(0, Ordering::SeqCst);
+        let selected = f
+            .runtime
+            .object_select_upload_directory("connection", 1, "dest/".into(), &root)
+            .await?;
+        f.runtime
+            .object_start_upload_directory(
+                "connection",
+                &selected.batch_id,
+                DirectoryConflictPolicy::Overwrite,
+            )
+            .await?;
+        // Await the owned job, not object_status: execution is independent of UI polling.
+        let handle = f
+            .runtime
+            .objects
+            .lock()
+            .await
+            .upload_directories
+            .get_mut(&selected.batch_id)
+            .ok_or("batch")?
+            .handle
+            .take()
+            .ok_or("handle")?;
+        tokio::time::timeout(std::time::Duration::from_secs(15), handle)
+            .await?
+            .map_err(|_| "directory worker join failed")?;
+        let status = f
+            .runtime
+            .object_status_upload_directory("connection", &selected.batch_id)
+            .await?;
+        assert_eq!(status.phase, "completed");
+        assert_eq!(status.completed_files, 257);
+        assert_eq!(status.completed_bytes, 257);
+        assert!(f.runtime.objects.lock().await.tasks.is_empty());
+        assert!(f.runtime.object_recovery_read()?.is_empty());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn streaming_directory_direct_pages_tokens_and_fixed_root() -> Result<(), TestError> {
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let root = f._dir.path().join("root");
+        std::fs::create_dir_all(root.join("nested"))?;
+        std::fs::write(root.join("nested/deep"), b"deep")?;
+        for n in 0..140 {
+            std::fs::write(root.join(format!("{n}")), b"x")?;
+        }
+        let selected = f
+            .runtime
+            .object_select_upload_directory("connection", 1, "".into(), &root)
+            .await?;
+        std::fs::rename(&root, f._dir.path().join("moved"))?;
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("replacement"), b"wrong")?;
+        let mut cursor = None;
+        let mut total = 0;
+        let mut nested = None;
+        loop {
+            let page = f
+                .runtime
+                .object_page_upload_directory(
+                    "connection",
+                    &selected.batch_id,
+                    None,
+                    cursor.clone(),
+                    Some(32),
+                )
+                .await?;
+            assert!(page.entries.len() <= 32);
+            for entry in &page.entries {
+                assert!(!entry.relative_path.ends_with("/deep"));
+                assert_ne!(entry.name, "replacement");
+                if entry.name == "nested" {
+                    nested = entry.directory_token.clone();
+                }
+            }
+            total += page.entries.len();
+            let expired = cursor;
+            cursor = page.next_cursor;
+            if let Some(expired) = expired {
+                assert_eq!(
+                    f.runtime
+                        .object_page_upload_directory(
+                            "connection",
+                            &selected.batch_id,
+                            None,
+                            Some(expired),
+                            None
+                        )
+                        .await
+                        .err()
+                        .ok_or("cursor")?
+                        .code,
+                    "CLOUD_DIRECTORY_CURSOR_RESET"
+                );
+            }
+            // Only current page directory tokens are retained; enter it immediately if present.
+            if let Some(token) = nested.take() {
+                let child = f
+                    .runtime
+                    .object_page_upload_directory(
+                        "connection",
+                        &selected.batch_id,
+                        Some(token),
+                        None,
+                        None,
+                    )
+                    .await?;
+                assert_eq!(child.entries.len(), 1);
+                assert_eq!(child.entries[0].name, "deep");
+                let back = f
+                    .runtime
+                    .object_page_upload_directory(
+                        "connection",
+                        &selected.batch_id,
+                        child.parent_token,
+                        None,
+                        Some(128),
+                    )
+                    .await?;
+                assert_eq!(back.entries.len(), 128);
+                if cursor.is_some() {
+                    assert!(
+                        f.runtime
+                            .object_page_upload_directory(
+                                "connection",
+                                &selected.batch_id,
+                                None,
+                                cursor.clone(),
+                                None
+                            )
+                            .await
+                            .is_err()
+                    );
+                }
+                break;
+            }
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(total > 0);
+        let other = f
+            .runtime
+            .object_select_upload_directory("connection", 1, "".into(), &root)
+            .await?;
+        let page = f
+            .runtime
+            .object_page_upload_directory("connection", &selected.batch_id, None, None, Some(1))
+            .await?;
+        assert!(
+            f.runtime
+                .object_page_upload_directory(
+                    "connection",
+                    &other.batch_id,
+                    Some(page.directory_token),
+                    page.next_cursor,
+                    None
+                )
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn streaming_directory_conflicts_and_unknown_stop() -> Result<(), TestError> {
+        use super::super::directory_types::DirectoryConflictPolicy as Policy;
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let root = f._dir.path().join("data");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("file"), b"x")?;
+        for decision in [Policy::Skip, Policy::Overwrite, Policy::Cancel] {
+            let selected = f
+                .runtime
+                .object_select_upload_directory("connection", 1, "".into(), &root)
+                .await?;
+            f.runtime
+                .object_start_upload_directory("connection", &selected.batch_id, Policy::Ask)
+                .await?;
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if f.runtime
+                        .object_status_upload_directory("connection", &selected.batch_id)
+                        .await?
+                        .phase
+                        == "conflict"
+                    {
+                        return Ok::<_, AppError>(());
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await??;
+            let conflict = directory_conflict(&f, &selected.batch_id).await?;
+            f.runtime
+                .object_resolve_upload_directory_conflict(
+                    "connection",
+                    &selected.batch_id,
+                    &conflict.conflict_id,
+                    decision,
+                    true,
+                )
+                .await?;
+            let status = directory_settled(&f, &selected.batch_id).await?;
+            if decision == Policy::Skip {
+                assert_eq!(status.skipped_files, 1);
+            }
+            if decision == Policy::Overwrite {
+                assert_eq!(status.completed_files, 1);
+            }
+            if decision == Policy::Cancel {
+                assert_eq!(status.phase, "cancelled");
+            }
+            f.runtime
+                .object_release_upload_directory("connection", &selected.batch_id)
+                .await?;
+        }
+        assert_eq!(f.events.0.load(Ordering::SeqCst), 0);
+        f.store.behavior.store(6, Ordering::SeqCst);
+        let selected = f
+            .runtime
+            .object_select_upload_directory("connection", 1, "".into(), &root)
+            .await?;
+        f.runtime
+            .object_start_upload_directory("connection", &selected.batch_id, Policy::Overwrite)
+            .await?;
+        assert_eq!(
+            directory_settled(&f, &selected.batch_id).await?.phase,
+            "failed"
+        );
+        assert_eq!(f.events.0.load(Ordering::SeqCst), 1);
+        f.runtime
+            .object_release_upload_directory("connection", &selected.batch_id)
+            .await?;
+        f.store.behavior.store(1, Ordering::SeqCst);
+        let selected = f
+            .runtime
+            .object_select_upload_directory("connection", 1, "".into(), &root)
+            .await?;
+        f.runtime
+            .object_start_upload_directory("connection", &selected.batch_id, Policy::Overwrite)
+            .await?;
+        let status = directory_settled(&f, &selected.batch_id).await?;
+        assert!(status.recovery_required);
+        assert_eq!(f.runtime.object_recovery_read()?.len(), 1);
+        assert_eq!(f.events.0.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn streaming_directory_invalidate_conflict_and_unsafe_entries() -> Result<(), TestError> {
+        use super::super::directory_types::DirectoryConflictPolicy as Policy;
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let root = f._dir.path().join("data");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("file"), b"x")?;
+        let selected = f
+            .runtime
+            .object_select_upload_directory("connection", 1, "".into(), &root)
+            .await?;
+        f.runtime
+            .object_start_upload_directory("connection", &selected.batch_id, Policy::Ask)
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if f.runtime
+                    .object_status_upload_directory("connection", &selected.batch_id)
+                    .await?
+                    .phase
+                    == "conflict"
+                {
+                    return Ok::<_, AppError>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        f.runtime.object_invalidate(Some("connection")).await?;
+        assert!(f.runtime.objects.lock().await.upload_directories.is_empty());
+        assert_eq!(f.events.0.load(Ordering::SeqCst), 0);
+        #[cfg(unix)]
+        {
+            let link = f._dir.path().join("link");
+            std::os::unix::fs::symlink(&root, &link)?;
+            assert!(
+                f.runtime
+                    .object_select_upload_directory("connection", 1, "".into(), &link)
+                    .await
+                    .is_err()
+            );
+            std::fs::remove_file(root.join("file"))?;
+            std::os::unix::fs::symlink("missing", root.join("symlink"))?;
+            std::fs::create_dir(root.join("empty"))?;
+            let selected = f
+                .runtime
+                .object_select_upload_directory("connection", 1, "".into(), &root)
+                .await?;
+            f.runtime
+                .object_start_upload_directory("connection", &selected.batch_id, Policy::Skip)
+                .await?;
+            let status = directory_settled(&f, &selected.batch_id).await?;
+            assert_eq!(status.skipped_symlinks, 1);
+            assert_eq!(status.skipped_empty_directories, 1);
+            f.runtime
+                .object_release_upload_directory("connection", &selected.batch_id)
+                .await?;
+            rustix::fs::mkfifoat(
+                &cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority())?,
+                "fifo",
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .map_err(std::io::Error::from)?;
+            let selected = f
+                .runtime
+                .object_select_upload_directory("connection", 1, "".into(), &root)
+                .await?;
+            f.runtime
+                .object_start_upload_directory("connection", &selected.batch_id, Policy::Skip)
+                .await?;
+            assert_eq!(
+                directory_settled(&f, &selected.batch_id).await?.phase,
+                "failed"
+            );
+        }
+        Ok(())
+    }
+    #[tokio::test]
+    async fn upload_directory_cancel_event_policy() -> Result<(), TestError> {
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let token = grant(&f).await?;
+        let task = f
+            .runtime
+            .object_upload("connection", &token, "target".into(), None, false)
+            .await?;
+        settled(&f, &task.transfer_id).await?;
+        f.runtime
+            .object_finish(
+                &task.transfer_id,
+                Err(app(ObjectServiceError::Cancelled)),
+                false,
+            )
+            .await;
+        let status = f
+            .runtime
+            .object_status()
+            .await?
+            .into_iter()
+            .find(|s| s.transfer_id == task.transfer_id)
+            .ok_or("task")?;
+        assert_eq!(status.phase, "cancelled");
+        assert_eq!(status.error.ok_or("error")?.code, "CLOUD_CANCELLED");
+        assert_eq!(f.events.0.load(Ordering::SeqCst), 0);
+        f.runtime
+            .object_finish(&task.transfer_id, Err(state_error()), false)
+            .await;
+        assert_eq!(f.events.0.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn bucket_selection_is_reused_by_later_lookups() -> Result<(), TestError> {
         let f = fixture().await?;
@@ -740,6 +1502,35 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn delete_folder_trailing_slash_snapshot_lifecycle() -> Result<(), TestError> {
+        let f = fixture().await?;
+        authorize(&f).await?;
+        f.store.listed_prefixes.lock().await.clear();
+        let plan = f.runtime.object_delete_plan("connection", "docs/").await?;
+        let keys: Vec<_> = plan.entries.iter().map(|entry| entry.key.clone()).collect();
+        assert_eq!(keys, vec!["docs/a", "docs/nested/b"]);
+        assert_eq!(plan.object_count, 2);
+        assert!(plan.entries.iter().all(|entry| entry.size == 1
+            && entry.etag.as_deref() == Some("etag") && !entry.protected));
+        assert_eq!(*f.store.listed_prefixes.lock().await, vec!["docs/"]);
+        assert_eq!(f.store.stats.load(Ordering::SeqCst), 0);
+        assert_eq!(f.store.mutations.load(Ordering::SeqCst), 0);
+        assert!(f.store.deleted_keys.lock().await.is_empty());
+        assert!(f.runtime.object_delete_execute("connection", &plan.plan_id, false).await.is_err());
+        assert_eq!(f.store.mutations.load(Ordering::SeqCst), 0);
+        // An object appearing after confirmation's snapshot must not be deleted.
+        f.store.extra_objects.lock().await.push("docs/new-after-plan".into());
+        let result = f.runtime.object_delete_execute("connection", &plan.plan_id, true).await?;
+        assert_eq!(result.deleted, keys);
+        assert!(result.failed.is_empty());
+        assert_eq!(*f.store.deleted_keys.lock().await, keys);
+        assert_eq!(*f.store.listed_prefixes.lock().await, vec!["docs/"]);
+        assert_eq!(f.runtime.object_delete_execute("connection", &plan.plan_id, true)
+            .await.err().ok_or("replay error")?.code, "CLOUD_DELETE_PLAN_STALE");
+        assert_eq!(f.store.mutations.load(Ordering::SeqCst), 2);
+        Ok(())
+    }
+    #[tokio::test]
     async fn delete_preview_uses_list_snapshot_without_stat() -> Result<(), TestError> {
         let f = fixture().await?;
         authorize(&f).await?;
@@ -959,7 +1750,9 @@ mod tests {
                 .windows(b"fake-secret".len())
                 .any(|w| w == b"fake-secret")
         );
-        assert!(f.events.0.load(Ordering::SeqCst) >= 2);
+        // Expected cancellation is audited in status, not globally reported;
+        // the unknown completion still emits its recovery error.
+        assert_eq!(f.events.0.load(Ordering::SeqCst), 1);
         f.runtime.stop_and_clear().await?;
         Ok(())
     }
@@ -1194,7 +1987,10 @@ impl CloudRuntime {
         Ok(())
     }
     /// Caller holds the shared network permit; credentials are loaded only after admission.
-    async fn object_session(&self, connection_id: &str) -> Result<Arc<ObjectSession>, AppError> {
+    pub(crate) async fn object_session(
+        &self,
+        connection_id: &str,
+    ) -> Result<Arc<ObjectSession>, AppError> {
         self.object_session_for(connection_id, None).await
     }
     /// Switch the active bucket for an open connection. The session is rebuilt
@@ -1315,12 +2111,20 @@ impl CloudRuntime {
             alias: String::new(),
         };
         // Deliberately no verify_capabilities, repository join, or encrypted tree reads.
+        let production_store = || -> Result<Arc<dyn ObjectStore>, AppError> {
+            let raw = Arc::new(super::S3Store::new(config).map_err(app)?);
+            let backend = peerdav_protocol_s3::CoreS3Backend::new(raw, connection.revision)
+                .map_err(|source| app(super::types::CloudError::Storage {
+                    source: object_store::Error::Generic { store: "file-core", source: Box::new(source) },
+                }))?;
+            Ok(Arc::new(peerdav_protocol_s3::CoreS3ReadBridge(backend)))
+        };
         #[cfg(not(test))]
-        let store: Arc<dyn ObjectStore> = Arc::new(super::S3Store::new(config).map_err(app)?);
+        let store = production_store()?;
         #[cfg(test)]
         let store: Arc<dyn ObjectStore> = match &state.backend {
             Some(backend) => Arc::clone(&backend.store),
-            None => Arc::new(super::S3Store::new(config).map_err(app)?),
+            None => production_store()?,
         };
         let service = Arc::new(
             ObjectService::try_new(
@@ -1683,6 +2487,8 @@ impl CloudRuntime {
         upload: bool,
     ) -> Result<ObjectLocalCapabilityDto, AppError> {
         self.object_admit()?;
+        // Serialize capability publication against credential invalidation.
+        let _lifecycle = self.object_lifecycle.lock().await;
         let _permit = self.network.read().await;
         let session = self.object_session(connection_id).await?;
         if session.revision != expected_revision {
@@ -1717,7 +2523,7 @@ impl CloudRuntime {
         let token = random_id()?;
         let mut state = self.objects.lock().await;
         state.prune();
-        if state.grants.len() >= 128 {
+        if state.local_handle_count() >= MAX_LOCAL_HANDLES {
             return Err(state_error());
         }
         state.grants.insert(
@@ -2138,11 +2944,15 @@ impl CloudRuntime {
                 self.object_report(error);
             }
             if let Some(error) = task.status.error.clone() {
-                self.object_report(error);
+                if error.code == "CLOUD_CANCELLED" {
+                    log::info!("object task cancelled: {error:?}");
+                } else {
+                    self.object_report(error);
+                }
             }
         }
     }
-    fn object_report(&self, error: AppError) {
+    pub(crate) fn object_report(&self, error: AppError) {
         log::error!("object task error: {error:?}");
         if let Err(source) = self.object_events.error(error) {
             log::error!("object error event failed: {source}");
@@ -2188,7 +2998,12 @@ impl CloudRuntime {
         }
         let mut statuses: Vec<_> = state.tasks.values().map(|t| t.status.clone()).collect();
         for status in self.object_recovery_read()? {
-            if !statuses.iter().any(|s| s.transfer_id == status.transfer_id) {
+            if !statuses.iter().any(|s| s.transfer_id == status.transfer_id)
+                && !state
+                    .upload_directories
+                    .get(&status.transfer_id)
+                    .is_some_and(|b| matches!(b.status.phase.as_str(), "running" | "conflict"))
+            {
                 statuses.push(status);
             }
         }
@@ -2199,6 +3014,19 @@ impl CloudRuntime {
         &self,
         connection_id: Option<&str>,
     ) -> Result<(), AppError> {
+        let batches: Vec<_> = {
+            let state = self.objects.lock().await;
+            state
+                .upload_directories
+                .iter()
+                .filter(|(_, b)| connection_id.is_none_or(|id| b.status.connection_id == id))
+                .map(|(id, b)| (id.clone(), b.status.connection_id.clone()))
+                .collect()
+        };
+        for (id, connection) in batches {
+            self.object_release_upload_directory(&connection, &id)
+                .await?;
+        }
         let handles = {
             let mut state = self.objects.lock().await;
             state.prune();
@@ -2222,6 +3050,9 @@ impl CloudRuntime {
             state
                 .plans
                 .retain(|_, (id, _)| connection_id.is_some_and(|selected| id != selected));
+            state.upload_directories.retain(|_, manifest| {
+                connection_id.is_some_and(|selected| manifest.status.connection_id != selected)
+            });
             state.grants.retain(|_, grant| {
                 connection_id.is_some_and(|selected| grant.connection_id != selected)
             });
@@ -2276,7 +3107,7 @@ impl CloudRuntime {
         // Failures are reported through app://error, never prevent vault locking.
         Ok(())
     }
-    fn object_recovery_db(&self) -> Result<rusqlite::Connection, AppError> {
+    pub(crate) fn object_recovery_db(&self) -> Result<rusqlite::Connection, AppError> {
         let db = rusqlite::Connection::open_with_flags(
             self.data_dir.join("cloud-object-recovery.sqlite"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -2305,7 +3136,7 @@ impl CloudRuntime {
         }
         Ok(db)
     }
-    fn object_recovery_write(&self, status: &ObjectTransferDto) -> Result<(), AppError> {
+    pub(crate) fn object_recovery_write(&self, status: &ObjectTransferDto) -> Result<(), AppError> {
         use chacha20poly1305::{
             ChaCha20Poly1305, KeyInit, Nonce,
             aead::{Aead, Payload},
@@ -2349,7 +3180,7 @@ impl CloudRuntime {
         self.object_recovery_db()?.execute("INSERT OR REPLACE INTO pending_object_upload(id,connection_id,revision,payload) VALUES (?1,?2,?3,?4)", rusqlite::params![status.transfer_id, status.connection_id, status.connection_revision, payload]).map_err(|source| app(DomainError::Database { operation: "record unknown object upload", source }))?;
         Ok(())
     }
-    fn object_recovery_remove(&self, id: &str) -> Result<(), AppError> {
+    pub(crate) fn object_recovery_remove(&self, id: &str) -> Result<(), AppError> {
         self.object_recovery_db()?
             .execute("DELETE FROM pending_object_upload WHERE id=?1", [id])
             .map_err(|source| {
@@ -2381,6 +3212,13 @@ impl CloudRuntime {
         {
             return Err(state_error());
         }
+        if state
+            .upload_directories
+            .get(transfer_id)
+            .is_some_and(|b| matches!(b.status.phase.as_str(), "running" | "conflict"))
+        {
+            return Err(state_error());
+        }
         let mut status = self
             .object_recovery_read()?
             .into_iter()
@@ -2399,9 +3237,12 @@ impl CloudRuntime {
         if let Some(task) = state.tasks.get_mut(transfer_id) {
             task.status = status.clone();
         }
+        if let Some(batch) = state.upload_directories.get_mut(transfer_id) {
+            batch.status.recovery_required = false;
+        }
         Ok(status)
     }
-    fn object_recovery_read(&self) -> Result<Vec<ObjectTransferDto>, AppError> {
+    pub(crate) fn object_recovery_read(&self) -> Result<Vec<ObjectTransferDto>, AppError> {
         use chacha20poly1305::{
             ChaCha20Poly1305, KeyInit, Nonce,
             aead::{Aead, Payload},

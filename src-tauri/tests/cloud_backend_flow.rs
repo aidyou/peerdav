@@ -510,6 +510,104 @@ fn runtime_for(dir: &tempfile::TempDir) -> Arc<CloudRuntime> {
     CloudRuntime::new(vault, Arc::new(NoopSyncEvents), dir.path().to_owned())
 }
 
+#[tokio::test]
+async fn file_browser_backend_cloud_contract() {
+    use peerdav_lib::file_manager::{cloud_list, cloud_preview};
+
+    let fixture = Fixture::start(false).await;
+    let data = tempfile::tempdir().expect("data dir");
+    let runtime = runtime_for(&data);
+    assert_eq!(
+        cloud_list(&runtime, "missing", "", None).await.unwrap_err().code,
+        "CLOUD_GATE_LOCKED"
+    );
+    assert_eq!(
+        cloud_preview(&runtime, "missing", "notes.txt").await.unwrap_err().code,
+        "CLOUD_GATE_LOCKED"
+    );
+    runtime.resume().expect("resume");
+    let connection = runtime
+        .save_connection(runtime_connection(&fixture))
+        .expect("connection");
+    fixture
+        .state
+        .objects
+        .lock()
+        .expect("objects")
+        .insert("runtime/docs/notes.txt".into(), b"adapter text\n".to_vec());
+    let browse = |prefix, cursor| cloud_list(&runtime, &connection.id, prefix, cursor);
+    let preview = |key| cloud_preview(&runtime, &connection.id, key);
+    let page = browse("docs/", None)
+        .await
+        .expect("adapter browse");
+    assert_eq!(page.prefix, "docs/");
+    assert!(page.complete);
+    assert!(page.next.is_none());
+    assert!(!page.prefix_protected);
+    assert_eq!(page.objects.len(), 1);
+    assert_eq!(page.objects[0].key, "docs/notes.txt");
+    assert!(!page.objects[0].protected);
+    {
+        let mut objects = fixture.state.objects.lock().expect("objects");
+        for key in ["a.txt", "b.txt", "c.txt"] {
+            objects.insert(format!("runtime/pages/{key}"), b"page".to_vec());
+        }
+    }
+    let first = browse("pages/", None).await.expect("first page");
+    assert!(!first.complete);
+    assert_eq!(first.objects.len(), 2);
+    let token = first.next.as_deref().expect("continuation");
+    let second = browse("pages/", Some(token))
+        .await
+        .expect("second page");
+    assert!(second.complete);
+    assert!(second.next.is_none());
+    assert_eq!(second.objects[0].key, "pages/c.txt");
+    let retry = browse("pages/", Some(token))
+        .await
+        .expect("same-token retry");
+    assert_eq!(
+        serde_json::to_value(retry).expect("retry page"),
+        serde_json::to_value(second).expect("second page")
+    );
+    let payload = preview("docs/notes.txt")
+        .await
+        .expect("adapter preview");
+    assert_eq!(payload.file_name, "notes.txt");
+    assert_eq!(payload.encoding, "utf8");
+    assert_eq!(payload.data, "adapter text\n");
+    let direct = runtime
+        .object_list(&connection.id, "unseen/", Some("forged"))
+        .await
+        .unwrap_err();
+    let adapted = browse("unseen/", Some("forged"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        serde_json::to_value(adapted).expect("adapted error"),
+        serde_json::to_value(direct).expect("direct error")
+    );
+    let direct = runtime
+        .object_preview(&connection.id, "missing.txt")
+        .await
+        .unwrap_err();
+    let adapted = preview("missing.txt").await.unwrap_err();
+    assert_eq!(
+        serde_json::to_value(adapted).expect("adapted error"),
+        serde_json::to_value(direct).expect("direct error")
+    );
+    assert!(
+        fixture
+            .state
+            .requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .all(|(method, _)| *method == Method::GET || *method == Method::HEAD)
+    );
+    runtime.stop_and_clear().await.expect("stop runtime");
+}
+
 fn runtime_connection(fixture: &Fixture) -> SaveS3Input {
     SaveS3Input {
         id: None,

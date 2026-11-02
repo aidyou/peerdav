@@ -125,6 +125,9 @@ impl PhysicalRoot {
             path: self.path.clone(),
         })
     }
+    pub(crate) fn upload_directory_handle(&self) -> Result<cap_std::fs::Dir, ObjectServiceError> {
+        self.dir.try_clone().map_err(|source| ObjectServiceError::Io { source })
+    }
     /// Whether a relative download target already exists under this capability.
     pub fn relative_target_exists(&self, relative_path: &str) -> Result<bool, ObjectServiceError> {
         valid_relative_path(relative_path)?;
@@ -158,6 +161,7 @@ impl PhysicalRoot {
         }
     }
 }
+
 #[derive(Clone, Debug)]
 pub struct ConfigRevision(pub String);
 #[derive(Clone, Debug, Default)]
@@ -606,6 +610,11 @@ impl ObjectService {
     fn target_identity(&self, key: &str) -> ProtectedIdentity {
         self.identity_with_prefix(key)
     }
+    pub(crate) fn preflight_upload(&self, key: &str) -> Result<(), ObjectServiceError> {
+        valid_key(key)?;
+        let _lease = self.guard.begin_mutation(&self.target_identity(key))?;
+        Ok(())
+    }
     pub async fn upload_stream_with_control(
         &self,
         key: &str,
@@ -899,7 +908,7 @@ fn now() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(u64::MAX)
 }
-fn valid_prefix(prefix: &str) -> Result<(), ObjectServiceError> {
+pub(crate) fn valid_prefix(prefix: &str) -> Result<(), ObjectServiceError> {
     // Folder prefixes carry a trailing slash (e.g. "probes/"); the store itself
     // validates the trimmed segment, so this check must trim the same way.
     let trimmed = prefix.trim_end_matches('/');
@@ -909,12 +918,37 @@ fn valid_prefix(prefix: &str) -> Result<(), ObjectServiceError> {
         valid_key(trimmed)
     }
 }
+#[cfg(test)]
+mod delete_prefix_tests {
+    use super::within_prefix;
+
+    #[test]
+    fn delete_prefix_boundaries() {
+        for (prefix, key, expected) in [
+            ("docs/", "docs/a", true),
+            ("docs/", "docs/nested/a", true),
+            ("docs/", "docs", false),
+            ("docs/", "docs-sibling/a", false),
+            ("docs/", "docstring/a", false),
+            ("", "docs/a", true),
+            ("", "a", true),
+            ("docs", "docs", true),
+            ("docs", "docs/a", true),
+            ("docs", "docs-sibling/a", false),
+            ("docs", "docstring/a", false),
+            ("docs/a", "docs/ab", false),
+        ] {
+            assert_eq!(within_prefix(prefix, key), expected, "{prefix:?}: {key:?}");
+        }
+    }
+}
+
 fn within_prefix(prefix: &str, key: &str) -> bool {
     prefix.is_empty()
         || key == prefix
         || key
             .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with('/'))
+            .is_some_and(|rest| prefix.ends_with('/') || rest.starts_with('/'))
 }
 fn valid_key(key: &str) -> Result<(), ObjectServiceError> {
     if key.is_empty()

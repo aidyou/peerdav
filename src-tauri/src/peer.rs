@@ -20,9 +20,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use peerdav_protocol_peerdav as wire;
+use wire::peerdav_file_core::{FileBackend, FileError, Operation, OperationContext, OperationBudget, ListRequest, ReadRequest, EntryKind, FileErrorKind};
+use futures_util::StreamExt;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use reqwest::StatusCode;
-use reqwest_dav::types::list_cmd::{ListEntity, ListMultiStatus};
+use reqwest_dav::types::list_cmd::ListEntity;
 use reqwest_dav::{Auth, Client, ClientBuilder, Depth};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -47,7 +51,7 @@ use crate::types::{
     OutboundAccessStatus, PEER_ACCESS_POLL_INTERVAL, PEER_ACCESS_WAIT, PEER_PRESENCE_INTERVAL,
     PEER_REQUEST_TIMEOUT, PEER_SYNC_INTERVAL, PeerAccessRequest, PeerEntry, PeerHealth, PeerInfo,
     PeerListing, PeerRecord, PeerRevocationInfo, PeerShare, PeerStatus, PreviewPayload,
-    SERVER_DISCOVERY_PORT_META, SHARE_URL_PREFIX, TransferResult,
+    SERVER_DISCOVERY_PORT_META, TransferResult,
 };
 use crate::vault::Vault;
 
@@ -57,7 +61,6 @@ const CLIENT_USERNAME: &str = "peerdav";
 const CATALOG_BODY_LIMIT: u64 = 1024 * 1024;
 const ACCESS_BODY_LIMIT: u64 = 16 * 1024;
 const AUTHORIZATION_BODY_LIMIT: u64 = 16 * 1024;
-const LISTING_BODY_LIMIT: u64 = 8 * 1024 * 1024;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(300);
@@ -265,12 +268,6 @@ const TEXT_FILENAMES: &[&str] = &[
 
 pub type TransferProgressCallback = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
-const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~');
-
 /// Tunable limits; tests use smaller values.
 #[derive(Debug, Clone)]
 pub struct PeerLimits {
@@ -332,12 +329,20 @@ enum AuthorizationOutcome {
 
 /// Process-wide peer client. Sessions are intentionally not cached: each
 /// operation re-reads the code from the vault so revocation is immediate.
+#[path = "peer_upload.rs"]
+pub(crate) mod upload_batches;
+
 pub struct PeerManager {
     vault: Arc<Vault>,
     temp_root: PathBuf,
     limits: PeerLimits,
     edits: Mutex<HashMap<String, ExternalEdit>>,
     access_cancellations: Mutex<HashSet<String>>,
+    upload_batches: Mutex<HashMap<String, crate::peer_upload_types::PeerUploadBatch>>,
+    #[cfg(test)]
+    upload_test_transport: Option<Arc<crate::peer_upload_types::TestUploadTransport>>,
+    upload_lifecycle: Mutex<()>,
+    upload_epoch: std::sync::atomic::AtomicU64,
     upload_cancellations: Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
     events: Arc<dyn PeerEvents>,
     background: std::sync::Mutex<Option<RunningPeerBackground>>,
@@ -432,6 +437,11 @@ impl PeerManager {
             limits,
             edits: Mutex::new(HashMap::new()),
             access_cancellations: Mutex::new(HashSet::new()),
+            upload_batches: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            upload_test_transport: None,
+            upload_lifecycle: Mutex::new(()),
+            upload_epoch: std::sync::atomic::AtomicU64::new(0),
             upload_cancellations: Mutex::new(HashMap::new()),
             events,
             background: std::sync::Mutex::new(None),
@@ -1544,6 +1554,7 @@ impl PeerManager {
     /// Removes a peer only from this installation. This is used after the
     /// server has already revoked an authorization.
     pub async fn forget_local(&self, peer_id: &str) -> Result<(), DomainError> {
+        self.stop_upload_batches(Some(peer_id)).await.map_err(|e| DomainError::Internal { detail: e.detail.unwrap_or(e.message) })?;
         let record = self
             .vault
             .peer_record(peer_id)?
@@ -1904,26 +1915,21 @@ impl PeerManager {
         share_id: &str,
         path: &str,
     ) -> Result<PeerListing, DomainError> {
-        let (_, client) = self.peer_client(peer_id)?;
+        let backend = self.read_backend(peer_id, share_id)?;
         let display = normalize_display_path(path)?;
-        let remote = encode_share_path(share_id, &display)?;
-
-        let entities = list_entities(
-            &client,
-            &remote,
-            Depth::Number(1),
-            "list directory",
-            &display,
-        )
-        .await?;
-
-        let mut entries = Vec::new();
-        for entity in entities {
-            let Some(entry) = listing_entry(entity, share_id, &display) else {
-                continue;
-            };
-            entries.push(entry);
-        }
+        let limit = NonZeroUsize::MAX;
+        let page = backend.list(read_context(wire::LISTING_BODY_LIMIT, limit), ListRequest {
+            parent: backend.scope().entry(display.clone()),
+            query: None, prefix: None, cursor: None, limit,
+        }).await.map_err(|source| DomainError::PeerFile { operation: "list directory", source })?;
+        let mut entries: Vec<PeerEntry> = page.entries().iter().map(|entry| PeerEntry {
+            path: entry.id.opaque().to_owned(),
+            name: entry.name.clone(),
+            is_dir: entry.kind == EntryKind::Directory,
+            size: entry.size.unwrap_or(0),
+            modified: entry.modified,
+            content_type: entry.content_type.clone(),
+        }).collect();
         entries.sort_by(|left, right| {
             right
                 .is_dir
@@ -2108,10 +2114,7 @@ impl PeerManager {
     ) -> Result<Option<String>, DomainError> {
         let (_, client) = self.peer_client(peer_id)?;
         let (display, remote, _) = remote_file_target(share_id, remote_path)?;
-        let response = client
-            .get_raw(&remote)
-            .await
-            .map_err(|error| map_dav_error("read .gitignore", error, &display))?;
+        let response = wire::get(&client, &remote, None).await.map_err(protocol_error)?;
         ensure_status(response.status(), "read .gitignore", &display)?;
         let bytes =
             read_response_limited(response, MAX_IGNORE_FILE_BYTES, "read .gitignore").await?;
@@ -2130,18 +2133,21 @@ impl PeerManager {
         share_id: &str,
         remote_path: &str,
     ) -> Result<(), DomainError> {
-        let (_, client) = self.peer_client(peer_id)?;
+        let backend = self.read_backend(peer_id, share_id)?;
         let display = normalize_display_path(remote_path)?;
         if display == "/" {
             return Err(DomainError::RemotePathInvalid {
                 detail: "the shared root cannot be deleted".to_owned(),
             });
         }
-        let remote = encode_share_path(share_id, &display)?;
-        client
-            .delete(&remote)
-            .await
-            .map_err(|error| map_dav_error("delete entry", error, &display))?;
+        // This existing operation explicitly authorizes recursive DAV deletion;
+        // do not pretend it offers atomic File/EmptyDirectory protection.
+        backend.delete(read_context(0, NonZeroUsize::MIN),
+            wire::peerdav_file_core::DeleteRequest {
+                entry: backend.scope().entry(display),
+                condition: wire::peerdav_file_core::Condition::Any,
+                mode: wire::peerdav_file_core::DeleteMode::Recursive,
+            }).await.map_err(protocol_error)?;
         Ok(())
     }
 
@@ -2387,22 +2393,26 @@ impl PeerManager {
         share_id: &str,
         remote_path: &str,
     ) -> Result<PreviewPayload, DomainError> {
-        let (_, client) = self.peer_client(peer_id)?;
-        let (display, remote, file_name) = remote_file_target(share_id, remote_path)?;
-
-        let response = client
-            .get_raw(&remote)
-            .await
-            .map_err(|error| map_dav_error("preview file", error, &display))?;
-        ensure_status(response.status(), "preview file", &display)?;
-        let bytes = read_response_limited(response, self.limits.max_preview_bytes, "preview file")
-            .await
-            .map_err(|error| match error {
-                DomainError::TransferTooLarge { size, limit } => {
-                    DomainError::PreviewTooLarge { size, limit }
+        let backend = self.read_backend(peer_id, share_id)?;
+        let (display, _, file_name) = remote_file_target(share_id, remote_path)?;
+        let limit = self.limits.max_preview_bytes;
+        let mut response = backend.read(read_context(limit, NonZeroUsize::MIN), ReadRequest {
+            entry: backend.scope().entry(display), range: None,
+        }).await.map_err(|source| DomainError::PeerFile { operation: "preview file", source })?;
+        if let Some(size) = response.entry.size.filter(|size| *size > limit) {
+            return Err(DomainError::PreviewTooLarge { size, limit });
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.body.next().await {
+            let chunk = chunk.map_err(|source| {
+                if source.kind == FileErrorKind::BudgetExceeded {
+                    DomainError::PreviewTooLarge { size: limit.saturating_add(1), limit }
+                } else {
+                    DomainError::PeerFile { operation: "preview file", source }
                 }
-                other => other,
             })?;
+            bytes.extend_from_slice(&chunk);
+        }
         preview_payload(file_name, bytes)
     }
 
@@ -2429,10 +2439,7 @@ impl PeerManager {
         let local_path = directory.join(&file_name);
 
         let result = async {
-            let response = client
-                .get_raw(&remote)
-                .await
-                .map_err(|error| map_dav_error("prepare external edit", error, &display))?;
+            let response = wire::get(&client, &remote, None).await.map_err(protocol_error)?;
             ensure_status(response.status(), "prepare external edit", &display)?;
             write_response_to_path(
                 response,
@@ -2650,6 +2657,14 @@ impl PeerManager {
         Ok(expected)
     }
 
+    /// Request-local scope only: this nonce is NOT a vault authorization epoch.
+    /// Never cache this backend; each admission must re-read vault authorization.
+    fn read_backend(&self, peer_id: &str, share_id: &str) -> Result<wire::CorePeerDavBackend, DomainError> {
+        let (record, client) = self.peer_client(peer_id)?;
+        wire::CorePeerDavBackend::new(client, record.id, share_id.to_owned(), next_read_generation(&READ_ADMISSIONS)?)
+            .map_err(protocol_error)
+    }
+
     fn peer_client(&self, peer_id: &str) -> Result<(PeerRecord, Client), DomainError> {
         let record = self
             .vault
@@ -2850,64 +2865,24 @@ fn validate_label(label: &str) -> Result<String, DomainError> {
 
 /// Normalizes a share-relative path for display: `/` for the root, otherwise
 /// one leading slash and no trailing slash.
+fn protocol_error(source: FileError) -> DomainError {
+    DomainError::PeerFile { operation: "remote file", source }
+}
+
 fn normalize_display_path(path: &str) -> Result<String, DomainError> {
-    let trimmed = path;
-    if trimmed.len() > MAX_REMOTE_PATH_BYTES {
-        return Err(DomainError::RemotePathInvalid {
-            detail: "the remote path is too long".to_owned(),
-        });
+    if path.len() > MAX_REMOTE_PATH_BYTES {
+        return Err(DomainError::RemotePathInvalid { detail: "the remote path is too long".into() });
     }
-    if trimmed.contains('\\') || trimmed.contains('\0') {
-        return Err(DomainError::RemotePathInvalid {
-            detail: "the remote path contains a forbidden character".to_owned(),
-        });
-    }
-    let mut segments = Vec::new();
-    for segment in trimmed.trim_matches('/').split('/') {
-        if segment.is_empty() {
-            continue;
-        }
-        if segment == "." || segment == ".." || segment.chars().any(char::is_control) {
-            return Err(DomainError::RemotePathInvalid {
-                detail: format!("`{segment}` is not a valid path segment"),
-            });
-        }
-        segments.push(segment);
-    }
-    if segments.is_empty() {
-        Ok("/".to_owned())
-    } else {
-        Ok(format!("/{}", segments.join("/")))
-    }
+    wire::normalize_display_path(path).map_err(protocol_error)
 }
 
 fn encode_share_path(share_id: &str, display: &str) -> Result<String, DomainError> {
     validate_share_id(share_id)?;
-    let mut encoded = String::from(SHARE_URL_PREFIX);
-    encoded.push_str(share_id);
-    encoded.push('/');
-    for segment in display.trim_matches('/').split('/') {
-        if segment.is_empty() {
-            continue;
-        }
-        encoded.push_str(&utf8_percent_encode(segment, PATH_SEGMENT).to_string());
-        encoded.push('/');
-    }
-    Ok(encoded)
+    wire::encode_share_path(share_id, display).map_err(protocol_error)
 }
 
 fn validate_share_id(share_id: &str) -> Result<(), DomainError> {
-    if share_id.is_empty()
-        || share_id.len() > 64
-        || !share_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    {
-        return Err(DomainError::RemotePathInvalid {
-            detail: "the share id is invalid".to_owned(),
-        });
-    }
-    Ok(())
+    wire::validate_share_id(share_id).map_err(protocol_error)
 }
 
 fn remote_file_target(
@@ -3208,7 +3183,7 @@ async fn resolve_remote_destination(
 }
 
 fn encode_segment(segment: &str) -> String {
-    utf8_percent_encode(segment, PATH_SEGMENT).to_string()
+    wire::encode_segment(segment)
 }
 
 /// Creates each missing collection on the way to `directory`. WebDAV returns
@@ -3231,15 +3206,20 @@ async fn ensure_remote_directories(
         if remote_exists(client, &encoded).await? {
             continue;
         }
-        match client.mkcol(&encoded).await {
-            Ok(()) => {}
-            Err(reqwest_dav::Error::Decode(reqwest_dav::DecodeError::StatusMismatched(status)))
-                if status.response_code == StatusCode::METHOD_NOT_ALLOWED.as_u16() => {}
-            Err(reqwest_dav::Error::Decode(reqwest_dav::DecodeError::Server(server)))
-                if server.response_code == StatusCode::METHOD_NOT_ALLOWED.as_u16() => {}
-            Err(error) => {
-                return Err(map_dav_error("create remote folder", error, &accumulated));
-            }
+        let backend = wire::CorePeerDavBackend::new(
+            client.clone(), "request-local".into(), share_id.to_owned(),
+            next_read_generation(&READ_ADMISSIONS)?,
+        ).map_err(protocol_error)?;
+        match backend.create_dir(
+            read_context(0, NonZeroUsize::MIN),
+            wire::peerdav_file_core::CreateDirRequest {
+                entry: backend.scope().entry(&accumulated),
+                condition: wire::peerdav_file_core::Condition::CreateOnly,
+            },
+        ).await {
+            Ok(_) => {}
+            Err(error) if error.status == Some(StatusCode::METHOD_NOT_ALLOWED.as_u16()) => {}
+            Err(source) => return Err(DomainError::PeerFile { operation: "create remote folder", source }),
         }
     }
     Ok(())
@@ -3254,23 +3234,7 @@ fn join_display(directory: &str, file_name: &str) -> String {
 }
 
 async fn remote_exists(client: &Client, path: &str) -> Result<bool, DomainError> {
-    let response = client
-        .list_raw(path, Depth::Number(0))
-        .await
-        .map_err(|error| map_dav_error("inspect remote path", error, path))?;
-    match response.status() {
-        status if status.is_success() => Ok(true),
-        StatusCode::NOT_FOUND => Ok(false),
-        StatusCode::UNAUTHORIZED => Err(DomainError::PeerAuthorizationRejected),
-        status => Err(DomainError::PeerRequest {
-            operation: "inspect remote path",
-            status: Some(status.as_u16()),
-            detail: status
-                .canonical_reason()
-                .unwrap_or("server rejected")
-                .to_owned(),
-        }),
-    }
+    wire::remote_exists(client, path).await.map_err(protocol_error)
 }
 
 async fn list_entities(
@@ -3278,40 +3242,11 @@ async fn list_entities(
     remote: &str,
     depth: Depth,
     operation: &'static str,
-    display: &str,
+    _display: &str,
 ) -> Result<Vec<ListEntity>, DomainError> {
-    let response = tokio::time::timeout(TRANSFER_TIMEOUT, client.list_raw(remote, depth))
+    wire::list_entities(client, remote, depth, Operation::List, wire::LISTING_BODY_LIMIT)
         .await
-        .map_err(|_| DomainError::PeerRequest {
-            operation,
-            status: None,
-            detail: "the request timed out".to_owned(),
-        })?
-        .map_err(|error| map_dav_error(operation, error, display))?;
-    ensure_status(response.status(), operation, display)?;
-
-    // Bound the XML body ourselves: `reqwest_dav::list` reads it without a
-    // limit, which would let a hostile server exhaust memory.
-    let bytes = read_response_limited(response, LISTING_BODY_LIMIT, operation).await?;
-    let text = std::str::from_utf8(&bytes).map_err(|error| DomainError::PeerProtocol {
-        detail: format!("the PROPFIND response is not valid UTF-8: {error}"),
-    })?;
-    let parsed: ListMultiStatus =
-        reqwest_dav::re_exports::serde_xml_rs::from_str(text).map_err(|error| {
-            DomainError::PeerProtocol {
-                detail: format!("invalid PROPFIND XML: {error}"),
-            }
-        })?;
-
-    parsed
-        .responses
-        .into_iter()
-        .map(|response| {
-            ListEntity::try_from(response).map_err(|error| DomainError::PeerProtocol {
-                detail: format!("unusable PROPFIND entry: {error}"),
-            })
-        })
-        .collect()
+        .map_err(|source| DomainError::PeerFile { operation, source })
 }
 
 async fn remote_meta(
@@ -3348,58 +3283,18 @@ struct RemoteMeta {
     etag: Option<String>,
 }
 
-fn listing_entry(entity: ListEntity, share_id: &str, requested: &str) -> Option<PeerEntry> {
-    let (href, is_dir, size, modified, content_type) = match entity {
-        ListEntity::Folder(folder) => (
-            folder.href,
-            true,
-            0,
-            Some(folder.last_modified.timestamp()),
-            None,
-        ),
-        ListEntity::File(file) => (
-            file.href,
-            false,
-            u64::try_from(file.content_length).unwrap_or(0),
-            Some(file.last_modified.timestamp()),
-            Some(file.content_type),
-        ),
-    };
+static READ_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
 
-    let path = href_to_relative(&href, share_id)?;
-    if path == "/" || path == requested {
-        return None;
-    }
-    let name = path.rsplit('/').next()?.to_owned();
-    if name.is_empty() {
-        return None;
-    }
-
-    Some(PeerEntry {
-        path,
-        name,
-        is_dir,
-        size,
-        modified,
-        content_type,
-    })
+fn next_read_generation(counter: &AtomicU64) -> Result<u64, DomainError> {
+    counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+        .map(|previous| previous + 1)
+        .map_err(|_| DomainError::Internal { detail: "peer read admission generation exhausted".into() })
 }
 
-fn href_to_relative(href: &str, share_id: &str) -> Option<String> {
-    let decoded = percent_decode_str(href).decode_utf8_lossy();
-    let path = if decoded.starts_with("http://") || decoded.starts_with("https://") {
-        Url::parse(&decoded).ok()?.path().to_owned()
-    } else {
-        decoded.into_owned()
-    };
-
-    let prefix = format!("{SHARE_URL_PREFIX}{share_id}");
-    let rest = path.strip_prefix(&prefix)?;
-    let rest = rest.trim_matches('/');
-    if rest.is_empty() {
-        Some("/".to_owned())
-    } else {
-        Some(format!("/{rest}"))
+fn read_context(max_bytes: u64, max_entries: NonZeroUsize) -> OperationContext {
+    OperationContext {
+        cancellation: Default::default(), deadline: None,
+        budget: OperationBudget { max_bytes, max_entries, max_chunk_bytes: NonZeroUsize::MAX },
     }
 }
 
@@ -3850,6 +3745,14 @@ mod tests {
             &announced
         ));
         assert!(announced_peer_matches("http://127.0.0.1:4918", &announced));
+    }
+
+    #[test]
+    fn read_admission_nonce_is_monotonic_and_fails_closed_at_overflow() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(next_read_generation(&counter).expect("last generation"), u64::MAX);
+        assert!(next_read_generation(&counter).is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]

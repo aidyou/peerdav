@@ -624,6 +624,52 @@ async fn saved_peer_availability_follows_server_lifecycle() {
 }
 
 #[tokio::test]
+async fn file_browser_backend_peer_contract() {
+    use peerdav_lib::file_manager::{peer_list, peer_preview};
+
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (info, _) = harness.connect().await;
+    let list = |path| peer_list(&harness.peers, &info.id, &harness.share_id, path);
+    let preview = |path| peer_preview(&harness.peers, &info.id, &harness.share_id, path);
+    let root = list("/").await.expect("adapter list");
+    assert_eq!(root.share_id, harness.share_id);
+    assert_eq!(root.path, "/");
+    assert!(!root.truncated);
+    assert_eq!(
+        root.entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["sub", "image.png", "notes.txt"]
+    );
+    let sub = list("/sub").await.expect("sub scope");
+    assert_eq!(sub.path, "/sub");
+    assert_eq!(sub.entries.len(), 2);
+    let text = preview("/sub/文 件.txt").await.expect("preview");
+    assert_eq!(text.file_name, "文 件.txt");
+    assert_eq!(text.encoding, "utf8");
+    assert_eq!(text.data, "unicode\n");
+    let image = preview("/image.png")
+        .await
+        .expect("media preview");
+    assert_eq!(image.encoding, "base64");
+    assert!(root.entries.iter().all(|entry| entry.modified.is_some()));
+    assert!(root.entries.iter().filter(|entry| !entry.is_dir).all(|entry| entry.content_type.is_some()));
+    let direct: AppError = harness
+        .peers
+        .preview(&info.id, &harness.share_id, "/missing.txt")
+        .await
+        .unwrap_err()
+        .into();
+    let adapted: AppError = preview("/missing.txt").await.unwrap_err().into();
+    assert_eq!(adapted.code, direct.code);
+    assert_eq!(adapted.message, direct.message);
+    assert_eq!(adapted.detail, direct.detail);
+    assert_eq!(adapted.context, direct.context);
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
 async fn browse_transfer_preview_and_external_edit_roundtrip() {
     let harness = Harness::new(vec![loopback_rule()], false).await;
     let (info, _code) = harness.connect().await;

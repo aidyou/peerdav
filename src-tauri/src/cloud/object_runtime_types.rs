@@ -142,6 +142,11 @@ pub(crate) struct ObjectTestBackend {
     >,
     pub store: std::sync::Arc<dyn super::traits::ObjectStore>,
 }
+pub(crate) const MAX_UPLOAD_DIRECTORY_DEPTH: usize = 64;
+pub(crate) const MAX_UPLOAD_DIRECTORY_PATH_BYTES: usize = 4096;
+pub(crate) const MAX_LOCAL_HANDLES: usize = 128;
+pub(crate) const UPLOAD_DIRECTORY_TTL_SECS: u64 = 1800;
+
 pub(crate) struct ObjectState {
     #[cfg(test)]
     pub backend: Option<ObjectTestBackend>,
@@ -152,6 +157,8 @@ pub(crate) struct ObjectState {
     pub active_buckets: std::collections::HashMap<String, String>,
     pub plans: std::collections::HashMap<String, (String, super::DeletePlan)>,
     pub grants: std::collections::HashMap<String, BoundGrant>,
+    pub upload_directories:
+        std::collections::HashMap<String, super::directory_types::DirectoryBatch>,
     pub tasks: std::collections::HashMap<String, ObjectTask>,
 }
 /// Untrusted, pre-save credentials used only to prove that the address can list
@@ -173,12 +180,20 @@ pub struct ProbeBucketsInput {
 }
 
 impl ObjectState {
+    pub fn local_handle_count(&self) -> usize {
+        self.grants.len() + self.upload_directories.len()
+    }
     pub fn prune(&mut self) {
         let now = std::time::Instant::now();
         let unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         self.grants.retain(|_, grant| grant.expires > now);
+        self.upload_directories.retain(|_, batch| {
+            matches!(batch.status.phase.as_str(), "running" | "conflict")
+                || batch.handle.as_ref().is_some_and(|h| !h.is_finished())
+                || now.duration_since(batch.created).as_secs() < UPLOAD_DIRECTORY_TTL_SECS
+        });
         self.plans
             .retain(|_, (_, plan)| plan.expires_at_unix > unix);
         self.tasks.retain(|_, task| {
@@ -194,6 +209,7 @@ impl ObjectState {
             active_buckets: std::collections::HashMap::new(),
             plans: std::collections::HashMap::new(),
             grants: std::collections::HashMap::new(),
+            upload_directories: std::collections::HashMap::new(),
             tasks: std::collections::HashMap::new(),
         }
     }
