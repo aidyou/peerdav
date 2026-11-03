@@ -53,21 +53,22 @@ const progressFor = (item) => {
       <TransferConflictControls v-if="open && queueState?.conflict" :key="`${queueState.queueId}:${queueState.conflict.conflictId}`" direction="download" :conflict="queueState.conflict" :apply-remaining="applyRemaining" :resolving="resolving || canceling" overwrite-allowed
         @update:apply-remaining="emit('update:applyRemaining', $event)" @resolve="emit('resolve', $event)" @cancel="emit('cancel')" />
 
-      <div class="queue-table">
-        <div class="queue-table__head" aria-hidden="true">
-          <span>{{ t('peer.queueColPath') }}</span>
-          <span>{{ t('peer.queueColSize') }}</span>
-          <span>{{ t('peer.queueColStatus') }}</span>
+      <div class="queue-table" role="table" :aria-label="t('peer.downloadQueue')">
+        <!-- 表头对视觉是列名，对读屏是列定义：用 ARIA 表格角色而不是 aria-hidden。 -->
+        <div class="queue-table__head" role="row">
+          <span role="columnheader">{{ t('peer.queueColPath') }}</span>
+          <span role="columnheader">{{ t('peer.queueColSize') }}</span>
+          <span role="columnheader">{{ t('peer.queueColStatus') }}</span>
         </div>
-        <ul class="transfer-queue download-queue">
-          <li v-for="item in items" :key="item.transferId || item.remotePath || item.relativePath" :data-status="item.status"
+        <ul class="transfer-queue download-queue" role="rowgroup">
+          <li v-for="item in items" role="row" :key="item.transferId || item.remotePath || item.relativePath" :data-status="item.status"
             :class="{ 'is-active': item.status === 'downloading' }" :data-progress="progressFor(item) ?? undefined">
-            <div class="queue-cell queue-cell--path" :title="item.relativePath">
+            <div class="queue-cell queue-cell--path" role="cell" :title="item.relativePath">
               <span class="queue-path">{{ item.relativePath }}</span>
               <details v-if="item.error"><summary>{{ t('transferQueue.details') }}</summary><p>{{ item.error }}</p></details>
             </div>
-            <div class="queue-cell queue-cell--size">{{ item.size != null ? formatBytes(item.size) : '—' }}</div>
-            <div class="queue-cell queue-cell--status">
+            <div class="queue-cell queue-cell--size" role="cell">{{ item.size != null ? formatBytes(item.size) : '—' }}</div>
+            <div class="queue-cell queue-cell--status" role="cell">
               <el-tag :type="statusTagTone(item.status)" effect="plain" round size="small">{{ t(`peer.downloadStatus${statusKey[item.status] || 'Pending'}`) }}</el-tag>
               <el-button v-if="item.retryable && !running" data-test="retry-download" link type="primary" size="small" @click="emit('retry', item)">{{ t('cloudBrowser.retryDownload') }}</el-button>
             </div>
@@ -127,7 +128,7 @@ const progressFor = (item) => {
 
 .queue-cell { min-width: 0; }
 .queue-cell--path { display: flex; flex-direction: column; gap: 2px; }
-.queue-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--app-text); }
+.queue-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--app-text); }
 .queue-cell--size { font-size: 12px; color: var(--app-text-muted); font-variant-numeric: tabular-nums; }
 .queue-cell--status { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
 .queue-cell--status :deep(.el-button) { margin-left: 0; }

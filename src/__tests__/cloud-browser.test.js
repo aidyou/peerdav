@@ -2,12 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { defineComponent, h } from "vue";
 import { DOMWrapper, flushPromises, mount } from "@vue/test-utils";
 
-const { nativeInvoke, confirmAction, app } = vi.hoisted(() => ({ nativeInvoke: vi.fn(), confirmAction: vi.fn(), app: { handleFailure: vi.fn(), setNotice: vi.fn() } }));
+const { nativeInvoke, confirmAction, app } = vi.hoisted(() => ({ nativeInvoke: vi.fn(), confirmAction: vi.fn(), app: { handleFailure: vi.fn(), setNotice: vi.fn(), setInfo: vi.fn(), setError: vi.fn() } }));
 vi.mock("../lib/appContext", () => ({ useAppContext: () => app }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: nativeInvoke }));
 vi.mock("../lib/confirm", () => ({ confirmAction }));
 vi.mock("../components/CloudSyncDrives.vue", () => ({ default: { props: ['connectionId', 'focusId'], emits: ['changed'], template: '<div data-test="sync-manager">{{ connectionId }}<button data-test="catalog-changed" @click="$emit(\'changed\')">Changed</button></div>' } }));
 import cloudBrowserSource from "../components/CloudBrowser.vue?raw";
+import downloadDialogSource from "../components/TransferQueueDialog.vue?raw";
+import uploadDialogSource from "../components/UploadBatchDialog.vue?raw";
 import CloudBrowser from "../components/CloudBrowser.vue";
 import { cloudObjects, objectChildren } from "../lib/cloud";
 import { errorStrategy } from "../lib/invoke";
@@ -113,7 +115,7 @@ describe("streaming directory upload", () => {
   const entry = (name, kind = 'file') => ({ name, relativePath: `tree/${name}`, kind, size: 7, directoryToken: kind === 'directory' ? 'child' : null, phase: 'unscanned' });
   const directPage = (entries = [entry('a.txt'), entry('deep', 'directory')], extra = {}) => ({ directoryToken: 'root', parentToken: null, relativePath: 'tree', entries, nextCursor: null, ...extra });
   beforeEach(() => {
-    app.handleFailure.mockClear(); app.setNotice.mockClear();
+    app.handleFailure.mockClear(); app.setNotice.mockClear(); app.setInfo.mockClear(); app.setError.mockClear();
     handlers.cloud_object_select_upload_directory = () => summary('selected');
     handlers.cloud_object_start_upload_directory = () => summary();
     handlers.cloud_object_status_upload_directory = () => summary();
@@ -462,11 +464,14 @@ describe("CloudBrowser", () => {
     expect(wrapper.findAll('.download-queue li')[0].attributes('data-status')).toBe('done');
     expect(wrapper.findAll('.download-queue li')[1].attributes('data-status')).toBe('downloading');
   });
-  it("keeps peer queue and browser CSS contracts without broad paragraph overrides", () => {
-    expect(cloudBrowserSource).toContain('max-height: min(320px, 34vh)');
-    expect(cloudBrowserSource).toContain('overscroll-behavior: contain');
-    expect(cloudBrowserSource).toContain('.transfer-dialog { display: flex; flex-direction: column; gap: 12px; }');
-    expect(cloudBrowserSource).toContain('border-radius: 10px');
+  it("keeps queue CSS contracts in the queue dialogs without broad paragraph overrides", () => {
+    // 队列样式随对话框拆到了组件里，契约跟着搬到真正的持有者；两个队列滚动区高度保持一致。
+    expect(downloadDialogSource).toContain('max-height: min(360px, 45vh)');
+    expect(uploadDialogSource).toContain('max-height: min(360px, 45vh)');
+    expect(downloadDialogSource).toContain('overscroll-behavior: contain');
+    expect(uploadDialogSource).toContain('overscroll-behavior: contain');
+    // 旧的内联队列样式不应在文件面板里复活。
+    expect(cloudBrowserSource).not.toContain('.transfer-queue');
     expect(cloudBrowserSource).not.toMatch(/\.cloud-browser p\s*[,\{]/);
     expect(cloudBrowserSource).not.toMatch(/@media \(max-width: 480px\)\s*\{\s*\.browser-main/);
     expect(cloudBrowserSource).toContain('display: flex; flex-direction: column; user-select: none');
@@ -537,8 +542,8 @@ describe("CloudBrowser", () => {
   });
   it("shows incomplete pagination until the final page and merges duplicate keys", async () => {
     handlers.cloud_object_list = ({ next }) => next ? page([file, { key: "b.txt", size: 3 }]) : page([file], "cursor", false);
-    const wrapper = await browser(); expect(wrapper.find('[data-test=incomplete]').exists()).toBe(true);
-    await click(wrapper, '[data-test=more]'); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_list", { connectionId: "c1", prefix: "", next: "cursor" }); expect(wrapper.find('[data-test=incomplete]').exists()).toBe(false); expect(wrapper.findAll(".file-table tbody tr")).toHaveLength(2);
+    const wrapper = await browser(); expect(wrapper.find('[data-test=incomplete]').exists()).toBe(false); expect(app.setInfo).toHaveBeenCalledWith("cloudBrowser.incomplete");
+    await click(wrapper, '[data-test=more]'); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_list", { connectionId: "c1", prefix: "", next: "cursor" }); expect(wrapper.text()).not.toContain(t("cloudBrowser.incomplete")); expect(wrapper.findAll(".file-table tbody tr")).toHaveLength(2);
   });
   it("does not claim an empty or complete listing after loading failure", async () => { handlers.cloud_object_list = () => { throw error("CLOUD_TRANSPORT"); }; const wrapper = await browser(); await vi.advanceTimersByTimeAsync(300); await flushPromises(); expect(wrapper.text()).toContain("Original backend reason"); expect(wrapper.text()).not.toContain(t("cloudBrowser.empty")); expect(wrapper.find("[data-test=retry-load]").exists()).toBe(true); expect(wrapper.find('[data-test=incomplete]').exists()).toBe(false); });
   it("never flashes hint text while the first page is still loading", async () => {
@@ -566,8 +571,9 @@ describe("CloudBrowser", () => {
   it("only warns about a partial listing once more objects are actually pending", async () => {
     handlers.cloud_object_list = () => page([file], "cursor", false);
     const wrapper = await browser();
-    expect(wrapper.find('[data-test=incomplete]').exists()).toBe(true);
-    expect(wrapper.find('[data-test=incomplete]').text()).toBe(t("cloudBrowser.incomplete"));
+    expect(app.setInfo).toHaveBeenCalledWith("cloudBrowser.incomplete");
+    expect(wrapper.find('[data-test=incomplete]').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain(t("cloudBrowser.incomplete"));
   });
   it("shows true empty state only after complete listing", async () => { handlers.cloud_object_list = () => page(); const wrapper = await browser(); expect(wrapper.text()).toContain(t("cloudBrowser.empty")); });
   it("automatically checks protection and requires discovered true before edits", async () => {
@@ -700,7 +706,19 @@ describe("CloudBrowser", () => {
     handlers.cloud_object_status = () => [transfer()]; const wrapper = await browser(); await textButton(wrapper, t("cloudBrowser.cancel")).trigger("click"); await flushPromises(); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_cancel", { transferId: "t1" }); expect(wrapper.text()).toContain(t("cloudBrowser.phase.cancelling")); handlers.cloud_object_status = () => [transfer("unknown", { recoveryRequired: true })]; await vi.advanceTimersByTimeAsync(1500); await flushPromises(); expect(wrapper.text()).toContain(t("cloudBrowser.phase.unknown")); expect(wrapper.text()).toContain(t("cloudBrowser.recovery")); expect(wrapper.html()).not.toContain("progressbar"); expect(wrapper.text()).not.toContain("%");
   });
   it("plans deletion before confirming exact target prefix count and irreversible warning", async () => {
-    handlers.cloud_object_delete_execute = () => ({ deleted: ["a"], failed: [{ key: "b", error: error("CLOUD_STORAGE") }] }); const wrapper = await browser(); await prepare(wrapper); await click(wrapper, '[data-test=delete-prefix]'); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_delete_plan", { connectionId: "c1", prefix: "" }); expect(confirmAction.mock.calls[0][1]).toBe(""); expect(confirmAction.mock.calls[0][2]).toMatchObject({ headerless: true, danger: true, type: null, confirmText: t("common.delete") }); const review = mount({ render: () => confirmAction.mock.calls[0][0] }); expect(review.find(".confirm-heading").text()).toBe(t("cloudBrowser.deleteTitle")); expect(review.find("svg").attributes("width")).toBe("20"); expect(review.find("svg circle").attributes("fill")).toBe("currentColor"); expect(review.find(".confirm-heading__icon").exists()).toBe(true); expect(review.find(".confirm-summary").text()).toBe(t("cloudBrowser.deleteSummary", { count: 5 })); expect(review.find('[data-test=delete-target]').text()).toBe(t("cloudBrowser.deleteRootPrefix")); expect(review.find('[data-test=delete-keys]').element.classList.contains("confirm-list")).toBe(true); expect(review.findAll("li").map((item) => item.text())).toEqual(deletePlan().entries.map((item) => item.key)); review.unmount(); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_delete_execute", { connectionId: "c1", planId: "plan-1", confirmed: true }); expect(wrapper.text()).toContain("Deleted: 1; failed: 1"); expect(wrapper.text()).toContain("Original backend reason");
+    handlers.cloud_object_delete_execute = () => ({ deleted: ["a"], failed: [{ key: "b", error: error("CLOUD_STORAGE") }] }); const wrapper = await browser(); await prepare(wrapper); await click(wrapper, '[data-test=delete-prefix]'); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_delete_plan", { connectionId: "c1", prefix: "" }); expect(confirmAction.mock.calls[0][1]).toBe(""); expect(confirmAction.mock.calls[0][2]).toMatchObject({ headerless: true, danger: true, type: null, confirmText: t("common.delete") }); const review = mount({ render: () => confirmAction.mock.calls[0][0] }); expect(review.find(".confirm-heading").text()).toBe(t("cloudBrowser.deleteTitle")); expect(review.find("svg").attributes("width")).toBe("20"); expect(review.find("svg circle").attributes("fill")).toBe("currentColor"); expect(review.find(".confirm-heading__icon").exists()).toBe(true); expect(review.find(".confirm-summary").text()).toBe(t("cloudBrowser.deleteSummary", { count: 5 })); expect(review.find('[data-test=delete-target]').text()).toBe(t("cloudBrowser.deleteRootPrefix")); expect(review.find('[data-test=delete-keys]').element.classList.contains("confirm-list")).toBe(true); expect(review.findAll("li").map((item) => item.text())).toEqual(deletePlan().entries.map((item) => item.key)); review.unmount(); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_delete_execute", { connectionId: "c1", planId: "plan-1", confirmed: true }); expect(app.setError).toHaveBeenCalledWith("cloudBrowser.deletePartial", { deleted: 1, failed: 1, reason: "Original backend reason" }); expect(wrapper.text()).not.toContain("Deleted: 1; failed: 1");
+  });
+  it("shows a loading delete button while the plan executes and never a persistent result banner", async () => {
+    const execute = deferred();
+    handlers.cloud_object_delete_execute = () => execute.promise;
+    const wrapper = await browser(); await prepare(wrapper);
+    await click(wrapper, '[data-test=delete-prefix]');
+    expect(wrapper.find('[data-test=delete-prefix]').attributes("disabled")).toBeDefined();
+    expect(wrapper.find('[data-test=delete-prefix] .action-spinner').exists()).toBe(true);
+    execute.resolve({ deleted: ["a", "b"], failed: [] }); await flushPromises();
+    expect(app.setNotice).toHaveBeenCalledWith("cloudBrowser.deletedObjects", { count: 2 });
+    expect(wrapper.find('[data-test=delete-prefix] .action-spinner').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain(t("cloudBrowser.deletedObjects", { count: 2 }));
   });
   it("does not execute cancelled or expired delete plans", async () => { const wrapper = await browser(); await prepare(wrapper); confirmAction.mockResolvedValue(false); await click(wrapper, '[data-test=delete-prefix]'); confirmAction.mockResolvedValue(true); handlers.cloud_object_delete_plan = () => deletePlan({ planId: "expired", expiresAtUnix: 1 }); await click(wrapper, '[data-test=delete-prefix]'); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_delete_execute")).toBe(false); expect(wrapper.text()).toContain(t('cloudBrowser.stalePlan')); });
   it("ignores stale directory page results after navigation", async () => { const late = deferred(); let count = 0; handlers.cloud_object_list = ({ prefix }) => { if (prefix) return page([{ key: "docs/new", size: 1 }]); if (++count === 1) return page([{ key: "docs/old", size: 1 }], "next", false); return late.promise; }; const wrapper = await browser(); await wrapper.find('[data-test=more]').trigger("click"); await wrapper.find("[data-test=folder-row]").trigger("dblclick"); await flushPromises(); late.resolve(page([{ key: "stale", size: 2 }])); await flushPromises(); expect(wrapper.text()).toContain("new"); expect(wrapper.text()).not.toContain("stale"); });
@@ -758,7 +776,7 @@ describe("CloudBrowser", () => {
   it.each(["en", "zh-CN"])("requires explicit acknowledgement and explains local-only risk in %s", async (locale) => {
     setLocale(locale); handlers.cloud_object_status = () => [transfer("unknown", { key: "uncertain/key", recoveryRequired: true })]; const wrapper = await browser();
     expect(wrapper.text()).toContain('"uncertain/key"'); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_recovery_acknowledge")).toBe(false);
-    confirmAction.mockResolvedValue(false); await textButton(wrapper, t("cloudBrowser.acknowledge")).trigger("click"); await flushPromises(); expect(confirmAction).toHaveBeenCalledWith(t("cloudBrowser.acknowledgeConfirm", { key: '"uncertain/key"' }), t("cloudBrowser.acknowledge"));
+    confirmAction.mockResolvedValue(false); await textButton(wrapper, t("cloudBrowser.acknowledge")).trigger("click"); await flushPromises(); expect(confirmAction.mock.calls[0][1]).toBe(t("cloudBrowser.acknowledge")); expect(confirmAction.mock.calls[0][2]).toMatchObject({ confirmText: t("cloudBrowser.acknowledgeAction") }); const ack = mount({ render: () => confirmAction.mock.calls[0][0] }); expect(ack.find(".confirm-summary").text()).toBe(t("cloudBrowser.acknowledgeBody")); expect(ack.find(".confirm-scope__value").text()).toBe("uncertain/key"); ack.unmount();
     expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_recovery_acknowledge")).toBe(false);
     confirmAction.mockResolvedValue(true); await textButton(wrapper, t("cloudBrowser.acknowledge")).trigger("click"); await flushPromises();
     expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_recovery_acknowledge", { transferId: "t1", connectionId: "c1", connectionRevision: 1, confirmed: true });
@@ -766,7 +784,7 @@ describe("CloudBrowser", () => {
   });
   it("does not infer a legacy null transfer target", async () => {
     handlers.cloud_object_status = () => [transfer("unknown", { key: null, sizeHint: null })]; const wrapper = await browser(); expect(wrapper.text()).toContain(t("cloudBrowser.unknownTarget"));
-    await textButton(wrapper, t("cloudBrowser.acknowledge")).trigger("click"); await flushPromises(); expect(confirmAction.mock.calls[0][0]).toContain(t("cloudBrowser.unknownTarget")); expect(confirmAction.mock.calls[0][0]).not.toContain("a.txt");
+    await textButton(wrapper, t("cloudBrowser.acknowledge")).trigger("click"); await flushPromises(); const ack = mount({ render: () => confirmAction.mock.calls[0][0] }); expect(ack.find('.confirm-scope__value').text()).toBe(t("cloudBrowser.unknownTarget")); expect(ack.text()).not.toContain("a.txt"); ack.unmount();
   });
   it("prevents a stale poll from overwriting acknowledgement and ignores confirmation after route change", async () => {
     handlers.cloud_object_status = () => [transfer("unknown")]; const wrapper = await browser(); const late = deferred(); handlers.cloud_object_status = () => late.promise;

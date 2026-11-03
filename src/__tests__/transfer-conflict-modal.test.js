@@ -73,7 +73,10 @@ describe.each(['upload', 'download'])('real Element Plus %s conflict lifecycle',
     const dialog = s.wrapper.findAllComponents(ElDialog).find(w => w.props('appendToBody'));
     expect(dialog.props('title')).toBe(message);
     expect(modal(direction).querySelector('.el-dialog__title').textContent).toBe(message);
-    expect(modal(direction).querySelector(`[data-test=${direction}-conflict] p`).textContent).toBe(`${message}: first.txt`);
+    // 正文不复述标题，只说明后果；路径单独成块展示。
+    expect(modal(direction).querySelector(`[data-test=${direction}-conflict] p`).textContent)
+      .toBe(t(direction === 'upload' ? 'cloudBrowser.conflictBodyUpload' : 'cloudBrowser.conflictBodyDownload'));
+    expect(modal(direction).querySelector('.conflict-path__value').textContent).toBe('first.txt');
   });
 
   it.each(['"bae60998ffe4923b131e3d6e4c19993e"', 'W/"revision"'])('labels the remote path and strips quotes from ETag %s', async etag => {

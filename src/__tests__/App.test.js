@@ -1042,6 +1042,7 @@ describe("home workspace", () => {
     expect(confirmAction).toHaveBeenCalledWith(
       "解绑服务器“Office”？服务器端授权将被取消，本机保存的授权码也会删除。",
       "解绑",
+      { danger: true, confirmText: "解绑" },
     );
     expect(forgetPeer).toHaveBeenCalledWith({ peerId: "peer-1" });
     expect(wrapper.text()).not.toContain("Office");
@@ -2826,6 +2827,7 @@ describe("Finder-style peer browser", () => {
     expect(confirmAction).toHaveBeenCalledWith(
       "删除文件夹“sub”及其中的所有内容？此操作无法撤销。",
       "删除",
+      { danger: true, confirmText: "删除" },
     );
     expect(remove).toHaveBeenCalledWith({
       peerId: "peer-1",

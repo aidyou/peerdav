@@ -55,6 +55,15 @@
   color: var(--el-text-color-regular);
 }
 
+/* Warning line inside a destructive confirmation, e.g. “N sync mappings remain”. */
+.confirm-warn {
+  margin: 8px 0 0;
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 600;
+  color: var(--el-color-danger);
+}
+
 .confirm-scope {
   display: flex;
   align-items: baseline;
@@ -101,6 +110,16 @@
 
 .confirm-list li + li {
   margin-top: 2px;
+}
+
+/*
+ * The MessageBox message is a flex child of `.el-message-box__container`, so by
+ * default it shrinks to its content and blocks like `.confirm-scope` / `.confirm-list`
+ * never reach the dialog edge. Let it fill the available width instead.
+ */
+.el-message-box__message {
+  flex: 1;
+  min-width: 0;
 }
 
 /*

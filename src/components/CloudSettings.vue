@@ -123,8 +123,8 @@ function closeEditor() {
 async function deleteConnection(item) {
   if (!item?.id) return;
   const count = (data.value.mappings || []).filter((m) => m.connectionId === item.id).length;
-  const message = h("div", [h("p", t("drive.removeConfirm", { name: item.name })), ...(count ? [h("p", { style: { color: "var(--el-color-danger, #d03050)", fontWeight: "bold" }, "data-test": "sync-removal-warning" }, t("drive.removeWarning", { count }))] : [])]);
-  if (!await confirmAction(message, t("drive.remove"), { type: count ? "error" : "warning" })) return;
+  const message = h("div", [h("p", { class: "confirm-summary" }, t("drive.removeConfirm", { name: item.name })), ...(count ? [h("p", { class: "confirm-warn", "data-test": "sync-removal-warning" }, t("drive.removeWarning", { count }))] : [])]);
+  if (!await confirmAction(message, t("drive.remove"), { danger: true, confirmText: t("drive.remove"), type: count ? "error" : "warning" })) return;
   try { await cloud.deleteConnection(String(item.id)); notifyConnectionsChanged(); if (connection.value.id === item.id) { connection.value = blankConnection(); editorOpen.value = false; } await refresh(); } catch (error) { fail(error); }
 }
 onMounted(refresh);

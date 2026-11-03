@@ -433,7 +433,6 @@ const peerHealth = ref({});
 // 只有「正在发这一条申请」的瞬时忙碌态留在组件里；申请结果由后端保存
 // （app.accessRequests），所以切换页面/重载后不会退回「待申请」。
 const requestingUrl = ref("");
-const peerNoticeState = ref(null);
 
 const manualEntry = computed(() =>
   peerUrl.value
@@ -449,17 +448,8 @@ const adminCurrentPassword = ref("");
 const adminNewPassword = ref("");
 const adminNewPasswordConfirm = ref("");
 
-const peerNotice = computed(() => {
-  if (!peerNoticeState.value) return "";
-  return t(peerNoticeState.value.key, peerNoticeState.value.params);
-});
-
 function adminArgs() {
   return { username: app.adminUsername, password: app.serverPassword };
-}
-
-function setPeerNotice(key, params) {
-  peerNoticeState.value = key ? { key, params } : null;
 }
 
 function parseRuleList(values, kind) {
@@ -666,6 +656,7 @@ async function deleteShare(share) {
     const confirmed = await confirmAction(
       t("shares.deleteConfirm", { name: share.name }),
       t("common.delete"),
+      { danger: true, confirmText: t("common.delete") },
     );
     if (!confirmed) return;
 
@@ -690,6 +681,7 @@ async function revokeAuthorization(authorization) {
     const confirmed = await confirmAction(
       t("auth.revokeConfirm", { label: authorization.label }),
       t("auth.revoke"),
+      { danger: true, confirmText: t("auth.revoke") },
     );
     if (!confirmed) return;
 
@@ -708,7 +700,6 @@ async function requestPeerAccess(url = peerUrl.value) {
   const target = String(url ?? "").trim();
   if (!target || requestingUrl.value) return;
   requestingUrl.value = target;
-  setPeerNotice(null);
   try {
     await app.beginPeerAccess(target, null, peerFingerprint.value.trim() || null);
     const discovered = findAccessRequest(app.accessRequests, { url: target });
@@ -730,7 +721,6 @@ async function cancelPeerRequest(url = peerUrl.value) {
     await app.cancelPeerAccess(entry.url);
   } catch (error) {
     app.handleFailure(error);
-    setPeerNotice("client.cancelFailed");
   } finally {
     requestingUrl.value = "";
   }
@@ -771,6 +761,7 @@ async function forgetPeer(peer) {
     const confirmed = await confirmAction(
       t("client.forgetConfirm", { label: peer.label }),
       t("client.forget"),
+      { danger: true, confirmText: t("client.forget") },
     );
     if (!confirmed) return;
 
@@ -779,7 +770,7 @@ async function forgetPeer(peer) {
       app.closePeer();
     }
     await Promise.all([app.refreshPeers(), app.refreshAdminData()]);
-    setPeerNotice("client.forgotten");
+    app.setNotice("client.forgotten");
   });
 }
 
@@ -1629,10 +1620,10 @@ async function loadInitialData() {
               {{ t("client.sending") }}
             </p>
             <p
-              v-else-if="manualEntryMessage || peerNotice"
+              v-else-if="manualEntryMessage"
               class="hint request-progress__notice"
             >
-              {{ manualEntryMessage || peerNotice }}
+              {{ manualEntryMessage }}
             </p>
 
             <list-skeleton v-if="outboundLoading" :rows="3" />

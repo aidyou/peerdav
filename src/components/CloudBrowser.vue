@@ -101,7 +101,7 @@ async function openColumn(item, event, column) {
   const ancestors = levels.slice(0, index + 1).map((level) => ({ ...level, entries: level.entries.slice() }));
   requestId++; columnVersion++;
   prefix.value = item.key; objects.value = []; next.value = null; complete.value = false;
-  protectedRoot.value = false; busy.value = false; partial.value = null;
+  protectedRoot.value = false; busy.value = false;
   clearSelection(); clearPreview();
   columnAncestors.value = ancestors;
   const scope = current();
@@ -196,7 +196,7 @@ async function selectBucket(bucket) {
   }
   if (disposed) return;
   prefix.value = ""; root.value = ""; objects.value = []; next.value = null; complete.value = false;
-  protectedRoot.value = false; busy.value = false; partial.value = null; error.value = null; prepared.value = false; preparationError.value = null;
+  protectedRoot.value = false; busy.value = false; error.value = null; prepared.value = false; preparationError.value = null;
   clearSelection();
   columnVersion++; columnAncestors.value = [];
   clearPreview();
@@ -271,7 +271,9 @@ function retryFailedOperation() {
   if (retry) void retry();
 }
 const transfers = ref([]);
-const partial = ref(null);
+const deleting = ref(false);
+// 列表不完整只提示一次：常驻横幅会一直占据内容区，顶部消息自动消失即可。
+watch(incompleteListing, (value, previous) => { if (value && !previous) app.setInfo?.("cloudBrowser.incomplete"); });
 
 const uploadNotices = new Set();
 const {
@@ -713,7 +715,7 @@ async function load(more = false) {
 function navigate(value) {
   if (!value.startsWith(root.value)) return;
   requestId++; prefix.value = value; objects.value = []; next.value = null; complete.value = false;
-  protectedRoot.value = false; busy.value = false; partial.value = null;
+  protectedRoot.value = false; busy.value = false;
   clearSelection();
   columnVersion++; columnAncestors.value = [];
   clearPreview();
@@ -724,7 +726,7 @@ function navigate(value) {
 // transient network failure never looks like the folder became empty.
 function refresh() {
   requestId++;
-  next.value = null; complete.value = false; busy.value = false; partial.value = null;
+  next.value = null; complete.value = false; busy.value = false;
   clearSelection(); clearPreview();
   void load();
   if (viewMode.value === "columns") void rebuildColumns();
@@ -821,9 +823,10 @@ function deleteDialogBody(plan, target) {
   ]);
 }
 async function remove(target) {
-  if (!canMutate.value || targetProtected(target)) return;
-  await operate(async (scope) => {
-    partial.value = null;
+  if (!canMutate.value || targetProtected(target) || deleting.value) return;
+  // 删除进行中：按钮显示 loading 并禁用；确认框在用户确认后立即关闭，不再叠加任何常驻提示。
+  deleting.value = true;
+  try { await operate(async (scope) => {
     const plan = await cloudObjects.deletePlan({ connectionId: scope.connectionId, prefix: target });
     if (!valid(scope)) return;
     if (!validDeletePlan(plan, target)) { error.value = { code: "CLOUD_CONFIRMATION_REQUIRED", message: t("cloudBrowser.invalidPlan") }; return; }
@@ -832,15 +835,27 @@ async function remove(target) {
     if (Date.now() >= plan.expiresAtUnix * 1000) { error.value = { code: "CLOUD_DELETE_PLAN_STALE", message: t("cloudBrowser.stalePlan") }; return; }
     const result = await cloudObjects.deleteExecute({ connectionId: scope.connectionId, planId: plan.planId, confirmed: true });
     if (!valid(scope)) return;
-    partial.value = result;
+    // 结果只走顶部自动消失的消息，不留常驻提示条；失败原因取最近的一条直接展示。
+    if (result.failed.length) {
+      app.setError?.("cloudBrowser.deletePartial", { deleted: result.deleted.length, failed: result.failed.length, reason: result.failed[0].error?.message || t("cloudBrowser.deleteFailedUnknown") });
+    } else if (result.deleted.length) {
+      app.setNotice?.("cloudBrowser.deletedObjects", { count: result.deleted.length });
+    }
     for (const item of result.failed) if (item.error?.code === "CLOUD_OBJECT_PROTECTED") fail(item.error, scope);
     await load();
-  });
+  }); } finally { deleting.value = false; }
 }
 async function acknowledge(item) {
   if (item.phase !== "unknown" || busy.value) return;
   await operate(async (scope) => {
-    if (!await confirmAction(t("cloudBrowser.acknowledgeConfirm", { key: item.key == null ? t("cloudBrowser.unknownTarget") : JSON.stringify(item.key) }), t("cloudBrowser.acknowledge")) || !valid(scope)) return;
+    const accepted = await confirmAction(h("div", [
+      h("p", { class: "confirm-summary" }, t("cloudBrowser.acknowledgeBody")),
+      h("div", { class: "confirm-scope" }, [
+        h("span", { class: "confirm-scope__label" }, t("cloudBrowser.acknowledgeTargetLabel")),
+        h("span", { class: "confirm-scope__value" }, item.key == null ? t("cloudBrowser.unknownTarget") : displayKey(item.key)),
+      ]),
+    ]), t("cloudBrowser.acknowledge"), { confirmText: t("cloudBrowser.acknowledgeAction") });
+    if (!accepted || !valid(scope)) return;
     // Invalidate polls started before this explicit local-state transition.
     statusVersion++;
     remember(await cloudObjects.recoveryAcknowledge({ transferId: item.transferId, connectionId: item.connectionId, connectionRevision: item.connectionRevision, confirmed: true }), scope);
@@ -890,7 +905,7 @@ watch(() => props.connectionId, () => {
   void cancelUploadSession();
   requestId++; statusVersion++; preparationVersion++; uploadNotices.clear(); prepared.value = false; preparing.value = false; preparationError.value = null; protectedRoot.value = false; connections.value = [];
   view.value = "files"; activeDriveId.value = ""; catalogDrives.value = []; buckets.value = []; activeBucket.value = "";
-  objects.value = []; transfers.value = []; partial.value = null; prefix.value = ""; root.value = ""; next.value = null; complete.value = false; busy.value = false; loading.value = false; error.value = null;
+  objects.value = []; transfers.value = []; prefix.value = ""; root.value = ""; next.value = null; complete.value = false; busy.value = false; loading.value = false; error.value = null;
   clearSelection();
   columnVersion++; columnAncestors.value = [];
   clearPreview();
@@ -985,8 +1000,9 @@ onBeforeUnmount(() => {
                   </button>
                 </el-tooltip>
                 <el-tooltip :content="t('cloudBrowser.deletePrefix')" placement="bottom" :show-after="200" :hide-after="0" :enterable="false">
-                  <button type="button" class="view-switch__button" data-test="delete-prefix" :aria-label="t('cloudBrowser.deletePrefix')" :disabled="!canMutate || hasProtectedObjects" @click="remove(prefix)">
-                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16" /><path d="M9 7V5h6v2" /><path d="M6 7l1 12h10l1-12" /></svg>
+                  <button type="button" class="view-switch__button" data-test="delete-prefix" :aria-label="t('cloudBrowser.deletePrefix')" :disabled="deleting || !canMutate || hasProtectedObjects" :aria-busy="deleting ? 'true' : undefined" @click="remove(prefix)">
+                    <svg v-if="deleting" class="action-spinner" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="34 20" /></svg>
+                    <svg v-else viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16" /><path d="M9 7V5h6v2" /><path d="M6 7l1 12h10l1-12" /></svg>
                   </button>
                 </el-tooltip>
                 <button ref="shortcutsTriggerEl" type="button" class="view-switch__button shortcuts-trigger" :aria-label="t('peer.shortcuts')" :aria-expanded="shortcutsOpen ? 'true' : 'false'" @click="toggleShortcutsPanel">
@@ -1014,7 +1030,6 @@ onBeforeUnmount(() => {
           </Teleport>
           <OperationErrorDialog :error="visibleError" :retryable="!!preparationError || !!retryOperation" :recheck="!!preparationError" :busy="busy || loading || preparing" @close="closeOperationError" @retry="retryFailedOperation" />
           <BrowserSkeleton v-if="loadingHint && entries.length" compact />
-          <p v-if="incompleteListing" class="browser-notice" data-test="incomplete">{{ t('cloudBrowser.incomplete') }}</p>
 
           <div ref="fileViewEl" class="file-view" tabindex="0" @keydown="onFileViewKeydown" @mousedown="onFileViewMousedown">
             <div v-if="marquee" class="marquee" :style="marqueeStyle" aria-hidden="true"></div>
@@ -1065,12 +1080,8 @@ onBeforeUnmount(() => {
             <div v-if="selectedEntries.length" class="selection-actions">
               <el-button v-if="viewMode !== 'columns' && selectedEntries.length === 1 && selectedEntry.isDir" type="primary" :disabled="busy" @click="runSelectionAction(openSelection)">{{ t('peer.open') }}</el-button>
               <el-button data-test="download" :type="selectedEntries.length > 1 ? 'primary' : undefined" plain :disabled="busy" @click="runSelectionAction(downloadSelection)">{{ t('cloudBrowser.download') }}</el-button>
-              <el-button v-if="selectedEntries.length === 1" data-test="delete-file" type="danger" plain :disabled="!canMutate || targetProtected(selectedEntry.key)" @click="runSelectionAction(([entry]) => remove(entry.key))">{{ t('cloudBrowser.delete') }}</el-button>
+              <el-button v-if="selectedEntries.length === 1" data-test="delete-file" type="danger" plain :loading="deleting" :disabled="deleting || !canMutate || targetProtected(selectedEntry.key)" @click="runSelectionAction(([entry]) => remove(entry.key))">{{ t('cloudBrowser.delete') }}</el-button>
             </div>
-          </div>
-          <div v-if="partial" class="browser-notice" role="status">
-            <p>{{ t('cloudBrowser.deleteResult', { deleted: partial.deleted.length, failed: partial.failed.length }) }}</p>
-            <ul><li v-for="item in partial.failed" :key="item.key">{{ item.key }} · {{ item.error.message }}</li></ul>
           </div>
           <ul v-if="transfers.length" class="cloud-tree cloud-transfers" :aria-label="t('cloudBrowser.transfers')"><li v-for="item in transfers" :key="item.transferId"><span>{{ item.key == null ? t('cloudBrowser.unknownTarget') : JSON.stringify(item.key) }}<span v-if="item.sizeHint != null"> · {{ t('cloudBrowser.bytes', { size: item.sizeHint }) }}</span> · {{ t(`cloudBrowser.${item.direction}`) }} · {{ t(`cloudBrowser.phase.${item.phase}`) }}<strong v-if="item.recoveryRequired || item.phase === 'unknown'"> · {{ t('cloudBrowser.recovery') }}</strong><span v-if="item.error"> · {{ item.error.message }}</span></span><p v-if="item.phase === 'acknowledged'">{{ t('cloudBrowser.acknowledgedNotice') }}</p><el-button v-if="item.phase === 'unknown'" :disabled="busy" @click="acknowledge(item)">{{ t('cloudBrowser.acknowledge') }}</el-button><el-button v-if="item.phase === 'running'" :disabled="busy" @click="cancel(item)">{{ t('cloudBrowser.cancel') }}</el-button></li></ul>
         </template>
@@ -1153,8 +1164,14 @@ onBeforeUnmount(() => {
 .shortcuts-panel__desc { margin: 0; font-size: 12px; line-height: 1.5; color: var(--app-text-muted); }
 .shortcuts-panel__note { margin: 0; padding-top: 6px; border-top: 1px solid color-mix(in oklab, var(--app-border) 55%, transparent); font-size: 11px; line-height: 1.5; color: var(--app-text-muted); }
 
-.browser-notice { margin: 0; padding: 8px 10px; border-radius: 8px; background: var(--app-surface-2); color: var(--app-text-secondary); font-size: 12.5px; }
 .cloud-error { flex: none; display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid color-mix(in oklab, var(--el-color-danger) 35%, var(--app-border)); border-radius: 8px; background: color-mix(in oklab, var(--el-color-danger) 7%, transparent); color: var(--el-color-danger); font-size: 12.5px; }
+/* 删除进行中的按钮反馈：SVG 变换原点必须显式声明，否则 WebKitGTK 下看不出旋转。 */
+.action-spinner { transform-box: view-box; transform-origin: 50% 50%; animation: cloud-spin 0.9s linear infinite; }
+@keyframes cloud-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .action-spinner { animation: none; }
+}
+
 .cloud-error__message { min-width: 0; overflow-wrap: anywhere; }
 
 /* Keep the pathbar and selection bar fixed; each view owns its scrolling region. */
@@ -1169,17 +1186,6 @@ onBeforeUnmount(() => {
 .file-empty { margin: 22px 0; text-align: center; font-size: 13px; color: var(--app-text-muted); }
 .file-view--placeholder { flex: 1; min-height: 0; overflow: hidden; }
 
-.transfer-dialog { display: flex; flex-direction: column; gap: 12px; }
-.download-dialog__summary { margin: 0; font-size: 12.5px; color: var(--app-text-muted); }
-.transfer-queue { list-style: none; max-height: min(320px, 34vh); overflow-y: auto; overscroll-behavior: contain; margin: 0; padding: 0; border: 1px solid var(--app-border); border-radius: 10px; }
-.transfer-queue li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 11px; }
-.transfer-queue li + li { border-top: 1px solid var(--app-border); }
-.transfer-queue__name { display: flex; align-items: center; gap: 9px; min-width: 0; }
-.transfer-queue__name > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.transfer-queue__name strong, .transfer-queue__name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.transfer-queue__name strong { font-size: 12.5px; color: var(--app-text); }
-.transfer-queue__name span { font-size: 11px; color: var(--app-text-muted); }
-.row-tag { flex: none; white-space: nowrap; }
 .load-more { flex: none; align-self: flex-start; }
 
 /* Provider-owned gallery preview content; view layout lives in FileManagerView. */

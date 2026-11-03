@@ -741,7 +741,7 @@ async function beginPeerAccess(url, label = null, fingerprint = null) {
 }
 
 async function removeLocalPeer(peer) {
-  if (!await confirmAction(t("client.removeLocalConfirm", { label: peer.label }), t("client.removeLocal"))) return;
+  if (!await confirmAction(t("client.removeLocalConfirm", { label: peer.label }), t("client.removeLocal"), { danger: true, confirmText: t("client.removeLocal") })) return;
   try {
     await invoke("remove_local_peer", { peerId: peer.id });
     if (activePeerId.value === peer.id) closePeer();

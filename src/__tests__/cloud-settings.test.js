@@ -100,7 +100,7 @@ describe("CloudSettings", () => {
     const [vnode, , options] = confirmAction.mock.calls[0];
     const dialog = mount(defineComponent({ render: () => vnode }));
     expect(dialog.text()).toContain('不会删除远端文件'); expect(dialog.find('[data-test="sync-removal-warning"]').text()).toContain('2');
-    expect(dialog.find('[data-test="sync-removal-warning"]').attributes('style')).toContain('color:'); expect(options.type).toBe('error');
+    expect(dialog.find('[data-test="sync-removal-warning"]').classes()).toContain('confirm-warn'); expect(options.type).toBe('error');
     expect(cloud.deleteConnection).not.toHaveBeenCalled(); expect(cloud.deleteMapping).not.toHaveBeenCalled(); dialog.unmount(); wrapper.unmount();
   });
   it("removes only the local connection after explicit acceptance", async () => {

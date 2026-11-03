@@ -22,6 +22,8 @@ const scanSkipsText = computed(() => t("cloudBrowser.uploadSkipped", { empty: sk
 const processed = computed(() => (props.summary?.completedFiles || 0) + (props.summary?.skippedFiles || 0));
 const total = computed(() => props.summary?.totalFiles || 0);
 const uploadedBytes = computed(() => props.summary?.completedBytes || 0);
+// 有统计内容时才作为 aria-live 区域，避免空区域被读屏登记为状态源。
+const hasStats = computed(() => total.value > 0 || uploadedBytes.value > 0 || (props.summary?.skippedFiles ?? 0) > 0);
 
 // 列表是远端目录预览而非逐文件队列，只有正在处理的条目才有状态可言。
 const isActive = (item) => item.relativePath === props.summary?.currentRelativePath && props.running;
@@ -43,8 +45,8 @@ const entrySize = (item) => {
 </script>
 
 <template>
-  <el-dialog :model-value="open" @update:model-value="emit('close')" width="560" align-center class="upload-dialog"
-    :show-close="!running" :close-on-click-modal="false" :close-on-press-escape="false" data-test="upload-dialog">
+  <el-dialog :model-value="open" @update:model-value="!running && emit('close')" width="600" align-center class="upload-dialog"
+    :show-close="!running" :close-on-click-modal="false" :close-on-press-escape="!running" data-test="upload-dialog">
     <template #header="{ titleId, titleClass }">
       <div class="queue-header">
         <span :id="titleId" :class="titleClass">{{ t('peer.uploadQueue') }}</span>
@@ -79,7 +81,7 @@ const entrySize = (item) => {
         <p class="upload-dir__path">
           <span class="upload-dir__label">{{ t('cloudBrowser.uploadRemoteDir') }}</span>
           <span class="mono upload-dir__value" :title="remotePath">{{ remotePath }}</span>
-          <span v-if="phaseIcon" class="upload-dir__state" :class="`is-${phaseIcon}`" :aria-label="t(`cloudBrowser.phase.${summary.phase}`)">
+          <span v-if="phaseIcon" class="upload-dir__state" :class="`is-${phaseIcon}`">
             <svg v-if="phaseIcon === 'active'" class="upload-dir__spinner" viewBox="0 0 16 16" aria-hidden="true">
               <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="24 14" />
             </svg>
@@ -89,23 +91,26 @@ const entrySize = (item) => {
             <svg v-else viewBox="0 0 16 16" aria-hidden="true">
               <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
             </svg>
+            <!-- 图标旁写明状态文字：动画可能被系统“减少动效”关闭，状态不能只靠旋转表达。 -->
+            <span class="upload-dir__state-text">{{ t(`cloudBrowser.phase.${summary.phase}`) }}</span>
           </span>
         </p>
-        <div class="queue-table">
-          <div class="queue-table__head" aria-hidden="true">
-            <span>{{ t('peer.queueColPath') }}</span>
-            <span>{{ t('peer.queueColSize') }}</span>
-            <span>{{ t('peer.queueColStatus') }}</span>
+        <div class="queue-table" role="table" :aria-label="t('peer.uploadQueue')">
+          <!-- 与下载队列一致：表头既是视觉列名，也是读屏的列定义。 -->
+          <div class="queue-table__head" role="row">
+            <span role="columnheader">{{ t('peer.queueColPath') }}</span>
+            <span role="columnheader">{{ t('peer.queueColSize') }}</span>
+            <span role="columnheader">{{ t('peer.queueColStatus') }}</span>
           </div>
-          <ul class="transfer-queue upload-queue">
-            <li v-for="item in page?.entries || []" :key="item.relativePath" :data-status="isActive(item) ? 'active' : 'unscanned'"
+          <ul class="transfer-queue upload-queue" role="rowgroup">
+            <li v-for="item in page?.entries || []" role="row" :key="item.relativePath" :data-status="isActive(item) ? 'active' : 'unscanned'"
               :class="{ 'is-active': isActive(item) }">
-              <div class="queue-cell queue-cell--path" :title="item.relativePath">
+              <div class="queue-cell queue-cell--path" role="cell" :title="item.relativePath">
                 <FileGlyph :entry="{ isDir: item.kind === 'directory', name: item.name }" />
                 <span class="queue-path">{{ item.name }}</span>
               </div>
-              <div class="queue-cell queue-cell--size">{{ entrySize(item) }}</div>
-              <div class="queue-cell queue-cell--status">
+              <div class="queue-cell queue-cell--size" role="cell">{{ entrySize(item) }}</div>
+              <div class="queue-cell queue-cell--status" role="cell">
                 <el-tag v-if="isActive(item)" :type="statusTagTone('uploading')" effect="plain" round size="small">{{ t('cloudBrowser.uploadActive') }}</el-tag>
                 <span v-else class="queue-empty">—</span>
               </div>
@@ -118,7 +123,7 @@ const entrySize = (item) => {
 
     <template #footer>
       <div class="dialog-footer">
-        <div class="dialog-footer__stats">
+        <div class="dialog-footer__stats" :role="hasStats ? 'status' : undefined">
           <span v-if="total > 0">{{ t('peer.uploadProcessed', { done: processed, total }) }}</span>
           <span v-if="uploadedBytes > 0">{{ t('peer.uploadUploaded', { bytes: formatBytes(uploadedBytes) }) }}</span>
           <span v-if="(summary?.skippedFiles ?? 0) > 0">{{ t('peer.uploadSkippedFiles', { count: summary.skippedFiles }) }}</span>
@@ -161,13 +166,20 @@ const entrySize = (item) => {
 .upload-dir__path { display: flex; align-items: center; gap: 2px; min-width: 0; font-size: 12.5px; color: var(--app-text-muted); }
 .upload-dir__label { flex: none; }
 .upload-dir__value { flex: 1; min-width: 0; font-size: 12px; color: var(--app-text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.upload-dir__state { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; margin-left: 4px; }
-.upload-dir__state svg { display: block; width: 16px; height: 16px; }
+.upload-dir__state { flex: none; display: inline-flex; align-items: center; gap: 5px; margin-left: 6px; }
+.upload-dir__state svg { display: block; width: 16px; height: 16px; flex: none; }
+.upload-dir__state-text { font-size: 12px; line-height: 16px; }
 .upload-dir__state.is-active { color: var(--el-color-primary); }
 .upload-dir__state.is-done { color: var(--el-color-success); }
 .upload-dir__state.is-error { color: var(--el-color-danger); }
-.upload-dir__spinner { animation: queue-spin 0.9s linear infinite; }
+/* transform-box/transform-origin 必须显式声明：WebKitGTK（Tauri Linux 内核）对 SVG 元素的
+   CSS transform 默认原点在视口左上角，不写就会“在转但看不出”，甚至表现为不旋转。 */
+.upload-dir__spinner { transform-box: view-box; transform-origin: 50% 50%; animation: queue-spin 0.9s linear infinite; }
 @keyframes queue-spin { to { transform: rotate(360deg); } }
+/* 旋转只是“进行中”的辅助表达，用户要求减少动效时改为静态图标。 */
+@media (prefers-reduced-motion: reduce) {
+  .upload-dir__spinner { animation: none; }
+}
 .upload-dir__notice { font-size: 11.5px; color: var(--app-text-muted); }
 
 /* 表头与数据行共用同一列模板：状态固定收窄、大小稍宽、路径吃掉剩余空间。 */
@@ -175,14 +187,14 @@ const entrySize = (item) => {
 .transfer-queue li { display: grid; grid-template-columns: minmax(0, 1fr) 108px 84px; align-items: center; gap: 10px; }
 .queue-table__head { padding: 6px 19px 6px 11px; color: var(--app-text-muted); font-size: 11.5px; font-weight: 600; }
 
-.transfer-queue { list-style: none; max-height: min(320px, 34vh); overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; margin: 0; padding: 0; border: 1px solid var(--app-border); border-radius: 10px; }
+.transfer-queue { list-style: none; max-height: min(360px, 45vh); overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; margin: 0; padding: 0; border: 1px solid var(--app-border); border-radius: 10px; }
 .transfer-queue li { padding: 9px 11px; }
 .transfer-queue li + li { border-top: 1px solid var(--app-border); }
 .transfer-queue li.is-active { background: color-mix(in oklab, var(--el-color-primary) 20%, transparent); }
 
 .queue-cell { min-width: 0; }
 .queue-cell--path { display: flex; align-items: center; gap: 9px; }
-.queue-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; color: var(--app-text); }
+.queue-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--app-text); }
 .queue-cell--size { font-size: 12px; color: var(--app-text-muted); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .queue-cell--status { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
 .queue-cell--status :deep(.el-button) { margin-left: 0; }

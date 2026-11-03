@@ -42,7 +42,6 @@ const peerPreviewPath = ref("");
 const previewOpen = ref(false);
 const previewLimit = ref(null);
 const peerEdit = ref(null);
-const peerNoticeState = ref(null);
 const viewMode = ref(readViewMode());
 const columnStack = ref([]);
 // 分栏模式下正在取子目录的那一列：点击后必须有即时反馈，否则深层目录看起来像没响应。
@@ -65,9 +64,9 @@ let browserDisposed = false;
 let uploadPollTimer;
 const canMutate = computed(() => Boolean(activeShare.value?.permissions?.canWrite) && !busy.value && !uploadRunning.value);
 const {
-  uploadDialogOpen, uploadSummary, uploadPage, uploadRunning, uploadPageLoading,
+  uploadDialogOpen, uploadSummary, uploadPage, uploadRunning,
   uploadBatchError, uploadPageNotice, uploadApplyRemaining, uploadResolving, uploadOverwriteAllowed,
-  selectUpload, loadUploadPage, pollUpload, cancelUpload, closeUpload, resolveUploadConflict, cancelUploadSession,
+  selectUpload, pollUpload, cancelUpload, closeUpload, resolveUploadConflict, cancelUploadSession,
 } = useUploadBatch({
   adapter: peerUploadAdapter,
   captureScope: () => ({ peerId: props.peer.id, shareName: activeShare.value.name, shareId: activeShareId.value,
@@ -119,11 +118,6 @@ const peerHost = computed(() => {
   } catch {
     return props.peer.url;
   }
-});
-
-const peerNotice = computed(() => {
-  if (!peerNoticeState.value) return "";
-  return t(peerNoticeState.value.key, peerNoticeState.value.params);
 });
 
 const breadcrumbs = computed(() => {
@@ -265,7 +259,9 @@ function setViewMode(mode) {
 }
 
 function setPeerNotice(key, params) {
-  peerNoticeState.value = { key, params };
+  // 提示只出现在顶部并自动消失，不在页面里留下常驻横幅。
+  if (key === "peer.editUploaded") app.setNotice?.(key, params);
+  else app.setInfo?.(key, params);
 }
 
 function clearPreview() {
@@ -282,7 +278,6 @@ function reset() {
   peerListing.value = null;
   clearPreview();
   peerEdit.value = null;
-  peerNoticeState.value = null;
   columnStack.value = [];
   clearSelection();
   // 切换对端时作废仍在飞行的目录请求，避免旧结果落到新对端上。
@@ -855,6 +850,7 @@ async function deleteEntry(entry) {
         name: entry.name,
       }),
       t("common.delete"),
+      { danger: true, confirmText: t("common.delete") },
     );
     if (!confirmed) return;
 
@@ -892,6 +888,7 @@ async function commitPeerEdit() {
         {
           confirmText: t("peer.overwrite"),
           cancelText: t("peer.skip"),
+          danger: true,
         },
       );
       if (!overwrite) {
@@ -1145,7 +1142,6 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
           </div>
         </Teleport>
 
-        <p v-if="peerNotice" class="browser-notice">{{ peerNotice }}</p>
 
         <div
           v-if="peerListing"
@@ -1316,9 +1312,9 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
       @cancel="cancelDownloadQueue" @close="closeDownloadQueue" @reveal="revealDownloadRoot" />
 
     <UploadBatchDialog :open="uploadDialogOpen" :summary="uploadSummary" :page="uploadPage" :running="uploadRunning"
-      :page-loading="uploadPageLoading" :batch-error="uploadBatchError" :page-notice="uploadPageNotice"
+      :batch-error="uploadBatchError" :page-notice="uploadPageNotice"
       v-model:apply-remaining="uploadApplyRemaining" :resolving="uploadResolving" :overwrite-allowed="uploadOverwriteAllowed"
-      @close="closeUpload" @cancel="cancelUpload" @page="loadUploadPage" @resolve="resolveUploadConflict" />
+      @close="closeUpload" @cancel="cancelUpload" @resolve="resolveUploadConflict" />
 
     <FilePreviewDialog
       :open="previewOpen"
@@ -1644,14 +1640,6 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   -webkit-app-region: no-drag;
 }
 
-.browser-notice {
-  margin: 0;
-  padding: 8px 10px;
-  border-radius: 8px;
-  background: var(--app-surface-2);
-  color: var(--app-text-secondary);
-  font-size: 12.5px;
-}
 
 /* Keep the pathbar and selection bar fixed; each view owns its scrolling region. */
 .browser-main > .file-view {
@@ -1850,83 +1838,6 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
 .edit-panel p {
   margin: 4px 0 0;
-}
-
-.transfer-dialog {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.transfer-dialog__name {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--app-text);
-  overflow-wrap: anywhere;
-}
-
-.saved-path {
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.65;
-  color: var(--app-text-secondary);
-  overflow-wrap: anywhere;
-}
-
-.transfer-queue {
-  list-style: none;
-  /* 队列长度不可控（整目录展开可达数百项），必须按视口收口，否则对话框会顶出屏幕。 */
-  max-height: min(320px, 34vh);
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  margin: 0;
-  padding: 0;
-  border: 1px solid var(--app-border);
-  border-radius: 10px;
-}
-
-.transfer-queue li {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 9px 11px;
-}
-
-.transfer-queue li + li {
-  border-top: 1px solid var(--app-border);
-}
-
-.transfer-queue__name {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-}
-
-.transfer-queue__name > div {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.transfer-queue__name strong,
-.transfer-queue__name span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.transfer-queue__name strong {
-  font-size: 12.5px;
-  color: var(--app-text);
-}
-
-.transfer-queue__name span {
-  font-size: 11px;
-  color: var(--app-text-muted);
 }
 
 @media (max-width: 760px) {

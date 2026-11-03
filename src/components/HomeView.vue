@@ -170,6 +170,7 @@ async function forgetPeer(peer) {
     const confirmed = await confirmAction(
       t("home.forgetConfirm", { label: peer.label }),
       t("home.forget"),
+      { danger: true, confirmText: t("home.forget") },
     );
     if (!confirmed) return;
 
