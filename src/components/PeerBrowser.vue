@@ -845,6 +845,10 @@ async function editEntry(entry) {
 async function deleteEntry(entry) {
   if (!entry || busy.value || !canDeleteEntries.value) return;
   await run(async () => {
+    // 禁止删除共享根目录（相当于 rm -rf /）：其中的条目必须逐个提交删除。
+    if (entry.path === "/") {
+      throw { code: "PEER_DELETE_ROOT_FORBIDDEN", message: t("peer.deleteRootForbidden"), detail: null, context: { path: entry.path } };
+    }
     const confirmed = await confirmAction(
       t(entry.isDir ? "peer.deleteFolderConfirm" : "peer.deleteFileConfirm", {
         name: entry.name,

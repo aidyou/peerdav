@@ -42,6 +42,8 @@ pub enum ObjectServiceError {
     StaleDeletePlan,
     #[error("delete plan confirmation is required")]
     ConfirmationRequired,
+    #[error("deleting the bucket root is forbidden; delete entries individually")]
+    RootDeleteForbidden,
     #[error("local download capability is invalid")]
     InvalidLocalCapability,
     #[error("local filesystem operation failed")]
@@ -744,6 +746,11 @@ impl ObjectService {
         expires_at_unix: u64,
     ) -> Result<DeletePlan, ObjectServiceError> {
         valid_prefix(prefix)?;
+        // Like forbidding `rm -rf /`: a root plan would wipe the whole bucket,
+        // so entries under the root must be deleted one by one.
+        if prefix.trim_end_matches('/').is_empty() {
+            return Err(ObjectServiceError::RootDeleteForbidden);
+        }
         let _lease = self.guard.begin_mutation(&self.target_identity(prefix))?;
         let now = now();
         let expiry = expires_at_unix.min(now.saturating_add(MAX_PLAN_TTL));

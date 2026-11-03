@@ -823,6 +823,11 @@ function deleteDialogBody(plan, target) {
   ]);
 }
 async function remove(target) {
+  // 类似禁止 `rm -rf /`：未指定目录（根前缀）时拒绝整体删除，根目录下的对象必须逐个删除。
+  if (!target || target === "/") {
+    error.value = { code: "CLOUD_DELETE_ROOT_FORBIDDEN", message: t("cloudBrowser.deleteRootForbidden") };
+    return;
+  }
   if (!canMutate.value || targetProtected(target) || deleting.value) return;
   // 删除进行中：按钮显示 loading 并禁用；确认框在用户确认后立即关闭，不再叠加任何常驻提示。
   deleting.value = true;
@@ -999,7 +1004,7 @@ onBeforeUnmount(() => {
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5c0-.8.7-1.5 1.5-1.5h4l1.8 2H19c.8 0 1.5.7 1.5 1.5v8c0 .8-.7 1.5-1.5 1.5H5c-.8 0-1.5-.7-1.5-1.5z" /><path d="M12 17v-5M9.5 14.5 12 12l2.5 2.5" /></svg>
                   </button>
                 </el-tooltip>
-                <el-tooltip :content="t('cloudBrowser.deletePrefix')" placement="bottom" :show-after="200" :hide-after="0" :enterable="false">
+                <el-tooltip :content="prefix ? t('cloudBrowser.deletePrefix') : t('cloudBrowser.deletePrefixRootHint')" placement="bottom" :show-after="200" :hide-after="0" :enterable="false">
                   <button type="button" class="view-switch__button" data-test="delete-prefix" :aria-label="t('cloudBrowser.deletePrefix')" :disabled="deleting || !canMutate || hasProtectedObjects" :aria-busy="deleting ? 'true' : undefined" @click="remove(prefix)">
                     <svg v-if="deleting" class="action-spinner" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="34 20" /></svg>
                     <svg v-else viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16" /><path d="M9 7V5h6v2" /><path d="M6 7l1 12h10l1-12" /></svg>

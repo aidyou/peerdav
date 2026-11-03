@@ -1727,6 +1727,23 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn root_delete_plan_is_forbidden() -> Result<(), TestError> {
+        let f = fixture().await?;
+        authorize(&f).await?;
+        for root in ["", "/"] {
+            assert_eq!(
+                f.runtime
+                    .object_delete_plan("connection", root)
+                    .await
+                    .err()
+                    .ok_or("root delete must be refused")?
+                    .code,
+                "CLOUD_DELETE_ROOT_FORBIDDEN"
+            );
+        }
+        Ok(())
+    }
+    #[tokio::test]
     async fn cached_delete_plan_works_once_but_revision_change_invalidates() -> Result<(), TestError>
     {
         let f = fixture().await?;

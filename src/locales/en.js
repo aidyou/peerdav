@@ -468,6 +468,8 @@ export default {
   "cloudBrowser.deleteSummary": "This will delete {count} objects and cannot be undone.",
   "cloudBrowser.deleteScopeLabel": "Prefix",
   "cloudBrowser.deleteRootPrefix": "entire bucket (root)",
+  "cloudBrowser.deleteRootForbidden": "The entire bucket (root) cannot be deleted at once. Select the files or folders under the root and delete them individually.",
+  "cloudBrowser.deletePrefixRootHint": "Bulk deletion is not allowed at the root; select the objects to delete individually",
   "cloudBrowser.invalidPlan": "The delete plan has missing, duplicate or invalid entries, or its count does not match. Deletion is blocked; request a complete plan again.",
   "cloudBrowser.unknownTarget": "Unknown target (legacy record)",
   "cloudBrowser.acknowledge": "Acknowledge uncertain result…",
@@ -735,6 +737,7 @@ export default {
   "peer.deleteFolderConfirm":
     "Delete the folder “{name}” and everything in it? This cannot be undone.",
   "peer.deleted": "Deleted “{name}”.",
+  "peer.deleteRootForbidden": "The shared root directory cannot be deleted. Select the files or folders it contains and delete them individually.",
   "peer.saveAs": "Save file",
   "peer.pickUploadFiles": "Choose files to upload (multiple)",
   "peer.pickUploadFolder": "Choose a folder to upload",

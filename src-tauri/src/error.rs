@@ -648,6 +648,10 @@ impl From<crate::cloud::ObjectServiceError> for DomainError {
                 "CLOUD_CONFIRMATION_REQUIRED",
                 "请确认删除操作 / Delete confirmation required",
             ),
+            ObjectServiceError::RootDeleteForbidden => (
+                "CLOUD_DELETE_ROOT_FORBIDDEN",
+                "禁止删除整个存储桶（根目录），请逐个删除其中的对象 / Deleting the entire bucket (root) is forbidden; delete the objects individually",
+            ),
             ObjectServiceError::Cancelled => ("CLOUD_CANCELLED", "下载已取消 / Download cancelled"),
             ObjectServiceError::DestinationExists => (
                 "CLOUD_PRECONDITION",
