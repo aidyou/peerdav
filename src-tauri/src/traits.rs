@@ -10,7 +10,7 @@ pub trait TransferQueueAdapter: Send + Sync {
     fn report_error(&self, error: &AppError);
     fn validate(&self) -> futures_util::future::BoxFuture<'_, Result<(), AppError>>;
     fn plan(&self, selection: crate::download_types::DownloadSelection) -> futures_util::future::BoxFuture<'_, Result<Vec<crate::download_types::DownloadItem>, AppError>>;
-    fn execute<'a>(&'a self, item: &'a crate::download_types::DownloadItem, root: &'a crate::cloud::PhysicalRoot, overwrite: bool, cancel: tokio_util::sync::CancellationToken) -> futures_util::future::BoxFuture<'a, Result<(), AppError>>;
+    fn execute<'a>(&'a self, item: &'a crate::download_types::DownloadItem, root: &'a crate::cloud::PhysicalRoot, overwrite: bool, cancel: tokio_util::sync::CancellationToken, progress: Option<crate::peer::TransferProgressCallback>) -> futures_util::future::BoxFuture<'a, Result<(), AppError>>;
 }
 
 /// Both upload transports must provide queue admission and a monitored worker.

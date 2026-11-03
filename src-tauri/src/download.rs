@@ -1,11 +1,18 @@
 use crate::local_upload::{invalid, token};
 use crate::{AppError, DomainError, download_types::*, traits::TransferQueueAdapter};
 use futures_util::FutureExt;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 fn app(e: crate::cloud::ObjectServiceError) -> AppError {
     AppError::from(DomainError::from(e))
 }
-pub(crate) fn item(remote_path: String, relative_path: String) -> Result<DownloadItem, AppError> {
+pub(crate) fn item(
+    remote_path: String,
+    relative_path: String,
+    size: u64,
+) -> Result<DownloadItem, AppError> {
     crate::cloud::object_service::valid_relative_path(&relative_path).map_err(app)?;
     if relative_path.len() > 4096 || relative_path.split('/').count() > MAX_DOWNLOAD_DEPTH {
         return Err(invalid());
@@ -13,6 +20,7 @@ pub(crate) fn item(remote_path: String, relative_path: String) -> Result<Downloa
     Ok(DownloadItem {
         remote_path,
         relative_path,
+        size,
         phase: "pending".into(),
     })
 }
@@ -44,6 +52,7 @@ impl DownloadQueues {
             completed_files: 0,
             skipped_files: 0,
             current_relative_path: None,
+            current_transferred: None,
             conflict: None,
             error: None,
         };
@@ -58,6 +67,7 @@ impl DownloadQueues {
                 items,
                 root: Arc::new(root),
                 adapter,
+                progress: Arc::new(AtomicU64::new(0)),
                 lifecycle,
                 cancel: tokio_util::sync::CancellationToken::new(),
                 notify: Arc::new(tokio::sync::Notify::new()),
@@ -111,7 +121,7 @@ impl DownloadQueues {
         Ok(q.status.clone())
     }
     async fn run(&self, id: &str) -> Result<(), AppError> {
-        let (items, root, adapter, cancel, lifecycle, notify) = {
+        let (items, root, adapter, cancel, lifecycle, notify, progress) = {
             let map = self.queues.lock().await;
             let q = map.get(id).ok_or_else(invalid)?;
             (
@@ -121,6 +131,7 @@ impl DownloadQueues {
                 q.cancel.clone(),
                 q.lifecycle.clone(),
                 Arc::clone(&q.notify),
+                Arc::clone(&q.progress),
             )
         };
         let operation = async {
@@ -132,6 +143,7 @@ impl DownloadQueues {
                     let mut map = self.queues.lock().await;
                     let q = map.get_mut(id).ok_or_else(invalid)?;
                     q.status.current_relative_path = Some(item.relative_path.clone());
+                    progress.store(0, Ordering::Relaxed);
                 }
                 let exists = root
                     .relative_target_exists(&item.relative_path)
@@ -191,8 +203,14 @@ impl DownloadQueues {
                     }));
                 }
                 if !(skip && fresh_exists) {
+                    let progress_cb: crate::peer::TransferProgressCallback = {
+                        let progress = Arc::clone(&progress);
+                        Arc::new(move |transferred, _total| {
+                            progress.store(transferred, Ordering::Relaxed);
+                        })
+                    };
                     adapter
-                        .execute(item, &root, choice == Some(ConflictResolution::Overwrite), cancel.clone())
+                        .execute(item, &root, choice == Some(ConflictResolution::Overwrite), cancel.clone(), Some(progress_cb))
                         .await?;
                 }
                 let mut map = self.queues.lock().await;
@@ -228,14 +246,14 @@ impl DownloadQueues {
         }
     }
     pub(crate) async fn status(&self, id: &str) -> Result<DownloadStatus, AppError> {
-        Ok(self
-            .queues
-            .lock()
-            .await
-            .get(id)
-            .ok_or_else(invalid)?
-            .status
-            .clone())
+        let map = self.queues.lock().await;
+        let q = map.get(id).ok_or_else(invalid)?;
+        let mut status = q.status.clone();
+        // 同步进度回调只能原子写入；在读取状态时落到 DTO，供前端渲染当前行进度。
+        if status.current_relative_path.is_some() {
+            status.current_transferred = Some(q.progress.load(Ordering::Relaxed));
+        }
+        Ok(status)
     }
     pub(crate) async fn page(
         &self,
@@ -343,8 +361,8 @@ mod tests {
         fn plan(&self, _: DownloadSelection) -> BoxFuture<'_, Result<Vec<DownloadItem>, AppError>> {
             Box::pin(async {
                 Ok(vec![
-                    item("a".into(), "a".into())?,
-                    item("b".into(), "b".into())?,
+                    item("a".into(), "a".into(), 0)?,
+                    item("b".into(), "b".into(), 0)?,
                 ])
             })
         }
@@ -354,6 +372,7 @@ mod tests {
             root: &'a crate::cloud::PhysicalRoot,
             overwrite: bool,
             cancel: tokio_util::sync::CancellationToken,
+            _progress: Option<crate::peer::TransferProgressCallback>,
         ) -> BoxFuture<'a, Result<(), AppError>> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);

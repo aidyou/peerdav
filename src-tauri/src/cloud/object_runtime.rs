@@ -2957,6 +2957,7 @@ impl CloudRuntime {
                             &relative_path,
                             Some(cancel),
                             overwrite_confirmed,
+                            None,
                         )
                         .await
                         .map_err(app)?;
@@ -3131,6 +3132,7 @@ impl CloudRuntime {
                                 file_name.as_deref().ok_or_else(state_error)?,
                                 Some(cancel),
                                 confirmed,
+                                None,
                             )
                             .await
                             .map_err(app)?;

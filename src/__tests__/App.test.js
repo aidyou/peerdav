@@ -2572,7 +2572,7 @@ describe("Finder-style peer browser", () => {
         conflict: { conflictId: "conflict-a", relativePath: "docs/a.txt", key: "/docs/a.txt", etag: null },
       }),
       peer_resolve_upload_batch: resolveConflict,
-      peer_status_upload_batch: async () => batchSummary("completed", { completedFiles: 1, completedBytes: 5 }),
+      peer_status_upload_batch: async () => batchSummary("completed", { completedFiles: 1, completedBytes: 5, totalFiles: 1 }),
     });
 
     await wrapper.findAll(".file-tile")[1].trigger("click");
@@ -2595,7 +2595,8 @@ describe("Finder-style peer browser", () => {
     await flushPromises();
     expect(resolveConflict).toHaveBeenCalledWith({ peerId: "peer-1", batchId: "peer-batch",
       conflictId: "conflict-a", decision: "overwrite", applyToRemaining: true });
-    expect(wrapper.find('[data-test="upload-summary"]').text()).toContain("1");
+    expect(wrapper.find('[data-test="upload-dialog"] .dialog-footer').text()).toContain("1/1");
+    expect(wrapper.find('[data-test="upload-dialog"] .dialog-footer').text()).toContain("5 B");
     expect(invoke.mock.calls.some(([name]) => name === "upload_peer_file" || name === "collect_upload_paths")).toBe(false);
 
     wrapper.unmount();
@@ -3320,7 +3321,7 @@ describe("Finder-style peer browser", () => {
     const { wrapper } = await openBrowser({
       peer_start_upload_batch: () => new Promise((resolve) => { finish = resolve; }),
       peer_cancel_upload_batch: cancel,
-      peer_status_upload_batch: async () => batchSummary("completed", { completedFiles: 1, completedBytes: 5 }),
+      peer_status_upload_batch: async () => batchSummary("completed", { completedFiles: 1, completedBytes: 5, totalFiles: 1 }),
     });
     await wrapper.find('button[aria-label="上传文件"]').trigger("click");
     await flushPromises();
@@ -3330,27 +3331,24 @@ describe("Finder-style peer browser", () => {
     finish(batchSummary("running"));
     await flushPromises();
     expect(wrapper.find('[data-test="close-upload"]').exists()).toBe(true);
-    expect(wrapper.find('[data-test="upload-summary"]').text()).toContain("1");
+    expect(wrapper.find('[data-test="upload-dialog"] .dialog-footer').text()).toContain("1/1");
     expect(wrapper.find('[data-test="upload-dialog"]').text()).not.toContain("%");
     wrapper.unmount();
   });
 
-  it("selects peer folder batches natively and replaces direct-child pages", async () => {
+  it("selects peer folder batches natively and previews direct children without navigation", async () => {
     const selectBatch = vi.fn(async () => batchSummary("selected"));
-    const pageBatch = vi.fn(async ({ directoryToken }) => directoryToken === "sub"
-      ? batchPage({ directoryToken: "sub", parentToken: "root", relativePath: "docs/sub",
-        entries: [{ name: "b.txt", relativePath: "docs/sub/b.txt", kind: "file", size: 4 }] })
-      : batchPage({ entries: [{ name: "sub", relativePath: "docs/sub", kind: "directory", directoryToken: "sub" }] }));
+    const pageBatch = vi.fn(async () => batchPage({ entries: [{ name: "sub", relativePath: "docs/sub", kind: "directory", directoryToken: "sub" }] }));
     const { wrapper } = await openBrowser({ peer_select_upload_batch: selectBatch, peer_page_upload_batch: pageBatch });
     await wrapper.find('button[aria-label="上传文件夹"]').trigger("click");
     await flushPromises();
     expect(selectBatch).toHaveBeenCalledWith({ peerId: "peer-1", shareName: "Docs", remoteDir: "/", mode: "folder",
       options: { respectGitignore: generalSettings.respectGitignore, patterns: generalSettings.ignorePatterns } });
     expect(invoke).toHaveBeenCalledWith("peer_start_upload_batch", { peerId: "peer-1", batchId: "peer-batch", conflictPolicy: "ask" });
-    await wrapper.find('[data-test="upload-enter"]').trigger("click");
-    await flushPromises();
     expect(wrapper.findAll('[data-test="upload-dialog"] li')).toHaveLength(1);
-    expect(wrapper.find('[data-test="upload-dialog"]').text()).toContain("b.txt");
+    expect(wrapper.find('[data-test="upload-dialog"]').text()).toContain("sub");
+    expect(wrapper.find('[data-test="upload-enter"]').exists()).toBe(false);
+    expect(pageBatch).toHaveBeenCalledTimes(1);
     expect(invoke.mock.calls.some(([name]) => name === "collect_upload_paths" || name === "upload_peer_file")).toBe(false);
     wrapper.unmount();
   });

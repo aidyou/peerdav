@@ -358,6 +358,7 @@ impl ObjectService {
         file_name: &str,
         cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
         overwrite: bool,
+        progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
     ) -> Result<(), ObjectServiceError> {
         valid_key(key)?;
         if file_name.is_empty()
@@ -375,7 +376,7 @@ impl ObjectService {
             .dir
             .try_clone()
             .map_err(|source| ObjectServiceError::Io { source })?;
-        self.download_into(key, dir, file_name, cancel, overwrite)
+        self.download_into(key, dir, file_name, cancel, overwrite, progress)
             .await
     }
     /// Downloads one object below a caller-provided relative path, creating the
@@ -386,6 +387,7 @@ impl ObjectService {
         relative_path: &str,
         cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
         overwrite: bool,
+        progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
     ) -> Result<(), ObjectServiceError> {
         valid_key(key)?;
         valid_relative_path(relative_path)?;
@@ -396,7 +398,7 @@ impl ObjectService {
         let parts: Vec<&str> = relative_path.split('/').collect();
         let (file_name, parents) = parts.split_last().ok_or(ObjectServiceError::InvalidKey)?;
         let dir = open_download_parent(root, parents)?;
-        self.download_into(key, dir, file_name, cancel, overwrite)
+        self.download_into(key, dir, file_name, cancel, overwrite, progress)
             .await
     }
     async fn download_into(
@@ -406,6 +408,7 @@ impl ObjectService {
         file_name: &str,
         cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
         overwrite: bool,
+        progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
     ) -> Result<(), ObjectServiceError> {
         let metadata = self.store.stat(key).await?;
         let stream = self.store.get(key, None).await?;
@@ -454,6 +457,9 @@ impl ObjectService {
                 }
                 file.write_all(&chunk)
                     .map_err(|source| ObjectServiceError::Io { source })?;
+                if let Some(progress) = progress.as_ref() {
+                    progress(received, metadata.size);
+                }
             }
             if cancel
                 .as_ref()
@@ -470,6 +476,9 @@ impl ObjectService {
             }
             file.sync_all()
                 .map_err(|source| ObjectServiceError::Io { source })?;
+            if let Some(progress) = progress.as_ref() {
+                progress(metadata.size, metadata.size);
+            }
             if cancel
                 .as_ref()
                 .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))

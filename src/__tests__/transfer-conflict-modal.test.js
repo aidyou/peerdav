@@ -6,7 +6,7 @@ import UploadBatchDialog from '../components/UploadBatchDialog.vue';
 import TransferQueueDialog from '../components/TransferQueueDialog.vue';
 import { useUploadBatch } from '../composables/useUploadBatch';
 import { useDownloadQueue } from '../composables/useDownloadQueue';
-import { locale } from '../lib/i18n';
+import { locale, t } from '../lib/i18n';
 
 const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock('../lib/invoke', () => ({ invoke, errorStrategy: () => 'report', normalizeAppError: e => e }));
@@ -15,7 +15,7 @@ const initialLocale = locale.value;
 afterEach(() => { wrappers.splice(0).forEach(w => w.unmount()); document.body.innerHTML = ''; locale.value = initialLocale; vi.clearAllMocks(); });
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 const state = (phase, conflict = null, id = 'queue-1') => ({ phase, conflict, batchId: id, queueId: id, completedFiles: 0, completedBytes: 0, skippedFiles: 0 });
-const conflict = id => ({ conflictId: id, relativePath: `${id}.txt`, etag: 'safe' });
+const conflict = id => ({ conflictId: id, relativePath: `${id}.txt`, key: `${id}.txt`, etag: 'safe' });
 const settle = async () => { await flushPromises(); await nextTick(); };
 const click = async selector => { const node = document.querySelector(selector); expect(node).not.toBeNull(); await new DOMWrapper(node).trigger('click'); await settle(); };
 
@@ -76,12 +76,14 @@ describe.each(['upload', 'download'])('real Element Plus %s conflict lifecycle',
     expect(modal(direction).querySelector(`[data-test=${direction}-conflict] p`).textContent).toBe(`${message}: first.txt`);
   });
 
-  it.each(['"bae60998ffe4923b131e3d6e4c19993e"', 'W/"revision"'])('displays ETag %s without JSON escaping or changing its value', async etag => {
+  it.each(['"bae60998ffe4923b131e3d6e4c19993e"', 'W/"revision"'])('labels the remote path and strips quotes from ETag %s', async etag => {
     const s = setup(direction);
     s.setState(state('conflict', { ...conflict('first'), etag }));
     await s.select(); await settle();
-    const paragraphs = [...modal(direction).querySelectorAll('p')];
-    expect(paragraphs.find(p => p.textContent.startsWith('ETag: ')).textContent).toBe(`ETag: ${etag}`);
+    const details = [...modal(direction).querySelectorAll('.conflict-details p')].map(p => p.textContent);
+    expect(details).toContain(`${t('cloudBrowser.conflictRemotePath')}first.txt`);
+    expect(details).toContain(`ETag: ${etag.replaceAll('"', '')}`);
+    expect(details.join('')).not.toContain('"');
     await click(`[data-test=${direction}-overwrite]`);
     expect(s.resolve.mock.calls[0][0]).toMatchObject({ conflictId: 'first', decision: 'overwrite', applyToRemaining: false });
   });

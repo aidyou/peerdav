@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::AtomicU64,
+        Arc,
+    },
+};
 use tokio::sync::{Mutex, Notify};
 
 pub const MAX_DOWNLOAD_ITEMS: usize = 10_000;
@@ -36,6 +42,8 @@ pub enum DownloadSelection {
 pub struct DownloadItem {
     pub remote_path: String,
     pub relative_path: String,
+    /// 文件字节大小，供下载队列展示“大小”列与行内进度分母。
+    pub size: u64,
     pub phase: String,
 }
 #[derive(Clone, Debug, Serialize)]
@@ -54,6 +62,8 @@ pub struct DownloadStatus {
     pub completed_files: usize,
     pub skipped_files: usize,
     pub current_relative_path: Option<String>,
+    /// 当前文件已传输字节；仅在有正在传输的文件时由队列状态动态填充。
+    pub current_transferred: Option<u64>,
     pub conflict: Option<DownloadConflict>,
     pub error: Option<crate::AppError>,
 }
@@ -68,6 +78,8 @@ pub(crate) struct DownloadQueue {
     pub items: Vec<DownloadItem>,
     pub root: Arc<crate::cloud::PhysicalRoot>,
     pub adapter: Arc<dyn crate::traits::TransferQueueAdapter>,
+    /// 当前文件已传输字节。同步进度回调只能原子写入，`status()` 读取时再落到 DTO。
+    pub progress: Arc<AtomicU64>,
     pub cancel: tokio_util::sync::CancellationToken,
     pub lifecycle: tokio_util::sync::CancellationToken,
     pub notify: Arc<Notify>,

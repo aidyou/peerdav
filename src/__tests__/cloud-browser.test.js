@@ -122,38 +122,24 @@ describe("streaming directory upload", () => {
     handlers.cloud_object_release_upload_directory = () => null;
     handlers.cloud_object_resolve_upload_directory_conflict = () => null;
   });
-  it('starts ask after the first direct page, replaces pages, enters and returns up', async () => {
-    handlers.cloud_object_page_upload_directory = ({ directoryToken, cursor }) => directoryToken === 'child'
-      ? directPage([entry('nested.txt')], { directoryToken: 'child', parentToken: 'root', relativePath: 'tree/deep' })
-      : cursor ? directPage([entry('last.txt')]) : directPage(undefined, { nextCursor: 'next' });
+  it('shows the fixed upload directory and its direct children without navigation controls', async () => {
     const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
     expect(calls('start')[0][1]).toEqual({ connectionId: 'c1', batchId: 'batch', conflictPolicy: 'ask' });
     expect(nativeInvoke.mock.calls.findIndex(([name]) => name === 'cloud_object_page_upload_directory')).toBeLessThan(nativeInvoke.mock.calls.findIndex(([name]) => name === 'cloud_object_start_upload_directory'));
-    expect(wrapper.find('[data-test=upload-dialog]').text()).not.toContain('nested.txt');
-    await click(wrapper, '[data-test=upload-enter]');
-    expect(wrapper.find('[data-test=upload-dialog]').text()).toContain('nested.txt');
-    expect(wrapper.findAll('[data-test=upload-dialog] li')).toHaveLength(1);
-    await click(wrapper, '[data-test=upload-up]');
-    await click(wrapper, '[data-test=upload-next]');
-    expect(calls('page').at(-1)[1]).toEqual({ connectionId: 'c1', batchId: 'batch', directoryToken: 'root', cursor: 'next', limit: 100 });
-    expect(wrapper.find('[data-test=upload-dialog]').text()).toContain('last.txt');
-    expect(wrapper.find('[data-test=upload-dialog]').text()).not.toContain('a.txt');
+    const dialog = wrapper.find('[data-test=upload-dialog]');
+    expect(dialog.text()).toContain('tree');
+    expect(dialog.text()).toContain('a.txt');
+    expect(dialog.text()).toContain('deep');
+    for (const test of ['upload-up', 'upload-page-reset', 'upload-next', 'upload-enter']) {
+      expect(wrapper.find(`[data-test=${test}]`).exists()).toBe(false);
+    }
+    expect(calls('page')).toHaveLength(1);
   });
-  it('resets expired cursors without retaining old rows or showing a global error', async () => {
-    let count = 0;
-    handlers.cloud_object_page_upload_directory = () => { if (++count === 2) throw error('CLOUD_DIRECTORY_CURSOR_RESET'); return directPage([entry(count === 1 ? 'old' : 'new')], { nextCursor: 'next' }); };
+  it('shows more than 100 completed files without percentage or accumulated rows', async () => {
     const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
-    await click(wrapper, '[data-test=upload-next]');
-    expect(calls('page').at(-1)[1]).toEqual({ connectionId: 'c1', batchId: 'batch', cursor: null, limit: 100 });
-    expect(wrapper.find('[data-test=upload-dialog]').text()).toContain(t('cloudBrowser.uploadCursorReset'));
-    expect(wrapper.find('[data-test=upload-dialog]').text()).toContain('new');
-    expect(app.handleFailure).not.toHaveBeenCalled();
-  });
-  it('shows more than 100 completed files without total, percentage, accumulated rows or per-file notices', async () => {
-    const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
-    handlers.cloud_object_status_upload_directory = () => summary('completed', { completedFiles: 10001, completedBytes: 70007 });
+    handlers.cloud_object_status_upload_directory = () => summary('completed', { completedFiles: 10001, completedBytes: 70007, totalFiles: 10001 });
     await vi.advanceTimersByTimeAsync(4500); await flushPromises();
-    expect(wrapper.find('[data-test=upload-summary]').text()).toContain('10001');
+    expect(wrapper.find('.dialog-footer').text()).toContain('10001/10001');
     expect(wrapper.find('[data-test=upload-dialog] [data-test=progress]').exists()).toBe(false);
     expect(wrapper.find('[data-test=upload-dialog]').text()).not.toContain('%');
     expect(wrapper.findAll('[data-test=upload-dialog] li')).toHaveLength(2);
@@ -261,8 +247,8 @@ describe("streaming directory upload", () => {
     await wrapper.find('[data-test=folder-row]').trigger('dblclick'); await flushPromises();
     const pending = deferred(); handlers.cloud_object_status_upload_directory = () => pending.promise;
     await vi.advanceTimersByTimeAsync(4500); expect(calls('status')).toHaveLength(1);
-    pending.resolve(summary('completed', { completedFiles: 250 })); await flushPromises();
-    expect(wrapper.find('[data-test=upload-summary]').text()).toContain('250');
+    pending.resolve(summary('completed', { completedFiles: 250, totalFiles: 250 })); await flushPromises();
+    expect(wrapper.find('[data-test=upload-dialog] .dialog-footer').text()).toContain('250/250');
     expect(calls('start')).toHaveLength(1);
   });
   it('displays terminal failure and recovery without duplicating backend error events', async () => {
@@ -445,7 +431,7 @@ describe("CloudBrowser", () => {
     await click(wrapper, '.selection-actions [data-test=download]');
     expect(wrapper.find('[role=progressbar]').exists()).toBe(false);
     expect(wrapper.find('[data-test=download-dialog] [data-test=progress]').exists()).toBe(false);
-    expect(wrapper.findAll('.queue-name')).toHaveLength(2);
+    expect(wrapper.findAll('.download-queue li')).toHaveLength(2);
     expect(wrapper.findAll('.download-queue li').map((row) => row.attributes('data-status'))).toEqual(phases.map((phase) => ({ completed: 'done', running: 'downloading', failed: 'error', cancelled: 'canceled' })[phase]));
   });
   it("invalidates pending ancestor rebuilds when switching buckets", async () => {
@@ -714,7 +700,7 @@ describe("CloudBrowser", () => {
     handlers.cloud_object_status = () => [transfer()]; const wrapper = await browser(); await textButton(wrapper, t("cloudBrowser.cancel")).trigger("click"); await flushPromises(); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_cancel", { transferId: "t1" }); expect(wrapper.text()).toContain(t("cloudBrowser.phase.cancelling")); handlers.cloud_object_status = () => [transfer("unknown", { recoveryRequired: true })]; await vi.advanceTimersByTimeAsync(1500); await flushPromises(); expect(wrapper.text()).toContain(t("cloudBrowser.phase.unknown")); expect(wrapper.text()).toContain(t("cloudBrowser.recovery")); expect(wrapper.html()).not.toContain("progressbar"); expect(wrapper.text()).not.toContain("%");
   });
   it("plans deletion before confirming exact target prefix count and irreversible warning", async () => {
-    handlers.cloud_object_delete_execute = () => ({ deleted: ["a"], failed: [{ key: "b", error: error("CLOUD_STORAGE") }] }); const wrapper = await browser(); await prepare(wrapper); await click(wrapper, '[data-test=delete-prefix]'); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_delete_plan", { connectionId: "c1", prefix: "" }); expect(confirmAction.mock.calls[0][1]).toBe(t("cloudBrowser.delete")); const review = mount({ render: () => confirmAction.mock.calls[0][0] }); expect(review.text()).toContain('Target prefix: ""'); expect(review.text()).toContain("5"); expect(review.text()).toContain("cannot be undone"); expect(review.find('[data-test=delete-keys]').element.style.overflow).toBe("auto"); expect(review.findAll("li").map((item) => item.text())).toEqual(deletePlan().entries.map((item) => JSON.stringify(item.key))); review.unmount(); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_delete_execute", { connectionId: "c1", planId: "plan-1", confirmed: true }); expect(wrapper.text()).toContain("Deleted: 1; failed: 1"); expect(wrapper.text()).toContain("Original backend reason");
+    handlers.cloud_object_delete_execute = () => ({ deleted: ["a"], failed: [{ key: "b", error: error("CLOUD_STORAGE") }] }); const wrapper = await browser(); await prepare(wrapper); await click(wrapper, '[data-test=delete-prefix]'); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_delete_plan", { connectionId: "c1", prefix: "" }); expect(confirmAction.mock.calls[0][1]).toBe(""); expect(confirmAction.mock.calls[0][2]).toMatchObject({ headerless: true, danger: true, type: null, confirmText: t("common.delete") }); const review = mount({ render: () => confirmAction.mock.calls[0][0] }); expect(review.find(".confirm-heading").text()).toBe(t("cloudBrowser.deleteTitle")); expect(review.find("svg").attributes("width")).toBe("20"); expect(review.find("svg circle").attributes("fill")).toBe("currentColor"); expect(review.find(".confirm-heading__icon").exists()).toBe(true); expect(review.find(".confirm-summary").text()).toBe(t("cloudBrowser.deleteSummary", { count: 5 })); expect(review.find('[data-test=delete-target]').text()).toBe(t("cloudBrowser.deleteRootPrefix")); expect(review.find('[data-test=delete-keys]').element.classList.contains("confirm-list")).toBe(true); expect(review.findAll("li").map((item) => item.text())).toEqual(deletePlan().entries.map((item) => item.key)); review.unmount(); expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_delete_execute", { connectionId: "c1", planId: "plan-1", confirmed: true }); expect(wrapper.text()).toContain("Deleted: 1; failed: 1"); expect(wrapper.text()).toContain("Original backend reason");
   });
   it("does not execute cancelled or expired delete plans", async () => { const wrapper = await browser(); await prepare(wrapper); confirmAction.mockResolvedValue(false); await click(wrapper, '[data-test=delete-prefix]'); confirmAction.mockResolvedValue(true); handlers.cloud_object_delete_plan = () => deletePlan({ planId: "expired", expiresAtUnix: 1 }); await click(wrapper, '[data-test=delete-prefix]'); expect(nativeInvoke.mock.calls.some(([name]) => name === "cloud_object_delete_execute")).toBe(false); expect(wrapper.text()).toContain(t('cloudBrowser.stalePlan')); });
   it("ignores stale directory page results after navigation", async () => { const late = deferred(); let count = 0; handlers.cloud_object_list = ({ prefix }) => { if (prefix) return page([{ key: "docs/new", size: 1 }]); if (++count === 1) return page([{ key: "docs/old", size: 1 }], "next", false); return late.promise; }; const wrapper = await browser(); await wrapper.find('[data-test=more]').trigger("click"); await wrapper.find("[data-test=folder-row]").trigger("dblclick"); await flushPromises(); late.resolve(page([{ key: "stale", size: 2 }])); await flushPromises(); expect(wrapper.text()).toContain("new"); expect(wrapper.text()).not.toContain("stale"); });
@@ -754,7 +740,7 @@ describe("CloudBrowser", () => {
     const entries = Array.from({ length: 130 }, (_, i) => ({ key: `folder/key-${i}\nquoted\"`, size: i, etag: null }));
     handlers.cloud_object_delete_plan = () => deletePlan({ entries, objectCount: entries.length }); confirmAction.mockResolvedValue(false);
     const wrapper = await browser(); await prepare(wrapper); await click(wrapper, '[data-test=delete-prefix]'); const review = mount({ render: () => confirmAction.mock.calls[0][0] });
-    expect(review.text()).toContain("130"); expect(review.findAll("li").map((item) => item.text())).toEqual(entries.map((item) => JSON.stringify(item.key))); expect(review.find("ul").element.style.maxHeight).toBe("40vh"); review.unmount();
+    expect(review.text()).toContain("130"); expect(review.findAll("li").map((item) => item.text())).toEqual(entries.map((item) => JSON.stringify(item.key))); expect(review.find("ul").element.classList.contains("confirm-list")).toBe(true); review.unmount();
   });
   it("uses prefix protection for read-only controls while allowing raw download", async () => {
     handlers.cloud_object_list = () => ({ ...page([file]), prefixProtected: true }); const wrapper = await browser();

@@ -55,7 +55,7 @@ impl TransferQueueAdapter for S3DownloadAdapter {
                     match self.session.store.stat(&path).await {
                         Ok(metadata) if metadata.key == path => {
                             if !targets.insert(name.to_owned()) { return Err(crate::local_upload::invalid()); }
-                            result.push(crate::download::item(path.clone(), name.to_owned())?);
+                            result.push(crate::download::item(path.clone(), name.to_owned(), metadata.size)?);
                             continue;
                         }
                         Ok(_) => return Err(crate::local_upload::invalid()),
@@ -79,7 +79,7 @@ impl TransferQueueAdapter for S3DownloadAdapter {
                         }
                         let relative = format!("{name}/{tail}");
                         if !targets.insert(relative.clone()) { return Err(crate::local_upload::invalid()); }
-                        result.push(crate::download::item(object.key, relative)?);
+                        result.push(crate::download::item(object.key, relative, object.size)?);
                     }
                     match page.next {
                         Some(token) if seen.insert(token.clone()) => next = Some(token),
@@ -97,6 +97,7 @@ impl TransferQueueAdapter for S3DownloadAdapter {
         root: &'a crate::cloud::PhysicalRoot,
         overwrite: bool,
         cancel: tokio_util::sync::CancellationToken,
+        progress: Option<crate::peer::TransferProgressCallback>,
     ) -> BoxFuture<'a, Result<(), AppError>> {
         Box::pin(async move {
             let _permit = self.runtime.network.read().await;
@@ -124,7 +125,7 @@ impl TransferQueueAdapter for S3DownloadAdapter {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(AppError::from(DomainError::TransferCanceled)),
-                r = service.download_to(&item.remote_path, "payload", None, false) => r.map_err(app)?,
+                r = service.download_to(&item.remote_path, "payload", None, false, progress) => r.map_err(app)?,
             }
             self.validate().await?;
             if overwrite

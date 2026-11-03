@@ -56,7 +56,7 @@ impl TransferQueueAdapter for PeerDownloadAdapter {
                     EntryKind::Directory => pending.push((path, name, 0usize)),
                     EntryKind::File => {
                         if !targets.insert(name.clone()) { return Err(crate::local_upload::invalid()); }
-                        result.push(crate::download::item(path, name)?);
+                        result.push(crate::download::item(path, name, entry.size.unwrap_or(0))?);
                     }
                 }
             }
@@ -77,7 +77,7 @@ impl TransferQueueAdapter for PeerDownloadAdapter {
                     if entry.is_dir { pending.push((entry.path, target, depth + 1)); }
                     else {
                         if !targets.insert(target.clone()) { return Err(crate::local_upload::invalid()); }
-                        result.push(crate::download::item(entry.path, target)?);
+                        result.push(crate::download::item(entry.path, target, entry.size)?);
                     }
                 }
             }
@@ -90,6 +90,7 @@ impl TransferQueueAdapter for PeerDownloadAdapter {
         root: &'a crate::cloud::PhysicalRoot,
         overwrite: bool,
         cancel: tokio_util::sync::CancellationToken,
+        progress: Option<crate::peer::TransferProgressCallback>,
     ) -> BoxFuture<'a, Result<(), AppError>> {
         Box::pin(async move {
             self.validate().await?;
@@ -115,7 +116,7 @@ impl TransferQueueAdapter for PeerDownloadAdapter {
                 biased;
                 _ = cancel.cancelled() => return Err(AppError::from(DomainError::TransferCanceled)),
                 r = self.manager.resumable_download(
-                    &client, &remote, &display, &destination, ConflictPolicy::Overwrite, None,
+                    &client, &remote, &display, &destination, ConflictPolicy::Overwrite, progress,
                 ) => { r.map_err(AppError::from)?; },
             }
             self.validate().await?;

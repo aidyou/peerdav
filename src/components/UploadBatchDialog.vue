@@ -3,65 +3,201 @@ import TransferConflictControls from "./TransferConflictControls.vue";
 import { computed } from "vue";
 import FileGlyph from "./FileGlyph.vue";
 import { formatBytes } from "../lib/format";
+import { statusTagTone } from "../lib/tagTone";
 import { t } from "../lib/i18n";
 const props = defineProps({
   open: Boolean, summary: { type: Object, default: null }, page: { type: Object, default: null },
-  running: Boolean, pageLoading: Boolean, resolving: Boolean, overwriteAllowed: Boolean,
+  running: Boolean, resolving: Boolean, overwriteAllowed: Boolean,
   batchError: { type: String, default: "" }, pageNotice: { type: String, default: "" }, applyRemaining: Boolean,
 });
-const emit = defineEmits(["close", "cancel", "page", "resolve", "update:applyRemaining"]);
-const skipped = computed(() => t("cloudBrowser.uploadSkipped", { empty: props.summary?.skippedEmptyDirectories ?? 0, links: props.summary?.skippedSymlinks ?? 0 }));
+const emit = defineEmits(["close", "cancel", "resolve", "update:applyRemaining"]);
+
+// 扫描阶段跳过的空目录/符号链接只在真的发生时写进帮助说明。
+const skippedEmpty = computed(() => props.summary?.skippedEmptyDirectories ?? 0);
+const skippedLinks = computed(() => props.summary?.skippedSymlinks ?? 0);
+const hasScanSkips = computed(() => skippedEmpty.value + skippedLinks.value > 0);
+const scanSkipsText = computed(() => t("cloudBrowser.uploadSkipped", { empty: skippedEmpty.value, links: skippedLinks.value }));
+
+// 批次统计与下载队列保持一致：已处理 = 已完成 + 已跳过，总量由后端扫描时累计。
+const processed = computed(() => (props.summary?.completedFiles || 0) + (props.summary?.skippedFiles || 0));
+const total = computed(() => props.summary?.totalFiles || 0);
+const uploadedBytes = computed(() => props.summary?.completedBytes || 0);
+
+// 列表是远端目录预览而非逐文件队列，只有正在处理的条目才有状态可言。
+const isActive = (item) => item.relativePath === props.summary?.currentRelativePath && props.running;
+// 上传目标目录固定为选择时的目录，预览页只展示它的直接子项。
+const remotePath = computed(() => props.page?.relativePath || props.summary?.rootName || "");
+// 目录行右侧状态图标：进行中旋转、完成打勾、失败红叉；取消不额外标注。
+const phaseIcon = computed(() => {
+  const phase = props.summary?.phase;
+  if (phase === "completed") return "done";
+  if (phase === "failed" || phase === "unknown") return "error";
+  if (!phase || phase === "cancelled" || phase === "cancelling") return null;
+  return "active";
+});
+const entrySize = (item) => {
+  if (item.kind === "file") return formatBytes(item.size);
+  if (item.kind === "directory") return "—";
+  return t(`cloudBrowser.uploadKind.${item.kind}`);
+};
 </script>
 
 <template>
-  <el-dialog :model-value="open" @update:model-value="emit('close')" :title="t('peer.uploadQueue')" width="560" align-center
+  <el-dialog :model-value="open" @update:model-value="emit('close')" width="560" align-center class="upload-dialog"
     :show-close="!running" :close-on-click-modal="false" :close-on-press-escape="false" data-test="upload-dialog">
-    <div class="transfer-dialog upload-dialog">
-      <p>{{ t('cloudBrowser.uploadStreaming') }}</p>
-      <template v-if="summary">
-        <p data-test="upload-summary">{{ t('cloudBrowser.uploadBatchSummary', { count: summary.completedFiles, bytes: formatBytes(summary.completedBytes), skipped: summary.skippedFiles }) }} · {{ t(`cloudBrowser.phase.${summary.phase}`) }}</p>
-        <p v-if="summary.currentRelativePath">{{ t('cloudBrowser.uploadCurrent') }}: {{ summary.currentRelativePath }}</p>
-        <p data-test="upload-skipped">{{ skipped }}</p>
-        <p v-if="summary.recoveryRequired" role="alert">{{ t('cloudBrowser.uploadRecovery') }}</p>
-        <TransferConflictControls v-if="open && summary.conflict" :key="`${summary.batchId}:${summary.conflict.conflictId}`" :conflict="summary.conflict" :apply-remaining="applyRemaining" :resolving="resolving" :overwrite-allowed="overwriteAllowed"
-          @update:apply-remaining="emit('update:applyRemaining', $event)" @resolve="emit('resolve', $event)" @cancel="emit('cancel')" />
-      </template>
-      <p v-if="batchError" role="alert">{{ batchError }}</p>
-      <p v-if="pageNotice" role="status">{{ pageNotice }}</p>
-      <p>{{ t('cloudBrowser.uploadPageOnly') }}</p>
-      <div>
-        <el-button data-test="upload-up" :disabled="pageLoading || !page?.parentToken" @click="emit('page', page.parentToken)">{{ t('cloudBrowser.uploadUp') }}</el-button>
-        <el-button data-test="upload-page-reset" :disabled="pageLoading" @click="emit('page')">{{ t('cloudBrowser.refresh') }}</el-button>
-        <span>{{ page?.relativePath || summary?.rootName }}</span>
-      </div>
-      <ul class="transfer-queue download-queue">
-        <li v-for="item in page?.entries || []" :key="item.relativePath" :data-status="item.relativePath === summary?.currentRelativePath && running ? 'active' : 'unscanned'">
-          <div class="transfer-queue__name download-queue__name">
-            <FileGlyph :entry="{ isDir: item.kind === 'directory', name: item.name }" />
-            <div><strong>{{ item.name }}</strong><span>{{ t(`cloudBrowser.uploadKind.${item.kind}`) }} · {{ item.kind === 'file' ? formatBytes(item.size) : '—' }}</span></div>
+    <template #header="{ titleId, titleClass }">
+      <div class="queue-header">
+        <span :id="titleId" :class="titleClass">{{ t('peer.uploadQueue') }}</span>
+        <el-popover placement="bottom-start" trigger="click" :width="320" :show-after="0" popper-class="queue-help-popper">
+          <div class="queue-help">
+            <p>{{ t('cloudBrowser.uploadStreaming') }}</p>
+            <p>{{ t('cloudBrowser.uploadPageOnly') }}</p>
+            <p v-if="hasScanSkips">{{ scanSkipsText }}</p>
           </div>
-          <el-button v-if="item.kind === 'directory'" data-test="upload-enter" :disabled="pageLoading || !item.directoryToken" @click="emit('page', item.directoryToken)">{{ t('cloudBrowser.uploadEnter') }}</el-button>
-          <span v-else>{{ item.relativePath === summary?.currentRelativePath && running ? t('cloudBrowser.uploadActive') : t('cloudBrowser.uploadUnscanned') }}</span>
-        </li>
-      </ul>
-      <el-button v-if="page?.nextCursor" data-test="upload-next" :disabled="pageLoading" @click="emit('page', page.directoryToken, page.nextCursor)">{{ t('cloudBrowser.uploadNextPage') }}</el-button>
+          <template #reference>
+            <button type="button" class="queue-header__help" :aria-label="t('peer.uploadHelpLabel')">?</button>
+          </template>
+        </el-popover>
+      </div>
+    </template>
+
+    <div class="transfer-dialog upload-dialog">
+
+      <!-- ① 传输状态：阶段已由目录行右侧图标表达，这里只保留当前文件路径。 -->
+      <div v-if="summary?.currentRelativePath" class="upload-summary" data-test="upload-summary">
+        <p class="upload-summary__current">{{ t('cloudBrowser.uploadCurrent') }} <span class="mono">{{ summary.currentRelativePath }}</span></p>
+      </div>
+
+      <!-- ② 需要处理：只在出现时以强调条呈现，冲突走独立浮层 -->
+      <TransferConflictControls v-if="open && summary?.conflict" :key="`${summary.batchId}:${summary.conflict.conflictId}`" :conflict="summary.conflict" :apply-remaining="applyRemaining" :resolving="resolving" :overwrite-allowed="overwriteAllowed"
+        @update:apply-remaining="emit('update:applyRemaining', $event)" @resolve="emit('resolve', $event)" @cancel="emit('cancel')" />
+      <p v-if="summary?.recoveryRequired" role="alert" class="upload-alert">{{ t('cloudBrowser.uploadRecovery') }}</p>
+      <p v-if="batchError" role="alert" class="upload-alert">{{ batchError }}</p>
+
+      <!-- ③ 远端目录预览：目录固定，只展示直接子项；不提供导航，避免与批次扫描竞态 -->
+      <section class="upload-dir">
+        <p class="upload-dir__path">
+          <span class="upload-dir__label">{{ t('cloudBrowser.uploadRemoteDir') }}</span>
+          <span class="mono upload-dir__value" :title="remotePath">{{ remotePath }}</span>
+          <span v-if="phaseIcon" class="upload-dir__state" :class="`is-${phaseIcon}`" :aria-label="t(`cloudBrowser.phase.${summary.phase}`)">
+            <svg v-if="phaseIcon === 'active'" class="upload-dir__spinner" viewBox="0 0 16 16" aria-hidden="true">
+              <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="24 14" />
+            </svg>
+            <svg v-else-if="phaseIcon === 'done'" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M3.5 8.5l3 3 5.5-6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <svg v-else viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+            </svg>
+          </span>
+        </p>
+        <div class="queue-table">
+          <div class="queue-table__head" aria-hidden="true">
+            <span>{{ t('peer.queueColPath') }}</span>
+            <span>{{ t('peer.queueColSize') }}</span>
+            <span>{{ t('peer.queueColStatus') }}</span>
+          </div>
+          <ul class="transfer-queue upload-queue">
+            <li v-for="item in page?.entries || []" :key="item.relativePath" :data-status="isActive(item) ? 'active' : 'unscanned'"
+              :class="{ 'is-active': isActive(item) }">
+              <div class="queue-cell queue-cell--path" :title="item.relativePath">
+                <FileGlyph :entry="{ isDir: item.kind === 'directory', name: item.name }" />
+                <span class="queue-path">{{ item.name }}</span>
+              </div>
+              <div class="queue-cell queue-cell--size">{{ entrySize(item) }}</div>
+              <div class="queue-cell queue-cell--status">
+                <el-tag v-if="isActive(item)" :type="statusTagTone('uploading')" effect="plain" round size="small">{{ t('cloudBrowser.uploadActive') }}</el-tag>
+                <span v-else class="queue-empty">—</span>
+              </div>
+            </li>
+          </ul>
+        </div>
+        <p v-if="pageNotice" role="status" class="upload-dir__notice">{{ pageNotice }}</p>
+      </section>
     </div>
+
     <template #footer>
-      <el-button v-if="running" data-test="cancel-upload" plain @click="emit('cancel')">{{ t('peer.cancelUpload') }}</el-button>
-      <el-button v-else data-test="close-upload" type="primary" @click="emit('close')">{{ t('common.close') }}</el-button>
+      <div class="dialog-footer">
+        <div class="dialog-footer__stats">
+          <span v-if="total > 0">{{ t('peer.uploadProcessed', { done: processed, total }) }}</span>
+          <span v-if="uploadedBytes > 0">{{ t('peer.uploadUploaded', { bytes: formatBytes(uploadedBytes) }) }}</span>
+          <span v-if="(summary?.skippedFiles ?? 0) > 0">{{ t('peer.uploadSkippedFiles', { count: summary.skippedFiles }) }}</span>
+        </div>
+        <div class="dialog-footer__actions">
+          <el-button v-if="running" data-test="cancel-upload" plain @click="emit('cancel')">{{ t('peer.cancelUpload') }}</el-button>
+          <el-button v-else data-test="close-upload" type="primary" @click="emit('close')">{{ t('common.close') }}</el-button>
+        </div>
+      </div>
     </template>
   </el-dialog>
 </template>
 
 <style scoped>
-.transfer-dialog { display: flex; flex-direction: column; gap: 12px; }
-.transfer-dialog p { margin: 0; font-size: 12.5px; overflow-wrap: anywhere; }
-.transfer-queue { list-style: none; max-height: min(320px, 34vh); overflow-y: auto; overscroll-behavior: contain; margin: 0; padding: 0; border: 1px solid var(--app-border); border-radius: 10px; }
-.transfer-queue li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 11px; }
+/* 对话框不超过窗口高度：头部/底部固定，内容区自身滚动。 */
+:deep(.upload-dialog.el-dialog) { display: flex; flex-direction: column; max-height: calc(100vh - 40px); }
+:deep(.upload-dialog .el-dialog__header),
+:deep(.upload-dialog .el-dialog__footer) { flex: none; }
+:deep(.upload-dialog .el-dialog__body) { flex: 1; min-height: 0; overflow-y: auto; }
+
+.queue-header { display: flex; align-items: center; gap: 8px; }
+.queue-header__help { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; border: 1px solid var(--app-border); border-radius: 50%; background: transparent; color: var(--app-text-muted); font-size: 11px; line-height: 1; cursor: pointer; }
+.queue-header__help:hover, .queue-header__help:focus-visible { color: var(--app-text); border-color: var(--app-text-muted); outline: none; }
+.queue-help { max-width: 300px; font-size: 12.5px; line-height: 1.55; color: var(--app-text-secondary); }
+.queue-help p { margin: 0; line-height: 1.55; }
+
+.transfer-dialog { display: flex; flex-direction: column; gap: 14px; }
+.transfer-dialog p { margin: 0; overflow-wrap: anywhere; }
+
+/* ① 传输状态：阶段由目录行图标表达，这里只显示当前文件。 */
+.upload-summary { display: flex; flex-direction: column; gap: 5px; }
+.upload-summary__current { display: flex; align-items: baseline; gap: 6px; font-size: 12px; color: var(--app-text-secondary); }
+.mono { font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; color: var(--app-text-muted); overflow-wrap: anywhere; }
+
+/* ② 需要处理：唯一的强调容器，左色条 + 极浅背景，与中性状态区分。 */
+.upload-alert { padding: 8px 10px; border-left: 3px solid var(--el-color-danger); border-radius: 6px; background: color-mix(in oklab, var(--el-color-danger) 7%, transparent); color: var(--el-color-danger); font-size: 12.5px; line-height: 1.5; }
+
+/* ③ 远端目录预览：目录固定，只保留一行路径与直接子项列表。 */
+.upload-dir { display: flex; flex-direction: column; gap: 8px; }
+.upload-dir__path { display: flex; align-items: center; gap: 2px; min-width: 0; font-size: 12.5px; color: var(--app-text-muted); }
+.upload-dir__label { flex: none; }
+.upload-dir__value { flex: 1; min-width: 0; font-size: 12px; color: var(--app-text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.upload-dir__state { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; margin-left: 4px; }
+.upload-dir__state svg { display: block; width: 16px; height: 16px; }
+.upload-dir__state.is-active { color: var(--el-color-primary); }
+.upload-dir__state.is-done { color: var(--el-color-success); }
+.upload-dir__state.is-error { color: var(--el-color-danger); }
+.upload-dir__spinner { animation: queue-spin 0.9s linear infinite; }
+@keyframes queue-spin { to { transform: rotate(360deg); } }
+.upload-dir__notice { font-size: 11.5px; color: var(--app-text-muted); }
+
+/* 表头与数据行共用同一列模板：状态固定收窄、大小稍宽、路径吃掉剩余空间。 */
+.queue-table__head,
+.transfer-queue li { display: grid; grid-template-columns: minmax(0, 1fr) 108px 84px; align-items: center; gap: 10px; }
+.queue-table__head { padding: 6px 19px 6px 11px; color: var(--app-text-muted); font-size: 11.5px; font-weight: 600; }
+
+.transfer-queue { list-style: none; max-height: min(320px, 34vh); overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; margin: 0; padding: 0; border: 1px solid var(--app-border); border-radius: 10px; }
+.transfer-queue li { padding: 9px 11px; }
 .transfer-queue li + li { border-top: 1px solid var(--app-border); }
-.transfer-queue__name { display: flex; align-items: center; gap: 9px; min-width: 0; }
-.transfer-queue__name > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.transfer-queue__name strong, .transfer-queue__name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.transfer-queue__name strong { font-size: 12.5px; color: var(--app-text); }
-.transfer-queue__name span { font-size: 11px; color: var(--app-text-muted); }
+.transfer-queue li.is-active { background: color-mix(in oklab, var(--el-color-primary) 20%, transparent); }
+
+.queue-cell { min-width: 0; }
+.queue-cell--path { display: flex; align-items: center; gap: 9px; }
+.queue-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; color: var(--app-text); }
+.queue-cell--size { font-size: 12px; color: var(--app-text-muted); font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.queue-cell--status { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.queue-cell--status :deep(.el-button) { margin-left: 0; }
+.queue-empty { font-size: 12px; color: var(--app-text-muted); }
+
+/* footer：统计靠左、操作靠右；gap 明确保证按钮之间有间隔。 */
+.dialog-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.dialog-footer__stats { display: flex; align-items: center; gap: 14px; min-width: 0; font-size: 12px; color: var(--app-text-muted); font-variant-numeric: tabular-nums; }
+.dialog-footer__actions { flex: none; display: flex; align-items: center; gap: 8px; }
+.dialog-footer__actions :deep(.el-button + .el-button) { margin-left: 0; }
+
+@media (max-width: 540px) {
+  .queue-table__head,
+  .transfer-queue li { grid-template-columns: minmax(0, 1fr) 72px 108px; }
+  .dialog-footer { align-items: flex-start; flex-direction: column; }
+  .dialog-footer__actions { width: 100%; justify-content: flex-end; }
+}
 </style>

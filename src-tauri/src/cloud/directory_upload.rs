@@ -47,7 +47,7 @@ impl CloudRuntime {
         let lifecycle = self.vault.transfer_cancellation().map_err(AppError::from)?;
         let (files, browser) = tokio::task::spawn_blocking(move || crate::local_upload::open_selected_files(paths)).await.map_err(|e| app(DomainError::Internal { detail: e.to_string() }))??;
         let queue_id = token()?;
-        let status = ObjectUploadDirectoryDto { batch_id: queue_id.clone(), queue_id, connection_id: connection_id.into(), connection_revision: revision, bucket: session.bucket.clone(), prefix, root_name: String::new(), phase: "selected".into(), current_relative_path: None, completed_files: 0, completed_bytes: 0, skipped_files: 0, skipped_symlinks: 0, skipped_empty_directories: 0, conflict: None, error: None, recovery_required: false };
+        let status = ObjectUploadDirectoryDto { batch_id: queue_id.clone(), queue_id, connection_id: connection_id.into(), connection_revision: revision, bucket: session.bucket.clone(), prefix, root_name: String::new(), phase: "selected".into(), current_relative_path: None, completed_files: 0, completed_bytes: 0, total_files: files.len() as u64, skipped_files: 0, skipped_symlinks: 0, skipped_empty_directories: 0, conflict: None, error: None, recovery_required: false };
         let mut state = self.objects.lock().await;
         state.prune();
         if state.upload_directories.len() >= 4 || state.local_handle_count().saturating_add(files.len()) > MAX_LOCAL_HANDLES { return Err(invalid()); }
@@ -112,6 +112,7 @@ impl CloudRuntime {
             current_relative_path: None,
             completed_files: 0,
             completed_bytes: 0,
+            total_files: 0,
             skipped_files: 0,
             skipped_symlinks: 0,
             skipped_empty_directories: 0,
@@ -255,7 +256,9 @@ impl CloudRuntime {
             if cancel.load(Ordering::Acquire) {
                 return Err(cancelled());
             }
+            let mut walked = false;
             let file = if let Some(mut current) = walk.take() {
+                walked = true;
                 let (returned, next) = tokio::task::spawn_blocking(move || {
                     let next = current.next_chunk(); (current, next)
                 }).await.map_err(|e| app(DomainError::Internal { detail: e.to_string() }))?;
@@ -288,12 +291,12 @@ impl CloudRuntime {
             session.service.preflight_upload(&key).map_err(app)?;
             {
                 let mut state = self.objects.lock().await;
-                state
-                    .upload_directories
-                    .get_mut(id)
-                    .ok_or_else(invalid)?
-                    .status
-                    .current_relative_path = Some(file.relative.clone());
+                let batch = state.upload_directories.get_mut(id).ok_or_else(invalid)?;
+                batch.status.current_relative_path = Some(file.relative.clone());
+                // 目录批次流式扫描，只有发现一个文件才能确定总量；选中文件批次已在选择时计数。
+                if walked {
+                    batch.status.total_files += 1;
+                }
             }
             let stat = tokio::select! {
                 _ = cancel_signal.notified() => return Err(cancelled()),

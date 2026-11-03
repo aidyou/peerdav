@@ -155,6 +155,11 @@ impl PeerManager {
         .await
         .map_err(task_error)??;
         let queue_id = token()?;
+        // 目录内容在 worker 中流式扫描，选择阶段只能确定显式选中的文件数。
+        let total_files = roots
+            .iter()
+            .filter(|root| matches!(**root, SelectedRoot::File(_)))
+            .count() as u64;
         let status = PeerUploadSummary {
             batch_id: queue_id.clone(),
             queue_id,
@@ -168,6 +173,7 @@ impl PeerManager {
             current_relative_path: None,
             completed_files: 0,
             completed_bytes: 0,
+            total_files,
             skipped_files: 0,
             skipped_symlinks: 0,
             skipped_empty_directories: 0,
@@ -289,6 +295,13 @@ impl PeerManager {
                             b.status.skipped_empty_directories = walk.skipped_empty_directories;
                         }
                         if let Some(file) = next? {
+                            {
+                                let mut map = self.upload_batches.lock().await;
+                                map.get_mut(id)
+                                    .ok_or_else(invalid)?
+                                    .status
+                                    .total_files += 1;
+                            }
                             self.upload_batch_file(
                                 id,
                                 &status,

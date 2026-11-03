@@ -26,6 +26,7 @@ pub struct ObjectUploadDirectoryDto {
     pub current_relative_path: Option<String>,
     pub completed_files: u64,
     pub completed_bytes: u64,
+    pub total_files: u64,
     pub skipped_files: u64,
     pub skipped_symlinks: u64,
     pub skipped_empty_directories: u64,
