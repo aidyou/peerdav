@@ -3,6 +3,10 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 pub const APPEND_VERSION: u32 = 2;
+/// 加密同步盘所有对象统一存放在该云端前缀下，与镜像同步的 `_peerdav_mirror` 区分，
+/// 用户用网盘工具浏览时能直接看清两类数据的归属。
+pub const APPEND_ROOT: &str = "_peerdav_encrypt";
+pub const APPEND_ANCHORS: &str = "_peerdav_encrypt/anchors/";
 pub const NONCE_LEN: usize = 24;
 pub const MASTER_LEN: usize = 32;
 pub const REPO_ID_LEN: usize = 16;

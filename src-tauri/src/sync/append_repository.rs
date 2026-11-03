@@ -270,7 +270,7 @@ impl AppendRepository {
             return Err(AppendError::Input("anchor too large"));
         }
         let key = format!(
-            "v2/anchors/{}-{}",
+            "{APPEND_ANCHORS}{}-{}",
             descriptor.repo_id,
             hex::encode(Sha256::digest(&bytes))
         );
@@ -290,7 +290,7 @@ impl AppendRepository {
     pub async fn discover_anchors<S: ObjectStore + ?Sized>(
         store: &S,
     ) -> Result<Vec<Candidate>, AppendError> {
-        let mut listing = store.list("v2/anchors/");
+        let mut listing = store.list(APPEND_ANCHORS);
         let mut candidates = Vec::new();
         while let Some(item) = listing.next().await {
             let meta = item.map_err(AppendError::Storage)?;
@@ -454,7 +454,7 @@ impl AppendRepository {
         let bytes = json(&e)?;
         let digest = hex::encode(Sha256::digest(&bytes));
         Ok((
-            format!("v2/{}/{kind}s/{digest}", self.anchor.descriptor.repo_id),
+            format!("{APPEND_ROOT}/{}/{kind}s/{digest}", self.anchor.descriptor.repo_id),
             bytes,
         ))
     }
@@ -837,7 +837,7 @@ mod tests {
         assert_eq!(wire, golden);
         assert_eq!(
             key,
-            "v2/00112233445566778899aabbccddeeff/blocks/c9ab99aff13090d572fe7d6c9815f36968e6c929c696b35019e0eba196281aa1"
+            "_peerdav_encrypt/00112233445566778899aabbccddeeff/blocks/c9ab99aff13090d572fe7d6c9815f36968e6c929c696b35019e0eba196281aa1"
         );
         assert_eq!(repo.open_block(golden)?.as_slice(), b"\0append-v2\n");
         Ok(())

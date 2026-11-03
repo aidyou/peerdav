@@ -57,7 +57,7 @@ pub async fn discover<S: ObjectStore + ?Sized>(
     };
     let limits = DiscoveryLimits::default();
     let repo = open_metered(store.clone(), binding, password, &mut meter, &limits).await?;
-    let prefix = format!("v2/{}/commits/", repo.repo_id());
+    let prefix = format!("{APPEND_ROOT}/{}/commits/", repo.repo_id());
     let mut token = None;
     let mut tokens = HashSet::new();
     loop {
@@ -230,7 +230,7 @@ async fn open_metered<S: ObjectStore + ?Sized>(
     if serde_json::to_vec(&anchor)? != bytes
         || anchor.descriptor.repo_id != binding.repo_id
         || anchor.descriptor.mode != binding.mode
-        || binding.key != format!("v2/anchors/{}-{}", binding.repo_id, binding.fingerprint)
+        || binding.key != format!("{APPEND_ANCHORS}{}-{}", binding.repo_id, binding.fingerprint)
     {
         return Err(AppendError::Invalid("anchor binding"));
     }
@@ -351,7 +351,7 @@ pub async fn list_candidates<S: ObjectStore + ?Sized>(
         journal: None,
     };
     let budget = &mut meter;
-    let prefix = format!("v2/{repo}/commits/");
+    let prefix = format!("{APPEND_ROOT}/{repo}/commits/");
     let mut token = None;
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -400,7 +400,7 @@ async fn get<S: ObjectStore + ?Sized>(
 ) -> Result<Vec<u8>, AppendError> {
     if let Some((index, _)) = &mut budget.journal {
         let prefix = format!(
-            "v2/{}/commits/",
+            "{APPEND_ROOT}/{}/commits/",
             String::from_utf8_lossy(index.repository_id())
         );
         if key.starts_with(&prefix) {
@@ -448,7 +448,7 @@ pub(crate) async fn read_bounded<S: ObjectStore + ?Sized>(
     key: &str,
     mut reserve: impl FnMut(usize, usize) -> Result<(), AppendError>,
 ) -> Result<Vec<u8>, AppendError> {
-    let wire_limit = if key.starts_with("v2/anchors/") {
+    let wire_limit = if key.starts_with(APPEND_ANCHORS) {
         64 * 1024
     } else if key.contains("/blocks/") {
         2 * (MAX_BLOCK_SIZE + 16) + 4096
@@ -594,7 +594,7 @@ async fn validate_metered<S: ObjectStore + ?Sized>(
                 if commits.len() >= MAX_DISCOVERY_NODES {
                     return Err(AppendError::ResourceLimit("nodes"));
                 }
-                let key = format!("v2/{repo_id}/commits/{}-{}", reference.operation_id, digest);
+                let key = format!("{APPEND_ROOT}/{repo_id}/commits/{}-{}", reference.operation_id, digest);
                 let bytes = get(store.as_ref(), &key, budget, limits).await?;
                 let expected = ObjectRef {
                     kind: "commit".into(),
@@ -605,7 +605,7 @@ async fn validate_metered<S: ObjectStore + ?Sized>(
                 if commit.operation_id != reference.operation_id {
                     return Err(AppendError::Invalid("commit operation reference"));
                 }
-                let tree_key = format!("v2/{repo_id}/trees/{}", commit.root.digest);
+                let tree_key = format!("{APPEND_ROOT}/{repo_id}/trees/{}", commit.root.digest);
                 let tree_bytes = get(store.as_ref(), &tree_key, budget, limits).await?;
                 metadata(budget, &tree_bytes, true, limits)?;
                 let tree = repo.open_tree(&tree_bytes, &commit.root)?;
@@ -734,7 +734,7 @@ async fn validate_tree_objects<S: ObjectStore + ?Sized>(
                     return Err(AppendError::ResourceLimit("nodes"));
                 }
                 for binding in &tree.bindings {
-                    let key = format!("v2/{repo_id}/blocks/{}", binding.object.digest);
+                    let key = format!("{APPEND_ROOT}/{repo_id}/blocks/{}", binding.object.digest);
                     let bytes = get(store.as_ref(), &key, budget, limits).await?;
                     allocation(budget, expansion(bytes.len())?, limits)?;
                     repo.open_block_with_ref(&bytes, Some(binding))?;
@@ -762,7 +762,7 @@ async fn validate_tree_objects<S: ObjectStore + ?Sized>(
                 )?;
                 stack.push((tree.clone(), digest.clone(), level, Visit::Exit));
                 for child in tree.children.iter().rev() {
-                    let key = format!("v2/{repo_id}/trees/{}", child.object.digest);
+                    let key = format!("{APPEND_ROOT}/{repo_id}/trees/{}", child.object.digest);
                     let bytes = get(store.as_ref(), &key, budget, limits).await?;
                     metadata(budget, &bytes, true, limits)?;
                     let child_tree = repo.open_tree(&bytes, &child.object)?;

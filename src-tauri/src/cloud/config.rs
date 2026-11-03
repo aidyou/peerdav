@@ -6,6 +6,7 @@ use zeroize::Zeroizing;
 
 use super::config_types::*;
 use super::types::{ProxyMode, S3Config};
+use crate::sync::append_types::APPEND_ANCHORS;
 use crate::sync::repository_types::RepoDescriptor;
 use crate::vault::Vault;
 
@@ -498,7 +499,7 @@ fn validate_mapping_protocol(mapping: &CloudMapping) -> Result<(), ConfigError> 
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                 || binding.anchor_key
                     != format!(
-                        "v2/anchors/{}-{}",
+                        "{APPEND_ANCHORS}{}-{}",
                         binding.repo_id, binding.anchor_fingerprint
                     )
                 || binding

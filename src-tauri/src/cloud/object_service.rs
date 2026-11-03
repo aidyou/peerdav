@@ -18,6 +18,7 @@ use super::{
     ObjectGuard, ObjectGuardError, ProtectedIdentity,
     object_types::{BrowsePage, DeletePlan, ObjectRef},
 };
+use crate::sync::append_types::APPEND_ANCHORS;
 use crate::sync::repository_types::decode_head;
 
 const MAX_PAGES: usize = 1000;
@@ -609,7 +610,7 @@ impl ObjectService {
                     Some(("", false))
                 } else if let Some(root) = key.strip_suffix("/control/HEAD") {
                     Some((root, false))
-                } else if let Some((root, anchor)) = key.rsplit_once("v2/anchors/") {
+                } else if let Some((root, anchor)) = key.rsplit_once(APPEND_ANCHORS) {
                     let root = root.strip_suffix('/').unwrap_or(root);
                     let Some((repo, digest)) = anchor.split_once('-') else {
                         return Err(ObjectServiceError::DiscoveryIncomplete);
@@ -664,7 +665,7 @@ impl ObjectService {
                     }
                     use sha2::{Digest, Sha256};
                     let expected = format!(
-                        "v2/anchors/{}-{}",
+                        "{APPEND_ANCHORS}{}-{}",
                         anchor.descriptor.repo_id,
                         hex::encode(Sha256::digest(&bytes))
                     );

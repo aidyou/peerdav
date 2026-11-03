@@ -41,7 +41,7 @@ impl<S: ObjectStore + ?Sized> BlockReader for PullBlocks<'_, S> {
                 .get(&(id.to_owned(), expected_len as u64))
                 .ok_or(AppendError::Invalid("missing authenticated block binding"))?;
             let key = format!(
-                "v2/{}/blocks/{}",
+                "{APPEND_ROOT}/{}/blocks/{}",
                 self.repository.repo_id(),
                 binding.object.digest
             );
@@ -598,7 +598,7 @@ async fn prepare_local<S: ObjectStore + ?Sized>(
             continue;
         }
         let key = format!(
-            "v2/{}/blocks/{}",
+            "{APPEND_ROOT}/{}/blocks/{}",
             repository.repo_id(),
             binding.object.digest
         );
@@ -629,7 +629,7 @@ async fn prepare_local<S: ObjectStore + ?Sized>(
         &operation,
         &mut count,
         PreparedObject::new(
-            format!("v2/{}/trees/{}", repository.repo_id(), root.digest),
+            format!("{APPEND_ROOT}/{}/trees/{}", repository.repo_id(), root.digest),
             wire,
         ),
     )?;
@@ -638,7 +638,7 @@ async fn prepare_local<S: ObjectStore + ?Sized>(
         .iter()
         .map(|tip| {
             format!(
-                "v2/{}/commits/{}-{}",
+                "{APPEND_ROOT}/{}/commits/{}-{}",
                 repository.repo_id(),
                 tip.operation_id,
                 tip.digest
@@ -658,7 +658,7 @@ async fn prepare_local<S: ObjectStore + ?Sized>(
         &mut count,
         PreparedObject::new(
             format!(
-                "v2/{}/commits/{}-{}",
+                "{APPEND_ROOT}/{}/commits/{}-{}",
                 repository.repo_id(),
                 tip.operation_id,
                 tip.digest

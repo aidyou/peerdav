@@ -157,11 +157,11 @@ impl AppendPublisher {
             let digest = hex::encode(Sha256::digest(object.bytes()));
             let expected = if rank == 2 {
                 format!(
-                    "v2/{}/commits/{operation_id}-{digest}",
+                    "{APPEND_ROOT}/{}/commits/{operation_id}-{digest}",
                     repository.repo_id()
                 )
             } else {
-                format!("v2/{}/{}s/{digest}", repository.repo_id(), envelope.kind)
+                format!("{APPEND_ROOT}/{}/{}s/{digest}", repository.repo_id(), envelope.kind)
             };
             if object.key() != expected {
                 return Err(PublishError::Invalid("object key"));
@@ -188,7 +188,7 @@ impl AppendPublisher {
                         .iter()
                         .map(|p| {
                             format!(
-                                "v2/{}/commits/{}-{}",
+                                "{APPEND_ROOT}/{}/commits/{}-{}",
                                 repository.repo_id(),
                                 p.operation_id,
                                 p.digest
