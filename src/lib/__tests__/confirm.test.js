@@ -49,6 +49,18 @@ describe("confirmAction", () => {
     expect(confirm.mock.calls[0][2].dangerouslyUseHTMLString).toBeUndefined();
   });
 
+  it("renders caller headings without a plain-text title", async () => {
+    confirm.mockResolvedValue('confirm');
+    const { h } = await import('vue');
+    const message = h('div', 'heading');
+    await expect(confirmAction(message, '', { headerless: true, danger: true, type: null })).resolves.toBe(true);
+    const [content, title, options] = confirm.mock.calls[0];
+    expect(content).toBe(message);
+    expect(title).toBe('');
+    expect(options).toMatchObject({ customClass: 'confirm-box--headerless confirm-box--danger', closeOnPressEscape: true });
+    expect(options.type).toBeUndefined();
+  });
+
   it("returns false when the user cancels", async () => {
     confirm.mockRejectedValue("cancel");
 

@@ -759,9 +759,9 @@ function remember(transfer, scope) {
 function upload() { return uploadDirectory("single"); }
 // Cloud and LAN share the bounded-page session, but retain backend safety policies.
 const {
-  uploadDialogOpen, uploadSummary, uploadPage, uploadRunning, uploadPageLoading,
+  uploadDialogOpen, uploadSummary, uploadPage, uploadRunning,
   uploadBatchError, uploadPageNotice, uploadApplyRemaining, uploadResolving, uploadOverwriteAllowed,
-  selectUpload: uploadDirectory, loadUploadPage, pollUpload, cancelUpload, closeUpload,
+  selectUpload: uploadDirectory, pollUpload, cancelUpload, closeUpload,
   resolveUploadConflict, cancelUploadSession,
 } = useUploadBatch({
   adapter: cloudUploadAdapter,
@@ -791,6 +791,35 @@ function validDeletePlan(plan, target) {
       && Number.isSafeInteger(item.size) && item.size >= 0 && (item.etag === null || typeof item.etag === "string"))
     && typeof plan.planId === "string" && plan.planId.length > 0 && Number.isFinite(plan.expiresAtUnix);
 }
+// 删除确认：Element Plus 的标题只接受纯文本，故把红色感叹号图标 + 标题渲染在消息体顶部，
+// 由 confirmAction 的 headerless 模式隐藏原生标题、把关闭按钮浮到右上角（样式见 src/assets/confirm.css）。
+function deleteDialogTitle() {
+  return h("div", { class: "confirm-heading" }, [
+    h("span", { class: "confirm-heading__icon" }, [
+      h("svg", { viewBox: "0 0 16 16", width: 20, height: 20, "aria-hidden": "true", focusable: "false", style: { display: "block" } }, [
+        h("circle", { cx: 8, cy: 8, r: 7, fill: "currentColor" }),
+        h("path", { d: "M8 4.4v4.2M8 11.2v.01", stroke: "#fff", "stroke-width": 1.7, "stroke-linecap": "round" }),
+      ]),
+    ]),
+    h("span", t("cloudBrowser.deleteTitle")),
+  ]);
+}
+// S3 键可含换行等控制字符：直接渲染会让一个对象在清单里看起来像多行，
+// 因此仅在存在歧义字符时显示 JSON 转义形式，普通键保持原样可读。
+function displayKey(value) {
+  return /[\n\r\t"]/.test(value) || value !== value.trim() ? JSON.stringify(value) : value;
+}
+function deleteDialogBody(plan, target) {
+  return h("div", [
+    deleteDialogTitle(),
+    h("p", { class: "confirm-summary" }, t("cloudBrowser.deleteSummary", { count: plan.objectCount })),
+    h("div", { class: "confirm-scope" }, [
+      h("span", { class: "confirm-scope__label" }, t("cloudBrowser.deleteScopeLabel")),
+      h("span", { class: "confirm-scope__value", "data-test": "delete-target" }, target ? displayKey(target) : t("cloudBrowser.deleteRootPrefix")),
+    ]),
+    h("ul", { class: "confirm-list", "data-test": "delete-keys" }, plan.entries.map((item) => h("li", { key: item.key }, displayKey(item.key)))),
+  ]);
+}
 async function remove(target) {
   if (!canMutate.value || targetProtected(target)) return;
   await operate(async (scope) => {
@@ -798,10 +827,7 @@ async function remove(target) {
     const plan = await cloudObjects.deletePlan({ connectionId: scope.connectionId, prefix: target });
     if (!valid(scope)) return;
     if (!validDeletePlan(plan, target)) { error.value = { code: "CLOUD_CONFIRMATION_REQUIRED", message: t("cloudBrowser.invalidPlan") }; return; }
-    const accepted = await confirmAction(h("div", [
-      h("p", { style: { whiteSpace: "pre-wrap" } }, t("cloudBrowser.deleteConfirm", { prefix: JSON.stringify(target), count: plan.objectCount })),
-      h("ul", { "data-test": "delete-keys", style: { maxHeight: "40vh", overflow: "auto", paddingLeft: "20px", overflowWrap: "anywhere", whiteSpace: "pre-wrap" } }, plan.entries.map((item) => h("li", { key: item.key }, JSON.stringify(item.key)))),
-    ]), t("cloudBrowser.delete"));
+    const accepted = await confirmAction(deleteDialogBody(plan, target), "", { headerless: true, danger: true, type: null, confirmText: t("common.delete") });
     if (!accepted || !valid(scope)) return;
     if (Date.now() >= plan.expiresAtUnix * 1000) { error.value = { code: "CLOUD_DELETE_PLAN_STALE", message: t("cloudBrowser.stalePlan") }; return; }
     const result = await cloudObjects.deleteExecute({ connectionId: scope.connectionId, planId: plan.planId, confirmed: true });
@@ -1060,9 +1086,9 @@ onBeforeUnmount(() => {
       @download="download(previewTarget)"
     />
     <UploadBatchDialog :open="uploadDialogOpen" :summary="uploadSummary" :page="uploadPage" :running="uploadRunning"
-      :page-loading="uploadPageLoading" :batch-error="uploadBatchError" :page-notice="uploadPageNotice"
+      :batch-error="uploadBatchError" :page-notice="uploadPageNotice"
       v-model:apply-remaining="uploadApplyRemaining" :resolving="uploadResolving" :overwrite-allowed="uploadOverwriteAllowed"
-      @close="closeUpload" @cancel="cancelUpload" @page="loadUploadPage" @resolve="resolveUploadConflict" />
+      @close="closeUpload" @cancel="cancelUpload" @resolve="resolveUploadConflict" />
     <TransferQueueDialog :open="downloadDialogOpen" :items="downloadQueue" :running="downloadRunning" :canceling="downloadCanceling"
       :summary="downloadSummary" :queue-state="downloadState" :next-offset="downloadPage.nextOffset" :page-loading="downloadPageLoading"
       v-model:apply-remaining="downloadApplyRemaining" :resolving="downloadResolving" @resolve="resolveDownloadConflict" @page="loadDownloadPage"

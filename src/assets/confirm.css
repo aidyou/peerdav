@@ -1,0 +1,118 @@
+/*
+ * Element Plus renders MessageBox titles as plain text, so confirmations that
+ * need a richer heading (for example a colored icon) render the heading inside
+ * the message body. The native title slot then stays empty and the close button
+ * floats into the top-right corner of the header area.
+ */
+.confirm-box--headerless {
+  position: relative;
+}
+
+.confirm-box--headerless .el-message-box__header {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  padding: 0;
+  z-index: 2;
+}
+
+.confirm-box--headerless .el-message-box__title {
+  display: none;
+}
+
+.confirm-box--headerless .el-message-box__headerbtn {
+  position: static;
+  top: auto;
+  right: auto;
+}
+
+.confirm-box--headerless .el-message-box__content {
+  padding-top: 12px;
+}
+
+/* Heading, summary, scope and object list used by headerless confirmations. */
+.confirm-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 32px 10px 0;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 24px;
+  color: var(--el-text-color-primary);
+}
+
+.confirm-heading__icon {
+  display: inline-flex;
+  flex: none;
+  color: var(--el-color-danger);
+}
+
+.confirm-summary {
+  margin: 0;
+  font-size: 14px;
+  line-height: 22px;
+  color: var(--el-text-color-regular);
+}
+
+.confirm-scope {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.confirm-scope__label {
+  flex: none;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.confirm-scope__value,
+.confirm-list {
+  font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.confirm-scope__value {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--el-fill-color-light);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--el-text-color-primary);
+}
+
+.confirm-list {
+  max-height: 32vh;
+  margin: 6px 0 0;
+  padding: 8px 8px 8px 24px;
+  overflow: auto;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  background: var(--el-fill-color-lighter);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--el-text-color-regular);
+}
+
+.confirm-list li + li {
+  margin-top: 2px;
+}
+
+/*
+ * Destructive confirmations: the action button must read as irreversible.
+ * Element Plus styles buttons through custom properties, so redefining them on
+ * the primary button keeps hover and active states consistent in both themes.
+ */
+.confirm-box--danger .el-message-box__btns .el-button--primary {
+  --el-button-bg-color: var(--el-color-danger);
+  --el-button-border-color: var(--el-color-danger);
+  --el-button-hover-bg-color: var(--el-color-danger-light-3);
+  --el-button-hover-border-color: var(--el-color-danger-light-3);
+  --el-button-active-bg-color: var(--el-color-danger-dark-2);
+  --el-button-active-border-color: var(--el-color-danger-dark-2);
+}
