@@ -201,6 +201,9 @@ pub struct CloudConfigSnapshot {
     pub repositories: Vec<CachedRepository>,
     #[serde(default)]
     pub append_repositories: Vec<AppendRepositoryRedacted>,
+    /// 明文镜像同步映射（路线 C）：保持目录结构的双向镜像，独立于加密同步盘。
+    #[serde(default)]
+    pub mirror_mappings: Vec<crate::mirror::MirrorMapping>,
 }
 impl Default for CloudConfigSnapshot {
     fn default() -> Self {
@@ -209,6 +212,7 @@ impl Default for CloudConfigSnapshot {
             mappings: Vec::new(),
             repositories: Vec::new(),
             append_repositories: Vec::new(),
+            mirror_mappings: Vec::new(),
         }
     }
 }

@@ -678,6 +678,59 @@ impl From<crate::cloud::ObjectServiceError> for DomainError {
     }
 }
 
+impl From<crate::mirror::MirrorError> for DomainError {
+    fn from(source: crate::mirror::MirrorError) -> Self {
+        use crate::mirror::MirrorError;
+        let (code, user_reason) = match source {
+            MirrorError::Cloud(error) => return error.into(),
+            MirrorError::InvalidRoot(_) => (
+                "MIRROR_INVALID_ROOT",
+                "本地目录无效或不存在 / Invalid or missing local directory",
+            ),
+            MirrorError::InvalidPrefix(_) => (
+                "MIRROR_INVALID_PREFIX",
+                "云端目录无效 / Invalid cloud directory",
+            ),
+            MirrorError::InvalidId(_) => (
+                "MIRROR_INVALID_ID",
+                "映射标识无效 / Invalid mapping id",
+            ),
+            MirrorError::UnsafePath(_) => (
+                "MIRROR_UNSAFE_PATH",
+                "不安全的本地路径 / Unsafe local path",
+            ),
+            MirrorError::Canceled => ("MIRROR_CANCELED", "同步已取消 / Sync canceled"),
+            MirrorError::Local(_) => (
+                "MIRROR_LOCAL_IO",
+                "本地文件操作失败 / Local file operation failed",
+            ),
+            MirrorError::Baseline(_) => (
+                "MIRROR_BASELINE",
+                "同步基线数据损坏 / Sync baseline data is corrupt",
+            ),
+            MirrorError::Busy => (
+                "MIRROR_BUSY",
+                "该映射正在同步中 / This mapping is already syncing",
+            ),
+            MirrorError::TooManyEntries => (
+                "MIRROR_TOO_MANY_ENTRIES",
+                "镜像目录对象数超过上限 / The mirror directory exceeds its object limit",
+            ),
+        };
+        Self::Cloud {
+            code,
+            user_reason,
+            source: Box::new(source),
+        }
+    }
+}
+
+impl From<crate::mirror::MirrorError> for AppError {
+    fn from(error: crate::mirror::MirrorError) -> Self {
+        AppError::from(DomainError::from(error))
+    }
+}
+
 /// Remove only known transport wrappers, never split an arbitrary cause on a
 /// colon: the original reason may itself contain colons or structured values.
 pub(crate) fn visible_reason(detail: &str) -> String {

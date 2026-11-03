@@ -395,6 +395,74 @@ impl CloudConfigStore {
         self.save_locked(&snapshot)
     }
 
+    /// 保存（新建或更新）一条镜像同步映射。云端目录会被规范化，
+    /// 同一连接 + 本地目录 + 云端目录的组合必须唯一，避免两条映射互相覆盖。
+    pub fn save_mirror_mapping(
+        &self,
+        input: crate::mirror::SaveMirrorMappingInput,
+    ) -> Result<crate::mirror::MirrorMapping, ConfigError> {
+        let _guard = self.guard()?;
+        let mut snapshot = self.load_locked()?;
+        if !snapshot.connections.iter().any(|c| c.id == input.connection_id) {
+            return Err(ConfigError::NotFound("connection".into()));
+        }
+        let cloud_prefix = crate::mirror::normalize_cloud_prefix(&input.cloud_prefix)
+            .map_err(|e| ConfigError::Validation(e.to_string()))?;
+        let local_root = input.local_root.clone();
+        if !local_root.is_absolute() {
+            return Err(ConfigError::Validation(
+                "本地目录必须是绝对路径 / Local root must be absolute".into(),
+            ));
+        }
+        let id = match input.id.as_deref() {
+            Some(id) => {
+                if !snapshot
+                    .mirror_mappings
+                    .iter()
+                    .any(|m| m.id == id && m.connection_id == input.connection_id)
+                {
+                    return Err(ConfigError::NotFound("mirror mapping".into()));
+                }
+                id.to_owned()
+            }
+            None => random_id()?,
+        };
+        let mapping = crate::mirror::MirrorMapping {
+            id: id.clone(),
+            connection_id: input.connection_id.clone(),
+            local_root,
+            cloud_prefix,
+            schedule: input.schedule,
+        };
+        // 同一连接下不允许两条镜像映射指向同一个本地目录或同一个云端目录：
+        // 它们会互相删除对方的文件。
+        for existing in &snapshot.mirror_mappings {
+            if existing.id == id || existing.connection_id != mapping.connection_id {
+                continue;
+            }
+            if existing.local_root == mapping.local_root
+                || (existing.cloud_prefix.is_empty() && mapping.cloud_prefix.is_empty())
+                || existing.cloud_prefix == mapping.cloud_prefix
+            {
+                return Err(ConfigError::Validation(
+                    "本地目录或云端目录与已有镜像映射冲突 / Local or cloud directory conflicts with an existing mirror mapping"
+                        .into(),
+                ));
+            }
+        }
+        snapshot.mirror_mappings.retain(|m| m.id != id);
+        snapshot.mirror_mappings.push(mapping.clone());
+        self.save_locked(&snapshot)?;
+        Ok(mapping)
+    }
+
+    pub fn delete_mirror_mapping(&self, id: &str) -> Result<(), ConfigError> {
+        let _guard = self.guard()?;
+        let mut snapshot = self.load_locked()?;
+        snapshot.mirror_mappings.retain(|m| m.id != id);
+        self.save_locked(&snapshot)
+    }
+
     pub fn cache_repository(
         &self,
         connection_id: &str,

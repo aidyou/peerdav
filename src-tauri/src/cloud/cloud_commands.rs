@@ -147,6 +147,38 @@ pub async fn cloud_sync(
 }
 
 #[tauri::command]
+pub fn mirror_save_mapping(
+    input: crate::mirror::SaveMirrorMappingInput,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<crate::mirror::MirrorMapping, AppError> {
+    cloud.0.save_mirror_mapping(input)
+}
+
+#[tauri::command]
+pub fn mirror_delete_mapping(
+    mapping_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<(), AppError> {
+    cloud.0.delete_mirror_mapping(&mapping_id)
+}
+
+#[tauri::command]
+pub async fn mirror_sync(
+    mapping_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<crate::mirror::MirrorSyncResult, AppError> {
+    cloud.0.mirror_sync(&mapping_id).await
+}
+
+#[tauri::command]
+pub fn mirror_cancel(
+    mapping_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<(), AppError> {
+    cloud.0.mirror_cancel(&mapping_id)
+}
+
+#[tauri::command]
 pub async fn cloud_append_discover(
     connection_id: String,
     cloud: tauri::State<'_, SharedCloud>,

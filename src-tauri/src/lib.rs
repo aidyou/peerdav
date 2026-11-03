@@ -17,8 +17,8 @@ mod fs;
 mod ignore_rules;
 mod keyfile;
 mod logging;
-#[cfg(test)]
 mod machine;
+mod mirror;
 pub mod paths;
 mod peer;
 mod local_upload;
@@ -327,6 +327,10 @@ pub fn run() {
                     cloud::cloud_commands::cloud_cancel,
                     cloud::cloud_commands::cloud_preview,
                     cloud::cloud_commands::cloud_sync,
+                    cloud::cloud_commands::mirror_save_mapping,
+                    cloud::cloud_commands::mirror_delete_mapping,
+                    cloud::cloud_commands::mirror_sync,
+                    cloud::cloud_commands::mirror_cancel,
                     cloud::object_commands::cloud_object_select_bucket,
                     cloud::object_commands::cloud_object_list,
                     cloud::object_commands::cloud_object_preview,

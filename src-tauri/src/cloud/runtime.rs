@@ -15,6 +15,7 @@ use crate::cloud::config_types::ConfigError;
 use crate::cloud::config_types::*;
 use crate::cloud::{S3Store, traits::ObjectStore};
 use crate::sync::merge;
+use crate::sync::manager_types::{SyncPhase, SyncStatus};
 use crate::sync::merge_types::{MergeSet, Node, RevisionValue};
 use crate::sync::publisher_types::PublishControl;
 use crate::sync::scan::scan;
@@ -341,6 +342,8 @@ pub struct CloudRuntime {
     pub(crate) object_lifecycle: tokio::sync::Mutex<()>,
     tickets: Mutex<HashMap<String, Ticket>>,
     pub(crate) schedules: super::runtime_schedule::CloudSchedules,
+    /// 每个镜像映射的运行中取消令牌；同步结束后移除，用于实现「同一映射不重入」与取消。
+    mirror_runs: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 impl CloudRuntime {
     pub fn new(vault: Arc<Vault>, events: Arc<dyn SyncEvents>, data_dir: PathBuf) -> Arc<Self> {
@@ -358,6 +361,7 @@ impl CloudRuntime {
             network: Arc::new(RwLock::new(())),
             tickets: Mutex::new(HashMap::new()),
             schedules: super::runtime_schedule::CloudSchedules::new(),
+            mirror_runs: Mutex::new(HashMap::new()),
         })
     }
     pub async fn stop_and_clear(&self) -> Result<(), AppError> {
@@ -432,11 +436,92 @@ impl CloudRuntime {
                 .collect(),
             append_repositories: s.append_repositories,
             mappings: s.mappings,
+            mirror_mappings: s.mirror_mappings,
             statuses: self.manager.snapshots(),
             capabilities: CloudCapabilities {
                 safe_apply: self.safe_apply,
             },
         })
+    }
+    pub fn save_mirror_mapping(
+        &self,
+        input: crate::mirror::SaveMirrorMappingInput,
+    ) -> Result<crate::mirror::MirrorMapping, AppError> {
+        self.config.save_mirror_mapping(input).map_err(config_error)
+    }
+    pub fn delete_mirror_mapping(&self, id: &str) -> Result<(), AppError> {
+        self.config.delete_mirror_mapping(id).map_err(config_error)
+    }
+    /// 取消正在运行的镜像同步；没有运行中的映射是空操作。
+    pub fn mirror_cancel(&self, mapping_id: &str) -> Result<(), AppError> {
+        let runs = self
+            .mirror_runs
+            .lock()
+            .map_err(|_| runtime_error("MIRROR_BUSY", "镜像同步运行表已锁死 / Mirror run registry poisoned"))?;
+        if let Some(cancel) = runs.get(mapping_id) {
+            cancel.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+    /// 手动触发一次镜像同步。同一映射不重入（返回 MIRROR_BUSY），
+    /// 进度与结束状态通过现有的 `app://cloud-progress` 事件发布。
+    pub async fn mirror_sync(
+        self: &Arc<Self>,
+        mapping_id: &str,
+    ) -> Result<crate::mirror::MirrorSyncResult, AppError> {
+        let mapping = {
+            let snapshot = self.config.snapshot().map_err(config_error)?;
+            snapshot
+                .mirror_mappings
+                .into_iter()
+                .find(|m| m.id == mapping_id)
+                .ok_or_else(|| config_error(ConfigError::NotFound("mirror mapping".into())))?
+        };
+        let cancel = {
+            let mut runs = self
+                .mirror_runs
+                .lock()
+                .map_err(|_| runtime_error("MIRROR_BUSY", "镜像同步运行表已锁死 / Mirror run registry poisoned"))?;
+            if runs.contains_key(mapping_id) {
+                return Err(AppError::from(crate::mirror::MirrorError::Busy));
+            }
+            let cancel = Arc::new(AtomicBool::new(false));
+            runs.insert(mapping_id.to_owned(), Arc::clone(&cancel));
+            cancel
+        };
+        let result = self.mirror_sync_inner(mapping, Arc::clone(&cancel)).await;
+        if let Ok(mut runs) = self.mirror_runs.lock() {
+            runs.remove(mapping_id);
+        }
+        result
+    }
+    async fn mirror_sync_inner(
+        &self,
+        mapping: crate::mirror::MirrorMapping,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<crate::mirror::MirrorSyncResult, AppError> {
+        let connection = self.connection(&mapping.connection_id)?;
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(S3Store::new(connection.config).map_err(cloud_error)?);
+        let _ = self.object_events.progress(SyncStatus {
+            mapping_id: mapping.id.clone(),
+            run_id: None,
+            phase: SyncPhase::Scanning,
+            detail: None,
+        });
+        let result = crate::mirror::run_sync(store, &mapping, &self.data_dir, cancel).await;
+        let phase = match &result {
+            Ok(_) => SyncPhase::Completed,
+            Err(crate::mirror::MirrorError::Canceled) => SyncPhase::Cancelled,
+            Err(_) => SyncPhase::Failed,
+        };
+        let _ = self.object_events.progress(SyncStatus {
+            mapping_id: mapping.id.clone(),
+            run_id: None,
+            phase,
+            detail: result.as_ref().err().map(|e| e.to_string()),
+        });
+        result.map_err(AppError::from)
     }
     pub fn save_connection(&self, input: SaveS3Input) -> Result<ConnectionRedacted, AppError> {
         self.config.save_connection(input).map_err(config_error)

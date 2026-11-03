@@ -51,6 +51,7 @@ pub fn hash_identifier(raw: &str) -> String {
 }
 
 /// 机器码是否可用于身份比对：固定长度的小写 hex。
+#[cfg(test)]
 pub fn valid_machine_code(code: &str) -> bool {
     let trimmed = code.trim();
     trimmed.len() == MACHINE_CODE_LEN
@@ -60,6 +61,7 @@ pub fn valid_machine_code(code: &str) -> bool {
 }
 
 /// 归一化对端上报的机器码；格式不对时视为「未上报」，退回 IP 身份。
+#[cfg(test)]
 pub fn normalize_reported(code: Option<&str>) -> Option<String> {
     let trimmed = code?.trim().to_ascii_lowercase();
     valid_machine_code(&trimmed).then_some(trimmed)

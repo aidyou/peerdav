@@ -23,6 +23,7 @@ pub struct CloudRuntimeSnapshot {
     pub repositories: Vec<RepositoryRedacted>,
     pub append_repositories: Vec<crate::cloud::config_types::AppendRepositoryRedacted>,
     pub mappings: Vec<CloudMapping>,
+    pub mirror_mappings: Vec<crate::mirror::MirrorMapping>,
     pub statuses: Vec<SyncStatus>,
     pub capabilities: CloudCapabilities,
 }
