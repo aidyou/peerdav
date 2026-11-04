@@ -217,6 +217,7 @@ async function refreshCatalog() {
     catalogDrives.value = [
       ...(catalog.repositories || []).filter((item) => item.connectionId === connectionId),
       ...(catalog.appendRepositories || []).filter((item) => item.connectionId === connectionId).map((item) => ({ id: item.binding.repoId })),
+      ...(catalog.mirrorMappings || []).filter((item) => item.connectionId === connectionId).map((item) => ({ id: item.id })),
     ];
     if (activeDriveId.value && !catalogDrives.value.some((item) => item.id === activeDriveId.value)) {
       activeDriveId.value = ""; view.value = "files";

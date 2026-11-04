@@ -9,7 +9,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
 
-use super::config_types::{CloudMapping, MIN_SCHEDULE_INTERVAL};
+use super::config_types::MIN_SCHEDULE_INTERVAL;
 use super::runtime::CloudRuntime;
 use crate::AppError;
 
@@ -143,25 +143,35 @@ async fn wait_cancel(cancel: Arc<AtomicBool>) {
 impl CloudRuntime {
     /// Start one schedule without retaining a strong runtime reference in the
     /// worker. This is also the seam used by deterministic schedule tests.
+    /// `mirror:{id}` keys schedule a mirror sync; bare ids schedule an append sync.
     pub fn start_schedule(
         self: &Arc<Self>,
         mapping_id: impl Into<String>,
     ) -> Result<ScheduleHandle, AppError> {
         let mapping_id = mapping_id.into();
-        let mapping = self.mapping(&mapping_id)?;
-        if mapping.schedule.interval < MIN_SCHEDULE_INTERVAL {
+        let (interval, enabled) = match mapping_id.strip_prefix("mirror:") {
+            Some(id) => {
+                let mapping = self.mirror_mapping(id)?;
+                (mapping.schedule.interval, mapping.schedule.enabled)
+            }
+            None => {
+                let mapping = self.mapping(&mapping_id)?;
+                (mapping.schedule.interval, mapping.schedule.enabled)
+            }
+        };
+        if interval < MIN_SCHEDULE_INTERVAL {
             return Err(schedule_error(
                 "CLOUD_SCHEDULE_INTERVAL",
                 "定时同步间隔不能少于 60 秒 / Schedule interval must be at least 60 seconds",
             ));
         }
-        if !mapping.schedule.enabled {
+        if !enabled {
             return Err(schedule_error(
                 "CLOUD_SCHEDULE_DISABLED",
                 "定时同步未启用 / Schedule is disabled",
             ));
         }
-        let seconds = mapping.schedule.interval.min(u64::MAX / 1000);
+        let seconds = interval.min(u64::MAX / 1000);
         let weak = Arc::downgrade(self);
         let source: TickSource = Arc::new(move |id| {
             let weak: Weak<CloudRuntime> = weak.clone();
@@ -172,7 +182,15 @@ impl CloudRuntime {
                 if !runtime.is_open() {
                     return Ok(());
                 }
-                runtime.scheduled_sync(&id).await
+                match id.strip_prefix("mirror:") {
+                    // 手动同步仍在跑时本轮跳过：MIRROR_BUSY 不是错误，不报给用户。
+                    Some(mirror_id) => match runtime.mirror_sync(mirror_id).await {
+                        Ok(_) => Ok(()),
+                        Err(error) if error.code == "MIRROR_BUSY" => Ok(()),
+                        Err(error) => Err(error),
+                    },
+                    None => runtime.scheduled_sync(&id).await,
+                }
             })
         });
         let reporter_runtime = Arc::downgrade(self);
@@ -263,21 +281,26 @@ impl CloudSchedules {
 
     pub async fn refresh(&self, runtime: &Arc<CloudRuntime>) -> Result<(), AppError> {
         let _reconcile = self.reconcile.lock().await;
-        let mappings = runtime
+        let snapshot = runtime
             .config
             .snapshot()
-            .map_err(|e| schedule_error("CLOUD_CONFIG", &e.to_string()))?
-            .mappings;
-        let wanted: HashMap<String, CloudMapping> = mappings
-            .into_iter()
+            .map_err(|e| schedule_error("CLOUD_CONFIG", &e.to_string()))?;
+        let mappings = snapshot.mappings;
+        let mirror_mappings = snapshot.mirror_mappings;
+        let mut wanted: HashMap<String, u64> = mappings
+            .iter()
             .filter(|m| m.schedule.enabled)
-            .map(|m| (m.id.clone(), m))
+            .map(|m| (m.id.clone(), m.schedule.interval))
             .collect();
+        // 镜像映射与 append 映射的 id 都是十六进制随机串，用前缀区分调度键。
+        for mapping in mirror_mappings.iter().filter(|m| m.schedule.enabled) {
+            wanted.insert(format!("mirror:{}", mapping.id), mapping.schedule.interval);
+        }
         self.stop_all().await?;
         if !runtime.is_open() {
             return Ok(());
         }
-        for id in wanted.keys() {
+        for (id, _interval) in wanted {
             if !runtime.is_open() {
                 break;
             }
@@ -294,7 +317,7 @@ impl CloudSchedules {
                         "定时任务状态不可用 / Schedule state unavailable",
                     )
                 })?
-                .insert(id.clone(), handle);
+                .insert(id, handle);
         }
         Ok(())
     }

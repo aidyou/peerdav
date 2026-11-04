@@ -7,13 +7,15 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: nativeInvoke }));
 vi.mock("../lib/appContext", () => ({ useAppContext: () => app }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => vi.fn()) }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openDialog }));
+vi.mock("../lib/confirm", () => ({ confirmAction: vi.fn(async () => true) }));
 vi.mock("element-plus/es", async () => {
   const { defineComponent, h } = await import("vue");
   const control = (tag) => defineComponent({ props: ["modelValue", "type", "value", "label"], emits: ["update:modelValue"], setup(p, { emit, slots, attrs }) { return () => h(tag, { ...attrs, type: p.type, value: tag === "option" ? p.value : p.modelValue, checked: p.modelValue === true, onInput: (e) => emit("update:modelValue", e.target.value), onChange: (e) => emit("update:modelValue", e.target.type === "checkbox" ? e.target.checked : e.target.value) }, tag === "input" ? undefined : tag === "option" ? p.label : tag === "select" ? [h("option", { value: "" }, "Select"), slots.default?.()] : slots.default?.()); } });
-  return { ElDialog: defineComponent({ props: ['modelValue'], setup(p, { slots, attrs }) { return () => p.modelValue ? h('section', attrs, [slots.default?.(), slots.footer?.()]) : null; } }), ElInput: control("input"), ElSelect: control("select"), ElOption: control("option"), ElButton: control("button"), ElSwitch: defineComponent({ props: ["modelValue"], emits: ["update:modelValue"], setup(p, { emit, attrs }) { return () => h("input", { ...attrs, type: "checkbox", checked: p.modelValue, onChange: (e) => emit("update:modelValue", e.target.checked) }); } }) };
+  return { ElDialog: defineComponent({ props: ['modelValue'], setup(p, { slots, attrs }) { return () => p.modelValue ? h('section', attrs, [slots.default?.(), slots.footer?.()]) : null; } }), ElInput: control("input"), ElSelect: control("select"), ElOption: control("option"), ElButton: control("button"), ElSwitch: defineComponent({ props: ["modelValue"], emits: ["update:modelValue"], setup(p, { emit, attrs }) { return () => h("input", { ...attrs, type: "checkbox", checked: p.modelValue, onChange: (e) => emit("update:modelValue", e.target.checked) }); } }), ElPopover: defineComponent({ setup(_, { slots }) { return () => h("div", slots.default?.()); } }) };
 });
 import CloudSettings from "../components/CloudSyncDrives.vue";
 import { cloud } from "../lib/cloud";
+import { confirmAction } from "../lib/confirm";
 import { errorStrategy, toUserMessage } from "../lib/invoke";
 import { setLocale } from "../lib/i18n";
 import en from "../locales/en";
@@ -28,14 +30,16 @@ const anchor = (key, mode = "encrypted") => ({ key, fingerprint: `fp-${key}`, re
 let rows;
 beforeEach(() => {
   vi.clearAllMocks(); setLocale("en");
-  rows = { connections: [{ id: "c1", name: "Primary" }], repositories: [{ id: "cas-repo", connectionId: "c1", name: "Legacy drive" }], appendRepositories: [{ connectionId: "c1", protocol: "append_v2", binding: { repoId: "append-repo", rootCandidates: ["docs", "photos"], selectedRoot: "photos", appendMode: "encrypted" } }], mappings: [], statuses: [] };
-  nativeInvoke.mockImplementation(async (command) => command === "cloud_list" ? structuredClone(rows) : command === "cloud_append_discover" ? [anchor("one"), anchor("two", "authenticated_plain")] : command === "cloud_create_sync_drive" ? { connectionId: "c1", protocol: "append_v2", binding: { repoId: "new-repo" } } : {});
+  rows = { connections: [{ id: "c1", name: "Primary" }], repositories: [{ id: "cas-repo", connectionId: "c1", name: "Legacy drive" }], appendRepositories: [{ connectionId: "c1", protocol: "append_v2", binding: { repoId: "append-repo", rootCandidates: ["docs", "photos"], selectedRoot: "photos", appendMode: "encrypted" } }], mappings: [], statuses: [], mirrorMappings: [] };
+  nativeInvoke.mockImplementation(async (command) => command === "cloud_list" ? structuredClone(rows) : command === "cloud_append_discover" ? [anchor("one"), anchor("two", "authenticated_plain")] : command === "cloud_create_sync_drive" ? { connectionId: "c1", protocol: "append_v2", binding: { repoId: "new-repo" } } : command === "cloud_append_join" ? { binding: { repoId: "joined-repo" } } : {});
 });
 const changed = vi.fn();
 const dialog = defineComponent({ props: ['modelValue'], setup(p, { slots, attrs }) { return () => p.modelValue ? h('section', attrs, [slots.default?.(), slots.footer?.()]) : null; } });
-async function mountSettings() { const w = mount(CloudSettings, { props: { connectionId: "c1", onChanged: changed }, global: { stubs: { ElDialog: dialog, ElInput: input, ElSelect: select, ElOption: option, ElSwitch: toggle, ElButton: button } } }); await flushPromises(); await w.find('.open-create-drive').trigger('click'); return w; }
-async function appendSettings() { const w = await mountSettings(); await w.find('.drive-connect').trigger('click'); return w; }
-async function fillPasswords(w) { await w.find(".append-password").setValue("password-123"); await w.find(".append-confirmation").setValue("password-123"); const join = w.find(".append-join-password"); if (join.exists()) await join.setValue("password-123"); }
+const popover = defineComponent({ setup(_, { slots }) { return () => h("div", slots.default?.()); } });
+async function mountSettings() { const w = mount(CloudSettings, { props: { connectionId: "c1", onChanged: changed }, global: { stubs: { ElDialog: dialog, ElInput: input, ElSelect: select, ElOption: option, ElSwitch: toggle, ElButton: button, ElPopover: popover } } }); await flushPromises(); await w.find('.open-create-drive').trigger('click'); return w; }
+async function appendSettings() { const w = await mountSettings(); await w.find('[data-test=tab-link]').trigger('click'); return w; }
+async function fillPasswords(w) { const create = w.find(".append-password"); if (create.exists()) await create.setValue("password-123"); const confirm = w.find(".append-confirmation"); if (confirm.exists()) await confirm.setValue("password-123"); const join = w.find(".append-join-password"); if (join.exists()) await join.setValue("password-123"); }
+async function fillLinkLocalRoot(w, root = "/local/Documents") { await w.find(".link-local-root").setValue(root); }
 const saveMappingButton = (w) => w.findAll("button").filter((b) => b.text() === "Save").at(-1);
 
 describe("append settings through unified invoke", () => {
@@ -70,7 +74,7 @@ describe("append settings through unified invoke", () => {
     await w.setProps({ focusId: '' }); expect(w.find('.drive-list .is-active').exists()).toBe(false); w.unmount();
   });
   it.each(["encrypted", "authenticated_plain"])("creates %s and binds the first local folder in one step", async (mode) => {
-    const w = await appendSettings(); await w.find(".new-drive-local").setValue("/local/Documents"); await w.find(".append-mode").setValue(mode);
+    const w = await mountSettings(); await w.find(".new-drive-local").setValue("/local/Documents"); await w.find(".append-mode").setValue(mode);
     expect(w.find(".append-create").attributes("disabled")).toBeDefined();
     if (mode === "authenticated_plain") expect(w.text()).toContain("still requires a password");
     await fillPasswords(w); expect(w.find(".append-create").attributes("disabled")).toBeUndefined();
@@ -84,9 +88,10 @@ describe("append settings through unified invoke", () => {
     expect(w.find('[data-test=create-drive-dialog]').exists()).toBe(false); expect(nativeInvoke.mock.calls.some(([c]) => c === "cloud_test_connection")).toBe(false); w.unmount();
   });
   it("requires explicit candidate selection and TOFU, resets trust when candidate changes", async () => {
+    rows.appendRepositories.push({ connectionId: "c1", protocol: "append_v2", binding: { repoId: "joined-repo", rootCandidates: ["docs"], appendMode: "encrypted" } });
     const w = await appendSettings(); await fillPasswords(w); await w.find(".append-discover").trigger("click"); await flushPromises();
     expect(nativeInvoke).toHaveBeenCalledWith("cloud_append_discover", { connectionId: "c1" }); expect(w.find(".append-candidate").element.value).toBe(""); expect(w.find(".append-join").exists()).toBe(false);
-    await w.find(".append-candidate").setValue("one"); expect(w.find('.advanced-security').attributes('open')).toBeUndefined(); expect(w.find('.append-fingerprint').element.closest('details')).toBe(w.find('.advanced-security').element); expect(w.find(".append-tofu").element.checked).toBe(false); expect(w.find(".append-join").attributes("disabled")).toBeDefined();
+    await w.find(".append-candidate").setValue("one"); await fillLinkLocalRoot(w); expect(w.find('.advanced-security').attributes('open')).toBeUndefined(); expect(w.find('.append-fingerprint').element.closest('details')).toBe(w.find('.advanced-security').element); expect(w.find(".append-tofu").element.checked).toBe(false); expect(w.find(".append-join").attributes("disabled")).toBeDefined();
     await w.find(".append-tofu").setValue(true); await w.find(".append-candidate").setValue("two"); expect(w.find(".append-tofu").element.checked).toBe(false);
     await w.find(".append-tofu").setValue(true); await w.find(".append-join").trigger("click"); await flushPromises();
     expect(nativeInvoke).toHaveBeenCalledWith("cloud_append_join", { input: { connectionId: "c1", anchorKey: "two", anchorFingerprint: "fp-two", repositoryId: "repo-two", mode: "authenticated_plain", acceptTofu: true, trustedFingerprint: null, password: "password-123" } });
@@ -94,10 +99,36 @@ describe("append settings through unified invoke", () => {
     expect(app.handleFailure.mock.calls).toEqual([]);
     expect(w.find('.append-state').text()).toBe('Sync drive saved.');
     expect(changed).toHaveBeenCalledTimes(1);
+    expect(nativeInvoke).toHaveBeenCalledWith("cloud_append_save_mapping", { input: { mappingId: null, mapping: { connectionId: "c1", repositoryId: "joined-repo", localRoot: "/local/Documents", logicalPath: "docs", schedule: { enabled: false, interval: 900 } }, selectedRoot: "docs" } });
     expect(nativeInvoke.mock.calls.some(([c]) => c === "cloud_test_connection")).toBe(false); w.unmount();
   });
+  it("asks for a root when the joined drive has several and binds the chosen one", async () => {
+    rows.appendRepositories.push({ connectionId: "c1", protocol: "append_v2", binding: { repoId: "joined-repo", rootCandidates: ["docs", "photos"], appendMode: "encrypted" } });
+    const w = await appendSettings(); await fillPasswords(w); await w.find(".append-discover").trigger("click"); await flushPromises();
+    await w.find(".append-candidate").setValue("one"); await fillLinkLocalRoot(w); await w.find(".append-tofu").setValue(true); await w.find(".append-join").trigger("click"); await flushPromises();
+    // 多根目录：join 成功但尚未绑定，等待用户选择。
+    expect(nativeInvoke.mock.calls.some(([c]) => c === "cloud_append_save_mapping")).toBe(false);
+    expect(w.find(".link-root").exists()).toBe(true);
+    await w.find(".link-root").setValue("photos"); await w.find(".append-bind").trigger("click"); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith("cloud_append_save_mapping", { input: { mappingId: null, mapping: { connectionId: "c1", repositoryId: "joined-repo", localRoot: "/local/Documents", logicalPath: "photos", schedule: { enabled: false, interval: 900 } }, selectedRoot: "photos" } });
+    expect(w.find('.append-state').text()).toBe('Sync drive saved.'); expect(changed).toHaveBeenCalledTimes(1); w.unmount();
+  });
+  it("asks for a new root name when the joined drive is empty", async () => {
+    rows.appendRepositories.push({ connectionId: "c1", protocol: "append_v2", binding: { repoId: "joined-repo", rootCandidates: [], appendMode: "encrypted" } });
+    const w = await appendSettings(); await fillPasswords(w); await w.find(".append-discover").trigger("click"); await flushPromises();
+    await w.find(".append-candidate").setValue("one"); await fillLinkLocalRoot(w); await w.find(".append-tofu").setValue(true); await w.find(".append-join").trigger("click"); await flushPromises();
+    expect(w.find(".link-new-root").exists()).toBe(true);
+    await w.find(".link-new-root").setValue("fresh-root"); await w.find(".append-bind").trigger("click"); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith("cloud_append_save_mapping", { input: expect.objectContaining({ selectedRoot: "fresh-root", mapping: expect.objectContaining({ logicalPath: "fresh-root" }) }) }); w.unmount();
+  });
+  it("keeps the join button disabled until a local folder is chosen", async () => {
+    const w = await appendSettings(); await fillPasswords(w); await w.find(".append-discover").trigger("click"); await flushPromises();
+    await w.find(".append-candidate").setValue("one"); await w.find(".append-tofu").setValue(true);
+    expect(w.find(".append-join").attributes("disabled")).toBeDefined();
+    await fillLinkLocalRoot(w); expect(w.find(".append-join").attributes("disabled")).toBeUndefined(); w.unmount();
+  });
   it("joins using an independently entered fingerprint without implicit TOFU", async () => {
-    const w = await appendSettings(); await fillPasswords(w); await w.find(".append-discover").trigger("click"); await flushPromises(); await w.find(".append-candidate").setValue("one");
+    const w = await appendSettings(); await fillPasswords(w); await w.find(".append-discover").trigger("click"); await flushPromises(); await w.find(".append-candidate").setValue("one"); await fillLinkLocalRoot(w);
     await w.find(".append-fingerprint").setValue("trusted-fp"); await w.find(".append-join").trigger("click"); await flushPromises();
     expect(nativeInvoke).toHaveBeenCalledWith("cloud_append_join", { input: expect.objectContaining({ acceptTofu: false, trustedFingerprint: "trusted-fp" }) }); w.unmount();
   });
@@ -131,10 +162,12 @@ describe("append settings through unified invoke", () => {
     await w.find(".append-discover").trigger("click"); await flushPromises(); expect(w.text()).toContain("Sync drive operation failed"); expect(app.handleFailure).toHaveBeenCalledWith(failure); expect(w.find(".append-candidate").exists()).toBe(false); expect(w.find(".append-discover").attributes("disabled")).toBeUndefined(); log.mockRestore(); w.unmount();
   });
   it.each(["cloud_create_sync_drive", "cloud_append_join"])("shows %s authentication failures and retains retry input", async (command) => {
-    const w = await appendSettings(); await w.find(".new-drive-local").setValue("/local/Documents"); await fillPasswords(w);
-    if (command === "cloud_append_join") { await w.find(".append-discover").trigger("click"); await flushPromises(); await w.find(".append-candidate").setValue("one"); await w.find(".append-tofu").setValue(true); }
+    const w = command === "cloud_create_sync_drive" ? await mountSettings() : await appendSettings();
+    if (command === "cloud_create_sync_drive") await w.find(".new-drive-local").setValue("/local/Documents");
+    await fillPasswords(w);
+    if (command === "cloud_append_join") { await w.find(".append-discover").trigger("click"); await flushPromises(); await w.find(".append-candidate").setValue("one"); await w.find(".append-tofu").setValue(true); await fillLinkLocalRoot(w); }
     const failure = { code: "CLOUD_APPEND_AUTHENTICATION", message: "Wrong password", detail: null, context: null }; const log = vi.spyOn(console, "error").mockImplementation(() => {}); nativeInvoke.mockRejectedValueOnce(failure);
-    await w.find(command === "cloud_create_sync_drive" ? ".append-create" : ".append-join").trigger("click"); await flushPromises(); expect(app.handleFailure).toHaveBeenCalledWith(failure); expect(w.text()).toContain("Sync drive operation failed"); expect(w.find(".append-password").element.value).toBe("password-123"); log.mockRestore(); w.unmount();
+    await w.find(command === "cloud_create_sync_drive" ? ".append-create" : ".append-join").trigger("click"); await flushPromises(); expect(app.handleFailure).toHaveBeenCalledWith(failure); expect(w.text()).toContain("Sync drive operation failed"); const retained = w.find(".append-password").exists() ? w.find(".append-password") : w.find(".append-join-password"); expect(retained.element.value).toBe("password-123"); log.mockRestore(); w.unmount();
   });
   it('selects a local directory and edits an existing append mapping using its configured protocol', async () => {
     rows.mappings = [{ id: 'a1', connectionId: 'c1', repositoryId: 'append-repo', localRoot: '/old', logicalPath: 'photos', schedule: { enabled: true, interval: 120 } }];
@@ -155,6 +188,94 @@ describe("append settings through unified invoke", () => {
   it("has matching bilingual keys and stable append error strategies", () => {
     expect(Object.keys(en).filter((k) => k.startsWith("cloudAppend.") || k.startsWith("errors.CLOUD_APPEND")).sort()).toEqual(Object.keys(zh).filter((k) => k.startsWith("cloudAppend.") || k.startsWith("errors.CLOUD_APPEND")).sort());
     for (const [code, strategy] of Object.entries({ CLOUD_APPEND_PASSWORD: "edit", CLOUD_APPEND_ROOT_SELECTION: "edit", CLOUD_APPEND_TRUST_REQUIRED: "edit", CLOUD_APPEND_FINGERPRINT: "edit", CLOUD_APPEND_AUTHENTICATION: "retry", CLOUD_APPEND_DEPENDENCY: "support", CLOUD_APPEND: "show" })) {
+      expect(errorStrategy({ code, message: "reason" })).toBe(strategy); expect(toUserMessage({ code, message: "original reason" })).toContain("original reason");
+    }
+  });
+});
+
+describe("mirror sync settings through unified invoke", () => {
+  it("creates a mirror mapping without a password and closes the dialog", async () => {
+    const w = await mountSettings();
+    await w.find(".create-encrypted-toggle").setValue(false);
+    expect(w.find(".append-password").exists()).toBe(false);
+    expect(w.find(".mirror-cloud-prefix").exists()).toBe(true);
+    await w.find(".mirror-local-root").setValue("/local/mirror");
+    expect(w.find(".mirror-create").attributes("disabled")).toBeUndefined();
+    await w.find(".mirror-create").trigger("click"); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith("mirror_save_mapping", { input: { id: null, connectionId: "c1", localRoot: "/local/mirror", cloudPrefix: "", schedule: { enabled: false, interval: 900 } } });
+    expect(app.handleFailure.mock.calls).toEqual([]);
+    expect(w.find('[data-test=create-drive-dialog]').exists()).toBe(false);
+    expect(changed).toHaveBeenCalled(); w.unmount();
+  });
+  it("keeps mirror create disabled until a local folder is chosen", async () => {
+    const w = await mountSettings();
+    await w.find(".create-encrypted-toggle").setValue(false);
+    expect(w.find(".mirror-create").attributes("disabled")).toBeDefined();
+    await w.find(".mirror-local-root").setValue("/local/mirror");
+    expect(w.find(".mirror-create").attributes("disabled")).toBeUndefined(); w.unmount();
+  });
+  it("picks a cloud folder level by level and appends a new name", async () => {
+    nativeInvoke.mockImplementation(async (command) => command === "cloud_list" ? structuredClone(rows) : command === "cloud_object_list" ? { objects: [{ key: "_peerdav_mirror/docs/" }, { key: "_peerdav_mirror/docs/a.txt" }, { key: "_peerdav_mirror/photos/" }], next: null } : {});
+    const w = await mountSettings();
+    await w.find(".create-encrypted-toggle").setValue(false);
+    await w.find(".pick-cloud-folder").trigger("click"); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_list", { connectionId: "c1", prefix: "_peerdav_mirror/", next: null });
+    expect(w.findAll("[data-test=picker-folder]").map((b) => b.text())).toEqual(["docs/", "photos/"]);
+    await w.find("[data-test=picker-folder]").trigger("click"); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_list", { connectionId: "c1", prefix: "_peerdav_mirror/docs/", next: null });
+    expect(w.find(".mirror-cloud-prefix").element.value).toBe("");
+    await w.find(".picker-new-name").setValue("work");
+    await w.find(".picker-select").trigger("click");
+    expect(w.find(".mirror-cloud-prefix").element.value).toBe("docs/work");
+    expect(w.find("[data-test=cloud-folder-picker]").exists()).toBe(false); w.unmount();
+  });
+  it("selects the current cloud folder without naming a new one", async () => {
+    nativeInvoke.mockImplementation(async (command) => command === "cloud_list" ? structuredClone(rows) : command === "cloud_object_list" ? { objects: [{ key: "_peerdav_mirror/docs/" }], next: null } : {});
+    const w = await mountSettings();
+    await w.find(".create-encrypted-toggle").setValue(false);
+    await w.find(".pick-cloud-folder").trigger("click"); await flushPromises();
+    await w.find("[data-test=picker-folder]").trigger("click"); await flushPromises();
+    await w.find(".picker-select").trigger("click");
+    expect(w.find(".mirror-cloud-prefix").element.value).toBe("docs"); w.unmount();
+  });
+  it("lists mirror mappings and syncs them, surfacing conflicts", async () => {
+    rows.mirrorMappings = [{ id: "m1", connectionId: "c1", localRoot: "/local/mirror", cloudPrefix: "docs", schedule: { enabled: false, interval: 900 } }];
+    nativeInvoke.mockImplementation(async (command) => command === "cloud_list" ? structuredClone(rows) : command === "mirror_sync" ? { uploaded: 2, downloaded: 0, deletedCloud: 0, deletedLocal: 0, restored: 0, conflicts: ["a.txt"], failures: [{ path: "b.txt", reason: "boom" }] } : {});
+    const w = await mountSettings(); await flushPromises();
+    expect(w.text()).toContain("/local/mirror → _peerdav_mirror/docs");
+    await w.findAll("button").find((b) => b.text() === "Sync now").trigger("click"); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith("mirror_sync", { mappingId: "m1" });
+    expect(w.text()).toContain("Conflicts (1)");
+    expect(w.text()).toContain("Failed items (1)");
+    expect(changed).toHaveBeenCalled(); w.unmount();
+  });
+  it("cancels a running mirror sync", async () => {
+    rows.mirrorMappings = [{ id: "m1", connectionId: "c1", localRoot: "/local/mirror", cloudPrefix: "docs", schedule: { enabled: false, interval: 900 } }];
+    let finish; nativeInvoke.mockImplementation((command) => command === "cloud_list" ? Promise.resolve(structuredClone(rows)) : command === "mirror_sync" ? new Promise((resolve) => { finish = resolve; }) : Promise.resolve({}));
+    const w = await mountSettings(); await flushPromises();
+    await w.findAll("button").find((b) => b.text() === "Sync now").trigger("click"); await flushPromises();
+    await w.findAll("button").find((b) => b.text() === "Cancel sync").trigger("click");
+    expect(nativeInvoke).toHaveBeenCalledWith("mirror_cancel", { mappingId: "m1" });
+    finish({ uploaded: 0, downloaded: 0, deletedCloud: 0, deletedLocal: 0, restored: 0, conflicts: [], failures: [] }); await flushPromises(); w.unmount();
+  });
+  it("deletes a mirror mapping after confirmation without touching files", async () => {
+    rows.mirrorMappings = [{ id: "m1", connectionId: "c1", localRoot: "/local/mirror", cloudPrefix: "docs", schedule: { enabled: false, interval: 900 } }];
+    const w = await mountSettings(); await flushPromises();
+    await w.findAll("button").find((b) => b.text() === "Remove").trigger("click"); await flushPromises();
+    expect(confirmAction).toHaveBeenCalled();
+    expect(nativeInvoke).toHaveBeenCalledWith("mirror_delete_mapping", { mappingId: "m1" });
+    expect(nativeInvoke.mock.calls.some(([c]) => c === "cloud_object_delete_plan" || c === "cloud_object_delete")).toBe(false); w.unmount();
+  });
+  it("toggles automatic mirror sync and persists the schedule", async () => {
+    rows.mirrorMappings = [{ id: "m1", connectionId: "c1", localRoot: "/local/mirror", cloudPrefix: "docs", schedule: { enabled: false, interval: 900 } }];
+    const w = await mountSettings(); await flushPromises();
+    await w.find(".mirror-schedule input[type=checkbox]").setValue(true); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith("mirror_save_mapping", { input: { id: "m1", connectionId: "c1", localRoot: "/local/mirror", cloudPrefix: "docs", schedule: { enabled: true, interval: 900 } } });
+    expect(nativeInvoke.mock.calls.filter(([c]) => c === "mirror_save_mapping")).toHaveLength(1); w.unmount();
+  });
+  it("has matching bilingual keys and stable mirror error strategies", () => {
+    expect(Object.keys(en).filter((k) => k.startsWith("drive.")).sort()).toEqual(Object.keys(zh).filter((k) => k.startsWith("drive.")).sort());
+    for (const [code, strategy] of Object.entries({ MIRROR_INVALID_ROOT: "edit", MIRROR_INVALID_PREFIX: "edit", MIRROR_INVALID_ID: "show", MIRROR_UNSAFE_PATH: "show", MIRROR_CANCELED: "ignore", MIRROR_LOCAL_IO: "show", MIRROR_BASELINE: "support", MIRROR_BUSY: "show", MIRROR_TOO_MANY_ENTRIES: "show" })) {
       expect(errorStrategy({ code, message: "reason" })).toBe(strategy); expect(toUserMessage({ code, message: "original reason" })).toContain("original reason");
     }
   });

@@ -40,6 +40,10 @@ export const cloud = Object.freeze({
   recoveryRecords: (mappingId) => invoke("cloud_recovery_records", { mappingId }),
   restore: (mappingId, recordId, destination) => invoke("cloud_restore", { mappingId, recordId, destination }),
   status: () => invoke("cloud_status"),
+  mirrorSaveMapping: (input) => invoke("mirror_save_mapping", { input }),
+  mirrorDeleteMapping: (mappingId) => invoke("mirror_delete_mapping", { mappingId }),
+  mirrorSync: (mappingId) => invoke("mirror_sync", { mappingId }),
+  mirrorCancel: (mappingId) => invoke("mirror_cancel", { mappingId }),
 });
 
 // Object browsing is independent of repository sync. Explicit payloads prevent

@@ -452,6 +452,18 @@ impl CloudRuntime {
     pub fn delete_mirror_mapping(&self, id: &str) -> Result<(), AppError> {
         self.config.delete_mirror_mapping(id).map_err(config_error)
     }
+    /// 读取单条镜像映射；不存在时返回 CLOUD_CONFIG_NOT_FOUND。
+    pub(crate) fn mirror_mapping(
+        &self,
+        id: &str,
+    ) -> Result<crate::mirror::MirrorMapping, AppError> {
+        let snapshot = self.config.snapshot().map_err(config_error)?;
+        snapshot
+            .mirror_mappings
+            .into_iter()
+            .find(|m| m.id == id)
+            .ok_or_else(|| config_error(ConfigError::NotFound("mirror mapping".into())))
+    }
     /// 取消正在运行的镜像同步；没有运行中的映射是空操作。
     pub fn mirror_cancel(&self, mapping_id: &str) -> Result<(), AppError> {
         let runs = self
@@ -469,14 +481,7 @@ impl CloudRuntime {
         self: &Arc<Self>,
         mapping_id: &str,
     ) -> Result<crate::mirror::MirrorSyncResult, AppError> {
-        let mapping = {
-            let snapshot = self.config.snapshot().map_err(config_error)?;
-            snapshot
-                .mirror_mappings
-                .into_iter()
-                .find(|m| m.id == mapping_id)
-                .ok_or_else(|| config_error(ConfigError::NotFound("mirror mapping".into())))?
-        };
+        let mapping = self.mirror_mapping(mapping_id)?;
         let cancel = {
             let mut runs = self
                 .mirror_runs
