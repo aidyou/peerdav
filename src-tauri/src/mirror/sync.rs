@@ -3,7 +3,11 @@ use std::collections::BTreeMap;
 use super::types::{CloudFile, LocalFile, MirrorAction, MirrorBaseline};
 
 /// 某个相对路径在本地是否相对基线发生了变化（不存在于基线视为新增）。
-fn local_changed(path: &str, local: &BTreeMap<String, LocalFile>, baseline: &MirrorBaseline) -> bool {
+fn local_changed(
+    path: &str,
+    local: &BTreeMap<String, LocalFile>,
+    baseline: &MirrorBaseline,
+) -> bool {
     match (local.get(path), baseline.entry(path)) {
         (Some(file), Some(entry)) => {
             file.mtime_ns != entry.local_mtime_ns || file.size != entry.local_size
@@ -34,8 +38,9 @@ fn cloud_changed(
 /// 判定矩阵（业界双向同步的共同基线法）：
 /// - 仅本地变 → 上传；仅云端变 → 下载
 /// - 本地删除且云端未变 → 删除云端；云端删除且本地未变 → 删除本地
-/// - 两侧都改 → 冲突：本地上传为 `.conflict` 副本，原文件保持不动
-/// - 本地删除但云端已改 → 下载恢复（修改优先于删除，避免丢数据）
+/// - 两侧都改 → 冲突：保留双方，本地版本覆盖原路径、云端版本另存为本地冲突副本
+/// - 本地删除但云端已改，或本地已改但云端已删 → 修改优先于删除：
+///   前者下载恢复，后者上传恢复，避免并发修改被删除操作吞掉
 /// - 两侧都删 → 无需动作（由调用方清理基线残留）
 pub fn plan(
     local: &BTreeMap<String, LocalFile>,
@@ -64,13 +69,13 @@ pub fn plan(
             (Some(_), Some(_), false, true) | (None, Some(_), false, true) => {
                 actions.push(MirrorAction::Download(path.clone()));
             }
-            // 两侧都变：冲突（含「本地改+云端删」「本地删+云端改」）。
+            // 两侧都变：冲突（本地保留原路径，云端版本由调用方另存为本地副本）。
             (Some(_), Some(_), true, true) => {
                 actions.push(MirrorAction::Conflict(path.clone()));
             }
-            // 本地改 + 云端删：上传冲突副本保留本地内容。
+            // 本地改 + 云端删：修改优先于删除，上传恢复原路径。
             (Some(_), None, true, true) => {
-                actions.push(MirrorAction::Conflict(path.clone()));
+                actions.push(MirrorAction::Upload(path.clone()));
             }
             // 本地删 + 云端改：下载恢复，修改优先于删除。
             (None, Some(_), true, true) => {
@@ -98,11 +103,17 @@ mod tests {
     use crate::mirror::types::BaselineEntry;
 
     fn local(mtime: i128, size: u64) -> LocalFile {
-        LocalFile { mtime_ns: mtime, size }
+        LocalFile {
+            mtime_ns: mtime,
+            size,
+        }
     }
 
     fn cloud(etag: &str, size: u64) -> CloudFile {
-        CloudFile { etag: Some(etag.into()), size }
+        CloudFile {
+            etag: Some(etag.into()),
+            size,
+        }
     }
 
     fn entry(mtime: i128, size: u64, etag: &str) -> BaselineEntry {
@@ -156,7 +167,10 @@ mod tests {
         ]);
         let baseline = baseline_with(&[("changed.txt", entry(100, 10, "e1"))]);
         let actions = plan(&local, &cloud, &baseline);
-        assert_eq!(paths(&actions), vec!["changed.txt", "new.txt", "remote-new.txt"]);
+        assert_eq!(
+            paths(&actions),
+            vec!["changed.txt", "new.txt", "remote-new.txt"]
+        );
         assert!(matches!(&actions[0], MirrorAction::Upload(p) if p == "changed.txt"));
         assert!(matches!(&actions[1], MirrorAction::Upload(p) if p == "new.txt"));
         assert!(matches!(&actions[2], MirrorAction::Download(p) if p == "remote-new.txt"));
@@ -197,11 +211,12 @@ mod tests {
     }
 
     #[test]
-    fn local_change_with_cloud_delete_keeps_local_as_conflict() {
+    fn local_change_with_cloud_delete_restores_the_cloud_copy() {
         let local = BTreeMap::from([("a.txt".into(), local(200, 12))]);
         let baseline = baseline_with(&[("a.txt", entry(100, 10, "e1"))]);
         let actions = plan(&local, &BTreeMap::new(), &baseline);
-        assert!(matches!(&actions[0], MirrorAction::Conflict(p) if p == "a.txt"));
+        // 修改优先于删除：本地版本重新上传，而不是只留一个冲突副本。
+        assert!(matches!(&actions[0], MirrorAction::Upload(p) if p == "a.txt"));
     }
 
     #[test]

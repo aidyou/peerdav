@@ -42,7 +42,7 @@ export const cloud = Object.freeze({
   status: () => invoke("cloud_status"),
   mirrorSaveMapping: (input) => invoke("mirror_save_mapping", { input }),
   mirrorDeleteMapping: (mappingId) => invoke("mirror_delete_mapping", { mappingId }),
-  mirrorSync: (mappingId) => invoke("mirror_sync", { mappingId }),
+  mirrorSync: (mappingId, force = false) => invoke("mirror_sync", { mappingId, force }),
   mirrorCancel: (mappingId) => invoke("mirror_cancel", { mappingId }),
 });
 

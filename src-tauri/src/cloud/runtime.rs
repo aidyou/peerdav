@@ -5,7 +5,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use zeroize::Zeroizing;
 
@@ -14,8 +14,8 @@ use crate::cloud::config::CloudConfigStore;
 use crate::cloud::config_types::ConfigError;
 use crate::cloud::config_types::*;
 use crate::cloud::{S3Store, traits::ObjectStore};
-use crate::sync::merge;
 use crate::sync::manager_types::{SyncPhase, SyncStatus};
+use crate::sync::merge;
 use crate::sync::merge_types::{MergeSet, Node, RevisionValue};
 use crate::sync::publisher_types::PublishControl;
 use crate::sync::scan::scan;
@@ -328,6 +328,26 @@ fn preview_counts(
     }
     counts
 }
+/// 镜像同步运行表的守卫：正常结束、取消、panic 或 future 被丢弃时都会移除条目
+/// 并置取消标记，避免留下永久 MIRROR_BUSY 的映射（例如调度任务被重建时）。
+struct MirrorRunGuard<'a> {
+    runs: &'a Mutex<HashMap<String, Arc<AtomicBool>>>,
+    id: String,
+}
+
+impl Drop for MirrorRunGuard<'_> {
+    fn drop(&mut self) {
+        let mut runs = match self.runs.lock() {
+            Ok(runs) => runs,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(cancel) = runs.get(&self.id) {
+            cancel.store(true, Ordering::Release);
+        }
+        runs.remove(&self.id);
+    }
+}
+
 pub struct CloudRuntime {
     pub(crate) vault: Arc<Vault>,
     pub(crate) config: CloudConfigStore,
@@ -367,6 +387,7 @@ impl CloudRuntime {
     pub async fn stop_and_clear(&self) -> Result<(), AppError> {
         self.gate.store(false, Ordering::Release);
         self.cancel.store(true, Ordering::Release);
+        self.cancel_mirror_runs();
         let _objects = self.object_lifecycle.lock().await;
         for result in [
             self.object_invalidate(None).await,
@@ -395,7 +416,38 @@ impl CloudRuntime {
                 }
             }
         }
+        self.wait_mirror_runs().await;
         Ok(())
+    }
+
+    /// 通知所有镜像同步尽快退出（锁库/退出时不再继续写本地或云端）。
+    fn cancel_mirror_runs(&self) {
+        let runs = match self.mirror_runs.lock() {
+            Ok(runs) => runs,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for cancel in runs.values() {
+            cancel.store(true, Ordering::Release);
+        }
+    }
+
+    /// 等待镜像同步释放运行表，最多 5 秒；超时只记录告警，不阻塞退出。
+    async fn wait_mirror_runs(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let empty = match self.mirror_runs.lock() {
+                Ok(runs) => runs.is_empty(),
+                Err(poisoned) => poisoned.into_inner().is_empty(),
+            };
+            if empty {
+                return;
+            }
+            if Instant::now() >= deadline {
+                log::warn!("mirror sync still running after shutdown timeout");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
     pub async fn refresh_schedules(self: &Arc<Self>) -> Result<(), AppError> {
         self.schedules.refresh(self).await
@@ -450,7 +502,20 @@ impl CloudRuntime {
         self.config.save_mirror_mapping(input).map_err(config_error)
     }
     pub fn delete_mirror_mapping(&self, id: &str) -> Result<(), AppError> {
-        self.config.delete_mirror_mapping(id).map_err(config_error)
+        self.config
+            .delete_mirror_mapping(id)
+            .map_err(config_error)?;
+        // 删除映射后不再保留它的运行令牌与基线：避免残留同步继续写文件，
+        // 也避免以后重新接入同一目录时误用旧基线。
+        if let Ok(runs) = self.mirror_runs.lock()
+            && let Some(cancel) = runs.get(id)
+        {
+            cancel.store(true, Ordering::Release);
+        }
+        if let Err(error) = crate::mirror::remove_baseline(&self.data_dir, id) {
+            log::warn!("failed to remove mirror baseline {id}: {error}");
+        }
+        Ok(())
     }
     /// 读取单条镜像映射；不存在时返回 CLOUD_CONFIG_NOT_FOUND。
     pub(crate) fn mirror_mapping(
@@ -466,10 +531,12 @@ impl CloudRuntime {
     }
     /// 取消正在运行的镜像同步；没有运行中的映射是空操作。
     pub fn mirror_cancel(&self, mapping_id: &str) -> Result<(), AppError> {
-        let runs = self
-            .mirror_runs
-            .lock()
-            .map_err(|_| runtime_error("MIRROR_BUSY", "镜像同步运行表已锁死 / Mirror run registry poisoned"))?;
+        let runs = self.mirror_runs.lock().map_err(|_| {
+            runtime_error(
+                "MIRROR_BUSY",
+                "镜像同步运行表已锁死 / Mirror run registry poisoned",
+            )
+        })?;
         if let Some(cancel) = runs.get(mapping_id) {
             cancel.store(true, Ordering::Release);
         }
@@ -477,16 +544,21 @@ impl CloudRuntime {
     }
     /// 手动触发一次镜像同步。同一映射不重入（返回 MIRROR_BUSY），
     /// 进度与结束状态通过现有的 `app://cloud-progress` 事件发布。
+    /// `force` 用于用户确认「大量删除」后的再次执行；其余调用一律不传。
     pub async fn mirror_sync(
         self: &Arc<Self>,
         mapping_id: &str,
+        force_mass_delete: bool,
     ) -> Result<crate::mirror::MirrorSyncResult, AppError> {
+        self.admit()?;
         let mapping = self.mirror_mapping(mapping_id)?;
         let cancel = {
-            let mut runs = self
-                .mirror_runs
-                .lock()
-                .map_err(|_| runtime_error("MIRROR_BUSY", "镜像同步运行表已锁死 / Mirror run registry poisoned"))?;
+            let mut runs = self.mirror_runs.lock().map_err(|_| {
+                runtime_error(
+                    "MIRROR_BUSY",
+                    "镜像同步运行表已锁死 / Mirror run registry poisoned",
+                )
+            })?;
             if runs.contains_key(mapping_id) {
                 return Err(AppError::from(crate::mirror::MirrorError::Busy));
             }
@@ -494,18 +566,25 @@ impl CloudRuntime {
             runs.insert(mapping_id.to_owned(), Arc::clone(&cancel));
             cancel
         };
-        let result = self.mirror_sync_inner(mapping, Arc::clone(&cancel)).await;
-        if let Ok(mut runs) = self.mirror_runs.lock() {
-            runs.remove(mapping_id);
-        }
-        result
+        let _guard = MirrorRunGuard {
+            runs: &self.mirror_runs,
+            id: mapping_id.to_owned(),
+        };
+        self.mirror_sync_inner(mapping, Arc::clone(&cancel), force_mass_delete)
+            .await
     }
     async fn mirror_sync_inner(
         &self,
         mapping: crate::mirror::MirrorMapping,
         cancel: Arc<AtomicBool>,
+        force_mass_delete: bool,
     ) -> Result<crate::mirror::MirrorSyncResult, AppError> {
         let connection = self.connection(&mapping.connection_id)?;
+        let context = crate::mirror::MirrorRunContext {
+            endpoint: connection.config.endpoint.clone(),
+            bucket: connection.config.bucket.clone(),
+            force_mass_delete,
+        };
         let store: Arc<dyn ObjectStore> =
             Arc::new(S3Store::new(connection.config).map_err(cloud_error)?);
         let _ = self.object_events.progress(SyncStatus {
@@ -514,7 +593,8 @@ impl CloudRuntime {
             phase: SyncPhase::Scanning,
             detail: None,
         });
-        let result = crate::mirror::run_sync(store, &mapping, &self.data_dir, cancel).await;
+        let result =
+            crate::mirror::run_sync(store, &mapping, &self.data_dir, &context, cancel).await;
         let phase = match &result {
             Ok(_) => SyncPhase::Completed,
             Err(crate::mirror::MirrorError::Canceled) => SyncPhase::Cancelled,
@@ -560,17 +640,36 @@ impl CloudRuntime {
         self.object_invalidate(Some(id)).await?;
         let _permit = self.network.write().await;
         self.admit()?;
-        for mapping in self
-            .config
-            .snapshot()
-            .map_err(config_error)?
+        let snapshot = self.config.snapshot().map_err(config_error)?;
+        for mapping in snapshot
             .mappings
             .iter()
             .filter(|mapping| mapping.connection_id == id)
         {
             self.manager.stop_mapping(&mapping.id).await?;
         }
-        self.config.delete_connection(id).map_err(config_error)
+        // 镜像映射随连接一起删除：取消仍在运行的同步并清掉基线，
+        // 否则它们会变成 UI 不可见、却仍按调度反复报错的孤儿任务。
+        let mirror_ids: Vec<String> = snapshot
+            .mirror_mappings
+            .iter()
+            .filter(|mapping| mapping.connection_id == id)
+            .map(|mapping| mapping.id.clone())
+            .collect();
+        if let Ok(runs) = self.mirror_runs.lock() {
+            for mapping_id in &mirror_ids {
+                if let Some(cancel) = runs.get(mapping_id) {
+                    cancel.store(true, Ordering::Release);
+                }
+            }
+        }
+        self.config.delete_connection(id).map_err(config_error)?;
+        for mapping_id in &mirror_ids {
+            if let Err(error) = crate::mirror::remove_baseline(&self.data_dir, mapping_id) {
+                log::warn!("failed to remove mirror baseline {mapping_id}: {error}");
+            }
+        }
+        Ok(())
     }
     pub async fn save_mapping(
         &self,
@@ -1272,5 +1371,30 @@ mod preview_count_tests {
         let encoded = serde_json::to_string(&remote.entries[0].projection_path)
             .expect("serialize projection path");
         assert!(!encoded.contains("private-scope"));
+    }
+}
+
+#[cfg(test)]
+mod mirror_guard_tests {
+    use super::{MirrorRunGuard, Mutex};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn guard_removes_the_run_and_cancels_it_on_drop() {
+        let runs = Mutex::new(HashMap::new());
+        let cancel = Arc::new(AtomicBool::new(false));
+        runs.lock()
+            .expect("runs")
+            .insert("m1".to_owned(), Arc::clone(&cancel));
+        {
+            let _guard = MirrorRunGuard {
+                runs: &runs,
+                id: "m1".to_owned(),
+            };
+        }
+        assert!(!runs.lock().expect("runs").contains_key("m1"));
+        assert!(cancel.load(Ordering::Acquire));
     }
 }

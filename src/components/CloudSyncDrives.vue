@@ -16,7 +16,7 @@ const createDialogOpen = ref(false);
 const createTab = ref("create");
 // 新建同步盘的内容模式：开 = 加密同步盘（append），关 = 明文镜像同步。
 const encrypted = ref(true);
-function closeCreateDialog() { if (busy.value) return; createDialogOpen.value = false; resetNewDrive(); resetLink(); }
+function closeCreateDialog() { if (busy.value) return; createDialogOpen.value = false; resetNewDrive(); resetLink(); resetMirror(); }
 const mode = ref("encrypted");
 const newDrive = ref({ localRoot: "", logicalPath: "", password: "", confirmation: "" });
 const password = ref("");
@@ -125,7 +125,7 @@ async function createMirror() {
   if (!canCreateMirror.value) return;
   await run(async (scope) => {
     state.value = "loading";
-    await cloud.mirrorSaveMapping({ id: null, connectionId: props.connectionId, localRoot: mirrorForm.value.localRoot, cloudPrefix: mirrorForm.value.cloudPrefix, schedule: { enabled: false, interval: 900 } });
+    await cloud.mirrorSaveMapping({ id: null, connectionId: props.connectionId, localRoot: mirrorForm.value.localRoot.trim(), cloudPrefix: mirrorForm.value.cloudPrefix.trim(), schedule: { enabled: false, interval: 900 } });
     if (scope !== generation || disposed) return;
     resetMirror(); createDialogOpen.value = false; await refresh(scope);
     if (scope !== generation || disposed) return;
@@ -226,17 +226,29 @@ async function deleteMirror(item) {
     if (scope === generation && !disposed) emit("changed");
   });
 }
-async function syncMirror(id) {
+async function syncMirror(id, force = false) {
   if (mirrorBusy.value[id] || busy.value) return;
   mirrorBusy.value = { ...mirrorBusy.value, [id]: true };
   try {
-    const result = await cloud.mirrorSync(id);
+    const result = await cloud.mirrorSync(id, force);
     mirrorResults.value = { ...mirrorResults.value, [id]: result };
     if (!disposed) emit("changed");
   } catch (error) {
-    if (!disposed) fail(error);
+    if (disposed) return;
+    // 删除量超过安全阈值时先让用户确认，再以 force 重跑一次。
+    if (error?.code === "MIRROR_MASS_DELETE" && !force) {
+      mirrorBusy.value = { ...mirrorBusy.value, [id]: false };
+      const confirmed = await confirmAction(
+        t("drive.mirrorMassDeleteConfirm"),
+        t("drive.mirrorMassDeleteTitle"),
+        { danger: true, confirmText: t("common.delete") },
+      );
+      if (confirmed && !disposed) await syncMirror(id, true);
+      return;
+    }
+    fail(error);
   } finally {
-    mirrorBusy.value = { ...mirrorBusy.value, [id]: false };
+    if (!disposed) mirrorBusy.value = { ...mirrorBusy.value, [id]: false };
   }
 }
 async function cancelMirror(id) {
@@ -353,7 +365,7 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
         <p class="hint">{{ t(encrypted ? 'drive.modeEncryptedHint' : 'drive.modeMirrorHint') }}</p>
         <form v-if="!encrypted" class="drive-create" @submit.prevent="createMirror">
           <label class="settings-row"><span>{{ t('drive.mirrorCloudFolder') }}</span>
-            <el-input :model-value="mirrorForm.cloudPrefix" class="mirror-cloud-prefix" :placeholder="t('drive.mirrorCloudFolderHint')" :disabled="busy" />
+            <el-input v-model="mirrorForm.cloudPrefix" class="mirror-cloud-prefix" :placeholder="t('drive.mirrorCloudFolderHint')" :disabled="busy" />
             <el-button class="pick-cloud-folder" :disabled="busy" @click="openPicker">{{ t('drive.pickCloudFolder') }}</el-button>
           </label>
           <label class="settings-row"><span>{{ t('drive.mirrorLocalFolder') }}</span>

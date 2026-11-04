@@ -244,10 +244,32 @@ describe("mirror sync settings through unified invoke", () => {
     const w = await mountSettings(); await flushPromises();
     expect(w.text()).toContain("/local/mirror → _peerdav_mirror/docs");
     await w.findAll("button").find((b) => b.text() === "Sync now").trigger("click"); await flushPromises();
-    expect(nativeInvoke).toHaveBeenCalledWith("mirror_sync", { mappingId: "m1" });
+    expect(nativeInvoke).toHaveBeenCalledWith("mirror_sync", { mappingId: "m1", force: false });
     expect(w.text()).toContain("Conflicts (1)");
     expect(w.text()).toContain("Failed items (1)");
     expect(changed).toHaveBeenCalled(); w.unmount();
+  });
+  it("asks for confirmation before a bulk mirror deletion", async () => {
+    rows.mirrorMappings = [{ id: "m1", connectionId: "c1", localRoot: "/local/mirror", cloudPrefix: "docs", schedule: { enabled: false, interval: 900 } }];
+    let attempts = 0;
+    nativeInvoke.mockImplementation(async (command) => {
+      if (command === "cloud_list") return structuredClone(rows);
+      if (command === "mirror_sync") {
+        attempts += 1;
+        if (attempts === 1) throw { code: "MIRROR_MASS_DELETE", message: "too many deletions" };
+        return { uploaded: 0, downloaded: 0, deletedCloud: 3, deletedLocal: 0, restored: 0, conflicts: [], failures: [] };
+      }
+      return {};
+    });
+    const w = await mountSettings(); await flushPromises();
+    await w.findAll("button").find((b) => b.text() === "Sync now").trigger("click"); await flushPromises();
+    expect(confirmAction).toHaveBeenCalled();
+    expect(nativeInvoke.mock.calls.filter(([c]) => c === "mirror_sync")).toEqual([
+      ["mirror_sync", { mappingId: "m1", force: false }],
+      ["mirror_sync", { mappingId: "m1", force: true }],
+    ]);
+    expect(app.handleFailure).not.toHaveBeenCalled();
+    w.unmount();
   });
   it("cancels a running mirror sync", async () => {
     rows.mirrorMappings = [{ id: "m1", connectionId: "c1", localRoot: "/local/mirror", cloudPrefix: "docs", schedule: { enabled: false, interval: 900 } }];
@@ -275,7 +297,7 @@ describe("mirror sync settings through unified invoke", () => {
   });
   it("has matching bilingual keys and stable mirror error strategies", () => {
     expect(Object.keys(en).filter((k) => k.startsWith("drive.")).sort()).toEqual(Object.keys(zh).filter((k) => k.startsWith("drive.")).sort());
-    for (const [code, strategy] of Object.entries({ MIRROR_INVALID_ROOT: "edit", MIRROR_INVALID_PREFIX: "edit", MIRROR_INVALID_ID: "show", MIRROR_UNSAFE_PATH: "show", MIRROR_CANCELED: "ignore", MIRROR_LOCAL_IO: "show", MIRROR_BASELINE: "support", MIRROR_BUSY: "show", MIRROR_TOO_MANY_ENTRIES: "show" })) {
+    for (const [code, strategy] of Object.entries({ MIRROR_INVALID_ROOT: "edit", MIRROR_INVALID_PREFIX: "edit", MIRROR_INVALID_ID: "show", MIRROR_UNSAFE_PATH: "show", MIRROR_CANCELED: "ignore", MIRROR_LOCAL_IO: "show", MIRROR_BASELINE: "support", MIRROR_BUSY: "show", MIRROR_MASS_DELETE: "show", MIRROR_TOO_MANY_ENTRIES: "show" })) {
       expect(errorStrategy({ code, message: "reason" })).toBe(strategy); expect(toUserMessage({ code, message: "original reason" })).toContain("original reason");
     }
   });

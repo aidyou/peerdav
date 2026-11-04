@@ -219,6 +219,7 @@ impl CloudConfigStore {
         snapshot
             .append_repositories
             .retain(|r| r.connection_id != id);
+        snapshot.mirror_mappings.retain(|m| m.connection_id != id);
         self.save_locked(&snapshot)
     }
 
@@ -403,11 +404,16 @@ impl CloudConfigStore {
     ) -> Result<crate::mirror::MirrorMapping, ConfigError> {
         let _guard = self.guard()?;
         let mut snapshot = self.load_locked()?;
-        if !snapshot.connections.iter().any(|c| c.id == input.connection_id) {
+        if !snapshot
+            .connections
+            .iter()
+            .any(|c| c.id == input.connection_id)
+        {
             return Err(ConfigError::NotFound("connection".into()));
         }
         let cloud_prefix = crate::mirror::normalize_cloud_prefix(&input.cloud_prefix)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
+        validate_schedule(&input.schedule)?;
         let local_root = input.local_root.clone();
         if !local_root.is_absolute() {
             return Err(ConfigError::Validation(
@@ -434,18 +440,26 @@ impl CloudConfigStore {
             cloud_prefix,
             schedule: input.schedule,
         };
-        // 同一连接下不允许两条镜像映射指向同一个本地目录或同一个云端目录：
-        // 它们会互相删除对方的文件。
+        // 镜像映射会互相接管对方的文件，因此本地根不能在任意映射之间相等或嵌套
+        // （即使连接不同，同一批本地文件也不能被两个远端同时镜像）；
+        // 云端前缀只与同一连接（同一桶）下的映射比较，空前缀占满整个镜像根。
         for existing in &snapshot.mirror_mappings {
-            if existing.id == id || existing.connection_id != mapping.connection_id {
+            if existing.id == id {
                 continue;
             }
-            if existing.local_root == mapping.local_root
-                || (existing.cloud_prefix.is_empty() && mapping.cloud_prefix.is_empty())
-                || existing.cloud_prefix == mapping.cloud_prefix
+            if existing.local_root.starts_with(&mapping.local_root)
+                || mapping.local_root.starts_with(&existing.local_root)
             {
                 return Err(ConfigError::Validation(
-                    "本地目录或云端目录与已有镜像映射冲突 / Local or cloud directory conflicts with an existing mirror mapping"
+                    "本地目录与已有镜像映射重叠 / Local root overlaps an existing mirror mapping"
+                        .into(),
+                ));
+            }
+            if existing.connection_id == mapping.connection_id
+                && mirror_prefix_overlap(&existing.cloud_prefix, &mapping.cloud_prefix)
+            {
+                return Err(ConfigError::Validation(
+                    "云端目录与已有镜像映射重叠 / Cloud prefix overlaps an existing mirror mapping"
                         .into(),
                 ));
             }
@@ -593,6 +607,12 @@ fn validate_mapping_protocol(mapping: &CloudMapping) -> Result<(), ConfigError> 
 fn logical_overlap(a: &str, b: &str) -> bool {
     a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
 }
+
+/// 镜像云端前缀的重叠判定：空串表示 `_peerdav_mirror/` 整根，覆盖所有前缀；
+/// 其余情况按路径分段判断祖先关系，避免 `docs` 与 `docs2` 被误判。
+fn mirror_prefix_overlap(a: &str, b: &str) -> bool {
+    a.is_empty() || b.is_empty() || logical_overlap(a, b)
+}
 fn random_id() -> Result<String, ConfigError> {
     let mut bytes = [0_u8; 16];
     rand::rngs::OsRng.try_fill_bytes(&mut bytes)?;
@@ -630,4 +650,106 @@ fn validate_config(config: &S3Config) -> Result<(), ConfigError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mirror::SaveMirrorMappingInput;
+
+    fn store() -> (tempfile::TempDir, CloudConfigStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault = Arc::new(Vault::open(&dir.path().join("vault.pd")).expect("open"));
+        vault
+            .initialize(dir.path().to_str().expect("path"), "admin", "password 123")
+            .expect("init");
+        (dir, CloudConfigStore::new(vault))
+    }
+
+    fn connection_input() -> SaveS3Input {
+        SaveS3Input {
+            id: None,
+            name: "main".into(),
+            endpoint: "https://s3.example".into(),
+            bucket: "bucket".into(),
+            buckets: Vec::new(),
+            region: "us-east-1".into(),
+            prefix: String::new(),
+            path_style: false,
+            access_key: Some("access".into()),
+            secret_key: Some("secret".into()),
+            session_token: None,
+            clear_credentials: false,
+            clear_session_token: false,
+            clear_proxy_auth: false,
+            allow_insecure_http: false,
+            proxy: ProxyMode::Direct,
+            schedule: None,
+        }
+    }
+
+    fn mirror_input(
+        connection_id: &str,
+        local_root: &std::path::Path,
+        cloud_prefix: &str,
+    ) -> SaveMirrorMappingInput {
+        SaveMirrorMappingInput {
+            id: None,
+            connection_id: connection_id.to_owned(),
+            local_root: local_root.to_path_buf(),
+            cloud_prefix: cloud_prefix.to_owned(),
+            schedule: ScheduleConfig {
+                enabled: false,
+                interval: 900,
+            },
+        }
+    }
+
+    #[test]
+    fn mirror_mappings_reject_overlap_and_invalid_schedule() {
+        let (dir, store) = store();
+        let connection = store
+            .save_connection(connection_input())
+            .expect("connection");
+        let root_a = dir.path().join("a");
+        let nested = root_a.join("nested");
+        let root_b = dir.path().join("b");
+        store
+            .save_mirror_mapping(mirror_input(&connection.id, &root_a, "docs"))
+            .expect("first mapping");
+
+        // 前缀相等、前缀嵌套、空前缀占满整根，都必须拒绝。
+        for prefix in ["docs", "docs/sub", ""] {
+            assert!(
+                store
+                    .save_mirror_mapping(mirror_input(&connection.id, &root_b, prefix))
+                    .is_err(),
+                "prefix {prefix:?} must overlap"
+            );
+        }
+        // 本地根嵌套同样会互相接管文件。
+        assert!(
+            store
+                .save_mirror_mapping(mirror_input(&connection.id, &nested, "other"))
+                .is_err()
+        );
+        // 前缀只是同名前缀（docs2）时不算重叠。
+        let saved = store
+            .save_mirror_mapping(mirror_input(&connection.id, &root_b, "docs2"))
+            .expect("disjoint mapping");
+        assert_eq!(saved.cloud_prefix, "docs2");
+
+        let mut invalid = mirror_input(&connection.id, &root_b, "third");
+        invalid.schedule.interval = 30;
+        assert!(store.save_mirror_mapping(invalid).is_err());
+
+        store.delete_connection(&connection.id).expect("delete");
+        assert!(
+            store
+                .snapshot()
+                .expect("snapshot")
+                .mirror_mappings
+                .is_empty()
+        );
+    }
 }

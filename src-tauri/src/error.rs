@@ -712,6 +712,10 @@ impl From<crate::mirror::MirrorError> for DomainError {
                 "MIRROR_BUSY",
                 "该映射正在同步中 / This mapping is already syncing",
             ),
+            MirrorError::MassDelete { .. } => (
+                "MIRROR_MASS_DELETE",
+                "本轮删除数量超过安全阈值，请确认后重试 / The planned deletions exceed the safety threshold; confirm and retry",
+            ),
             MirrorError::TooManyEntries => (
                 "MIRROR_TOO_MANY_ENTRIES",
                 "镜像目录对象数超过上限 / The mirror directory exceeds its object limit",

@@ -184,7 +184,7 @@ impl CloudRuntime {
                 }
                 match id.strip_prefix("mirror:") {
                     // 手动同步仍在跑时本轮跳过：MIRROR_BUSY 不是错误，不报给用户。
-                    Some(mirror_id) => match runtime.mirror_sync(mirror_id).await {
+                    Some(mirror_id) => match runtime.mirror_sync(mirror_id, false).await {
                         Ok(_) => Ok(()),
                         Err(error) if error.code == "MIRROR_BUSY" => Ok(()),
                         Err(error) => Err(error),
@@ -300,11 +300,23 @@ impl CloudSchedules {
         if !runtime.is_open() {
             return Ok(());
         }
+        let mut first_error = None;
         for (id, _interval) in wanted {
             if !runtime.is_open() {
                 break;
             }
-            let handle = runtime.start_schedule(id.clone())?;
+            let handle = match runtime.start_schedule(id.clone()) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    // 单条调度失败不能阻止其余映射继续注册，否则一次坏配置会让所有
+                    // 定时同步停摆；错误在最后统一返回给调用方。
+                    log::error!("failed to start schedule {id}: {error:?}");
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            };
             if !runtime.is_open() {
                 handle.stop_and_join().await?;
                 break;
@@ -319,7 +331,10 @@ impl CloudSchedules {
                 })?
                 .insert(id, handle);
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub async fn stop_all(&self) -> Result<(), AppError> {

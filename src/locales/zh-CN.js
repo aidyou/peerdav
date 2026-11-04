@@ -80,6 +80,8 @@ export default {
   "drive.mirrorDeleteConfirm": "删除镜像映射「{name}」？仅移除同步配置，不会删除本地与云端文件。",
   "drive.mirrorConflicts": "冲突文件（{count}）",
   "drive.mirrorFailures": "失败项（{count}）",
+  "drive.mirrorMassDeleteTitle": "确认大量删除",
+  "drive.mirrorMassDeleteConfirm": "本轮同步计划删除的文件数量超过安全阈值。继续后会在本地与云端按差异执行删除，请确认已完成备份。",
   "drive.linkLocalFolder": "本地目录",
   "drive.linkPasswordHint": "请输入该同步盘创建时设置的密码。",
   "drive.linkRootHint": "该同步盘有多个同步目录，请选择要绑定到本地目录的一个。",

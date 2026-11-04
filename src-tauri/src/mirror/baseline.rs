@@ -16,7 +16,9 @@ fn baseline_path(data_dir: &Path, mapping_id: &str) -> Result<PathBuf, MirrorErr
     {
         return Err(MirrorError::InvalidId(mapping_id.to_owned()));
     }
-    Ok(data_dir.join(BASELINE_DIR).join(format!("{mapping_id}.json")))
+    Ok(data_dir
+        .join(BASELINE_DIR)
+        .join(format!("{mapping_id}.json")))
 }
 
 /// 加载某个映射的基线；文件不存在视为空基线（首次同步）。
@@ -24,8 +26,8 @@ pub fn load(data_dir: &Path, mapping_id: &str) -> Result<MirrorBaseline, MirrorE
     let path = baseline_path(data_dir, mapping_id)?;
     match std::fs::read(&path) {
         Ok(bytes) => {
-            let baseline: MirrorBaseline = serde_json::from_slice(&bytes)
-                .map_err(|e| MirrorError::Baseline(e.to_string()))?;
+            let baseline: MirrorBaseline =
+                serde_json::from_slice(&bytes).map_err(|e| MirrorError::Baseline(e.to_string()))?;
             Ok(baseline)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(MirrorBaseline::default()),
@@ -47,13 +49,22 @@ pub fn save(
     let mut tmp = path.clone();
     tmp.set_extension("json.tmp");
     {
-        let mut file =
-            std::fs::File::create(&tmp).map_err(MirrorError::from)?;
+        let mut file = std::fs::File::create(&tmp).map_err(MirrorError::from)?;
         file.write_all(&bytes).map_err(MirrorError::from)?;
         file.sync_all().map_err(MirrorError::from)?;
     }
     std::fs::rename(&tmp, &path).map_err(MirrorError::from)?;
     Ok(())
+}
+
+/// 删除某个映射的基线文件；文件不存在视为成功（幂等清理）。
+pub fn remove(data_dir: &Path, mapping_id: &str) -> Result<(), MirrorError> {
+    let path = baseline_path(data_dir, mapping_id)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(MirrorError::from(error)),
+    }
 }
 
 impl MirrorBaseline {
@@ -117,10 +128,8 @@ mod tests {
     use super::*;
 
     fn dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "peerdav-mirror-baseline-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("peerdav-mirror-baseline-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -133,7 +142,10 @@ mod tests {
         baseline.record_upload("a.txt", 1, 10, Some("etag-1".into()), 10);
         save(&dir, "abc123", &baseline).unwrap();
         let again = load(&dir, "abc123").unwrap();
-        assert_eq!(again.entry("a.txt").unwrap().cloud_etag.as_deref(), Some("etag-1"));
+        assert_eq!(
+            again.entry("a.txt").unwrap().cloud_etag.as_deref(),
+            Some("etag-1")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -142,6 +154,19 @@ mod tests {
         let dir = dir();
         for bad in ["", "..", "a/b", "a\\b", "a\0b"] {
             assert!(load(&dir, bad).is_err(), "{bad:?}");
+            assert!(remove(&dir, bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn removing_a_baseline_is_idempotent() {
+        let dir = dir();
+        let mut baseline = load(&dir, "abc123").unwrap();
+        baseline.record_upload("a.txt", 1, 10, Some("etag-1".into()), 10);
+        save(&dir, "abc123", &baseline).unwrap();
+        remove(&dir, "abc123").unwrap();
+        assert!(load(&dir, "abc123").unwrap().entries.is_empty());
+        remove(&dir, "abc123").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

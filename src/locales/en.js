@@ -79,6 +79,8 @@ export default {
   "drive.mirrorDeleteConfirm": "Remove the mirror mapping “{name}”? Only the sync configuration is removed; local and cloud files stay.",
   "drive.mirrorConflicts": "Conflicts ({count})",
   "drive.mirrorFailures": "Failed items ({count})",
+  "drive.mirrorMassDeleteTitle": "Confirm bulk deletion",
+  "drive.mirrorMassDeleteConfirm": "This sync plans to delete more files than the safety threshold allows. Continuing deletes them on both sides; make sure you have a backup.",
   "drive.linkLocalFolder": "Local folder",
   "drive.linkPasswordHint": "Enter the password set when this drive was created.",
   "drive.linkRootHint": "This drive has several synced folders; choose the one to bind to the local folder.",

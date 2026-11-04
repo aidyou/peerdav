@@ -786,7 +786,7 @@ async fn sync_drive_create_join_sync_both_modes_without_cas_probe_or_control_hea
     use peerdav_lib::cloud::runtime_types::{
         CreateAppendRepositoryInput, JoinAppendRepositoryInput, SaveAppendMappingInput,
     };
-    use peerdav_lib::sync::append_types::{APPEND_ANCHORS, APPEND_ROOT, AppendMode};
+    use peerdav_lib::sync::append_types::{APPEND_ROOT, AppendMode};
     for mode in [AppendMode::Encrypted, AppendMode::AuthenticatedPlain] {
         let fixture = Fixture::start(true).await; // Deliberately cannot pass CAS probing.
         let data = tempfile::tempdir().unwrap();
