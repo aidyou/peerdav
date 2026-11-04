@@ -8,7 +8,7 @@ use peerdav_lib::cloud::config_types::{
     SaveAppendBindingInput, SaveS3Input, ScheduleConfig, StorageProtocol,
 };
 use peerdav_lib::cloud::types::ProxyMode;
-use peerdav_lib::sync::append_types::{AppendMode, TrustSource};
+use peerdav_lib::sync::append_types::{APPEND_ANCHORS, AppendMode, TrustSource};
 use peerdav_lib::sync::repository_types::{ChunkerProfile, RepoDescriptor, RepositoryMode};
 use tempfile::TempDir;
 
@@ -96,7 +96,7 @@ fn append_binding_roundtrip_preserves_selection_mode_trust_and_encryption() {
     let fingerprint = "ab".repeat(32);
     let mut binding = AppendRepositoryBinding {
         repo_id: "repo".into(),
-        anchor_key: format!("v2/anchors/repo-{fingerprint}"),
+        anchor_key: format!("{APPEND_ANCHORS}repo-{fingerprint}"),
         anchor_fingerprint: fingerprint,
         append_mode: AppendMode::AuthenticatedPlain,
         trust_source: TrustSource::Unconfirmed,

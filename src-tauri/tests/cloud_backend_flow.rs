@@ -634,6 +634,7 @@ fn runtime_connection(fixture: &Fixture) -> SaveS3Input {
 async fn sync_drive_defaults_to_append_preserves_cas_and_deletes_only_local_associations() {
     use peerdav_lib::cloud::config_types::StorageProtocol;
     use peerdav_lib::cloud::runtime_types::{CreateAppendRepositoryInput, SaveAppendMappingInput};
+    use peerdav_lib::sync::append_types::APPEND_ANCHORS;
 
     let fixture = Fixture::start(false).await;
     let data = tempfile::tempdir().expect("data dir");
@@ -713,7 +714,7 @@ async fn sync_drive_defaults_to_append_preserves_cas_and_deletes_only_local_asso
     assert!(
         requests
             .iter()
-            .all(|(_, path)| path.contains("/v2/anchors/")),
+            .all(|(_, path)| path.contains(APPEND_ANCHORS)),
         "{requests:?}"
     );
     assert!(
@@ -785,7 +786,7 @@ async fn sync_drive_create_join_sync_both_modes_without_cas_probe_or_control_hea
     use peerdav_lib::cloud::runtime_types::{
         CreateAppendRepositoryInput, JoinAppendRepositoryInput, SaveAppendMappingInput,
     };
-    use peerdav_lib::sync::append_types::AppendMode;
+    use peerdav_lib::sync::append_types::{APPEND_ANCHORS, APPEND_ROOT, AppendMode};
     for mode in [AppendMode::Encrypted, AppendMode::AuthenticatedPlain] {
         let fixture = Fixture::start(true).await; // Deliberately cannot pass CAS probing.
         let data = tempfile::tempdir().unwrap();
@@ -987,7 +988,7 @@ async fn sync_drive_create_join_sync_both_modes_without_cas_probe_or_control_hea
                 .lock()
                 .unwrap()
                 .keys()
-                .all(|key| key.starts_with("runtime/v2/"))
+                .all(|key| key.starts_with(&format!("runtime/{APPEND_ROOT}/")))
         );
         runtime.stop_and_clear().await.unwrap();
         fixture.shutdown().await;

@@ -407,7 +407,7 @@ async fn download_changed_source_etag_preserves_target_and_removes_staging() {
     std::fs::write(d.path().join("out"), b"old").unwrap();
     let (store, calls) = DownloadStore::new(b"new", 3, DownloadMode::ChangedEtag);
     let err = download_service(store, d.path())
-        .download_to("remote/object", "out", None, true)
+        .download_to("remote/object", "out", None, true, None)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -426,7 +426,7 @@ async fn download_changed_source_size_preserves_target_and_removes_staging() {
     std::fs::write(d.path().join("out"), b"old").unwrap();
     let (store, _) = DownloadStore::new(b"new", 3, DownloadMode::ChangedSize);
     let err = download_service(store, d.path())
-        .download_to("remote/object", "out", None, true)
+        .download_to("remote/object", "out", None, true, None)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -449,7 +449,7 @@ async fn download_cancel_at_stream_end_preserves_target_for_empty_and_nonempty_c
             DownloadMode::CancelAtEnd(cancel.clone()),
         );
         let err = download_service(store, d.path())
-            .download_to("remote/object", "out", Some(cancel), true)
+            .download_to("remote/object", "out", Some(cancel), true, None)
             .await
             .unwrap_err();
         assert!(matches!(err, ObjectServiceError::Cancelled));
@@ -466,7 +466,7 @@ async fn download_commit_failure_cleans_staging_and_preserves_destination_direct
         let (store, _) =
             DownloadStore::new(b"new", 3, DownloadMode::CommitCollision(target.clone()));
         let err = download_service(store, d.path())
-            .download_to("remote/object", "out", None, overwrite)
+            .download_to("remote/object", "out", None, overwrite, None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -487,7 +487,7 @@ async fn download_racing_file_after_preflight_never_overwrites_without_confirmat
     let (store, _) = DownloadStore::new(b"new", 3, DownloadMode::FileCollision(target.clone()));
     assert!(matches!(
         download_service(store, d.path())
-            .download_to("remote/object", "out", None, false)
+            .download_to("remote/object", "out", None, false, None)
             .await,
         Err(ObjectServiceError::DestinationExists)
     ));
@@ -502,11 +502,11 @@ async fn download_ordinary_overwrite_requires_explicit_confirmation() {
     let (store, _) = DownloadStore::new(b"new", 3, DownloadMode::Good);
     let svc = download_service(store, d.path());
     assert!(matches!(
-        svc.download_to("remote/object", "out", None, false).await,
+        svc.download_to("remote/object", "out", None, false, None).await,
         Err(ObjectServiceError::DestinationExists)
     ));
     assert_eq!(std::fs::read(d.path().join("out")).unwrap(), b"old");
-    svc.download_to("remote/object", "out", None, true)
+    svc.download_to("remote/object", "out", None, true, None)
         .await
         .unwrap();
     assert_eq!(std::fs::read(d.path().join("out")).unwrap(), b"new");
@@ -530,15 +530,20 @@ async fn plan_rejects_out_of_prefix_control_head_and_sibling() {
 
 #[tokio::test]
 async fn empty_root_browse_and_confirmed_delete_work_for_ordinary_objects() {
-    let (store, calls) = FakeStore::new(vec![page(&["a", "folder/b"], None)]);
+    let (store, calls) = FakeStore::new(vec![page(&["folder/a", "folder/b"], None)]);
     let svc = service(store, "");
     svc.discover("").await.unwrap();
     let listed = svc.browse("", None).await.unwrap();
     assert_eq!(listed.prefix, "");
     assert_eq!(listed.objects.len(), 2);
-    let plan = svc.delete_plan("", 4_000_000_000).await.unwrap();
+    // 根目录禁止整体删除：必须按目录逐个删除条目。
+    assert!(matches!(
+        svc.delete_plan("", 4_000_000_000).await,
+        Err(ObjectServiceError::RootDeleteForbidden)
+    ));
+    let plan = svc.delete_plan("folder/", 4_000_000_000).await.unwrap();
     assert_eq!(svc.execute_delete(&plan, true).await.unwrap().len(), 2);
-    assert_eq!(calls.lock().unwrap().deletes, vec!["a", "folder/b"]);
+    assert_eq!(calls.lock().unwrap().deletes, vec!["folder/a", "folder/b"]);
 }
 
 #[tokio::test]
@@ -557,9 +562,10 @@ async fn root_sync_marker_blocks_empty_root_delete() {
     let svc = service(store, "");
     svc.discover("").await.unwrap();
     assert_eq!(svc.browse("", None).await.unwrap().objects.len(), 2);
+    // 根目录整体删除被安全规则拒绝，不会进入保护检查与列举。
     assert!(matches!(
         svc.delete_plan("", 4_000_000_000).await,
-        Err(ObjectServiceError::Guard(_))
+        Err(ObjectServiceError::RootDeleteForbidden)
     ));
     assert!(calls.lock().unwrap().deletes.is_empty());
 }
@@ -605,7 +611,7 @@ async fn independent_completed_operations_do_not_exhaust_the_connection() {
         svc.discover("").await.unwrap();
         assert!(svc.browse("", None).await.unwrap().complete);
         assert!(
-            svc.delete_plan("", 4_000_000_000)
+            svc.delete_plan("a", 4_000_000_000)
                 .await
                 .unwrap()
                 .entries
@@ -631,7 +637,7 @@ async fn complete_thousand_page_traversals_have_independent_budgets() {
     for _ in 0..2 {
         svc.discover("").await.unwrap();
         assert!(
-            svc.delete_plan("", 4_000_000_000)
+            svc.delete_plan("a", 4_000_000_000)
                 .await
                 .unwrap()
                 .entries
@@ -657,7 +663,7 @@ async fn single_traversals_reject_100001_raw_entries_without_deduplication() {
         Err(ObjectServiceError::DiscoveryIncomplete)
     ));
     assert!(matches!(
-        svc.delete_plan("", 4_000_000_000).await,
+        svc.delete_plan("a", 4_000_000_000).await,
         Err(ObjectServiceError::DiscoveryIncomplete)
     ));
     assert!(matches!(
@@ -677,7 +683,7 @@ async fn exact_entry_limit_is_per_traversal_and_remaining_budget_is_explicit() {
     let svc = service(store, "");
     for _ in 0..2 {
         svc.discover("").await.unwrap();
-        let plan = svc.delete_plan("", 4_000_000_000).await.unwrap();
+        let plan = svc.delete_plan("a", 4_000_000_000).await.unwrap();
         assert_eq!(plan.entries.len(), 100_000);
         assert_eq!(svc.delete_plan_snapshot(&plan.id).unwrap().len(), 100_000);
     }
@@ -705,14 +711,14 @@ async fn delete_plan_rejects_thousandth_nonterminal_page_without_poisoning_disco
         .map(|index| page(&[], Some(&(index + 1).to_string())))
         .collect();
     assert!(matches!(
-        svc.delete_plan("", 4_000_000_000).await,
+        svc.delete_plan("a", 4_000_000_000).await,
         Err(ObjectServiceError::DiscoveryIncomplete)
     ));
     assert_eq!(calls.lock().unwrap().list, 1001);
     *store.pages.lock().unwrap() = vec![page(&[], None)];
     svc.discover("").await.unwrap();
     assert!(
-        svc.delete_plan("", 4_000_000_000)
+        svc.delete_plan("a", 4_000_000_000)
             .await
             .unwrap()
             .entries
@@ -835,7 +841,7 @@ async fn issued_snapshot_rejects_oversized_escaped_metadata_before_output_copy()
     }]);
     let svc = service(store, "");
     svc.discover("").await.unwrap();
-    let plan = svc.delete_plan("", 4_000_000_000).await.unwrap();
+    let plan = svc.delete_plan("file", 4_000_000_000).await.unwrap();
     assert!(matches!(
         svc.delete_plan_snapshot(&plan.id),
         Err(ObjectServiceError::DiscoveryIncomplete)
@@ -919,14 +925,14 @@ async fn delete_without_etag_rejects_size_change_but_accepts_unchanged_size() {
     }]);
     let svc = service(store.clone(), "");
     svc.discover("").await.unwrap();
-    let stale = svc.delete_plan("", 4_000_000_000).await.unwrap();
+    let stale = svc.delete_plan("a", 4_000_000_000).await.unwrap();
     store.pages.lock().unwrap()[0].objects[0].size = 2;
     assert!(matches!(
         svc.execute_delete(&stale, true).await,
         Err(ObjectServiceError::StaleDeletePlan)
     ));
     assert!(calls.lock().unwrap().deletes.is_empty());
-    let current = svc.delete_plan("", 4_000_000_000).await.unwrap();
+    let current = svc.delete_plan("a", 4_000_000_000).await.unwrap();
     assert_eq!(svc.execute_delete(&current, true).await.unwrap().len(), 1);
     assert_eq!(calls.lock().unwrap().deletes, vec!["a"]);
 }
@@ -941,7 +947,7 @@ async fn cleanup_failure_preserves_primary_and_cleanup_errors() {
         DownloadMode::CleanupFailure(d.path().to_path_buf()),
     );
     let error = download_service(store, d.path())
-        .download_to("remote/object", "out", None, true)
+        .download_to("remote/object", "out", None, true, None)
         .await
         .unwrap_err();
     match error {
@@ -1184,6 +1190,7 @@ async fn authenticated_plain_v2_anchor_protects_each_discovered_root() {
 }
 
 async fn assert_invalid_marker_still_protects(case: &str) {
+    use peerdav_lib::sync::append_types::APPEND_ANCHORS;
     use sha2::{Digest, Sha256};
     let (mut relative, mut bytes) =
         append_marker(peerdav_lib::sync::append_types::AppendMode::Encrypted);
@@ -1194,7 +1201,7 @@ async fn assert_invalid_marker_still_protects(case: &str) {
             anchor.descriptor.version = 99;
             bytes = serde_json::to_vec(&anchor).unwrap();
             relative = format!(
-                "v2/anchors/{}-{}",
+                "{APPEND_ANCHORS}{}-{}",
                 anchor.descriptor.repo_id,
                 hex::encode(Sha256::digest(&bytes))
             );
@@ -1208,7 +1215,7 @@ async fn assert_invalid_marker_still_protects(case: &str) {
         }
         "digest" => {
             relative = format!(
-                "v2/anchors/00112233445566778899aabbccddeeff-{}",
+                "{APPEND_ANCHORS}00112233445566778899aabbccddeeff-{}",
                 "0".repeat(64)
             )
         }
@@ -1217,7 +1224,7 @@ async fn assert_invalid_marker_still_protects(case: &str) {
                 serde_json::from_slice(&bytes).unwrap();
             bytes = serde_json::to_vec_pretty(&anchor).unwrap();
             relative = format!(
-                "v2/anchors/{}-{}",
+                "{APPEND_ANCHORS}{}-{}",
                 anchor.descriptor.repo_id,
                 hex::encode(Sha256::digest(&bytes))
             );
@@ -1603,7 +1610,7 @@ async fn sync_protection_crosses_parent_and_child_store_connections() {
             Err(ObjectServiceError::Guard(_))
         ));
         assert!(matches!(
-            svc.delete_plan("", 4_000_000_000).await,
+            svc.delete_plan(relative_target, 4_000_000_000).await,
             Err(ObjectServiceError::Guard(_))
         ));
         let calls = calls.lock().unwrap();
@@ -1709,7 +1716,7 @@ async fn download_correct_content_get_once_with_no_range() {
     let d = tempdir().unwrap();
     let (store, calls) = DownloadStore::new(b"payload", 7, DownloadMode::Good);
     download_service(store, d.path())
-        .download_to("remote/object", "out", None, false)
+        .download_to("remote/object", "out", None, false, None)
         .await
         .unwrap();
     assert_eq!(std::fs::read(d.path().join("out")).unwrap(), b"payload");
@@ -1724,7 +1731,7 @@ async fn download_stream_error_leaves_existing_target_unchanged() {
     std::fs::write(d.path().join("out"), b"old").unwrap();
     let (store, _) = DownloadStore::new(b"new", 3, DownloadMode::StreamError);
     let err = download_service(store, d.path())
-        .download_to("remote/object", "out", None, true)
+        .download_to("remote/object", "out", None, true, None)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -1741,7 +1748,7 @@ async fn download_cancel_leaves_existing_target_unchanged() {
     let (store, _) = DownloadStore::new(b"new", 7, DownloadMode::CancelAfterFirst);
     let cancel = Arc::new(AtomicBool::new(true));
     let err = download_service(store, d.path())
-        .download_to("remote/object", "out", Some(cancel), true)
+        .download_to("remote/object", "out", Some(cancel), true, None)
         .await
         .unwrap_err();
     assert!(matches!(err, ObjectServiceError::Cancelled));
@@ -1753,7 +1760,7 @@ async fn download_length_mismatch_does_not_create_target() {
     let d = tempdir().unwrap();
     let (store, _) = DownloadStore::new(b"short", 99, DownloadMode::Good);
     let err = download_service(store, d.path())
-        .download_to("remote/object", "out", None, false)
+        .download_to("remote/object", "out", None, false, None)
         .await
         .unwrap_err();
     assert!(matches!(err, ObjectServiceError::SizeMismatch));
@@ -1769,11 +1776,11 @@ async fn download_symlink_and_parent_traversal_names_are_rejected_without_extern
     let (store, _) = DownloadStore::new(b"payload", 7, DownloadMode::Good);
     let svc = download_service(store, d.path());
     assert!(matches!(
-        svc.download_to("remote/object", "link", None, true).await,
+        svc.download_to("remote/object", "link", None, true, None).await,
         Err(ObjectServiceError::DestinationSymlink)
     ));
     assert!(matches!(
-        svc.download_to("remote/object", "../outside", None, true)
+        svc.download_to("remote/object", "../outside", None, true, None)
             .await,
         Err(ObjectServiceError::InvalidKey)
     ));
@@ -1793,7 +1800,7 @@ async fn download_selected_directory_fd_survives_path_rename_and_replacement() {
     let renamed = parent.path().join("renamed");
     std::fs::rename(&selected, &renamed).unwrap();
     std::fs::create_dir(&selected).unwrap();
-    svc.download_to("remote/object", "out", None, false)
+    svc.download_to("remote/object", "out", None, false, None)
         .await
         .unwrap();
     assert_eq!(std::fs::read(renamed.join("out")).unwrap(), b"payload");
