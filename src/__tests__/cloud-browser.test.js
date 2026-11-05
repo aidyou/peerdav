@@ -47,6 +47,7 @@ function textButton(wrapper, label) { return wrapper.findAll("button").find((ite
 beforeEach(() => {
   vi.useFakeTimers(); nativeInvoke.mockReset(); confirmAction.mockReset(); confirmAction.mockResolvedValue(true); setLocale("en");
   localStorage.removeItem("peerdav.cloudView");
+  localStorage.removeItem("peerdav.cloudViewScope");
   handlers = { cloud_list: () => ({ connections: [{ id: "c1", name: "Main", bucket: "main", buckets: ["main", "photos"], prefix: "configured/" }, { id: "c2", name: "Other", bucket: "main", buckets: ["main"] }] }), cloud_object_select_bucket: () => ({}), cloud_object_list: () => page([file]), cloud_object_status: () => [], cloud_object_discover: () => ({ complete: true }), cloud_object_prepare: () => ({ physicalId: "physical", discovered: true }), cloud_object_select_local: () => ({ token: "opaque", fileName: "a.txt", localPath: "/must-not-leak" }), cloud_object_upload: () => transfer(), cloud_object_download: () => transfer("running", { direction: "download" }), cloud_object_cancel: () => transfer("cancelling"), reveal_local_directory: () => ({}), cloud_object_recovery_acknowledge: () => transfer("acknowledged"), cloud_object_delete_plan: () => deletePlan(), cloud_object_delete_execute: () => ({ deleted: [file.key], failed: [] }) };
   Object.assign(handlers, {
     transfer_select_download: () => queueSummary('selected'), transfer_start_download: () => queueSummary(),
@@ -481,11 +482,19 @@ describe("CloudBrowser", () => {
     expect(wrapper.find('.browser-sidebar').exists()).toBe(true); expect(wrapper.find('.browser-main').exists()).toBe(true);
     expect(wrapper.find('.sync-management-entry').exists()).toBe(false); expect(wrapper.find('select').exists()).toBe(false);
     expect(wrapper.find('.bucket-link').classes()).toContain('is-active'); expect(wrapper.find('.sidebar-empty').text()).toBe(t('cloudBrowser.noSyncDrives'));
-    await click(wrapper, '.sidebar-section-head'); expect(wrapper.find('[data-test="sync-manager"]').text()).toContain('c1');
+    await click(wrapper, '.sidebar-section-manage'); expect(wrapper.find('[data-test="sync-manager"]').text()).toContain('c1');
     expect(wrapper.find('[data-test="upload"]').exists()).toBe(false); expect(wrapper.text()).not.toMatch(/CAS|Append V2/);
     await wrapper.setProps({ connectionId: 'c2' }); await flushPromises();
     expect(wrapper.find('[data-test="sync-manager"]').exists()).toBe(false); expect(wrapper.find('[data-test="upload"]').exists()).toBe(true);
     expect(nativeInvoke.mock.calls.some(([name]) => name === 'cloud_sync' || name === 'cloud_create_repository')).toBe(false);
+  });
+  it('stays on the sync-drive management view after a reload', async () => {
+    const first = await browser();
+    await click(first, '.sidebar-section-manage');
+    expect(JSON.parse(localStorage.getItem('peerdav.cloudViewScope')).view).toBe('management');
+    const second = await browser();
+    expect(second.find('[data-test="sync-manager"]').exists()).toBe(true);
+    expect(second.find('[data-test="upload"]').exists()).toBe(false);
   });
   it('numbers current-connection drives in manager order, highlights focus and returns to files via bucket selection', async () => {
     handlers.cloud_list = () => ({ connections: [{ id: 'c1', name: 'Main', bucket: 'main', buckets: ['main'] }], repositories: [{ id: 'cas', connectionId: 'c1' }, { id: 'other', connectionId: 'c2' }], appendRepositories: [{ connectionId: 'c1', binding: { repoId: 'append' } }] });
@@ -506,7 +515,7 @@ describe("CloudBrowser", () => {
   it('refreshes sidebar after manager changes and drops a removed active drive', async () => {
     const catalog = { connections: [{ id: 'c1', name: 'Main', bucket: 'main', buckets: ['main'] }], repositories: [], appendRepositories: [] };
     handlers.cloud_list = () => structuredClone(catalog);
-    const wrapper = await browser(); await click(wrapper, '.sidebar-section-head');
+    const wrapper = await browser(); await click(wrapper, '.sidebar-section-manage');
     catalog.appendRepositories.push({ connectionId: 'c1', binding: { repoId: 'new' } });
     await click(wrapper, '[data-test="catalog-changed"]'); expect(wrapper.find('.drive-link').text()).toBe('Sync drive 1');
     await click(wrapper, '.drive-link'); catalog.appendRepositories = [];

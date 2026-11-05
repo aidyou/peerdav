@@ -27,11 +27,24 @@ import { t } from "../lib/i18n";
 const props = defineProps({ connectionId: { type: String, required: true } });
 const app = useAppContext();
 
-const view = ref("files");
-const activeDriveId = ref("");
+// 刷新（webview 重新加载）后保持上次停留的视图，不跳回文件首页。
+const SCOPE_STORAGE_KEY = "peerdav.cloudViewScope";
+function readViewScope() {
+  try {
+    const raw = globalThis.localStorage?.getItem(SCOPE_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch { return null; }
+}
+const savedScope = readViewScope();
+const view = ref(savedScope?.view === "management" ? "management" : "files");
+const activeDriveId = ref(typeof savedScope?.activeDriveId === "string" ? savedScope.activeDriveId : "");
 const catalogDrives = ref([]);
 const buckets = ref([]);
 const activeBucket = ref("");
+watch([view, activeDriveId], ([v, id]) => {
+  try { globalThis.localStorage?.setItem(SCOPE_STORAGE_KEY, JSON.stringify({ view: v, activeDriveId: id })); } catch { /* 禁用存储不应阻塞视图切换 */ }
+});
 
 // View modes mirror the LAN browser: icons, list, columns and gallery.
 const VIEW_STORAGE_KEY = "peerdav.cloudView";
@@ -902,15 +915,19 @@ async function poll() {
 async function bootstrap() {
   await refreshCatalog();
   if (disposed) return;
+  // 刷新后停留在同步盘管理视图时，不强制绑定存储桶回到文件首页。
+  if (view.value === "management") return;
   const bucket = buckets.value[0];
   if (bucket) await selectBucket(bucket);
   else { void prepare(); void load(); }
 }
-watch(() => props.connectionId, () => {
+watch(() => props.connectionId, (_id, prevId) => {
   void disposeDownload();
   void cancelUploadSession();
   requestId++; statusVersion++; preparationVersion++; uploadNotices.clear(); prepared.value = false; preparing.value = false; preparationError.value = null; protectedRoot.value = false; connections.value = [];
-  view.value = "files"; activeDriveId.value = ""; catalogDrives.value = []; buckets.value = []; activeBucket.value = "";
+  // 首次 immediate 触发保留持久化恢复的视图与聚焦盘；仅在连接真正切换时才回到文件首页。
+  if (prevId !== undefined) { view.value = "files"; activeDriveId.value = ""; }
+  catalogDrives.value = []; buckets.value = []; activeBucket.value = "";
   objects.value = []; transfers.value = []; prefix.value = ""; root.value = ""; next.value = null; complete.value = false; busy.value = false; loading.value = false; error.value = null;
   clearSelection();
   columnVersion++; columnAncestors.value = [];
@@ -952,10 +969,10 @@ onBeforeUnmount(() => {
           <FileGlyph :entry="{ isDir: true, name: bucket }" /><span>{{ bucket }}</span>
         </button>
         <p v-if="!buckets.length" class="sidebar-empty">{{ t('cloudBrowser.noBuckets') }}</p>
-        <button type="button" class="sidebar-section-head" :class="{ 'is-active': view === 'management' && !activeDriveId }" @click="openManagement()">
-          <span class="sidebar-label">{{ t('cloudBrowser.syncDrives') }}</span>
-          <span class="sidebar-section-manage">{{ t('drive.manageActions') }}</span>
-        </button>
+        <div class="sidebar-section-head">
+          <p class="sidebar-label">{{ t('cloudBrowser.syncDrives') }}</p>
+          <button type="button" class="sidebar-section-manage" :class="{ 'is-active': view === 'management' && !activeDriveId }" @click="openManagement()">{{ t('drive.manageActions') }}</button>
+        </div>
         <button v-for="(drive, index) in drives" :key="index" type="button" class="share-link drive-link" :class="{ 'is-active': view === 'management' && activeDriveId === drive.id }" @click="openManagement(drive.id)">
           <FileGlyph :entry="{ isDir: true, name: drive.label }" /><span>{{ drive.label }}</span>
         </button>
@@ -1120,21 +1137,20 @@ onBeforeUnmount(() => {
 .sidebar-identity strong { font-size: 13px; color: var(--app-text); }
 .sidebar-identity span { font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace; font-size: 11px; color: var(--app-text-muted); }
 
-.browser-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 180px minmax(0, 1fr); overflow: hidden; background: var(--app-surface); }
-.browser-sidebar { min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 3px; padding: 14px 10px; overflow-y: auto; background: color-mix(in oklab, var(--app-surface-2) 72%, transparent); border-right: 1px solid var(--app-border); }
+.browser-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 180px minmax(0, 1fr); overflow: hidden; background: transparent; }
+.browser-sidebar { min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 3px; padding: 14px 10px; overflow-y: auto; background: color-mix(in oklab, var(--app-surface) 70%, transparent); border-right: 1px solid var(--app-border); }
 .sidebar-label { margin: 0 8px 6px; font-size: 11px; font-weight: 600; color: var(--app-text-muted); }
 .sidebar-empty { margin: 6px 8px; font-size: 12px; line-height: 1.5; color: var(--app-text-muted); }
-.sidebar-section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; margin: 10px 0 0; padding: 6px 9px; border: 0; border-radius: 8px; background: transparent; cursor: pointer; text-align: left; }
-.sidebar-section-head:hover { background: var(--app-surface-3); }
-.sidebar-section-head.is-active { background: var(--app-surface-2); }
+.sidebar-section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; margin: 10px 8px 6px; }
 .sidebar-section-head .sidebar-label { margin: 0; }
-.sidebar-section-manage { flex: 0 0 auto; font-size: 11px; color: var(--app-text-muted); }
-.sidebar-section-head:hover .sidebar-section-manage, .sidebar-section-head.is-active .sidebar-section-manage { color: var(--app-text); }
-.share-link { display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 9px; border: 0; border-radius: 8px; background: transparent; color: var(--app-text-secondary); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; }
+.sidebar-section-manage { flex: 0 0 auto; padding: 2px 9px; border: 1px solid transparent; border-radius: 999px; background: transparent; color: var(--app-text-muted); font: inherit; font-size: 11px; cursor: pointer; transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease; }
+.sidebar-section-manage:hover { color: var(--app-text); background: var(--app-surface-3); }
+.sidebar-section-manage.is-active { color: var(--el-color-primary); border-color: color-mix(in oklab, var(--el-color-primary) 45%, transparent); background: color-mix(in oklab, var(--el-color-primary) 12%, transparent); }
+.share-link { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 8px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--app-text-secondary); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease; }
 .share-link :deep(.file-glyph) { width: 18px; height: 18px; }
 .share-link span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .share-link:hover { background: var(--app-surface-3); }
-.share-link.is-active { color: var(--app-text); background: var(--app-surface-2); box-shadow: 0 1px 5px rgba(22, 32, 46, 0.07); }
+.share-link.is-active { color: var(--el-color-primary); border-color: color-mix(in oklab, var(--el-color-primary) 45%, transparent); background: color-mix(in oklab, var(--el-color-primary) 12%, transparent); }
 
 .browser-main { min-width: 0; min-height: 0; overflow: hidden; padding: 14px 16px 18px; display: flex; flex-direction: column; gap: 12px; }
 .management-view { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 12px; overflow: hidden; }

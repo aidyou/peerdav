@@ -11,7 +11,7 @@ vi.mock("../lib/confirm", () => ({ confirmAction: vi.fn(async () => true) }));
 vi.mock("element-plus/es", async () => {
   const { defineComponent, h } = await import("vue");
   const control = (tag) => defineComponent({ props: ["modelValue", "type", "value", "label"], emits: ["update:modelValue"], setup(p, { emit, slots, attrs }) { return () => h(tag, { ...attrs, type: p.type, value: tag === "option" ? p.value : p.modelValue, checked: p.modelValue === true, onInput: (e) => emit("update:modelValue", e.target.value), onChange: (e) => emit("update:modelValue", e.target.type === "checkbox" ? e.target.checked : e.target.value) }, tag === "input" ? undefined : tag === "option" ? p.label : tag === "select" ? [h("option", { value: "" }, "Select"), slots.default?.()] : slots.default?.()); } });
-  return { ElDialog: defineComponent({ props: ['modelValue'], setup(p, { slots, attrs }) { return () => p.modelValue ? h('section', attrs, [slots.default?.(), slots.footer?.()]) : null; } }), ElInput: control("input"), ElSelect: control("select"), ElOption: control("option"), ElButton: control("button"), ElSwitch: defineComponent({ props: ["modelValue"], emits: ["update:modelValue"], setup(p, { emit, attrs }) { return () => h("input", { ...attrs, type: "checkbox", checked: p.modelValue, onChange: (e) => emit("update:modelValue", e.target.checked) }); } }), ElPopover: defineComponent({ setup(_, { slots }) { return () => h("div", slots.default?.()); } }) };
+  return { ElDialog: defineComponent({ props: ['modelValue'], setup(p, { slots, attrs }) { return () => p.modelValue ? h('section', attrs, [slots.default?.(), slots.footer?.()]) : null; } }), ElInput: control("input"), ElSelect: control("select"), ElOption: control("option"), ElButton: control("button"), ElSwitch: defineComponent({ props: ["modelValue"], emits: ["update:modelValue"], setup(p, { emit, attrs }) { return () => h("input", { ...attrs, type: "checkbox", checked: p.modelValue, onChange: (e) => emit("update:modelValue", e.target.checked) }); } }), ElPopover: defineComponent({ setup(_, { slots }) { return () => h("div", slots.default?.()); } }), ElCollapse: defineComponent({ setup(_, { slots }) { return () => h("div", slots.default?.()); } }), ElCollapseItem: defineComponent({ props: ["name"], setup(p, { slots, attrs }) { return () => h("div", attrs, [h("div", { class: "collapse-item__title" }, slots.title?.()), h("div", { class: "collapse-item__content" }, slots.default?.())]); } }), ElTag: defineComponent({ setup(_, { slots, attrs }) { return () => h("span", attrs, slots.default?.()); } }) };
 });
 import CloudSettings from "../components/CloudSyncDrives.vue";
 import { cloud } from "../lib/cloud";
@@ -36,7 +36,10 @@ beforeEach(() => {
 const changed = vi.fn();
 const dialog = defineComponent({ props: ['modelValue'], setup(p, { slots, attrs }) { return () => p.modelValue ? h('section', attrs, [slots.default?.(), slots.footer?.()]) : null; } });
 const popover = defineComponent({ setup(_, { slots }) { return () => h("div", slots.default?.()); } });
-async function mountSettings() { const w = mount(CloudSettings, { props: { connectionId: "c1", onChanged: changed }, global: { stubs: { ElDialog: dialog, ElInput: input, ElSelect: select, ElOption: option, ElSwitch: toggle, ElButton: button, ElPopover: popover } } }); await flushPromises(); await w.find('.add-menu-trigger').trigger('click'); await w.find('.open-create-drive').trigger('click'); return w; }
+const collapse = defineComponent({ setup(_, { slots }) { return () => h("div", slots.default?.()); } });
+const collapseItem = defineComponent({ props: ["name"], setup(p, { slots, attrs }) { return () => h("div", attrs, [h("div", { class: "collapse-item__title" }, slots.title?.()), h("div", { class: "collapse-item__content" }, slots.default?.())]); } });
+const tag = defineComponent({ setup(_, { slots, attrs }) { return () => h("span", attrs, slots.default?.()); } });
+async function mountSettings() { const w = mount(CloudSettings, { props: { connectionId: "c1", onChanged: changed }, global: { stubs: { ElDialog: dialog, ElInput: input, ElSelect: select, ElOption: option, ElSwitch: toggle, ElButton: button, ElPopover: popover, ElCollapse: collapse, ElCollapseItem: collapseItem, ElTag: tag } } }); await flushPromises(); await w.find('.add-menu-trigger').trigger('click'); await w.find('.open-create-drive').trigger('click'); return w; }
 async function appendSettings() { const w = await mountSettings(); await w.find('.add-menu-trigger').trigger('click'); await w.find('.add-connect-drive').trigger('click'); return w; }
 async function openCreateDialog(w) { if (!w.find('[data-test=create-drive-dialog]').exists()) { await w.find('.add-menu-trigger').trigger('click'); await w.find('.open-create-drive').trigger('click'); } return w; }
 async function openMappingDialog(w) { await w.find('.add-menu-trigger').trigger('click'); await w.find('.new-mapping').trigger('click'); return w; }
@@ -120,7 +123,8 @@ describe("append settings through unified invoke", () => {
   it("shows the local mapping table without a statistics column", async () => {
     rows.mappings = [{ id: 'm1', connectionId: 'c1', repositoryId: 'cas-repo', localRoot: '/local', logicalPath: 'docs', schedule: {} }];
     const w = await mountSettings(); await w.find('.cancel-create-drive').trigger('click');
-    expect(w.findAll('[data-test="sync-group"] .drive-table th').map((cell) => cell.text())).toEqual(['Local folder', 'Remote folder', 'Status', 'Manage']);
+    expect(w.find('[data-test="sync-group"] .client-collapse').exists()).toBe(true);
+    expect(w.findAll('[data-test="sync-group"] .client-item__detail li > span').map((cell) => cell.text())).toEqual(['Local folder', 'Remote folder']);
     expect(w.find('.mapping-item').text()).toContain('/local');
     expect(w.find('.mapping-item').text()).toContain('Sync drive 1 · docs');
     expect(w.find('.mapping-status').text()).toBe('Idle');
@@ -317,7 +321,8 @@ describe("mirror sync settings through unified invoke", () => {
     rows.mirrorMappings = [{ id: "m1", connectionId: "c1", localRoot: "/local/mirror", cloudPrefix: "docs", schedule: { enabled: false, interval: 900 } }];
     nativeInvoke.mockImplementation(async (command) => command === "cloud_list" ? structuredClone(rows) : command === "mirror_sync" ? { uploaded: 2, downloaded: 0, deletedCloud: 0, deletedLocal: 0, restored: 0, conflicts: ["a.txt"], failures: [{ path: "b.txt", reason: "boom" }] } : {});
     const w = await mountSettings(); await openMirrorTab(w); await flushPromises();
-    expect(w.findAll('[data-test="mirror-group"] .drive-table th').map((cell) => cell.text())).toEqual(['Local folder', 'Cloud folder', 'Status', 'Statistics', 'Manage']);
+    expect(w.find('[data-test="mirror-group"] .client-collapse').exists()).toBe(true);
+    expect(w.findAll('[data-test="mirror-group"] .client-item__detail li > span').map((cell) => cell.text())).toEqual(['Cloud folder', 'Statistics']);
     expect(w.text()).toContain("/local/mirror");
     expect(w.text()).toContain("_peerdav_mirror/docs");
     await w.findAll("button").find((b) => b.text() === "Sync now").trigger("click"); await flushPromises();

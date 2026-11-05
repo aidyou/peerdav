@@ -1579,6 +1579,7 @@ provide(
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
+  background-image: radial-gradient(circle at top left, color-mix(in oklab, var(--accent) 12%, transparent), transparent 34%), radial-gradient(circle at bottom right, color-mix(in oklab, var(--accent-green) 10%, transparent), transparent 32%);
 }
 
 .peer-unavailable {

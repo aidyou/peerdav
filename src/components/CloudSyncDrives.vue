@@ -72,6 +72,11 @@ const selectedRepository = computed(() => repositories.value.find((r) => r.id ==
 const roots = computed(() => selectedRepository.value?.binding?.rootCandidates || []);
 const mappings = computed(() => (data.value.mappings || []).filter((m) => m.connectionId === props.connectionId));
 const mirrorMappings = computed(() => (data.value.mirrorMappings || []).filter((m) => m.connectionId === props.connectionId));
+// 折叠面板默认全部展开，便于直接看到每个目录的完整信息。
+const activeSyncIds = ref([]);
+const activeMirrorIds = ref([]);
+watch(mappings, (list) => { activeSyncIds.value = list.map((m) => m.id); }, { immediate: true });
+watch(mirrorMappings, (list) => { activeMirrorIds.value = list.map((m) => m.id); }, { immediate: true });
 const statuses = computed(() => (data.value.statuses || []).filter((s) => mappings.value.some((m) => m.id === s.mappingId)));
 const candidate = computed(() => candidates.value.find((c) => c.key === selectedCandidateKey.value));
 const canJoin = computed(() => !busy.value && !!candidate.value && !!password.value && (!!trustedFingerprint.value.trim() || acceptTofu.value) && !!linkForm.value.localRoot.trim());
@@ -407,34 +412,48 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
         </header>
         <div class="drive-table-wrap">
       <ul class="drive-list"><li v-for="repo in repositories" :key="repo.id" :class="{ 'is-active': repo.id === focusId }">{{ repo.label }} · {{ repositoryType(repo) }}</li></ul>
-      <table class="drive-table">
-        <thead><tr><th>{{ t('cloud.localRoot') }}</th><th>{{ t('drive.remoteFolder') }}</th><th>{{ t('drive.status') }}</th><th>{{ t('drive.manageActions') }}</th></tr></thead>
-        <tbody>
-          <tr v-for="item in mappings" :key="item.id" class="mapping-item" :class="{ 'is-active': item.repositoryId === focusId }">
-            <td class="mapping-local-cell">{{ item.localRoot }}</td>
-            <td class="mapping-remote-cell">{{ mappingRemote(item) }}</td>
-            <td class="mapping-status" role="status">{{ mappingStatus(item) }}</td>
-            <td class="mapping-actions">
-              <el-button class="mapping-edit" :disabled="busy" @click="editMapping(item)">{{ t('cloud.edit') }}</el-button>
-              <el-button class="mapping-preview" :disabled="busy" @click="showPreview(item)">{{ t('cloud.preview') }}</el-button>
-              <el-button class="mapping-cancel" :disabled="busy" @click="cancel(item)">{{ t('cloud.cancel') }}</el-button>
-              <el-button class="mapping-recovery" :disabled="busy" @click="loadRecovery(item)">{{ t('cloud.recovery') }}</el-button>
-              <el-button class="mapping-remove" :disabled="busy" @click="deleteMapping(item)">{{ t('drive.removeMapping') }}</el-button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
+      <el-collapse v-if="mappings.length" v-model="activeSyncIds" class="client-collapse">
+        <el-collapse-item v-for="item in mappings" :key="item.id" :name="item.id" class="mapping-item">
+          <template #title>
+            <div class="client-item__main">
+              <span class="client-item__icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 13.7-5.6" /><path d="M20 12a8 8 0 0 1-13.7 5.6" /><path d="M17.6 3.4v3.4h-3.4" /><path d="M6.4 20.6v-3.4h3.4" /></svg>
+              </span>
+              <div class="client-item__title">
+                <strong class="mapping-local-cell">{{ item.localRoot }}</strong>
+                <span class="hint mapping-remote-cell">{{ mappingRemote(item) }}</span>
+              </div>
+            </div>
+            <div class="client-item__status">
+              <el-tag class="mapping-status row-tag" role="status" effect="plain" round size="small">{{ mappingStatus(item) }}</el-tag>
+            </div>
+            <div class="client-item__actions" @click.stop>
+              <el-button class="mapping-preview list-pill" type="primary" round size="small" :disabled="busy" @click="showPreview(item)">{{ t('cloud.preview') }}</el-button>
+              <el-button class="mapping-cancel list-pill" round size="small" :disabled="busy" @click="cancel(item)">{{ t('cloud.cancel') }}</el-button>
+            </div>
+          </template>
+          <ul class="client-item__detail">
+            <li><span>{{ t('cloud.localRoot') }}</span><strong>{{ item.localRoot }}</strong></li>
+            <li><span>{{ t('drive.remoteFolder') }}</span><strong>{{ mappingRemote(item) }}</strong></li>
+          </ul>
+          <div class="client-item__block mapping-actions">
+            <el-button class="mapping-edit" :disabled="busy" @click="editMapping(item)">{{ t('cloud.edit') }}</el-button>
+            <el-button class="mapping-recovery" :disabled="busy" @click="loadRecovery(item)">{{ t('cloud.recovery') }}</el-button>
+            <el-button class="mapping-remove" :disabled="busy" @click="deleteMapping(item)">{{ t('drive.removeMapping') }}</el-button>
+          </div>
+          <div v-if="preview && preview.mappingId === item.id" class="cloud-preview">
+            <p>{{ t('cloud.confirmPreview') }}</p>
+            <p>{{ t('cloud.previewUploads') }}: {{ preview.summary?.uploads ?? 0 }} · {{ t('cloud.previewDownloads') }}: {{ preview.summary?.downloads ?? 0 }} · {{ t('cloud.previewDeletes') }}: {{ preview.summary?.deletes ?? 0 }} · {{ t('cloud.previewConflicts') }}: {{ preview.summary?.conflicts ?? 0 }}</p>
+            <pre v-if="typeof preview.summary === 'string'">{{ preview.summary }}</pre>
+            <el-button :disabled="busy" @click="applyPreview">{{ t('cloud.sync') }}</el-button>
+          </div>
+          <div v-if="recovery.length && recoveryMappingId === item.id" class="recovery-list">
+            <p class="hint">{{ t('drive.recoveryFor', { path: recoveryMappingId }) }}</p>
+            <ul><li v-for="record in recovery" :key="record.id">{{ record.relativePath }} · {{ record.phase }}<el-button :disabled="busy" @click="restore(record)">{{ t('cloud.restore') }}</el-button></li></ul>
+          </div>
+        </el-collapse-item>
+      </el-collapse>
       <p v-if="!mappings.length" class="hint table-note">{{ t('drive.noLocalFolders') }}</p>
-      <div v-if="preview" class="cloud-preview">
-        <p>{{ t('cloud.confirmPreview') }}</p>
-        <p>{{ t('cloud.previewUploads') }}: {{ preview.summary?.uploads ?? 0 }} · {{ t('cloud.previewDownloads') }}: {{ preview.summary?.downloads ?? 0 }} · {{ t('cloud.previewDeletes') }}: {{ preview.summary?.deletes ?? 0 }} · {{ t('cloud.previewConflicts') }}: {{ preview.summary?.conflicts ?? 0 }}</p>
-        <pre v-if="typeof preview.summary === 'string'">{{ preview.summary }}</pre>
-        <el-button :disabled="busy" @click="applyPreview">{{ t('cloud.sync') }}</el-button>
-      </div>
-      <div v-if="recovery.length" class="recovery-list">
-        <p class="hint">{{ t('drive.recoveryFor', { path: recoveryMappingId }) }}</p>
-        <ul><li v-for="record in recovery" :key="record.id">{{ record.relativePath }} · {{ record.phase }}<el-button :disabled="busy" @click="restore(record)">{{ t('cloud.restore') }}</el-button></li></ul>
-      </div>
     </div>
       </section>
 
@@ -448,35 +467,48 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
           <el-button class="list-pill new-mirror-drive" type="primary" round size="small" :disabled="busy" @click="openMirrorCreate">{{ t('drive.createMirror') }}</el-button>
         </header>
         <div class="drive-table-wrap">
-      <table class="drive-table">
-        <thead><tr><th>{{ t('cloud.localRoot') }}</th><th>{{ t('drive.mirrorCloudFolder') }}</th><th>{{ t('drive.status') }}</th><th>{{ t('drive.stats') }}</th><th>{{ t('drive.manageActions') }}</th></tr></thead>
-        <tbody>
-          <tr v-for="item in mirrorMappings" :key="item.id" class="mirror-item" :class="{ 'is-active': item.id === focusId }">
-            <td>{{ item.localRoot }}</td>
-            <td class="mono">{{ mirrorRemote(item) }}</td>
-            <td class="mirror-status" role="status">{{ mirrorStatusText(item) }}</td>
-            <td class="mirror-stats">{{ mirrorStats(item) }}</td>
-            <td class="mirror-actions">
-              <el-button v-if="!mirrorBusy[item.id]" :disabled="busy" @click="syncMirror(item.id)">{{ t('drive.mirrorSync') }}</el-button>
-              <el-button v-else @click="cancelMirror(item.id)">{{ t('drive.mirrorCancel') }}</el-button>
-              <el-button :disabled="mirrorBusy[item.id] || busy" @click="deleteMirror(item)">{{ t('drive.mirrorDelete') }}</el-button>
-              <label class="mirror-schedule">
-                <el-switch :model-value="!!item.schedule?.enabled" :disabled="busy || mirrorBusy[item.id]" @update:model-value="toggleMirrorSchedule(item, $event)" />
-                <span>{{ t('cloud.schedule') }}</span>
-                <input :value="item.schedule?.interval || 900" class="mirror-interval" type="number" min="60" step="60" :disabled="busy || mirrorBusy[item.id] || !item.schedule?.enabled" @change="changeMirrorInterval(item, $event.target.value)" />
-              </label>
-              <details v-if="mirrorResults[item.id]?.conflicts?.length" class="mirror-conflicts">
-                <summary>{{ t('drive.mirrorConflicts', { count: mirrorResults[item.id].conflicts.length }) }}</summary>
-                <ul><li v-for="path in mirrorResults[item.id].conflicts" :key="path">{{ path }}</li></ul>
-              </details>
-              <details v-if="mirrorResults[item.id]?.failures?.length" class="mirror-failures">
-                <summary>{{ t('drive.mirrorFailures', { count: mirrorResults[item.id].failures.length }) }}</summary>
-                <ul><li v-for="failure in mirrorResults[item.id].failures" :key="failure.path">{{ failure.path }} · {{ failure.reason }}</li></ul>
-              </details>
-            </td>
-          </tr>
-        </tbody>
-      </table>
+      <el-collapse v-if="mirrorMappings.length" v-model="activeMirrorIds" class="client-collapse">
+        <el-collapse-item v-for="item in mirrorMappings" :key="item.id" :name="item.id" class="mirror-item">
+          <template #title>
+            <div class="client-item__main">
+              <span class="client-item__icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M12 3v18" /><path d="M9 7 4 12l5 5" /><path d="M15 7l5 5-5 5" /></svg>
+              </span>
+              <div class="client-item__title">
+                <strong>{{ item.localRoot }}</strong>
+                <span class="hint">{{ mirrorRemote(item) }}</span>
+              </div>
+            </div>
+            <div class="client-item__status">
+              <el-tag class="mirror-status row-tag" role="status" effect="plain" round size="small">{{ mirrorStatusText(item) }}</el-tag>
+            </div>
+            <div class="client-item__actions" @click.stop>
+              <el-button v-if="!mirrorBusy[item.id]" class="mirror-sync list-pill" type="primary" round size="small" :disabled="busy" @click="syncMirror(item.id)">{{ t('drive.mirrorSync') }}</el-button>
+              <el-button v-else class="mirror-cancel list-pill" round size="small" @click="cancelMirror(item.id)">{{ t('drive.mirrorCancel') }}</el-button>
+            </div>
+          </template>
+          <ul class="client-item__detail">
+            <li><span>{{ t('drive.mirrorCloudFolder') }}</span><strong class="mono">{{ mirrorRemote(item) }}</strong></li>
+            <li><span>{{ t('drive.stats') }}</span><strong class="mirror-stats">{{ mirrorStats(item) }}</strong></li>
+          </ul>
+          <div class="client-item__block mirror-actions">
+            <el-button class="mirror-delete" :disabled="mirrorBusy[item.id] || busy" @click="deleteMirror(item)">{{ t('drive.mirrorDelete') }}</el-button>
+            <label class="mirror-schedule">
+              <el-switch :model-value="!!item.schedule?.enabled" :disabled="busy || mirrorBusy[item.id]" @update:model-value="toggleMirrorSchedule(item, $event)" />
+              <span>{{ t('cloud.schedule') }}</span>
+              <input :value="item.schedule?.interval || 900" class="mirror-interval" type="number" min="60" step="60" :disabled="busy || mirrorBusy[item.id] || !item.schedule?.enabled" @change="changeMirrorInterval(item, $event.target.value)" />
+            </label>
+            <details v-if="mirrorResults[item.id]?.conflicts?.length" class="mirror-conflicts">
+              <summary>{{ t('drive.mirrorConflicts', { count: mirrorResults[item.id].conflicts.length }) }}</summary>
+              <ul><li v-for="path in mirrorResults[item.id].conflicts" :key="path">{{ path }}</li></ul>
+            </details>
+            <details v-if="mirrorResults[item.id]?.failures?.length" class="mirror-failures">
+              <summary>{{ t('drive.mirrorFailures', { count: mirrorResults[item.id].failures.length }) }}</summary>
+              <ul><li v-for="failure in mirrorResults[item.id].failures" :key="failure.path">{{ failure.path }} · {{ failure.reason }}</li></ul>
+            </details>
+          </div>
+        </el-collapse-item>
+      </el-collapse>
       <p v-if="!mirrorMappings.length" class="hint table-note">{{ t('drive.noMirrorDrives') }}</p>
         </div>
       </section>
@@ -636,7 +668,7 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
 </template>
 
 <style scoped>
-.drive-roles { flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 24px; }
+.drive-roles { flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 40px; }
 .drive-group { min-width: 0; }
 .role-heading { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 11px; margin-bottom: 10px; }
 .role-heading .group-title { margin: 0; }
@@ -644,7 +676,7 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
 .role-icon--mirror { color: color-mix(in oklab, var(--accent-green) 72%, var(--app-text)); background: color-mix(in oklab, var(--accent-green) 10%, var(--app-surface-2)); }
 .role-icon svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 .add-menu { position: relative; }
-.add-menu-trigger { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; border: 1px solid var(--app-border); border-radius: 6px; background: transparent; color: var(--app-text-secondary); font-size: 16px; line-height: 1; cursor: pointer; }
+.add-menu-trigger { display: inline-flex; align-items: center; justify-content: center; min-width: 28px; height: 28px; padding: 0 10px; border: 1px solid var(--app-border); border-radius: 999px; background: transparent; color: var(--app-text-secondary); font-size: 16px; line-height: 1; cursor: pointer; }
 .add-menu-trigger:hover, .add-menu-trigger[aria-expanded="true"] { background: var(--app-surface-2); color: var(--app-text); }
 .add-menu-list { position: absolute; right: 0; top: calc(100% + 4px); z-index: 30; display: grid; min-width: 190px; padding: 4px; border: 1px solid var(--app-border); border-radius: 10px; background: var(--app-surface); box-shadow: 0 12px 28px rgba(22, 32, 46, 0.16); }
 .add-menu-list button { padding: 8px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--app-text); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
@@ -663,11 +695,30 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
 .field-inline input[type="number"] { width: 90px; padding: 4px 8px; border: 1px solid var(--app-border); border-radius: 6px; font: inherit; color: var(--app-text); background: var(--app-surface); }
 .sync-drives :deep(.el-input), .sync-drives :deep(.el-select) { min-width: 0; max-width: 100%; }
 .drive-table-wrap { min-width: 0; }
-.drive-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-.drive-table th, .drive-table td { padding: 8px; border-bottom: 1px solid var(--app-border); text-align: left; vertical-align: top; }
-.drive-table th { position: sticky; top: 0; z-index: 1; background: var(--app-surface); color: var(--app-text-muted); font-weight: 500; white-space: nowrap; }
 .table-note { margin: 12px 8px 0; color: var(--app-text-muted); font-size: 12px; font-style: italic; line-height: 1.5; }
-.drive-table tr.is-active { background: var(--app-surface-2); box-shadow: inset 3px 0 var(--el-color-primary); }
+/* 折叠面板复刻设置页客户端布局语言：表头行三栏 + 展开明细。 */
+.client-collapse { border: 1px solid var(--app-border); border-radius: 8px; overflow: hidden; }
+.client-collapse :deep(.el-collapse-item),
+.client-collapse :deep(.el-collapse-item__header) { border-bottom: 0; }
+.client-collapse :deep(.el-collapse-item:not(:last-child)) { border-bottom: 1px solid var(--app-border); }
+.client-collapse :deep(.el-collapse-item__header) { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; height: auto; padding: 10px 15px; line-height: 1.4; font-size: 14px; color: var(--app-text); }
+.client-collapse :deep(.el-collapse-item__title) { display: grid; grid-template-columns: minmax(0, 1fr) minmax(72px, max-content) minmax(58px, max-content); align-items: center; gap: 16px; min-width: 0; }
+.client-collapse :deep(.el-collapse-item__arrow) { margin: 0; justify-self: end; }
+.client-collapse :deep(.el-collapse-item__wrap) { background: var(--app-surface-2); }
+.client-collapse :deep(.el-collapse-item__content) { padding: 12px 15px 14px; }
+.client-item__main { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.client-item__icon { flex: none; display: inline-flex; align-items: center; justify-content: center; color: var(--app-text-muted); }
+.client-item__icon svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.client-item__title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.client-item__title strong { font-size: 14px; color: var(--app-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.client-item__title .hint { font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.client-item__status { justify-self: start; }
+.client-item__actions { display: flex; align-items: center; gap: 6px; }
+.client-item__detail { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.client-item__detail li { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 10px; font-size: 12.5px; line-height: 1.5; }
+.client-item__detail li > span { color: var(--app-text-muted); }
+.client-item__detail li > strong { color: var(--app-text-secondary); font-weight: 500; overflow-wrap: anywhere; }
+.client-item__block { margin-top: 10px; }
 .mapping-actions, .mirror-actions { display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; }
 .mapping-actions :deep(.el-button), .mirror-actions :deep(.el-button) { margin-left: 0; }
 .mirror-actions { flex-direction: column; align-items: flex-start; }
@@ -683,7 +734,6 @@ summary { cursor: pointer; padding: .7rem 0; }
 .picker-list { list-style: none; padding: 0; margin: .4rem 0; max-height: 220px; overflow: auto; }
 .picker-folder { width: 100%; text-align: left; padding: 6px 10px; border: 1px solid var(--app-border); border-radius: 6px; background: var(--app-surface-2); cursor: pointer; }
 .picker-folder:hover { background: var(--app-surface-3); }
-.mirror-status, .mapping-status { color: var(--app-text-muted); font-size: 12.5px; }
 .connect-candidate-type { font-weight: 600; color: var(--app-text); }
 .mapping-drive-static { color: var(--app-text-secondary); }
 .mirror-stats { color: var(--app-text-muted); white-space: nowrap; }
