@@ -107,6 +107,65 @@ fn ensure_directory(_: &Path, _: &Path, _: &Path) -> Result<(), EngineError> {
     Err(EngineError::Unsupported)
 }
 
+/// Timer runs must not turn an empty side or an abnormal batch into deletion authority.
+/// Count only baseline files: namespace/directory anchors must not dilute the ratio.
+pub(crate) fn check_automatic_deletions(
+    base: &Projection,
+    local: &super::scan_types::ScanReport,
+    target: &Projection,
+) -> Result<(), EngineError> {
+    let known: BTreeSet<PathBuf> = base
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            matches!(
+                entry.value,
+                RevisionValue::Live {
+                    node: Node::File(_),
+                    ..
+                }
+            )
+            .then(|| entry.projection_path.iter().collect())
+        })
+        .collect();
+    let local_paths: BTreeSet<PathBuf> = local
+        .files
+        .iter()
+        .map(|file| PathBuf::from(&file.path))
+        .collect();
+    let target_paths: BTreeSet<PathBuf> = target
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            matches!(
+                entry.value,
+                RevisionValue::Live {
+                    node: Node::File(_),
+                    ..
+                }
+            )
+            .then(|| entry.projection_path.iter().collect())
+        })
+        .collect();
+    let deleted: BTreeSet<_> = known
+        .difference(&local_paths)
+        .chain(known.difference(&target_paths))
+        .collect();
+    let total = known.len().max(local_paths.len()).max(target_paths.len());
+    let count = deleted.len();
+    if count > 0
+        && (local_paths.is_empty()
+            || target_paths.is_empty()
+            || count > crate::mirror::MASS_DELETE_ABSOLUTE
+            || (count >= crate::mirror::MASS_DELETE_MINIMUM
+                && count.saturating_mul(100)
+                    > total.saturating_mul(crate::mirror::MASS_DELETE_PERCENT)))
+    {
+        return Err(EngineError::DeletionConfirmation);
+    }
+    Ok(())
+}
+
 /// Validate all paths before any writes and establish target directories.
 /// Kept separate so recovery can run in its original position before file application.
 pub fn prepare(

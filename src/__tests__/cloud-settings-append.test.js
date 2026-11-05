@@ -244,10 +244,22 @@ describe("mirror sync settings through unified invoke", () => {
     const w = await mountSettings(); await flushPromises();
     expect(w.text()).toContain("/local/mirror → _peerdav_mirror/docs");
     await w.findAll("button").find((b) => b.text() === "Sync now").trigger("click"); await flushPromises();
-    expect(nativeInvoke).toHaveBeenCalledWith("mirror_sync", { mappingId: "m1", force: false });
+    expect(nativeInvoke).toHaveBeenCalledWith("mirror_sync", { mappingId: "m1", force: false, planId: null });
     expect(w.text()).toContain("Conflicts (1)");
     expect(w.text()).toContain("Failed items (1)");
     expect(changed).toHaveBeenCalled(); w.unmount();
+  });
+  it("syncs normal mirror deletions without a confirmation dialog", async () => {
+    rows.mirrorMappings = [{ id: "m1", connectionId: "c1", localRoot: "/local/mirror", cloudPrefix: "docs", schedule: { enabled: false, interval: 900 } }];
+    nativeInvoke.mockImplementation(async (command) => command === "cloud_list" ? structuredClone(rows) : command === "mirror_sync" ? { uploaded: 0, downloaded: 0, deletedCloud: 1, deletedLocal: 1, restored: 0, conflicts: [], failures: [] } : {});
+    const w = await mountSettings(); await flushPromises();
+    await w.findAll("button").find((b) => b.text() === "Sync now").trigger("click"); await flushPromises();
+    expect(nativeInvoke.mock.calls.filter(([c]) => c === "mirror_sync")).toEqual([
+      ["mirror_sync", { mappingId: "m1", force: false, planId: null }],
+    ]);
+    expect(confirmAction).not.toHaveBeenCalled();
+    expect(app.handleFailure).not.toHaveBeenCalled();
+    w.unmount();
   });
   it("asks for confirmation before a bulk mirror deletion", async () => {
     rows.mirrorMappings = [{ id: "m1", connectionId: "c1", localRoot: "/local/mirror", cloudPrefix: "docs", schedule: { enabled: false, interval: 900 } }];
@@ -256,7 +268,7 @@ describe("mirror sync settings through unified invoke", () => {
       if (command === "cloud_list") return structuredClone(rows);
       if (command === "mirror_sync") {
         attempts += 1;
-        if (attempts === 1) throw { code: "MIRROR_MASS_DELETE", message: "too many deletions" };
+        if (attempts === 1) throw { code: "MIRROR_MASS_DELETE", message: "confirm deletions", context: { planId: "snapshot-1", paths: ["DeleteCloud(keep.txt)"] } };
         return { uploaded: 0, downloaded: 0, deletedCloud: 3, deletedLocal: 0, restored: 0, conflicts: [], failures: [] };
       }
       return {};
@@ -265,10 +277,42 @@ describe("mirror sync settings through unified invoke", () => {
     await w.findAll("button").find((b) => b.text() === "Sync now").trigger("click"); await flushPromises();
     expect(confirmAction).toHaveBeenCalled();
     expect(nativeInvoke.mock.calls.filter(([c]) => c === "mirror_sync")).toEqual([
-      ["mirror_sync", { mappingId: "m1", force: false }],
-      ["mirror_sync", { mappingId: "m1", force: true }],
+      ["mirror_sync", { mappingId: "m1", force: false, planId: null }],
+      ["mirror_sync", { mappingId: "m1", force: true, planId: "snapshot-1" }],
     ]);
     expect(app.handleFailure).not.toHaveBeenCalled();
+    w.unmount();
+  });
+  it.each(["MIRROR_CONFIRM_MERGE", "MIRROR_MASS_DELETE"])("does not retry %s when confirmation is declined", async (code) => {
+    rows.mirrorMappings = [{ id: "m1", connectionId: "c1", localRoot: "/local/mirror", cloudPrefix: "docs", schedule: { enabled: false, interval: 900 } }];
+    confirmAction.mockResolvedValueOnce(false);
+    nativeInvoke.mockImplementation(async (command) => {
+      if (command === "cloud_list") return structuredClone(rows);
+      if (command === "mirror_sync") throw { code, message: "review plan", context: { planId: "plan-1", paths: ["precious.txt"] } };
+      return {};
+    });
+    const w = await mountSettings(); await flushPromises();
+    await w.findAll("button").find((b) => b.text() === "Sync now").trigger("click"); await flushPromises();
+    expect(confirmAction.mock.calls.at(-1)[0]).toContain("precious.txt");
+    expect(nativeInvoke.mock.calls.filter(([c]) => c === "mirror_sync")).toHaveLength(1);
+    w.unmount();
+  });
+  it("never auto-approves a changed merge plan", async () => {
+    rows.mirrorMappings = [{ id: "m1", connectionId: "c1", localRoot: "/local/mirror", cloudPrefix: "docs", schedule: { enabled: false, interval: 900 } }];
+    let attempts = 0;
+    nativeInvoke.mockImplementation(async (command) => {
+      if (command === "cloud_list") return structuredClone(rows);
+      if (command === "mirror_sync") throw { code: "MIRROR_CONFIRM_MERGE", message: "changed plan", context: { planId: `plan-${++attempts}`, paths: ["Conflict(precious.txt)"] } };
+      return {};
+    });
+    const w = await mountSettings(); await flushPromises();
+    await w.findAll("button").find((b) => b.text() === "Sync now").trigger("click"); await flushPromises();
+    expect(nativeInvoke.mock.calls.filter(([c]) => c === "mirror_sync")).toEqual([
+      ["mirror_sync", { mappingId: "m1", force: false, planId: null }],
+      ["mirror_sync", { mappingId: "m1", force: false, planId: "plan-1" }],
+    ]);
+    expect(confirmAction).toHaveBeenCalledTimes(1);
+    expect(app.handleFailure).toHaveBeenCalled();
     w.unmount();
   });
   it("cancels a running mirror sync", async () => {

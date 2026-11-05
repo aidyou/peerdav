@@ -55,6 +55,7 @@ struct Worker {
     revision: u64,
     manager: std::sync::Weak<SyncManager>,
     data_dir: PathBuf,
+    automatic: bool,
 }
 impl SyncWorker for Worker {
     fn run(
@@ -72,6 +73,7 @@ impl SyncWorker for Worker {
         let revision = self.revision;
         let manager = self.manager.clone();
         let _data = self.data_dir.clone();
+        let automatic = self.automatic;
         Box::pin(async move {
             let control = PublishControl {
                 cancel: Arc::clone(&context.cancel),
@@ -104,9 +106,9 @@ impl SyncWorker for Worker {
                     });
                 }
             };
-            let result = engine::run_with_progress(
+            let result = engine::run_with_deletion_policy(
                 repository, &mut idx, &root, &private, &mapping, &operation, revision, &control,
-                &progress,
+                &progress, automatic,
             )
             .await;
             let journal: Option<crate::sync::index_types::RunJournal> =
@@ -184,6 +186,13 @@ impl SyncWorker for Worker {
                             "CLOUD_MANIFEST_UNSUPPORTED"
                         }
                         Some(_) => "CLOUD_MANIFEST_INVALID",
+                        None if matches!(
+                            error,
+                            crate::sync::engine_types::EngineError::DeletionConfirmation
+                        ) =>
+                        {
+                            "CLOUD_DELETE_CONFIRMATION"
+                        }
                         None if pending => "SYNC_PENDING_RECOVERY",
                         None => "CLOUD_SYNC_FAILED",
                     };
@@ -544,11 +553,12 @@ impl CloudRuntime {
     }
     /// 手动触发一次镜像同步。同一映射不重入（返回 MIRROR_BUSY），
     /// 进度与结束状态通过现有的 `app://cloud-progress` 事件发布。
-    /// `force` 用于用户确认「大量删除」后的再次执行；其余调用一律不传。
+    /// 删除需同时提供 `force` 和本轮确认的计划令牌；定时任务不传确认。
     pub async fn mirror_sync(
         self: &Arc<Self>,
         mapping_id: &str,
         force_mass_delete: bool,
+        confirmed_plan: Option<String>,
     ) -> Result<crate::mirror::MirrorSyncResult, AppError> {
         self.admit()?;
         let mapping = self.mirror_mapping(mapping_id)?;
@@ -570,23 +580,31 @@ impl CloudRuntime {
             runs: &self.mirror_runs,
             id: mapping_id.to_owned(),
         };
-        self.mirror_sync_inner(mapping, Arc::clone(&cancel), force_mass_delete)
-            .await
+        self.mirror_sync_inner(
+            mapping,
+            Arc::clone(&cancel),
+            force_mass_delete,
+            confirmed_plan,
+        )
+        .await
     }
     async fn mirror_sync_inner(
         &self,
         mapping: crate::mirror::MirrorMapping,
         cancel: Arc<AtomicBool>,
         force_mass_delete: bool,
+        confirmed_plan: Option<String>,
     ) -> Result<crate::mirror::MirrorSyncResult, AppError> {
         let connection = self.connection(&mapping.connection_id)?;
         let context = crate::mirror::MirrorRunContext {
             endpoint: connection.config.endpoint.clone(),
             bucket: connection.config.bucket.clone(),
             force_mass_delete,
+            confirmed_plan,
         };
-        let store: Arc<dyn ObjectStore> =
-            Arc::new(S3Store::new(connection.config).map_err(cloud_error)?);
+        let store = S3Store::new(connection.config).map_err(cloud_error)?;
+        store.verify_capabilities().await.map_err(cloud_error)?;
+        let store: Arc<dyn ObjectStore> = Arc::new(store);
         let _ = self.object_events.progress(SyncStatus {
             mapping_id: mapping.id.clone(),
             run_id: None,
@@ -595,7 +613,12 @@ impl CloudRuntime {
         });
         let result =
             crate::mirror::run_sync(store, &mapping, &self.data_dir, &context, cancel).await;
+        let partial_error = result
+            .as_ref()
+            .ok()
+            .and_then(|summary| mirror_partial_error(&mapping.id, summary));
         let phase = match &result {
+            Ok(_) if partial_error.is_some() => SyncPhase::Failed,
             Ok(_) => SyncPhase::Completed,
             Err(crate::mirror::MirrorError::Canceled) => SyncPhase::Cancelled,
             Err(_) => SyncPhase::Failed,
@@ -604,8 +627,16 @@ impl CloudRuntime {
             mapping_id: mapping.id.clone(),
             run_id: None,
             phase,
-            detail: result.as_ref().err().map(|e| e.to_string()),
+            detail: partial_error
+                .as_ref()
+                .map(|error| error.message.clone())
+                .or_else(|| result.as_ref().err().map(|e| e.to_string())),
         });
+        if let Some(error) = partial_error {
+            // Keep partial counts for manual callers, but always use the unified
+            // background exit as timer callers do not inspect successful payloads.
+            self.manager.report_background(error);
+        }
         result.map_err(AppError::from)
     }
     pub fn save_connection(&self, input: SaveS3Input) -> Result<ConnectionRedacted, AppError> {
@@ -951,6 +982,14 @@ impl CloudRuntime {
         mapping_id: &str,
         preview_id: &str,
     ) -> Result<CloudSyncResult, AppError> {
+        self.sync_from_preview(mapping_id, preview_id, false).await
+    }
+    pub(crate) async fn sync_from_preview(
+        &self,
+        mapping_id: &str,
+        preview_id: &str,
+        automatic: bool,
+    ) -> Result<CloudSyncResult, AppError> {
         self.admit()?;
         if !self.safe_apply {
             return Err(runtime_error(
@@ -1015,7 +1054,7 @@ impl CloudRuntime {
                     "远端或配置已变化 / Remote or configuration changed",
                 ));
             }
-            return self.start_append_worker(m, &ticket.epoch).await;
+            return self.start_append_worker(m, &ticket.epoch, automatic).await;
         }
         let (repo, rev) = self.repo(&m).await?;
         if rev != ticket.revision || repo.head().await.map_err(repo_error)?.commit != ticket.head {
@@ -1059,6 +1098,7 @@ impl CloudRuntime {
             revision: rev,
             manager: Arc::downgrade(&self.manager),
             data_dir: self.data_dir.clone(),
+            automatic,
         });
         match self.manager.start(m.id, worker)? {
             StartResult::Started(run_id) => Ok(CloudSyncResult { run_id }),
@@ -1177,6 +1217,25 @@ impl CloudRuntime {
         })
     }
 }
+fn mirror_partial_error(
+    mapping_id: &str,
+    result: &crate::mirror::MirrorSyncResult,
+) -> Option<AppError> {
+    if result.failures.is_empty() {
+        return None;
+    }
+    Some(AppError {
+        code: "MIRROR_PARTIAL_FAILURE".into(),
+        message: format!(
+            "镜像同步有 {} 项失败，请查看详情 / Mirror sync has {} failed items; see details",
+            result.failures.len(),
+            result.failures.len()
+        ),
+        detail: Some(serde_json::json!(result.failures).to_string()),
+        context: Some(serde_json::json!({ "mappingId": mapping_id, "failures": result.failures })),
+    })
+}
+
 fn probe_apply_capability(data_dir: &Path) -> bool {
     let probe = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let area = tempfile::tempdir_in(data_dir)?;
@@ -1301,6 +1360,67 @@ mod preview_count_tests {
         assert_eq!(actual.downloads, downloads);
         assert_eq!(actual.deletes, deletes);
         assert_eq!(actual.conflicts, conflicts);
+    }
+
+    #[test]
+    fn automatic_deletion_guard_checks_empty_sides_ratio_and_absolute_boundary() {
+        use crate::sync::materialize::check_automatic_deletions as check;
+        let names: Vec<String> = (0..450).map(|n| format!("file-{n}")).collect();
+        let baseline = |n: usize| Projection {
+            entries: names[..n]
+                .iter()
+                .flat_map(|name| projection(name, "digest", name, name).entries)
+                .collect(),
+        };
+        let scan = |n: usize, removed: usize| {
+            report(
+                &names[removed..n]
+                    .iter()
+                    .map(|name| (name.as_str(), "digest"))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let base = baseline(40);
+        assert!(check(&base, &scan(40, 0), &base).is_ok());
+        assert!(check(&base, &scan(40, 1), &base).is_ok());
+        assert!(check(&base, &scan(40, 10), &base).is_ok()); // exactly 25%
+        assert!(check(&base, &scan(40, 11), &base).is_err());
+        assert!(check(&base, &scan(40, 40), &base).is_err());
+        assert!(check(&base, &scan(40, 0), &empty_projection()).is_err());
+        assert!(check(&empty_projection(), &report(&[]), &base).is_ok()); // no inferred deletion
+        let base = baseline(450);
+        assert!(check(&base, &scan(450, 100), &base).is_ok());
+        assert!(check(&base, &scan(450, 101), &base).is_err());
+        // Missing files on opposite sides must be counted together, not independently.
+        let base = baseline(40);
+        let mut remote = base.clone();
+        remote.entries.drain(6..12);
+        assert!(check(&base, &scan(40, 6), &remote).is_err());
+    }
+
+    #[test]
+    fn mirror_partial_failure_retains_original_details_without_exposing_paths_in_message() {
+        let success = crate::mirror::MirrorSyncResult::default();
+        assert!(super::mirror_partial_error("mirror", &success).is_none());
+        let failed: crate::mirror::MirrorSyncResult = serde_json::from_value(serde_json::json!({
+            "uploaded": 1, "downloaded": 0, "deletedCloud": 0, "deletedLocal": 0,
+            "conflicts": [], "restored": 0,
+            "failures": [{ "path": "private/file", "reason": "HTTP 412 PreconditionFailed" }]
+        }))
+        .unwrap();
+        let error = super::mirror_partial_error("mirror", &failed).unwrap();
+        assert_eq!(error.code, "MIRROR_PARTIAL_FAILURE");
+        assert!(!error.message.contains("private/file"));
+        assert!(
+            error
+                .detail
+                .unwrap()
+                .contains("HTTP 412 PreconditionFailed")
+        );
+        assert_eq!(
+            error.context.unwrap()["failures"][0]["path"],
+            "private/file"
+        );
     }
 
     #[test]

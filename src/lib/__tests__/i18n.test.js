@@ -197,6 +197,8 @@ describe("error mapping", () => {
     expect(errorStrategy(error("TRANSFER_TOO_LARGE"))).toBe("show");
     expect(errorStrategy(error("PEER_PREVIEW_TOO_LARGE"))).toBe("show");
     expect(errorStrategy(error("PEER_PREVIEW_TOO_MANY_LINES"))).toBe("show");
+    expect(errorStrategy(error("CLOUD_DELETE_CONFIRMATION"))).toBe("show");
+    expect(errorStrategy(error("MIRROR_PARTIAL_FAILURE"))).toBe("show");
     expect(errorStrategy(error("SOMETHING_NEW"))).toBe("show");
   });
 

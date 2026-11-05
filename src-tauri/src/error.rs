@@ -691,14 +691,10 @@ impl From<crate::mirror::MirrorError> for DomainError {
                 "MIRROR_INVALID_PREFIX",
                 "云端目录无效 / Invalid cloud directory",
             ),
-            MirrorError::InvalidId(_) => (
-                "MIRROR_INVALID_ID",
-                "映射标识无效 / Invalid mapping id",
-            ),
-            MirrorError::UnsafePath(_) => (
-                "MIRROR_UNSAFE_PATH",
-                "不安全的本地路径 / Unsafe local path",
-            ),
+            MirrorError::InvalidId(_) => ("MIRROR_INVALID_ID", "映射标识无效 / Invalid mapping id"),
+            MirrorError::UnsafePath(_) => {
+                ("MIRROR_UNSAFE_PATH", "不安全的本地路径 / Unsafe local path")
+            }
             MirrorError::Canceled => ("MIRROR_CANCELED", "同步已取消 / Sync canceled"),
             MirrorError::Local(_) => (
                 "MIRROR_LOCAL_IO",
@@ -712,9 +708,13 @@ impl From<crate::mirror::MirrorError> for DomainError {
                 "MIRROR_BUSY",
                 "该映射正在同步中 / This mapping is already syncing",
             ),
+            MirrorError::ConfirmMerge { .. } => (
+                "MIRROR_CONFIRM_MERGE",
+                "首次接入已有文件需要确认合并 / Confirm merging existing files before syncing",
+            ),
             MirrorError::MassDelete { .. } => (
                 "MIRROR_MASS_DELETE",
-                "本轮删除数量超过安全阈值，请确认后重试 / The planned deletions exceed the safety threshold; confirm and retry",
+                "检测到整侧变空或异常批量删除，请核对计划并确认 / An emptied folder or unusual bulk deletion requires plan confirmation",
             ),
             MirrorError::TooManyEntries => (
                 "MIRROR_TOO_MANY_ENTRIES",
@@ -731,7 +731,25 @@ impl From<crate::mirror::MirrorError> for DomainError {
 
 impl From<crate::mirror::MirrorError> for AppError {
     fn from(error: crate::mirror::MirrorError) -> Self {
-        AppError::from(DomainError::from(error))
+        let context = match &error {
+            crate::mirror::MirrorError::MassDelete {
+                plan_id,
+                paths,
+                planned,
+                total,
+            } => Some(
+                json!({ "planId": plan_id, "paths": paths, "planned": planned, "total": total }),
+            ),
+            crate::mirror::MirrorError::ConfirmMerge { plan_id, paths } => {
+                Some(json!({ "planId": plan_id, "paths": paths }))
+            }
+            _ => None,
+        };
+        let mut result = AppError::from(DomainError::from(error));
+        if context.is_some() {
+            result.context = context;
+        }
+        result
     }
 }
 
@@ -1209,6 +1227,30 @@ mod tests {
                 .is_some_and(|detail| detail.contains("HTTP 403"))
         );
         assert_eq!(error.context, Some(json!({ "peerIp": "10.126.0.7" })));
+    }
+
+    #[test]
+    fn mirror_confirmation_errors_preserve_the_reviewed_plan() {
+        let deletion = AppError::from(crate::mirror::MirrorError::MassDelete {
+            planned: 1,
+            total: 1,
+            plan_id: "snapshot-1".into(),
+            paths: vec!["DeleteCloud(precious.txt)".into()],
+        });
+        assert_eq!(deletion.code, "MIRROR_MASS_DELETE");
+        assert_eq!(deletion.context, Some(json!({
+            "planId": "snapshot-1", "planned": 1, "total": 1,
+            "paths": ["DeleteCloud(precious.txt)"]
+        })));
+        assert!(deletion.detail.is_some());
+        let merge = AppError::from(crate::mirror::MirrorError::ConfirmMerge {
+            plan_id: "snapshot-2".into(),
+            paths: vec!["Conflict(precious.txt)".into()],
+        });
+        assert_eq!(merge.code, "MIRROR_CONFIRM_MERGE");
+        assert_eq!(merge.context, Some(json!({
+            "planId": "snapshot-2", "paths": ["Conflict(precious.txt)"]
+        })));
     }
 
     #[test]

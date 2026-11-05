@@ -169,11 +169,12 @@ pub async fn mirror_delete_mapping(
 pub async fn mirror_sync(
     mapping_id: String,
     force: Option<bool>,
+    plan_id: Option<String>,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<crate::mirror::MirrorSyncResult, AppError> {
     cloud
         .0
-        .mirror_sync(&mapping_id, force.unwrap_or(false))
+        .mirror_sync(&mapping_id, force.unwrap_or(false), plan_id)
         .await
 }
 

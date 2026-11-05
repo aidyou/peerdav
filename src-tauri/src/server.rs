@@ -1118,6 +1118,12 @@ async fn handle_request(
         return empty_response(StatusCode::NOT_FOUND);
     };
 
+    // dav-server implements DELETE recursively. Reject the share root before
+    // handing off, otherwise children can be removed before remove_dir refuses it.
+    if request.method() == Method::DELETE && relative.as_os_str().is_empty() {
+        return empty_response(StatusCode::FORBIDDEN);
+    }
+
     let share = match gate.shares.read() {
         Ok(shares) => shares.get(&share_id).cloned(),
         Err(_) => {

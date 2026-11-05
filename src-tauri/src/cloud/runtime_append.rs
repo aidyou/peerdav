@@ -14,6 +14,12 @@ pub(crate) fn append_error<E: std::error::Error + Send + Sync + 'static>(error: 
         Some(AppendError::PendingDependency(_)) => "CLOUD_APPEND_DEPENDENCY",
         _ => "CLOUD_APPEND",
     };
+    let code = match any.downcast_ref::<crate::sync::append_engine_types::AppendEngineError>() {
+        Some(crate::sync::append_engine_types::AppendEngineError::Local(
+            crate::sync::engine_types::EngineError::DeletionConfirmation,
+        )) => "CLOUD_DELETE_CONFIRMATION",
+        _ => code,
+    };
     AppError::from(DomainError::Cloud {
         code,
         user_reason: "追加仓库操作失败 / Append repository operation failed",
@@ -355,6 +361,7 @@ impl CloudRuntime {
         &self,
         mapping: CloudMapping,
         epoch: &str,
+        automatic: bool,
     ) -> Result<CloudSyncResult, AppError> {
         let cached = self.append_cached(&mapping)?;
         let private = mapping
@@ -385,6 +392,7 @@ impl CloudRuntime {
             private,
             mapping: mapping.logical_path,
             manager: Arc::downgrade(&self.manager),
+            automatic,
         });
         match self.manager.start(mapping.id, worker)? {
             StartResult::Started(run_id) => Ok(CloudSyncResult { run_id }),
@@ -403,6 +411,7 @@ struct AppendWorker {
     private: PathBuf,
     mapping: String,
     manager: std::sync::Weak<SyncManager>,
+    automatic: bool,
 }
 impl SyncWorker for AppendWorker {
     fn run(
@@ -427,9 +436,10 @@ impl SyncWorker for AppendWorker {
         let private = self.private.clone();
         let mapping = self.mapping.clone();
         let manager = self.manager.clone();
+        let automatic = self.automatic;
         Box::pin(async move {
             let mut index = index?;
-            let result = append_engine::run(
+            let result = append_engine::run_with_deletion_policy(
                 store,
                 &trust(&cached.binding),
                 cached.password.as_bytes(),
@@ -441,6 +451,7 @@ impl SyncWorker for AppendWorker {
                     run_id: &hex::encode(rand::random::<[u8; 16]>()),
                 },
                 context.cancel,
+                automatic,
             )
             .await;
             match result {

@@ -118,7 +118,11 @@ fn walk(
             }
         };
         // 符号链接一律跳过：镜像不追踪链接目标，也不应成为链接逃逸的通道。
-        if metadata.file_type().is_symlink() {
+        if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
+            report.skipped.push((
+                skipped_path(&child),
+                "符号链接或特殊文件未扫描，本轮禁止删除 / Symlink or special file skipped; deletions disabled".into(),
+            ));
             continue;
         }
         if metadata.is_dir() {

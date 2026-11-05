@@ -74,6 +74,13 @@ impl Capabilities {
         request: &DeleteRequest,
     ) -> Result<(), FileError> {
         scope.validate_entry(&request.entry, Operation::Delete)?;
+        if request.entry.opaque().trim_matches('/').is_empty() {
+            return Err(FileError::new(
+                FileErrorKind::InvalidInput,
+                Operation::Delete,
+                MutationOutcome::NotApplied,
+            ));
+        }
         Self::require(
             self.deletes.contains(&DeleteSupport {
                 mode: request.mode,

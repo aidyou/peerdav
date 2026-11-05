@@ -33,6 +33,16 @@ pub trait ObjectStore: Send + Sync {
     ) -> BoxFuture<'a, Result<ObjectMetadata, CloudError>>;
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), CloudError>>;
 
+    /// A HEAD followed by an unconditional DELETE is not a conditional delete.
+    /// Providers without an atomic revision precondition must refuse the request.
+    fn delete_if_match<'a>(
+        &'a self,
+        _key: &'a str,
+        _etag: &'a str,
+    ) -> BoxFuture<'a, Result<(), CloudError>> {
+        Box::pin(async { Err(CloudError::Unsupported) })
+    }
+
     fn list_page<'a>(
         &'a self,
         _prefix: &'a str,

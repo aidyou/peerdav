@@ -31,6 +31,10 @@ pub struct EngineReport {
 pub enum EngineError {
     #[error("directory manifest operation failed")]
     Tree(#[from] super::tree_types::TreeError),
+    #[error(
+        "检测到异常删除，请预览并手动确认同步 / Unusual deletions detected; preview and confirm manually"
+    )]
+    DeletionConfirmation,
     #[error("synchronization requires recovery confirmation")]
     PendingRecovery,
     #[error("synchronization recovery failed")]

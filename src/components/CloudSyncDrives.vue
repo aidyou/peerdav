@@ -226,24 +226,29 @@ async function deleteMirror(item) {
     if (scope === generation && !disposed) emit("changed");
   });
 }
-async function syncMirror(id, force = false) {
+async function syncMirror(id, force = false, planId = null) {
   if (mirrorBusy.value[id] || busy.value) return;
   mirrorBusy.value = { ...mirrorBusy.value, [id]: true };
   try {
-    const result = await cloud.mirrorSync(id, force);
+    const result = await cloud.mirrorSync(id, force, planId);
     mirrorResults.value = { ...mirrorResults.value, [id]: result };
     if (!disposed) emit("changed");
   } catch (error) {
     if (disposed) return;
-    // 删除量超过安全阈值时先让用户确认，再以 force 重跑一次。
-    if (error?.code === "MIRROR_MASS_DELETE" && !force) {
-      mirrorBusy.value = { ...mirrorBusy.value, [id]: false };
+    // The backend binds approval to the displayed immutable snapshot. Never
+    // automatically approve a changed plan or retry without its plan token.
+    const merge = error?.code === "MIRROR_CONFIRM_MERGE";
+    if ((merge || error?.code === "MIRROR_MASS_DELETE") && !planId && error.context?.planId) {
+      const paths = Array.isArray(error.context.paths) ? error.context.paths.join("\n") : "";
       const confirmed = await confirmAction(
-        t("drive.mirrorMassDeleteConfirm"),
-        t("drive.mirrorMassDeleteTitle"),
-        { danger: true, confirmText: t("common.delete") },
+        `${t(merge ? "drive.mirrorMergeConfirm" : "drive.mirrorMassDeleteConfirm")}\n\n${paths}`,
+        t(merge ? "drive.mirrorMergeTitle" : "drive.mirrorMassDeleteTitle"),
+        { danger: !merge, confirmText: t(merge ? "confirm.ok" : "common.delete") },
       );
-      if (confirmed && !disposed) await syncMirror(id, true);
+      if (confirmed && !disposed) {
+        mirrorBusy.value = { ...mirrorBusy.value, [id]: false };
+        await syncMirror(id, !merge, error.context.planId);
+      }
       return;
     }
     fail(error);

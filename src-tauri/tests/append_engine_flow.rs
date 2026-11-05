@@ -195,7 +195,7 @@ async fn fixture() -> (Remote, AppendRepository, TrustBinding, String) {
     peerdav_lib::sync::append_tree::canonicalize_tree(&mut tree).unwrap();
     let (root, wire) = repo.seal_tree(&tree).unwrap();
     remote.put_object(
-        &format!("v2/{}/trees/{}", repo.repo_id(), root.digest),
+        &format!("{APPEND_ROOT}/{}/trees/{}", repo.repo_id(), root.digest),
         &wire,
     );
     let (reference, wire) = repo
@@ -209,7 +209,7 @@ async fn fixture() -> (Remote, AppendRepository, TrustBinding, String) {
         .unwrap();
     remote.put_object(
         &format!(
-            "v2/{}/commits/{}-{}",
+            "{APPEND_ROOT}/{}/commits/{}-{}",
             repo.repo_id(),
             reference.operation_id,
             reference.digest
@@ -893,6 +893,68 @@ async fn run_hidden_sibling_tips_converge_without_merge_publication() {
             .filter(|r| r.operation == "put" && r.key.contains("/commits/"))
             .count(),
         2
+    );
+}
+
+#[tokio::test]
+async fn automatic_append_blocks_empty_local_and_remote_without_advancing_baseline() {
+    use peerdav_lib::sync::{append_engine::run_with_deletion_policy, engine_types::EngineError};
+    let (remote, _, binding, _) = fixture().await;
+    let a = Device::new();
+    let b = Device::new();
+    let mut ai = a.index(&binding);
+    let mut bi = b.index(&binding);
+    sync(&remote, &binding, &a, &mut ai, "a-base").await;
+    sync(&remote, &binding, &b, &mut bi, "b-base").await;
+    let baseline_a = ai.active_epoch().unwrap().unwrap();
+    let baseline_b = bi.active_epoch().unwrap().unwrap();
+    std::fs::remove_file(a.root.path().join("hello.txt")).unwrap();
+    let before = remote.requests().len();
+    let result = run_with_deletion_policy(
+        Arc::new(Paged(remote.store(), true, None)),
+        &binding,
+        b"p",
+        &mut ai,
+        &a.request("auto-local-empty"),
+        Arc::new(AtomicBool::new(false)),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(AppendEngineError::Local(EngineError::DeletionConfirmation))
+    ));
+    assert_eq!(ai.active_epoch().unwrap().unwrap(), baseline_a);
+    assert!(
+        remote.requests()[before..]
+            .iter()
+            .all(|r| r.operation != "put" && r.operation != "delete")
+    );
+    sync(&remote, &binding, &a, &mut ai, "manual-delete").await;
+    let before = remote.requests().len();
+    let result = run_with_deletion_policy(
+        Arc::new(Paged(remote.store(), true, None)),
+        &binding,
+        b"p",
+        &mut bi,
+        &b.request("auto-remote-empty"),
+        Arc::new(AtomicBool::new(false)),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(AppendEngineError::Local(EngineError::DeletionConfirmation))
+    ));
+    assert_eq!(bi.active_epoch().unwrap().unwrap(), baseline_b);
+    assert_eq!(
+        std::fs::read(b.root.path().join("hello.txt")).unwrap(),
+        b"hello"
+    );
+    assert!(
+        remote.requests()[before..]
+            .iter()
+            .all(|r| r.operation != "put" && r.operation != "delete")
     );
 }
 

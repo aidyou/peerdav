@@ -119,6 +119,33 @@ pub async fn run_with_progress(
     control: &PublishControl,
     progress: &(dyn Fn(super::manager_types::SyncPhase) + Send + Sync),
 ) -> Result<EngineReport, EngineError> {
+    run_with_deletion_policy(
+        repository,
+        index,
+        root,
+        private,
+        mapping,
+        operation_id,
+        config_revision,
+        control,
+        progress,
+        false,
+    )
+    .await
+}
+
+pub async fn run_with_deletion_policy(
+    repository: Arc<Repository>,
+    index: &mut SyncIndex,
+    root: &Path,
+    private: &Path,
+    mapping: &str,
+    operation_id: &str,
+    config_revision: u64,
+    control: &PublishControl,
+    progress: &(dyn Fn(super::manager_types::SyncPhase) + Send + Sync),
+    automatic: bool,
+) -> Result<EngineReport, EngineError> {
     progress(super::manager_types::SyncPhase::Scanning);
     if !root.is_absolute()
         || !private.is_absolute()
@@ -157,6 +184,9 @@ pub async fn run_with_progress(
         if pending.is_none() {
             pending = Some(active);
         }
+    }
+    if automatic && pending.is_some() {
+        return Err(EngineError::PendingRecovery);
     }
     let operation_id = pending
         .as_ref()
@@ -208,6 +238,15 @@ pub async fn run_with_progress(
     let base_projection =
         super::namespace::project_scoped(&merge::project(&base.revisions)?, mapping)
             .map_err(EngineError::Merge)?;
+    if automatic {
+        let remote_projection =
+            super::namespace::project_scoped(&merge::project(&remote.revisions)?, mapping)?;
+        super::materialize::check_automatic_deletions(
+            &base_projection,
+            &scan_report,
+            &remote_projection,
+        )?;
+    }
     let known_paths: BTreeMap<PathBuf, _> = base_projection
         .entries
         .iter()
@@ -429,6 +468,10 @@ pub async fn run_with_progress(
     let projection =
         super::namespace::project_scoped(&merge::project(&final_snapshot.revisions)?, mapping)
             .map_err(EngineError::Merge)?;
+    if automatic {
+        // CAS retries may have merged a newer remote snapshot after the first check.
+        super::materialize::check_automatic_deletions(&base_projection, &scan_report, &projection)?;
+    }
     let source_scan = pending
         .as_ref()
         .map_or(&scan_report, |pending| &pending.source_scan);

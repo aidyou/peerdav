@@ -767,6 +767,19 @@ async fn approval_identity_follows_the_machine_code() {
 async fn webdav_collections_move_and_copy_are_scoped() {
     let harness = Harness::new(full_permissions(), vec![loopback_rule()]).await;
     let code = harness.issue_code().await;
+    let precious = harness.share_root().join("precious/nested");
+    std::fs::create_dir_all(&precious).unwrap();
+    std::fs::write(precious.join("keep.txt"), b"must survive root DELETE").unwrap();
+    for target in [harness.share_path(""), harness.share_path("/")] {
+        let response = harness
+            .request(Method::DELETE, &target, Some(&code), b"")
+            .await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            std::fs::read(precious.join("keep.txt")).unwrap(),
+            b"must survive root DELETE"
+        );
+    }
 
     let mkcol = harness
         .request_with_headers(

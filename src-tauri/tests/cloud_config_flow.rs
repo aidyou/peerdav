@@ -51,6 +51,48 @@ fn legacy_mapping() -> serde_json::Value {
 }
 
 #[test]
+fn mirror_and_repository_mappings_cannot_share_local_trees() {
+    let (dir, store) = store();
+    let connection = store.save_connection(input()).unwrap();
+    let root = dir.path().join("sync-root");
+    fs::create_dir_all(root.join("nested")).unwrap();
+    fs::write(root.join("precious.txt"), b"unchanged").unwrap();
+    let repository = AddMappingInput {
+        connection_id: connection.id.clone(),
+        repository_id: "repo".into(),
+        local_root: root.clone(),
+        logical_path: "remote".into(),
+        schedule: ScheduleConfig::default(),
+    };
+    let mirror = |path: std::path::PathBuf| {
+        serde_json::from_value(serde_json::json!({ "id": null, "connectionId": connection.id, "localRoot": path, "cloudPrefix": "docs", "schedule": { "enabled": false, "interval": 900 } })).unwrap()
+    };
+    let mapping = store.add_mapping(repository.clone(), &[]).unwrap();
+    assert!(store.save_mirror_mapping(mirror(root.clone())).is_err());
+    assert!(
+        store
+            .save_mirror_mapping(mirror(root.join("nested")))
+            .is_err()
+    );
+    store.delete_mapping(&mapping.id).unwrap();
+    let mapping = store.save_mirror_mapping(mirror(root.clone())).unwrap();
+    assert!(store.add_mapping(repository.clone(), &[]).is_err());
+    assert!(
+        store
+            .add_mapping(
+                AddMappingInput {
+                    local_root: root.join("nested"),
+                    ..repository
+                },
+                &[]
+            )
+            .is_err()
+    );
+    assert_eq!(fs::read(root.join("precious.txt")).unwrap(), b"unchanged");
+    store.delete_mirror_mapping(&mapping.id).unwrap();
+}
+
+#[test]
 fn legacy_schema_defaults_to_cas_and_rejects_unknown_protocol_or_fields() {
     let legacy = legacy_mapping();
     let mapping: CloudMapping = serde_json::from_value(legacy.clone()).expect("legacy mapping");

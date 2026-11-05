@@ -55,6 +55,42 @@ fn entry(scope: &BackendScope) -> Entry {
         revision: None,
     }
 }
+#[test]
+fn root_deletion_is_rejected_even_with_recursive_capability() {
+    let scope = scope(1);
+    let caps = Capabilities {
+        deletes: vec![DeleteSupport {
+            mode: DeleteMode::Recursive,
+            condition: ConditionKind::Any,
+        }],
+        ..Default::default()
+    };
+    for target in ["", "/", "///"] {
+        let result = caps.check_delete(
+            &scope,
+            &DeleteRequest {
+                entry: scope.entry(target),
+                mode: DeleteMode::Recursive,
+                condition: Condition::Any,
+            },
+        );
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, FileErrorKind::InvalidInput);
+        assert_eq!(error.outcome, MutationOutcome::NotApplied);
+    }
+    assert!(
+        caps.check_delete(
+            &scope,
+            &DeleteRequest {
+                entry: scope.entry("explicit-folder/"),
+                mode: DeleteMode::Recursive,
+                condition: Condition::Any
+            }
+        )
+        .is_ok()
+    );
+}
+
 fn unsupported<T>(result: Result<T, FileError>, operation: Operation) {
     let error = result.err().unwrap();
     assert_eq!(error.kind, FileErrorKind::Unsupported);

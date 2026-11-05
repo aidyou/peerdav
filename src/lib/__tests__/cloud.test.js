@@ -43,6 +43,15 @@ describe("cloud API wrappers", () => {
     ]);
   });
 
+  it("passes only the explicitly confirmed mirror plan and defaults to no approval", async () => {
+    await cloud.mirrorSync("m");
+    await cloud.mirrorSync("m", true, "snapshot-1");
+    expect(invoke.mock.calls).toEqual([
+      ["mirror_sync", { mappingId: "m", force: false, planId: null }],
+      ["mirror_sync", { mappingId: "m", force: true, planId: "snapshot-1" }],
+    ]);
+  });
+
   it("strictly serializes directory capabilities without local paths or caller keys", async () => {
     const args = { connectionId: "c", prefix: "target/", batchId: "batch", conflictId: "conflict-a", path: "/secret", key: "forged", relativePath: "forged" };
     await cloudObjects.selectUploadDirectory(args);
@@ -85,6 +94,7 @@ describe("cloud API wrappers", () => {
       "list", "probeBuckets", "connectionCredentials", "saveConnection", "testConnection", "deleteConnection",
       "createRepository", "joinRepository", "saveMapping", "appendDiscover", "createSyncDrive", "appendCreate", "appendJoin", "appendSaveMapping", "deleteMapping",
       "preview", "sync", "cancel", "recoveryRecords", "restore", "status",
+      "mirrorSaveMapping", "mirrorDeleteMapping", "mirrorSync", "mirrorCancel",
     ]);
   });
 

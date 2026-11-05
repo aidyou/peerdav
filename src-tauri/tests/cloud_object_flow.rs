@@ -32,6 +32,8 @@ struct Calls {
     deletes: Vec<String>,
     cancelled: bool,
     delete_fail: Option<String>,
+    delete_race: bool,
+    conditional_delete_unsupported: bool,
     upload_keys: Vec<String>,
     stat_keys: Vec<String>,
     list_prefixes: Vec<String>,
@@ -157,15 +159,30 @@ impl ObjectStore for FakeStore {
     }
     fn delete<'a>(
         &'a self,
+        _key: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
+        Box::pin(async { panic!("object service must never use unconditional DELETE") })
+    }
+    fn delete_if_match<'a>(
+        &'a self,
         key: &'a str,
+        etag: &'a str,
     ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
         Box::pin(async move {
             let mut calls = self.calls.lock().unwrap();
-            if calls
-                .delete_fail
-                .as_deref()
-                .is_some_and(|failed| failed == key)
-            {
+            if calls.conditional_delete_unsupported {
+                return Err(CloudError::Unsupported);
+            }
+            let mut pages = self.pages.lock().unwrap();
+            let object = pages
+                .iter_mut()
+                .flat_map(|p| &mut p.objects)
+                .find(|m| m.key == key)
+                .ok_or(CloudError::NotFound)?;
+            if calls.delete_race {
+                object.etag = Some("concurrent-replacement".into());
+            }
+            if object.etag.as_deref() != Some(etag) || calls.delete_fail.as_deref() == Some(key) {
                 return Err(CloudError::Precondition);
             }
             calls.deletes.push(key.into());
@@ -502,7 +519,8 @@ async fn download_ordinary_overwrite_requires_explicit_confirmation() {
     let (store, _) = DownloadStore::new(b"new", 3, DownloadMode::Good);
     let svc = download_service(store, d.path());
     assert!(matches!(
-        svc.download_to("remote/object", "out", None, false, None).await,
+        svc.download_to("remote/object", "out", None, false, None)
+            .await,
         Err(ObjectServiceError::DestinationExists)
     ));
     assert_eq!(std::fs::read(d.path().join("out")).unwrap(), b"old");
@@ -916,25 +934,52 @@ fn protection_query_reports_ancestors_and_validates_path_segments() {
 }
 
 #[tokio::test]
-async fn delete_without_etag_rejects_size_change_but_accepts_unchanged_size() {
-    let mut metadata = FakeStore::meta("a");
-    metadata.etag = None;
-    let (store, calls) = FakeStore::new(vec![ObjectPage {
-        objects: vec![metadata],
-        next_token: None,
-    }]);
+async fn delete_requires_nonempty_etag_before_any_mutation() {
+    for etag in [None, Some(String::new())] {
+        let mut metadata = FakeStore::meta("folder/b");
+        metadata.etag = etag;
+        let (store, calls) = FakeStore::new(vec![ObjectPage {
+            objects: vec![FakeStore::meta("folder/a"), metadata],
+            next_token: None,
+        }]);
+        let svc = service(store, "");
+        svc.discover("").await.unwrap();
+        let plan = svc.delete_plan("folder", 4_000_000_000).await.unwrap();
+        assert!(matches!(
+            svc.execute_delete(&plan, true).await,
+            Err(ObjectServiceError::Cloud(CloudError::Unsupported))
+        ));
+        assert!(calls.lock().unwrap().deletes.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn delete_racing_replacement_is_preserved_and_plan_consumed() {
+    let (store, calls) = FakeStore::new(vec![page(&["a"], None)]);
     let svc = service(store.clone(), "");
     svc.discover("").await.unwrap();
-    let stale = svc.delete_plan("a", 4_000_000_000).await.unwrap();
-    store.pages.lock().unwrap()[0].objects[0].size = 2;
-    assert!(matches!(
-        svc.execute_delete(&stale, true).await,
-        Err(ObjectServiceError::StaleDeletePlan)
-    ));
+    let plan = svc.delete_plan("a", 4_000_000_000).await.unwrap();
+    calls.lock().unwrap().delete_race = true;
+    let result = svc.execute_delete(&plan, true).await.unwrap();
+    assert!(matches!(result[0], Err(CloudError::Precondition)));
     assert!(calls.lock().unwrap().deletes.is_empty());
-    let current = svc.delete_plan("a", 4_000_000_000).await.unwrap();
-    assert_eq!(svc.execute_delete(&current, true).await.unwrap().len(), 1);
-    assert_eq!(calls.lock().unwrap().deletes, vec!["a"]);
+    assert_eq!(
+        store.pages.lock().unwrap()[0].objects[0].etag.as_deref(),
+        Some("concurrent-replacement")
+    );
+    assert!(svc.execute_delete(&plan, true).await.is_err());
+}
+
+#[tokio::test]
+async fn delete_unsupported_atomic_operation_never_falls_back() {
+    let (store, calls) = FakeStore::new(vec![page(&["a"], None)]);
+    let svc = service(store, "");
+    svc.discover("").await.unwrap();
+    let plan = svc.delete_plan("a", 4_000_000_000).await.unwrap();
+    calls.lock().unwrap().conditional_delete_unsupported = true;
+    let result = svc.execute_delete(&plan, true).await.unwrap();
+    assert!(matches!(result[0], Err(CloudError::Unsupported)));
+    assert!(calls.lock().unwrap().deletes.is_empty());
 }
 
 #[tokio::test]
@@ -1776,7 +1821,8 @@ async fn download_symlink_and_parent_traversal_names_are_rejected_without_extern
     let (store, _) = DownloadStore::new(b"payload", 7, DownloadMode::Good);
     let svc = download_service(store, d.path());
     assert!(matches!(
-        svc.download_to("remote/object", "link", None, true, None).await,
+        svc.download_to("remote/object", "link", None, true, None)
+            .await,
         Err(ObjectServiceError::DestinationSymlink)
     ));
     assert!(matches!(

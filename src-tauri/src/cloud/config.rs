@@ -271,7 +271,8 @@ impl CloudConfigStore {
             return Err(ConfigError::NotFound("mapping".into()));
         }
         let binding = crate::sync::root_state::bind_initial(input.local_root.clone())?;
-        let root = binding.root_path;
+        let root = std::fs::canonicalize(&binding.root_path)
+            .map_err(crate::sync::root_types::RootError::Io)?;
         crate::sync::paths::validate_root_protection(&root, protected)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
         let logical = input.logical_path.trim_matches('/').to_owned();
@@ -286,6 +287,16 @@ impl CloudConfigStore {
         }) {
             return Err(ConfigError::Validation(
                 "mapping overlaps an existing mapping".into(),
+            ));
+        }
+        if snapshot
+            .mirror_mappings
+            .iter()
+            .any(|m| m.local_root.starts_with(&root) || root.starts_with(&m.local_root))
+        {
+            return Err(ConfigError::Validation(
+                "本地目录与已有镜像映射重叠 / Local root overlaps an existing mirror mapping"
+                    .into(),
             ));
         }
         let existing = snapshot.mappings.iter().find(|m| Some(m.id.as_str()) == id);
@@ -418,6 +429,18 @@ impl CloudConfigStore {
         if !local_root.is_absolute() {
             return Err(ConfigError::Validation(
                 "本地目录必须是绝对路径 / Local root must be absolute".into(),
+            ));
+        }
+        crate::sync::root_state::bind_initial(local_root.clone())?;
+        let local_root =
+            std::fs::canonicalize(&local_root).map_err(crate::sync::root_types::RootError::Io)?;
+        if snapshot
+            .mappings
+            .iter()
+            .any(|m| m.local_root.starts_with(&local_root) || local_root.starts_with(&m.local_root))
+        {
+            return Err(ConfigError::Validation(
+                "本地目录与已有同步映射重叠 / Local root overlaps an existing sync mapping".into(),
             ));
         }
         let id = match input.id.as_deref() {

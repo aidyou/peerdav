@@ -136,12 +136,22 @@ mod tests {
                     };
                 }
                 // S3 LIST uses a lexical prefix, including any trailing slash.
-                let mut keys = vec!["data/file".to_owned(), "docs/a".to_owned(),
-                    "docs/nested/b".to_owned(), "docs-sibling/keep".to_owned()];
+                let mut keys = vec![
+                    "data/file".to_owned(),
+                    "docs/a".to_owned(),
+                    "docs/nested/b".to_owned(),
+                    "docs-sibling/keep".to_owned(),
+                ];
                 keys.extend(self.extra_objects.lock().await.iter().cloned());
                 Ok(ObjectPage {
-                    objects: keys.into_iter().filter(|key| key.starts_with(prefix))
-                        .map(|key| ObjectMetadata { key, size: 1, etag: Some("etag".into()) })
+                    objects: keys
+                        .into_iter()
+                        .filter(|key| key.starts_with(prefix))
+                        .map(|key| ObjectMetadata {
+                            key,
+                            size: 1,
+                            etag: Some("etag".into()),
+                        })
                         .collect(),
                     next_token: None,
                 })
@@ -229,12 +239,22 @@ mod tests {
                 })
             })
         }
-        fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), CloudError>> {
+        fn delete_if_match<'a>(
+            &'a self,
+            key: &'a str,
+            etag: &'a str,
+        ) -> BoxFuture<'a, Result<(), CloudError>> {
             Box::pin(async move {
+                if etag != "etag" {
+                    return Err(CloudError::Precondition);
+                }
                 self.deleted_keys.lock().await.push(key.to_owned());
                 self.mutations.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
+        }
+        fn delete<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, Result<(), CloudError>> {
+            Box::pin(async { panic!("unconditional delete must not be used") })
         }
         fn upload_stream_with_control<'a>(
             &'a self,
@@ -433,19 +453,65 @@ mod tests {
         f.store.behavior.store(8, Ordering::SeqCst);
         for paths in [vec![a.clone(), b], vec![a]] {
             let count = paths.len() as u64;
-            let selected = f.runtime.object_select_upload_files("connection", 1, "data/".into(), paths).await?;
-            let page = f.runtime.object_page_upload_directory("connection", &selected.batch_id, None, None, Some(100)).await?;
+            let selected = f
+                .runtime
+                .object_select_upload_files("connection", 1, "data/".into(), paths)
+                .await?;
+            let page = f
+                .runtime
+                .object_page_upload_directory(
+                    "connection",
+                    &selected.batch_id,
+                    None,
+                    None,
+                    Some(100),
+                )
+                .await?;
             assert_eq!(page.entries.len() as u64, count);
-            f.runtime.object_start_upload_directory("connection", &selected.batch_id, Policy::Ask).await?;
+            f.runtime
+                .object_start_upload_directory("connection", &selected.batch_id, Policy::Ask)
+                .await?;
             let conflict = directory_conflict(&f, &selected.batch_id).await?;
-            assert!(f.runtime.object_resolve_upload_directory_conflict("connection", &selected.batch_id, &conflict.conflict_id, Policy::Cancel, true).await.is_err());
-            f.runtime.object_resolve_upload_directory_conflict("connection", &selected.batch_id, &conflict.conflict_id, Policy::Skip, true).await?;
-            assert!(f.runtime.object_resolve_upload_directory_conflict("connection", &selected.batch_id, &conflict.conflict_id, Policy::Overwrite, true).await.is_err());
+            assert!(
+                f.runtime
+                    .object_resolve_upload_directory_conflict(
+                        "connection",
+                        &selected.batch_id,
+                        &conflict.conflict_id,
+                        Policy::Cancel,
+                        true
+                    )
+                    .await
+                    .is_err()
+            );
+            f.runtime
+                .object_resolve_upload_directory_conflict(
+                    "connection",
+                    &selected.batch_id,
+                    &conflict.conflict_id,
+                    Policy::Skip,
+                    true,
+                )
+                .await?;
+            assert!(
+                f.runtime
+                    .object_resolve_upload_directory_conflict(
+                        "connection",
+                        &selected.batch_id,
+                        &conflict.conflict_id,
+                        Policy::Overwrite,
+                        true
+                    )
+                    .await
+                    .is_err()
+            );
             let done = directory_settled(&f, &selected.batch_id).await?;
             assert_eq!(done.phase, "completed");
             assert_eq!(done.skipped_files, count);
             assert_eq!(f.store.mutations.load(Ordering::SeqCst), 0);
-            f.runtime.object_release_upload_directory("connection", &selected.batch_id).await?;
+            f.runtime
+                .object_release_upload_directory("connection", &selected.batch_id)
+                .await?;
         }
         Ok(())
     }
@@ -984,14 +1050,31 @@ mod tests {
             .await??;
             let conflict = directory_conflict(&f, &selected.batch_id).await?;
             if decision == Policy::Cancel {
-                assert!(f.runtime.object_resolve_upload_directory_conflict(
-                    "connection", &selected.batch_id, &conflict.conflict_id, decision, true,
-                ).await.is_err());
-                f.runtime.object_cancel_upload_directory("connection", &selected.batch_id).await?;
+                assert!(
+                    f.runtime
+                        .object_resolve_upload_directory_conflict(
+                            "connection",
+                            &selected.batch_id,
+                            &conflict.conflict_id,
+                            decision,
+                            true,
+                        )
+                        .await
+                        .is_err()
+                );
+                f.runtime
+                    .object_cancel_upload_directory("connection", &selected.batch_id)
+                    .await?;
             } else {
-                f.runtime.object_resolve_upload_directory_conflict(
-                    "connection", &selected.batch_id, &conflict.conflict_id, decision, true,
-                ).await?;
+                f.runtime
+                    .object_resolve_upload_directory_conflict(
+                        "connection",
+                        &selected.batch_id,
+                        &conflict.conflict_id,
+                        decision,
+                        true,
+                    )
+                    .await?;
             }
             let status = directory_settled(&f, &selected.batch_id).await?;
             if decision == Policy::Skip {
@@ -1573,22 +1656,42 @@ mod tests {
         assert_eq!(keys, vec!["docs/a", "docs/nested/b"]);
         assert_eq!(plan.object_count, 2);
         assert!(plan.entries.iter().all(|entry| entry.size == 1
-            && entry.etag.as_deref() == Some("etag") && !entry.protected));
+            && entry.etag.as_deref() == Some("etag")
+            && !entry.protected));
         assert_eq!(*f.store.listed_prefixes.lock().await, vec!["docs/"]);
         assert_eq!(f.store.stats.load(Ordering::SeqCst), 0);
         assert_eq!(f.store.mutations.load(Ordering::SeqCst), 0);
         assert!(f.store.deleted_keys.lock().await.is_empty());
-        assert!(f.runtime.object_delete_execute("connection", &plan.plan_id, false).await.is_err());
+        assert!(
+            f.runtime
+                .object_delete_execute("connection", &plan.plan_id, false)
+                .await
+                .is_err()
+        );
         assert_eq!(f.store.mutations.load(Ordering::SeqCst), 0);
         // An object appearing after confirmation's snapshot must not be deleted.
-        f.store.extra_objects.lock().await.push("docs/new-after-plan".into());
-        let result = f.runtime.object_delete_execute("connection", &plan.plan_id, true).await?;
+        f.store
+            .extra_objects
+            .lock()
+            .await
+            .push("docs/new-after-plan".into());
+        let result = f
+            .runtime
+            .object_delete_execute("connection", &plan.plan_id, true)
+            .await?;
         assert_eq!(result.deleted, keys);
         assert!(result.failed.is_empty());
         assert_eq!(*f.store.deleted_keys.lock().await, keys);
         assert_eq!(*f.store.listed_prefixes.lock().await, vec!["docs/"]);
-        assert_eq!(f.runtime.object_delete_execute("connection", &plan.plan_id, true)
-            .await.err().ok_or("replay error")?.code, "CLOUD_DELETE_PLAN_STALE");
+        assert_eq!(
+            f.runtime
+                .object_delete_execute("connection", &plan.plan_id, true)
+                .await
+                .err()
+                .ok_or("replay error")?
+                .code,
+            "CLOUD_DELETE_PLAN_STALE"
+        );
         assert_eq!(f.store.mutations.load(Ordering::SeqCst), 2);
         Ok(())
     }
@@ -2353,9 +2456,14 @@ impl CloudRuntime {
         let production_store = || -> Result<Arc<dyn ObjectStore>, AppError> {
             let raw = Arc::new(super::S3Store::new(config).map_err(app)?);
             let backend = peerdav_protocol_s3::CoreS3Backend::new(raw, connection.revision)
-                .map_err(|source| app(super::types::CloudError::Storage {
-                    source: object_store::Error::Generic { store: "file-core", source: Box::new(source) },
-                }))?;
+                .map_err(|source| {
+                    app(super::types::CloudError::Storage {
+                        source: object_store::Error::Generic {
+                            store: "file-core",
+                            source: Box::new(source),
+                        },
+                    })
+                })?;
             Ok(Arc::new(peerdav_protocol_s3::CoreS3ReadBridge(backend)))
         };
         #[cfg(not(test))]

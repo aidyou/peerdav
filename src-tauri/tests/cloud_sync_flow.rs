@@ -330,6 +330,83 @@ fn regular_files(root: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 #[tokio::test]
+async fn automatic_sync_blocks_empty_local_and_remote_without_advancing_baseline() {
+    use peerdav_lib::sync::engine_types::EngineError;
+    let store = Store::new();
+    let repo = repository(store.clone(), RepositoryMode::Encrypted, b"p").await;
+    let mut a = device("a");
+    let mut b = device("b");
+    write_file(a._root.path(), b"keep");
+    run(
+        store.clone(),
+        &mut a,
+        RepositoryMode::Encrypted,
+        b"p",
+        &op(1),
+    )
+    .await
+    .unwrap();
+    run(
+        store.clone(),
+        &mut b,
+        RepositoryMode::Encrypted,
+        b"p",
+        &op(2),
+    )
+    .await
+    .unwrap();
+    let before = repo.head().await.unwrap();
+    std::fs::remove_file(a._root.path().join("note.txt")).unwrap();
+    let error = engine::run_with_deletion_policy(
+        repo.clone(),
+        &mut a.index,
+        a._root.path(),
+        a._private.path(),
+        "shared",
+        &op(3),
+        1,
+        &control(),
+        &|_| {},
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, EngineError::DeletionConfirmation));
+    assert_eq!(repo.head().await.unwrap().generation, before.generation);
+    // An explicit manual operation can still confirm the intended deletion.
+    run(
+        store.clone(),
+        &mut a,
+        RepositoryMode::Encrypted,
+        b"p",
+        &op(4),
+    )
+    .await
+    .unwrap();
+    let baseline: peerdav_lib::sync::merge_types::MergeSet =
+        b.index.load("engine", "materialized").unwrap().unwrap();
+    let error = engine::run_with_deletion_policy(
+        repo,
+        &mut b.index,
+        b._root.path(),
+        b._private.path(),
+        "shared",
+        &op(5),
+        1,
+        &control(),
+        &|_| {},
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, EngineError::DeletionConfirmation));
+    assert_eq!(read_file(b._root.path()), b"keep");
+    let after: peerdav_lib::sync::merge_types::MergeSet =
+        b.index.load("engine", "materialized").unwrap().unwrap();
+    assert_eq!(baseline.revisions, after.revisions);
+}
+
+#[tokio::test]
 async fn empty_second_device_materializes_first_file() {
     let store = Store::new();
     let mut a = device("a");

@@ -184,7 +184,7 @@ impl CloudRuntime {
                 }
                 match id.strip_prefix("mirror:") {
                     // 手动同步仍在跑时本轮跳过：MIRROR_BUSY 不是错误，不报给用户。
-                    Some(mirror_id) => match runtime.mirror_sync(mirror_id, false).await {
+                    Some(mirror_id) => match runtime.mirror_sync(mirror_id, false, None).await {
                         Ok(_) => Ok(()),
                         Err(error) if error.code == "MIRROR_BUSY" => Ok(()),
                         Err(error) => Err(error),
@@ -207,9 +207,9 @@ impl CloudRuntime {
         ))
     }
 
-    /// Timer entry point. It intentionally does not manufacture a preview or
-    /// confirmation. A mapping is eligible only after a materialized baseline
-    /// has been persisted for the current root identity.
+    /// Timer entry point. Internal previews validate freshness, but never grant
+    /// manual deletion authority: workers recheck deletion safety on actual state.
+    /// A mapping also requires a persisted materialized baseline for its root.
     pub(crate) async fn scheduled_sync(&self, mapping_id: &str) -> Result<(), AppError> {
         self.admit()?;
         let mapping = self.mapping(mapping_id)?;
@@ -234,7 +234,8 @@ impl CloudRuntime {
                 ));
             }
             let preview = self.preview(mapping_id).await?;
-            self.manual_sync(mapping_id, &preview.preview_id).await?;
+            self.sync_from_preview(mapping_id, &preview.preview_id, true)
+                .await?;
             return Ok(());
         }
         let key = self
@@ -261,7 +262,8 @@ impl CloudRuntime {
         drop(index);
         // Only an already authorized, materialized binding can reach this path.
         let preview = self.preview(mapping_id).await?;
-        self.manual_sync(mapping_id, &preview.preview_id).await?;
+        self.sync_from_preview(mapping_id, &preview.preview_id, true)
+            .await?;
         Ok(())
     }
 }

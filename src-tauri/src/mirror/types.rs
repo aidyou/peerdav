@@ -16,6 +16,10 @@ pub const CONFLICT_MARKER: &str = ".conflict.";
 /// 下载临时文件标记。正常流程会立即重命名，崩溃残留的临时文件由扫描与列举跳过，
 /// 避免把半截内容当成普通文件同步。
 pub const TEMP_MARKER: &str = ".peerdav-mirror-tmp";
+/// 异常批量删除的数量及比例门槛；少量日常删除不要求重复确认。
+pub const MASS_DELETE_ABSOLUTE: usize = 100;
+pub const MASS_DELETE_MINIMUM: usize = 10;
+pub const MASS_DELETE_PERCENT: usize = 25;
 
 /// 镜像同步映射：本地目录与云端目录之间保持目录结构的明文双向镜像。
 ///
@@ -55,6 +59,13 @@ pub struct SaveMirrorMappingInput {
 /// 旧基线不再适用于当前目标，必须重置，否则会把「新目标里看不到旧文件」误判成删除。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MirrorBaseline {
+    /// Earlier versions could adopt different equal-sized files as a common state.
+    /// Such entries are never trusted for deletion or replacement after migration.
+    #[serde(default)]
+    pub safety_version: u32,
+    /// 已完成当前目标的初次接入；文件全部删完后也不能重新当成首次接入。
+    #[serde(default)]
+    pub initialized: bool,
     #[serde(default)]
     pub identity: Option<MirrorIdentity>,
     /// 相对路径（POSIX 风格）→ 基线条目。
@@ -70,6 +81,8 @@ pub struct MirrorIdentity {
     pub bucket: String,
     pub cloud_prefix: String,
     pub local_root: String,
+    #[serde(default)]
+    pub root_identity: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,9 +154,18 @@ pub enum MirrorError {
     Busy,
     #[error("镜像目录对象数超过上限")]
     TooManyEntries,
-    /// 单轮计划删除的文件数超过安全阈值。调用方需显式确认后才能继续。
-    #[error("本轮计划删除 {planned} 个文件（两侧共 {total} 个），超过安全阈值；请确认后重试")]
-    MassDelete { planned: usize, total: usize },
+    /// 异常批量删除或整侧变空必须绑定当前快照，由调用方显式确认。
+    #[error(
+        "本轮计划删除 {planned} 个文件（基线及当前快照最多 {total} 个），检测到异常删除；请核对计划并确认后重试"
+    )]
+    MassDelete {
+        planned: usize,
+        total: usize,
+        plan_id: String,
+        paths: Vec<String>,
+    },
+    #[error("首次接入非空目录需要确认合并 / Confirm merging existing folders before syncing")]
+    ConfirmMerge { plan_id: String, paths: Vec<String> },
 }
 
 /// 云端对象在基线比较视角下的快照。ETag 是服务商返回的不透明版本标识，

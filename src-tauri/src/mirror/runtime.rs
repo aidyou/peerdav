@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
@@ -10,7 +12,7 @@ use futures_util::{StreamExt, stream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::cloud::traits::ObjectStore;
-use crate::cloud::types::{CloudError, ObjectMetadata};
+use crate::cloud::types::{CloudError, ObjectMetadata, PutCondition};
 use crate::machine;
 
 use super::baseline;
@@ -25,12 +27,6 @@ use super::types::{
 const READ_CHUNK: usize = 256 * 1024;
 /// 单个镜像目录最多容纳的对象数，超过即拒绝同步。
 const MAX_CLOUD_ENTRIES: usize = 500_000;
-/// 删除动作的绝对数量阈值：超过后必须显式确认。
-const MASS_DELETE_ABSOLUTE: usize = 100;
-/// 参与比例判断的最小删除数：小目录删一两个文件属于正常操作，不应被拦下。
-const MASS_DELETE_MINIMUM: usize = 10;
-/// 删除动作占总路径数的百分比阈值（按最大值向下取整比较），超过后必须显式确认。
-const MASS_DELETE_PERCENT: usize = 25;
 /// 下载临时文件的序号，避免同一目录内并发/重试时互相覆盖。
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -42,6 +38,7 @@ pub struct MirrorRunContext {
     pub bucket: String,
     /// 用户已确认本轮的大量删除计划。
     pub force_mass_delete: bool,
+    pub confirmed_plan: Option<String>,
 }
 
 fn canceled(cancel: &AtomicBool) -> Result<(), MirrorError> {
@@ -102,48 +99,68 @@ pub async fn list_cloud(
     Ok(files)
 }
 
-/// 把本地文件流式上传到云端键。本地读取失败记入共享备注并在结果里转回本地错误，
-/// 避免把本地 IO 错误误报成云存储错误。
+/// Read a bounded local snapshot without following links, then publish with
+/// a provider-enforced condition; local I/O failures retain their original cause.
 async fn upload_file(
     store: &dyn ObjectStore,
     path: &Path,
     key: &str,
+    expected: Option<&CloudFile>,
+    scanned: &LocalFile,
     cancel: Arc<AtomicBool>,
 ) -> Result<ObjectMetadata, MirrorError> {
-    let file = tokio::fs::File::open(path)
-        .await
-        .map_err(MirrorError::from)?;
-    let failure: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
-    let note = Arc::clone(&failure);
-    let body = stream::unfold(file, move |mut file| {
-        let note = Arc::clone(&note);
-        async move {
-            let mut buf = vec![0u8; READ_CHUNK];
-            match file.read(&mut buf).await {
-                Ok(0) => None,
-                Ok(n) => Some((Ok(buf[..n].to_vec().into()), file)),
-                Err(error) => {
-                    if let Ok(mut guard) = note.lock() {
-                        *guard = Some(error);
-                    }
-                    Some((Err(CloudError::Unsupported), file))
-                }
-            }
-        }
-    });
-    match store
-        .upload_stream_with_control(key, Box::pin(body), cancel)
-        .await
+    let capabilities = store.capabilities();
+    if !capabilities.conditional_writes_verified
+        || !capabilities.create_only
+        || (expected.is_some() && !capabilities.conditional_replace)
     {
-        Ok(meta) => Ok(meta),
-        Err(error) => {
-            let local = failure.lock().ok().and_then(|mut guard| guard.take());
-            if let Some(local) = local {
-                return Err(MirrorError::Local(local));
-            }
-            Err(MirrorError::from(error))
-        }
+        return Err(CloudError::Unsupported.into());
     }
+    let condition = match expected {
+        Some(file) => PutCondition::MatchEtag(file.etag.clone().ok_or(CloudError::Unsupported)?),
+        None => PutCondition::CreateOnly,
+    };
+    if scanned.size > crate::cloud::types::MAX_PUT_BYTES as u64 {
+        return Err(CloudError::PayloadTooLarge.into());
+    }
+    canceled(&cancel)?;
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| MirrorError::UnsafePath("missing parent".into()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| MirrorError::UnsafePath("missing file name".into()))?;
+    let parent = scan::open_root_nofollow(parent_path)?;
+    let mut options = CapOpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = parent.open_with(name, &options)?;
+    if !file.metadata()?.is_file() || !local_state_matches(path, scanned) {
+        return Err(CloudError::Precondition.into());
+    }
+    let mut file = tokio::fs::File::from_std(file.into_std());
+    // Snapshot and validate before exposing any bytes to a mutating request.
+    let mut data = Vec::new();
+    loop {
+        canceled(&cancel)?;
+        let mut chunk = vec![0; READ_CHUNK];
+        let count = file.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        if data.len().saturating_add(count) > crate::cloud::types::MAX_PUT_BYTES {
+            return Err(CloudError::PayloadTooLarge.into());
+        }
+        data.extend_from_slice(&chunk[..count]);
+    }
+    if data.len() as u64 != scanned.size || !local_state_matches(path, scanned) {
+        return Err(CloudError::Precondition.into());
+    }
+    canceled(&cancel)?;
+    let body = stream::once(async move { Ok(data.into()) });
+    store
+        .put(key, Box::pin(body), condition)
+        .await
+        .map_err(MirrorError::from)
 }
 
 /// 从本地根逐级打开相对路径的父目录；每级都 `nofollow`，缺失目录逐级创建。
@@ -178,11 +195,27 @@ async fn download_file(
     local_root: &Path,
     relative: &str,
     key: &str,
+    expected_cloud: &CloudFile,
+    expected_local: Option<&LocalFile>,
     cancel: &AtomicBool,
 ) -> Result<(i128, u64), MirrorError> {
     types::validate_relative_str(relative)
         .map_err(|reason| MirrorError::UnsafePath(format!("{relative}: {reason}")))?;
     let relative_path = Path::new(relative);
+    async fn verify_cloud(
+        store: &dyn ObjectStore,
+        key: &str,
+        expected: &CloudFile,
+    ) -> Result<(), MirrorError> {
+        let current = store.stat(key).await?;
+        if expected.etag.is_none() || current.etag != expected.etag || current.size != expected.size
+        {
+            return Err(CloudError::Precondition.into());
+        }
+        Ok(())
+    }
+    let expected = expected_cloud;
+    verify_cloud(store, key, expected).await?;
     let mut body = store.get(key, None).await.map_err(MirrorError::from)?;
     let parent = open_parent_dir(local_root, relative_path)?;
     let path = local_root.join(relative_path);
@@ -201,12 +234,24 @@ async fn download_file(
         .open_with(&temp_name, &options)
         .map_err(MirrorError::from)?;
     let mut file = tokio::fs::File::from_std(temp_file.into_std());
+    let mut received = 0_u64;
     let result = (async {
         while let Some(chunk) = body.next().await {
             canceled(cancel)?;
             let chunk = chunk.map_err(MirrorError::from)?;
+            received = received
+                .checked_add(chunk.len() as u64)
+                .ok_or(CloudError::PayloadTooLarge)?;
+            if received > expected.size {
+                return Err(CloudError::Precondition.into());
+            }
             file.write_all(&chunk).await.map_err(MirrorError::from)?;
         }
+        if received != expected.size {
+            return Err(CloudError::Precondition.into());
+        }
+        verify_cloud(store, key, expected).await?;
+        canceled(cancel)?;
         file.sync_all().await.map_err(MirrorError::from)?;
         Ok::<(), MirrorError>(())
     })
@@ -216,11 +261,23 @@ async fn download_file(
         let _ = parent.remove_file(&temp_name);
         return Err(error);
     }
-    let parent_relative = relative_path.parent().unwrap_or_else(|| Path::new(""));
-    let temp_path = local_root.join(parent_relative).join(&temp_name);
-    if let Err(error) = tokio::fs::rename(&temp_path, &path).await {
-        let _ = parent.remove_file(&temp_name);
-        return Err(MirrorError::from(error));
+    let name = relative_path
+        .file_name()
+        .ok_or_else(|| MirrorError::UnsafePath(relative.into()))?;
+    let publish = (|| {
+        if let Some(scanned) = expected_local {
+            if !local_state_matches(&path, scanned) {
+                return Err(MirrorError::Cloud(CloudError::Precondition));
+            }
+            preserve_local(&parent, name)?;
+        }
+        rename_noreplace(&parent, std::ffi::OsStr::new(&temp_name), name)
+    })();
+    if let Err(error) = publish {
+        if let Err(cleanup) = parent.remove_file(&temp_name) {
+            log::warn!("mirror temporary cleanup failed: {cleanup:?}");
+        }
+        return Err(error);
     }
     let meta = std::fs::symlink_metadata(&path).map_err(MirrorError::from)?;
     if !meta.is_file() {
@@ -235,6 +292,38 @@ async fn download_file(
     Ok((mtime_ns, meta.len()))
 }
 
+/// Atomic no-clobber publication anchored to the opened directory, never a pathname rename.
+fn rename_noreplace(
+    parent: &Dir,
+    from: &std::ffi::OsStr,
+    to: &std::ffi::OsStr,
+) -> Result<(), MirrorError> {
+    #[cfg(target_os = "linux")]
+    {
+        rustix::fs::renameat_with(parent, from, parent, to, rustix::fs::RenameFlags::NOREPLACE)
+            .map_err(std::io::Error::from)?;
+        parent.open(".")?.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (parent, from, to);
+        Err(CloudError::Unsupported.into())
+    }
+}
+
+/// Move the actual entry (not a copied snapshot) into a unique recovery file.
+/// Concurrent writers retain their inode and their writes remain recoverable.
+fn preserve_local(parent: &Dir, name: &std::ffi::OsStr) -> Result<(), MirrorError> {
+    let recovery = format!(
+        "{}{}recovery-{}",
+        name.to_string_lossy(),
+        types::CONFLICT_MARKER,
+        hex::encode(rand::random::<[u8; 16]>())
+    );
+    rename_noreplace(parent, name, std::ffi::OsStr::new(&recovery))
+}
+
 /// 同步开始前重新校验本地文件与扫描时一致，避免上传扫描过程中被改动的文件。
 fn local_state_matches(path: &Path, scanned: &LocalFile) -> bool {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
@@ -244,7 +333,7 @@ fn local_state_matches(path: &Path, scanned: &LocalFile) -> bool {
         .modified()
         .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i128)
         .unwrap_or(-1);
-    mtime_ns == scanned.mtime_ns && meta.len() == scanned.size
+    meta.is_file() && mtime_ns == scanned.mtime_ns && meta.len() == scanned.size
 }
 
 fn action_path(action: &MirrorAction) -> &String {
@@ -262,7 +351,7 @@ fn action_path(action: &MirrorAction) -> &String {
 ///
 /// 单条失败不中断整体同步（记入 `failures`）；取消令牌在扫描、列举与每条操作前检查。
 /// 基线在所有操作结束后保存一次，成功执行的操作会更新对应条目。
-/// 扫描或列举不完整时关闭删除传播；删除量超过阈值时必须由调用方显式确认。
+/// 扫描或列举不完整时关闭删除传播；首次接入与异常删除必须确认当前计划。
 pub async fn run_sync(
     store: Arc<dyn ObjectStore>,
     mapping: &MirrorMapping,
@@ -272,15 +361,40 @@ pub async fn run_sync(
 ) -> Result<MirrorSyncResult, MirrorError> {
     let root = std::fs::canonicalize(&mapping.local_root)
         .map_err(|_| MirrorError::InvalidRoot(mapping.local_root.display().to_string()))?;
+    let root_handle = scan::open_root_nofollow(&mapping.local_root)?;
+    #[cfg(unix)]
+    let root_identity = {
+        use cap_std::fs::MetadataExt;
+        let metadata = root_handle.dir_metadata()?;
+        Some((metadata.dev(), metadata.ino()))
+    };
+    #[cfg(not(unix))]
+    let root_identity = None;
     let identity = MirrorIdentity {
         connection_id: mapping.connection_id.clone(),
         endpoint: context.endpoint.clone(),
         bucket: context.bucket.clone(),
         cloud_prefix: mapping.cloud_prefix.clone(),
         local_root: root.display().to_string(),
+        root_identity,
     };
     let mut baseline = baseline::load(data_dir, &mapping.id)?;
-    if baseline.identity.as_ref() != Some(&identity) {
+    if baseline.safety_version != 1 || baseline.identity.as_ref() != Some(&identity) {
+        // A configured target change starts a new merge, never reuses deletion history.
+        // Replacement of the same configured folder is not an intentional rebind.
+        let replaced_root = baseline.identity.as_ref().is_some_and(|previous| {
+            previous.connection_id == identity.connection_id
+                && previous.endpoint == identity.endpoint
+                && previous.bucket == identity.bucket
+                && previous.cloud_prefix == identity.cloud_prefix
+                && previous.local_root == identity.local_root
+                && previous.root_identity != identity.root_identity
+        });
+        if baseline.safety_version == 1 && replaced_root {
+            return Err(MirrorError::InvalidRoot(
+                "目录实体已变化，请检查挂载或重新绑定目录 / Folder identity changed; check the mount or rebind the folder".into(),
+            ));
+        }
         if !baseline.entries.is_empty() {
             log::warn!(
                 "mirror baseline for {} no longer matches its target; resetting before sync \
@@ -293,7 +407,9 @@ pub async fn run_sync(
             );
         }
         baseline = MirrorBaseline {
-            identity: Some(identity),
+            safety_version: 1,
+            initialized: false,
+            identity: Some(identity.clone()),
             entries: BTreeMap::new(),
         };
     }
@@ -323,23 +439,8 @@ pub async fn run_sync(
             }
         }
     }
-    // 首次同步（或目标变化后重置）时，把两侧同名且大小相同的文件视为已建立基线：
-    // 重新接入一个已有的镜像目录不应把所有文件都变成冲突副本。
-    if baseline.entries.is_empty() {
-        for (path, file) in &local {
-            if let Some(cloud_file) = cloud.get(path)
-                && cloud_file.size == file.size
-            {
-                baseline.record_upload(
-                    path,
-                    file.mtime_ns,
-                    file.size,
-                    cloud_file.etag.clone(),
-                    cloud_file.size,
-                );
-            }
-        }
-    }
+    // Unknown state is never a common baseline, even for equal-sized files.
+    // The planner preserves both versions as a conflict instead of inferring equality.
     let mut actions = sync::plan(&local, &cloud, &baseline);
     if !complete {
         let before = actions.len();
@@ -366,17 +467,55 @@ pub async fn run_sync(
             )
         })
         .count();
-    let total = local.len().max(cloud.len());
-    if deletions > MASS_DELETE_ABSOLUTE
-        || (deletions >= MASS_DELETE_MINIMUM && deletions * 100 > total * MASS_DELETE_PERCENT)
+    let total = local.len().max(cloud.len()).max(baseline.entries.len());
+    let emptied_side = (local.is_empty()
+        && actions
+            .iter()
+            .any(|action| matches!(action, MirrorAction::DeleteCloud(_))))
+        || (cloud.is_empty()
+            && actions
+                .iter()
+                .any(|action| matches!(action, MirrorAction::DeleteLocal(_))));
+    let unusual_deletion = emptied_side
+        || deletions > types::MASS_DELETE_ABSOLUTE
+        || (deletions >= types::MASS_DELETE_MINIMUM
+            && deletions.saturating_mul(100) > total.saturating_mul(types::MASS_DELETE_PERCENT));
+    use sha2::Digest;
+    let plan_id = hex::encode(sha2::Sha256::digest(format!(
+        "{identity:?}|{baseline:?}|{local:?}|{cloud:?}|{actions:?}"
+    )));
+    let confirmed = context.confirmed_plan.as_deref() == Some(plan_id.as_str());
+    let initial_merge = !baseline.initialized && baseline.entries.is_empty();
+    if !actions.is_empty()
+        && !confirmed
+        && (initial_merge || (context.confirmed_plan.is_some() && deletions == 0))
     {
-        if !context.force_mass_delete {
-            return Err(MirrorError::MassDelete {
-                planned: deletions,
-                total,
-            });
-        }
-        log::warn!("mirror mass delete confirmed by caller: {deletions} of {total} paths");
+        return Err(MirrorError::ConfirmMerge {
+            plan_id,
+            paths: actions.iter().map(|action| format!("{action:?}")).collect(),
+        });
+    }
+    // Normal baseline-backed deletions propagate automatically, including timer runs.
+    // Exceptional deletions still require the exact plan; `force` alone is insufficient.
+    if deletions > 0
+        && (unusual_deletion || context.confirmed_plan.is_some())
+        && !(context.force_mass_delete && confirmed)
+    {
+        return Err(MirrorError::MassDelete {
+            planned: deletions,
+            total,
+            plan_id,
+            paths: actions
+                .iter()
+                .filter(|action| {
+                    matches!(
+                        action,
+                        MirrorAction::DeleteCloud(_) | MirrorAction::DeleteLocal(_)
+                    )
+                })
+                .map(|action| format!("{action:?}"))
+                .collect(),
+        });
     }
 
     let machine = machine_label();
@@ -384,6 +523,19 @@ pub async fn run_sync(
 
     for action in actions {
         canceled(&cancel)?;
+        let current_root = scan::open_root_nofollow(&mapping.local_root)?;
+        #[cfg(unix)]
+        {
+            use cap_std::fs::MetadataExt;
+            let metadata = current_root.dir_metadata()?;
+            if Some((metadata.dev(), metadata.ino())) != identity.root_identity {
+                return Err(MirrorError::InvalidRoot(
+                    "folder identity changed during sync".into(),
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = current_root;
         let path = action_path(&action).clone();
         match action {
             MirrorAction::Upload(_) => {
@@ -401,7 +553,16 @@ pub async fn run_sync(
                     continue;
                 }
                 let key = types::cloud_key(&mapping.cloud_prefix, &path);
-                match upload_file(store.as_ref(), &abs, &key, Arc::clone(&cancel)).await {
+                match upload_file(
+                    store.as_ref(),
+                    &abs,
+                    &key,
+                    cloud.get(&path),
+                    scanned,
+                    Arc::clone(&cancel),
+                )
+                .await
+                {
                     Ok(meta) => {
                         baseline.record_upload(
                             &path,
@@ -420,7 +581,19 @@ pub async fn run_sync(
             }
             MirrorAction::Download(_) | MirrorAction::Restore(_) => {
                 let key = types::cloud_key(&mapping.cloud_prefix, &path);
-                match download_file(store.as_ref(), &mapping.local_root, &path, &key, &cancel).await
+                let Some(expected_cloud) = cloud.get(&path) else {
+                    continue;
+                };
+                match download_file(
+                    store.as_ref(),
+                    &mapping.local_root,
+                    &path,
+                    &key,
+                    expected_cloud,
+                    local.get(&path),
+                    &cancel,
+                )
+                .await
                 {
                     Ok((mtime_ns, size)) => {
                         let cloud_file = cloud.get(&path);
@@ -443,8 +616,17 @@ pub async fn run_sync(
                 }
             }
             MirrorAction::DeleteCloud(_) => {
+                if mapping.local_root.join(&path).try_exists()? {
+                    result.failures.push(MirrorFailure { path, reason: "本地文件已重新出现，取消云端删除 / Local file reappeared; cloud deletion canceled".into() });
+                    continue;
+                }
                 let key = types::cloud_key(&mapping.cloud_prefix, &path);
-                match store.delete(&key).await {
+                let expected = cloud.get(&path).and_then(|file| file.etag.as_deref());
+                let deletion = match expected {
+                    Some(etag) => store.delete_if_match(&key, etag).await,
+                    None => Err(CloudError::Unsupported),
+                };
+                match deletion {
                     Ok(()) => {
                         baseline.remove(&path);
                         result.deleted_cloud += 1;
@@ -456,14 +638,32 @@ pub async fn run_sync(
                 }
             }
             MirrorAction::DeleteLocal(_) => {
+                let key = types::cloud_key(&mapping.cloud_prefix, &path);
+                match store.stat(&key).await {
+                    Err(CloudError::NotFound) => {}
+                    Ok(_) => {
+                        result.failures.push(MirrorFailure { path, reason: "云端文件已重新出现，取消本地删除 / Cloud file reappeared; local deletion canceled".into() });
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
                 let abs = mapping.local_root.join(&path);
-                match tokio::fs::remove_file(&abs).await {
+                let deletion = (|| {
+                    let scanned = local.get(&path).ok_or(CloudError::Precondition)?;
+                    if !local_state_matches(&abs, scanned) {
+                        return Err(MirrorError::Cloud(CloudError::Precondition));
+                    }
+                    let relative = Path::new(&path);
+                    let parent = open_parent_dir(&mapping.local_root, relative)?;
+                    let name = relative
+                        .file_name()
+                        .ok_or_else(|| MirrorError::UnsafePath(path.clone()))?;
+                    preserve_local(&parent, name)
+                })();
+                match deletion {
                     Ok(()) => {
                         baseline.remove(&path);
                         result.deleted_local += 1;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        baseline.remove(&path);
                     }
                     Err(error) => result.failures.push(MirrorFailure {
                         path: path.clone(),
@@ -495,11 +695,16 @@ pub async fn run_sync(
                 // 两个版本都保留，原路径恢复为两侧一致，基线可以如实记录。
                 let key = types::cloud_key(&mapping.cloud_prefix, &path);
                 let conflict_relative = types::conflict_name(&path, &machine, &stamp);
+                let Some(expected_cloud) = cloud.get(&path) else {
+                    continue;
+                };
                 if let Err(error) = download_file(
                     store.as_ref(),
                     &mapping.local_root,
                     &conflict_relative,
                     &key,
+                    expected_cloud,
+                    None,
                     &cancel,
                 )
                 .await
@@ -512,7 +717,16 @@ pub async fn run_sync(
                     });
                     continue;
                 }
-                match upload_file(store.as_ref(), &abs, &key, Arc::clone(&cancel)).await {
+                match upload_file(
+                    store.as_ref(),
+                    &abs,
+                    &key,
+                    cloud.get(&path),
+                    scanned,
+                    Arc::clone(&cancel),
+                )
+                .await
+                {
                     Ok(meta) => {
                         baseline.record_upload(
                             &path,
@@ -534,6 +748,9 @@ pub async fn run_sync(
 
     // 清理两侧都不再存在的陈旧基线条目。
     baseline.retain(|p| local.contains_key(p) || cloud.contains_key(p));
+    if complete {
+        baseline.initialized = true;
+    }
     baseline::save(data_dir, &mapping.id, &baseline)?;
     Ok(result)
 }
@@ -550,6 +767,8 @@ mod tests {
     /// 内存版对象存储：键 -> (内容, etag)，用于端到端验证镜像同步管线。
     struct MemoryStore {
         objects: Mutex<HashMap<String, (Vec<u8>, String)>>,
+        conditional_delete: bool,
+        truncated_read: bool,
     }
 
     impl MemoryStore {
@@ -564,6 +783,8 @@ mod tests {
                         })
                         .collect(),
                 ),
+                conditional_delete: true,
+                truncated_read: false,
             }
         }
 
@@ -595,7 +816,12 @@ mod tests {
 
     impl ObjectStore for MemoryStore {
         fn capabilities(&self) -> StorageCapabilities {
-            StorageCapabilities::default()
+            StorageCapabilities {
+                create_only: true,
+                conditional_replace: true,
+                conditional_writes_verified: true,
+                ..Default::default()
+            }
         }
         fn list<'a>(&'a self, prefix: &'a str) -> crate::cloud::types::ObjectListing<'a> {
             let items: Vec<ObjectMetadata> = self
@@ -641,9 +867,15 @@ mod tests {
                 .expect("test store lock")
                 .get(key)
                 .map(|(value, _)| value.clone());
+            let truncated = self.truncated_read;
             Box::pin(async move {
                 match entry {
-                    Some(value) => Ok(stream::once(async move { Ok(Bytes::from(value)) }).boxed()),
+                    Some(mut value) => {
+                        if truncated {
+                            value.truncate(value.len().saturating_sub(1));
+                        }
+                        Ok(stream::once(async move { Ok(Bytes::from(value)) }).boxed())
+                    }
                     None => Err(CloudError::NotFound),
                 }
             })
@@ -652,15 +884,28 @@ mod tests {
             &'a self,
             key: &'a str,
             mut body: crate::cloud::types::ObjectStream,
-            _condition: PutCondition,
+            condition: PutCondition,
         ) -> BoxFuture<'a, Result<ObjectMetadata, CloudError>> {
             Box::pin(async move {
+                use sha2::Digest;
                 let mut data = Vec::new();
                 while let Some(chunk) = body.next().await {
                     data.extend_from_slice(&chunk?);
                 }
-                let etag = format!("etag-{}", data.len());
-                self.insert(key, data.clone(), &etag);
+                let etag = hex::encode(sha2::Sha256::digest(&data));
+                let mut objects = self.objects.lock().unwrap();
+                match condition {
+                    PutCondition::CreateOnly if objects.contains_key(key) => {
+                        return Err(CloudError::Precondition);
+                    }
+                    PutCondition::MatchEtag(ref expected)
+                        if objects.get(key).map(|(_, etag)| etag) != Some(expected) =>
+                    {
+                        return Err(CloudError::Precondition);
+                    }
+                    _ => {}
+                }
+                objects.insert(key.into(), (data.clone(), etag.clone()));
                 Ok(ObjectMetadata {
                     key: key.to_owned(),
                     size: data.len() as u64,
@@ -686,6 +931,23 @@ mod tests {
                     size: data.len() as u64,
                     etag: Some(etag),
                 })
+            })
+        }
+        fn delete_if_match<'a>(
+            &'a self,
+            key: &'a str,
+            etag: &'a str,
+        ) -> BoxFuture<'a, Result<(), CloudError>> {
+            Box::pin(async move {
+                if !self.conditional_delete {
+                    return Err(CloudError::Unsupported);
+                }
+                let mut objects = self.objects.lock().unwrap();
+                if objects.get(key).map(|(_, current)| current.as_str()) != Some(etag) {
+                    return Err(CloudError::Precondition);
+                }
+                objects.remove(key);
+                Ok(())
             })
         }
         fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), CloudError>> {
@@ -717,7 +979,32 @@ mod tests {
             endpoint: "https://s3.example.test".to_owned(),
             bucket: "bucket".to_owned(),
             force_mass_delete: false,
+            confirmed_plan: None,
         }
+    }
+
+    // Existing behavioral fixtures explicitly accept their computed plans. Safety
+    // regressions call super::run_sync directly to exercise the refusal boundary.
+    async fn run_sync(
+        store: Arc<dyn ObjectStore>,
+        mapping: &MirrorMapping,
+        data: &Path,
+        context: &MirrorRunContext,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<MirrorSyncResult, MirrorError> {
+        let first = super::run_sync(store.clone(), mapping, data, context, cancel.clone()).await;
+        let plan_id = match first {
+            Err(MirrorError::ConfirmMerge { plan_id, .. }) => plan_id,
+            Err(MirrorError::MassDelete { plan_id, .. }) if context.force_mass_delete => plan_id,
+            result => return result,
+        };
+        let approved = MirrorRunContext {
+            confirmed_plan: Some(plan_id),
+            endpoint: context.endpoint.clone(),
+            bucket: context.bucket.clone(),
+            force_mass_delete: context.force_mass_delete,
+        };
+        super::run_sync(store, mapping, data, &approved, cancel).await
     }
 
     fn forced_context() -> MirrorRunContext {
@@ -787,6 +1074,7 @@ mod tests {
         let (local, data) = test_dirs();
         write(&local, "keep.txt", "keep");
         write(&local, "gone.txt", "gone");
+        write(&local, "anchor.txt", "anchor");
         let store = Arc::new(MemoryStore::new(vec![(
             "_peerdav_mirror/docs/keep.txt",
             b"keep".to_vec(),
@@ -794,7 +1082,7 @@ mod tests {
         let mapping = mapping(&local, "docs");
         let cancel = Arc::new(AtomicBool::new(false));
 
-        // 第一轮把本地两个文件都上传。
+        // 第一轮建立三个文件的共同基线。
         run_sync(
             store.clone(),
             &mapping,
@@ -810,9 +1098,9 @@ mod tests {
                 .contains(&"_peerdav_mirror/docs/gone.txt".to_owned())
         );
 
-        // 本地删除 gone.txt → 同步应删除云端副本。
+        // 本地删除 gone.txt → 可信基线下自动传播，不携带确认令牌。
         std::fs::remove_file(local.join("gone.txt")).unwrap();
-        let result = run_sync(
+        let result = super::run_sync(
             store.clone(),
             &mapping,
             &data,
@@ -834,12 +1122,261 @@ mod tests {
             .lock()
             .expect("test store lock")
             .remove("_peerdav_mirror/docs/keep.txt");
-        let result = run_sync(store.clone(), &mapping, &data, &context(), cancel)
+        let result = super::run_sync(store.clone(), &mapping, &data, &context(), cancel)
             .await
             .unwrap();
         assert_eq!(result.deleted_local, 1);
         assert!(!local.join("keep.txt").exists());
+        let recovery = std::fs::read_dir(&local)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("keep.txt.conflict.recovery-")
+            })
+            .unwrap();
+        assert_eq!(std::fs::read(recovery).unwrap(), b"keep");
         let _ = std::fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn scheduled_mirror_runs_propagate_normal_deletions_but_refuse_empty_side() {
+        use crate::cloud::runtime_schedule::{ScheduleHandle, TickSource};
+        use std::time::Duration;
+
+        for empty_side in [false, true] {
+            let (local, data) = test_dirs();
+            write(&local, "gone.txt", "gone");
+            if !empty_side {
+                write(&local, "keep.txt", "keep");
+            }
+            let store = Arc::new(MemoryStore::new(vec![]));
+            let mapping = mapping(&local, "docs");
+            run_sync(
+                store.clone(),
+                &mapping,
+                &data,
+                &context(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+            std::fs::remove_file(local.join("gone.txt")).unwrap();
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let source: TickSource = {
+                let store = store.clone();
+                let data = data.clone();
+                Arc::new(move |_| {
+                    let store = store.clone();
+                    let mapping = mapping.clone();
+                    let data = data.clone();
+                    let sender = sender.clone();
+                    Box::pin(async move {
+                        // Timer entry points never supply force or a confirmation token.
+                        let result = super::run_sync(
+                            store,
+                            &mapping,
+                            &data,
+                            &context(),
+                            Arc::new(AtomicBool::new(false)),
+                        )
+                        .await
+                        .map_err(crate::AppError::from);
+                        let notification = match &result {
+                            Ok(result) => (result.deleted_cloud, None),
+                            Err(error) => (0, Some(error.code.clone())),
+                        };
+                        sender.send(notification).unwrap();
+                        result.map(|_| ())
+                    })
+                })
+            };
+            let schedule =
+                ScheduleHandle::start_for_test("mirror:test", Duration::from_millis(20), source);
+            let outcome = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            schedule.stop_and_join().await.unwrap();
+            if empty_side {
+                assert_eq!(outcome, (0, Some("MIRROR_MASS_DELETE".into())));
+                assert_eq!(store.get_value("_peerdav_mirror/docs/gone.txt"), b"gone");
+            } else {
+                assert_eq!(outcome, (1, None));
+                assert!(
+                    !store
+                        .keys()
+                        .contains(&"_peerdav_mirror/docs/gone.txt".into())
+                );
+            }
+            std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_initialized_folders_do_not_repeat_initial_confirmation() {
+        let (local, data) = test_dirs();
+        let store = Arc::new(MemoryStore::new(vec![]));
+        let mapping = mapping(&local, "docs");
+        let cancel = Arc::new(AtomicBool::new(false));
+        super::run_sync(store.clone(), &mapping, &data, &context(), cancel.clone())
+            .await
+            .unwrap();
+        assert!(baseline::load(&data, &mapping.id).unwrap().initialized);
+        write(&local, "new.txt", "new");
+        let result = super::run_sync(store.clone(), &mapping, &data, &context(), cancel.clone())
+            .await
+            .unwrap();
+        assert_eq!(result.uploaded, 1);
+        // Both sides intentionally removed the only file: the empty state stays initialized.
+        std::fs::remove_file(local.join("new.txt")).unwrap();
+        store
+            .objects
+            .lock()
+            .unwrap()
+            .remove("_peerdav_mirror/docs/new.txt");
+        super::run_sync(store.clone(), &mapping, &data, &context(), cancel.clone())
+            .await
+            .unwrap();
+        assert!(
+            baseline::load(&data, &mapping.id)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        store.insert(
+            "_peerdav_mirror/docs/remote.txt",
+            b"remote".to_vec(),
+            "remote-v1",
+        );
+        let result = super::run_sync(store, &mapping, &data, &context(), cancel)
+            .await
+            .unwrap();
+        assert_eq!(result.downloaded, 1);
+        std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_suddenly_empty_side_requires_confirmation_in_both_directions() {
+        for delete_local in [true, false] {
+            let (local, data) = test_dirs();
+            write(&local, "precious.txt", "keep");
+            let store = Arc::new(MemoryStore::new(vec![]));
+            let mapping = mapping(&local, "docs");
+            let cancel = Arc::new(AtomicBool::new(false));
+            run_sync(store.clone(), &mapping, &data, &context(), cancel.clone())
+                .await
+                .unwrap();
+            if delete_local {
+                std::fs::remove_file(local.join("precious.txt")).unwrap();
+            } else {
+                store
+                    .objects
+                    .lock()
+                    .unwrap()
+                    .remove("_peerdav_mirror/docs/precious.txt");
+            }
+            for context in [context(), forced_context()] {
+                let result =
+                    super::run_sync(store.clone(), &mapping, &data, &context, cancel.clone()).await;
+                assert!(matches!(
+                    result,
+                    Err(MirrorError::MassDelete {
+                        planned: 1,
+                        total: 1,
+                        ..
+                    })
+                ));
+            }
+            if delete_local {
+                assert_eq!(
+                    store.get_value("_peerdav_mirror/docs/precious.txt"),
+                    b"keep"
+                );
+            } else {
+                assert_eq!(std::fs::read(local.join("precious.txt")).unwrap(), b"keep");
+            }
+            std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn deletion_thresholds_allow_normal_batches_and_pause_unusual_batches() {
+        for (count, removed, needs_confirmation) in [
+            (12, 9, false),
+            (40, 10, false),
+            (39, 10, true),
+            (500, 100, false),
+            (500, 101, true),
+        ] {
+            let (local, data) = test_dirs();
+            for index in 0..count {
+                write(&local, &format!("file-{index}.txt"), "keep");
+            }
+            let store = Arc::new(MemoryStore::new(vec![]));
+            let mapping = mapping(&local, "docs");
+            let cancel = Arc::new(AtomicBool::new(false));
+            run_sync(store.clone(), &mapping, &data, &context(), cancel.clone())
+                .await
+                .unwrap();
+            for index in 0..removed {
+                std::fs::remove_file(local.join(format!("file-{index}.txt"))).unwrap();
+            }
+            let result = super::run_sync(store.clone(), &mapping, &data, &context(), cancel).await;
+            if needs_confirmation {
+                assert!(
+                    matches!(result, Err(MirrorError::MassDelete { planned, total, .. }) if planned == removed && total == count)
+                );
+                assert_eq!(store.keys().len(), count);
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result.deleted_cloud, removed as u64);
+                assert!(result.failures.is_empty());
+                assert_eq!(store.keys().len(), count - removed);
+            }
+            std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn changing_the_local_folder_requires_a_new_merge() {
+        let (local, data) = test_dirs();
+        write(&local, "old.txt", "old");
+        let store = Arc::new(MemoryStore::new(vec![]));
+        let original = mapping(&local, "docs");
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_sync(store.clone(), &original, &data, &context(), cancel.clone())
+            .await
+            .unwrap();
+        let new_root = local.with_file_name("new-local");
+        std::fs::create_dir(&new_root).unwrap();
+        write(&new_root, "new.txt", "new");
+        let changed = MirrorMapping {
+            local_root: new_root.clone(),
+            ..original
+        };
+        let result =
+            super::run_sync(store.clone(), &changed, &data, &context(), cancel.clone()).await;
+        let Err(MirrorError::ConfirmMerge { plan_id, .. }) = result else {
+            panic!("a changed local folder must require a new merge");
+        };
+        assert_eq!(store.keys().len(), 1);
+        assert!(!new_root.join("old.txt").exists());
+        let approved = MirrorRunContext {
+            confirmed_plan: Some(plan_id),
+            ..context()
+        };
+        let result = super::run_sync(store.clone(), &changed, &data, &approved, cancel)
+            .await
+            .unwrap();
+        assert_eq!(result.uploaded, 1);
+        assert_eq!(result.downloaded, 1);
+        assert_eq!(result.deleted_cloud + result.deleted_local, 0);
+        assert_eq!(std::fs::read(local.join("old.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(new_root.join("old.txt")).unwrap(), b"old");
+        std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
     }
 
     #[tokio::test]
@@ -988,7 +1525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn equal_size_files_are_adopted_on_the_first_sync() {
+    async fn equal_size_different_files_preserve_both_versions_on_first_sync() {
         let (local, data) = test_dirs();
         write(&local, "a.txt", "local");
         let store = Arc::new(MemoryStore::new(vec![(
@@ -1005,12 +1542,23 @@ mod tests {
         )
         .await
         .unwrap();
-        // 接入已有镜像目录时，同名同大小视为同一状态，不复制、不覆盖。
         assert_eq!(result.uploaded, 0);
         assert_eq!(result.downloaded, 0);
-        assert!(result.conflicts.is_empty());
+        assert_eq!(result.conflicts, vec!["a.txt"]);
         assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"local");
-        assert_eq!(store.get_value("_peerdav_mirror/docs/a.txt"), b"cloud");
+        assert_eq!(store.get_value("_peerdav_mirror/docs/a.txt"), b"local");
+        let copies: Vec<_> = std::fs::read_dir(&local)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(types::CONFLICT_MARKER)
+            })
+            .collect();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(std::fs::read(&copies[0]).unwrap(), b"cloud");
         let _ = std::fs::remove_dir_all(local.parent().unwrap());
     }
 
@@ -1052,7 +1600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changing_the_cloud_prefix_resets_the_baseline_instead_of_deleting_local_files() {
+    async fn changing_the_cloud_prefix_requires_a_new_merge_without_reusing_deletion_history() {
         let (local, data) = test_dirs();
         write(&local, "a.txt", "keep me");
         let store = Arc::new(MemoryStore::new(vec![]));
@@ -1071,20 +1619,124 @@ mod tests {
             cloud_prefix: "work".to_owned(),
             ..mapping.clone()
         };
-        let result = run_sync(
+        let result = super::run_sync(
             store.clone(),
             &changed,
             &data,
             &context(),
             Arc::new(AtomicBool::new(false)),
         )
+        .await;
+        let Err(MirrorError::ConfirmMerge { plan_id, .. }) = result else {
+            panic!("changed prefix must require a new merge plan");
+        };
+        assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"keep me");
+        assert!(
+            !store
+                .keys()
+                .contains(&"_peerdav_mirror/work/a.txt".to_string())
+        );
+        let approved = MirrorRunContext {
+            confirmed_plan: Some(plan_id),
+            ..context()
+        };
+        let result = super::run_sync(
+            store.clone(),
+            &changed,
+            &data,
+            &approved,
+            Arc::new(AtomicBool::new(false)),
+        )
         .await
         .unwrap();
-        assert_eq!(result.deleted_local, 0);
         assert_eq!(result.uploaded, 1);
-        assert!(local.join("a.txt").exists());
-        assert_eq!(store.get_value("_peerdav_mirror/work/a.txt"), b"keep me");
+        assert_eq!(result.deleted_local + result.deleted_cloud, 0);
+        assert_eq!(store.get_value("_peerdav_mirror/docs/a.txt"), b"keep me");
         let _ = std::fs::remove_dir_all(local.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replaced_root_and_symlink_subtree_never_delete_cloud_files() {
+        let (local, data) = test_dirs();
+        write(&local, "sub/precious.txt", "keep");
+        let store = Arc::new(MemoryStore::new(vec![]));
+        let mapping = mapping(&local, "docs");
+        run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        let moved = local.with_file_name("moved");
+        std::fs::rename(&local, &moved).unwrap();
+        std::fs::create_dir(&local).unwrap();
+        let result = run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &forced_context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert!(matches!(result, Err(MirrorError::InvalidRoot(_))));
+        assert_eq!(
+            store.get_value("_peerdav_mirror/docs/sub/precious.txt"),
+            b"keep"
+        );
+        std::fs::remove_dir(&local).unwrap();
+        std::fs::rename(&moved, &local).unwrap();
+        let sub = local.join("sub");
+        std::fs::rename(&sub, local.join("original-sub")).unwrap();
+        std::os::unix::fs::symlink(local.join("original-sub"), &sub).unwrap();
+        let result = run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.deleted_cloud, 0);
+        assert!(!result.failures.is_empty());
+        assert_eq!(
+            store.get_value("_peerdav_mirror/docs/sub/precious.txt"),
+            b"keep"
+        );
+        std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_baseline_never_authorizes_deletion() {
+        let (local, data) = test_dirs();
+        let store = Arc::new(MemoryStore::new(vec![(
+            "_peerdav_mirror/docs/precious.txt",
+            b"keep".to_vec(),
+        )]));
+        let mapping = mapping(&local, "docs");
+        let mut legacy = MirrorBaseline::default();
+        legacy.record_upload("precious.txt", 1, 4, Some("etag".into()), 4);
+        baseline::save(&data, &mapping.id, &legacy).unwrap();
+        let result = run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.deleted_cloud, 0);
+        assert_eq!(std::fs::read(local.join("precious.txt")).unwrap(), b"keep");
+        assert_eq!(
+            store.get_value("_peerdav_mirror/docs/precious.txt"),
+            b"keep"
+        );
+        std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
     }
 
     #[cfg(unix)]
@@ -1129,6 +1781,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmation_is_required_and_stale_plans_never_authorize_deletion() {
+        let (local, data) = test_dirs();
+        write(&local, "a.txt", "precious");
+        let store = Arc::new(MemoryStore::new(vec![]));
+        let mapping = mapping(&local, "docs");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let first =
+            super::run_sync(store.clone(), &mapping, &data, &context(), cancel.clone()).await;
+        let Err(MirrorError::ConfirmMerge { plan_id, .. }) = first else {
+            panic!("merge must be confirmed");
+        };
+        assert!(store.keys().is_empty());
+        let approved = MirrorRunContext {
+            confirmed_plan: Some(plan_id),
+            ..context()
+        };
+        super::run_sync(store.clone(), &mapping, &data, &approved, cancel.clone())
+            .await
+            .unwrap();
+        std::fs::remove_file(local.join("a.txt")).unwrap();
+        let error = super::run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &forced_context(),
+            cancel.clone(),
+        )
+        .await
+        .unwrap_err();
+        let MirrorError::MassDelete { plan_id, .. } = error else {
+            panic!("force without a token is unsafe");
+        };
+        write(&local, "new.txt", "new");
+        let stale = MirrorRunContext {
+            confirmed_plan: Some(plan_id),
+            ..forced_context()
+        };
+        assert!(matches!(
+            super::run_sync(store.clone(), &mapping, &data, &stale, cancel).await,
+            Err(MirrorError::MassDelete { .. })
+        ));
+        assert_eq!(store.get_value("_peerdav_mirror/docs/a.txt"), b"precious");
+        assert!(
+            !store
+                .keys()
+                .contains(&"_peerdav_mirror/docs/new.txt".into())
+        );
+        std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_bulk_approval_never_authorizes_a_changed_normal_deletion() {
+        let (local, data) = test_dirs();
+        write(&local, "a.txt", "precious");
+        write(&local, "b.txt", "keep");
+        let store = Arc::new(MemoryStore::new(vec![]));
+        let mapping = mapping(&local, "docs");
+        let cancel = Arc::new(AtomicBool::new(false));
+        run_sync(store.clone(), &mapping, &data, &context(), cancel.clone())
+            .await
+            .unwrap();
+        std::fs::remove_file(local.join("a.txt")).unwrap();
+        std::fs::remove_file(local.join("b.txt")).unwrap();
+        let error = super::run_sync(store.clone(), &mapping, &data, &context(), cancel.clone())
+            .await
+            .unwrap_err();
+        let MirrorError::MassDelete { plan_id, .. } = error else {
+            panic!("empty side must pause");
+        };
+        write(&local, "b.txt", "keep");
+        let stale = MirrorRunContext {
+            confirmed_plan: Some(plan_id),
+            ..forced_context()
+        };
+        assert!(matches!(
+            super::run_sync(store.clone(), &mapping, &data, &stale, cancel).await,
+            Err(MirrorError::MassDelete { .. })
+        ));
+        assert_eq!(store.get_value("_peerdav_mirror/docs/a.txt"), b"precious");
+        std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn downloads_never_clobber_new_files_and_reject_changed_remote() {
+        let (local, _) = test_dirs();
+        let store = MemoryStore::new(vec![("a", b"cloud".to_vec())]);
+        let meta = store.stat("a").await.unwrap();
+        let expected = CloudFile {
+            etag: meta.etag,
+            size: meta.size,
+        };
+        write(&local, "a.txt", "new local data");
+        let result = download_file(
+            &store,
+            &local,
+            "a.txt",
+            "a",
+            &expected,
+            None,
+            &AtomicBool::new(false),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(local.join("a.txt")).unwrap(),
+            b"new local data"
+        );
+        store.insert("a", b"changed".to_vec(), "new revision");
+        let result = download_file(
+            &store,
+            &local,
+            "missing.txt",
+            "a",
+            &expected,
+            None,
+            &AtomicBool::new(false),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!local.join("missing.txt").exists());
+        std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsupported_delete_and_truncated_download_preserve_originals() {
+        let (local, data) = test_dirs();
+        write(&local, "a.txt", "precious");
+        let mut store = MemoryStore::new(vec![]);
+        store.conditional_delete = false;
+        let store = Arc::new(store);
+        let mapping = mapping(&local, "docs");
+        run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(local.join("a.txt")).unwrap();
+        let result = run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &forced_context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.deleted_cloud, 0);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(store.get_value("_peerdav_mirror/docs/a.txt"), b"precious");
+        let mut truncated = MemoryStore::new(vec![("a", b"remote".to_vec())]);
+        truncated.truncated_read = true;
+        let meta = truncated.stat("a").await.unwrap();
+        write(&local, "a.txt", "keep local");
+        let scanned = scan::scan(&local, &AtomicBool::new(false)).unwrap();
+        let expected = CloudFile {
+            etag: meta.etag,
+            size: meta.size,
+        };
+        assert!(
+            download_file(
+                &truncated,
+                &local,
+                "a.txt",
+                "a",
+                &expected,
+                scanned.files.get("a.txt"),
+                &AtomicBool::new(false)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"keep local");
+        std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
     async fn mass_delete_requires_explicit_confirmation() {
         let (local, data) = test_dirs();
         for index in 0..10 {
@@ -1162,7 +1994,8 @@ mod tests {
             error,
             MirrorError::MassDelete {
                 planned: 10,
-                total: 10
+                total: 10,
+                ..
             }
         ));
         assert_eq!(store.keys().len(), 10);

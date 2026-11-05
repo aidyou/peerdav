@@ -629,7 +629,11 @@ async fn prepare_local<S: ObjectStore + ?Sized>(
         &operation,
         &mut count,
         PreparedObject::new(
-            format!("{APPEND_ROOT}/{}/trees/{}", repository.repo_id(), root.digest),
+            format!(
+                "{APPEND_ROOT}/{}/trees/{}",
+                repository.repo_id(),
+                root.digest
+            ),
             wire,
         ),
     )?;
@@ -705,7 +709,10 @@ pub async fn pull<S: ObjectStore + ?Sized>(
     request: &AppendPullRequest<'_>,
     cancel: Arc<AtomicBool>,
 ) -> Result<AppendEngineReport, AppendEngineError> {
-    pull_or_run(store, binding, password, index, request, cancel, false).await
+    pull_or_run(
+        store, binding, password, index, request, cancel, false, false,
+    )
+    .await
 }
 
 /// Synchronize local changes and remote history with independent apply cancellation.
@@ -717,7 +724,22 @@ pub async fn run<S: ObjectStore + ?Sized>(
     request: &AppendPullRequest<'_>,
     cancel: Arc<AtomicBool>,
 ) -> Result<AppendEngineReport, AppendEngineError> {
-    pull_or_run(store, binding, password, index, request, cancel, true).await
+    run_with_deletion_policy(store, binding, password, index, request, cancel, false).await
+}
+
+pub async fn run_with_deletion_policy<S: ObjectStore + ?Sized>(
+    store: Arc<S>,
+    binding: &TrustBinding,
+    password: &[u8],
+    index: &mut AppendIndex,
+    request: &AppendPullRequest<'_>,
+    cancel: Arc<AtomicBool>,
+    automatic: bool,
+) -> Result<AppendEngineReport, AppendEngineError> {
+    pull_or_run(
+        store, binding, password, index, request, cancel, true, automatic,
+    )
+    .await
 }
 
 async fn pull_or_run<S: ObjectStore + ?Sized>(
@@ -728,6 +750,7 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
     request: &AppendPullRequest<'_>,
     mut cancel: Arc<AtomicBool>,
     publish: bool,
+    automatic: bool,
 ) -> Result<AppendEngineReport, AppendEngineError> {
     if cancel.load(Ordering::SeqCst) && index.pending_epoch()?.is_none() {
         return Err(AppendEngineError::Cancelled);
@@ -764,6 +787,9 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
     };
     let base_projection = projection(&base, request.mapping)?;
     let pending = index.pending_epoch()?;
+    if automatic && pending.is_some() {
+        return Err(AppendEngineError::RecoveryPaused);
+    }
     let operation = match &pending {
         Some(epoch) => epoch.id.clone(),
         None => index.begin_run("engine", request.run_id)?,
@@ -899,6 +925,13 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
             }
         }
         merge::validate(&revisions)?;
+        if automatic {
+            materialize::check_automatic_deletions(
+                &base_projection,
+                &current_scan,
+                &projection(&revisions, request.mapping)?,
+            )?;
+        }
         let mut publication = None;
         if publish && !matches_projection(&current_scan, &base_projection) {
             let repository = append_discovery::open_budgeted(
