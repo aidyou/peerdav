@@ -40,7 +40,8 @@ async function mountSettings() { const w = mount(CloudSettings, { props: { conne
 async function appendSettings() { const w = await mountSettings(); await w.find('.add-menu-trigger').trigger('click'); await w.find('.add-connect-drive').trigger('click'); return w; }
 async function openCreateDialog(w) { if (!w.find('[data-test=create-drive-dialog]').exists()) { await w.find('.add-menu-trigger').trigger('click'); await w.find('.open-create-drive').trigger('click'); } return w; }
 async function openMappingDialog(w) { await w.find('.add-menu-trigger').trigger('click'); await w.find('.new-mapping').trigger('click'); return w; }
-async function openMirrorTab(w) { await w.findAll('.drive-tab')[1].trigger('click'); return w; }
+// 同步盘与镜像盘现为两个常驻块，不再切 tab；保留 helper 名以兼容既有调用点。
+async function openMirrorTab(w) { return w; }
 async function fillPasswords(w) { const create = w.find(".append-password"); if (create.exists()) await create.setValue("password-123"); const confirm = w.find(".append-confirmation"); if (confirm.exists()) await confirm.setValue("password-123"); const join = w.find(".append-join-password"); if (join.exists()) await join.setValue("password-123"); }
 async function fillLinkLocalRoot(w, root = "/local/Documents") { await w.find(".link-local-root").setValue(root); }
 const saveMappingButton = (w) => w.findAll("button").filter((b) => b.text() === "Save").at(-1);
@@ -71,10 +72,13 @@ describe("append settings through unified invoke", () => {
     expect(w.find('.mirror-cloud-prefix').exists()).toBe(true);
     w.unmount();
   });
-  it("offers two drive tabs and a three-action add menu", async () => {
+  it("offers two drive sections and a three-action add menu", async () => {
     const w = await mountSettings();
-    expect(w.findAll('.drive-tab').map((tab) => tab.text())).toEqual(['Sync drives', 'Mirror drives']);
-    expect(w.find('[data-test=create-drive-dialog]').attributes('style')).toContain('min-height: 400px');
+    expect(w.findAll('.drive-group').length).toBe(2);
+    expect(w.find('[data-test="sync-group"] .group-title').text()).toContain('Sync drives');
+    expect(w.find('[data-test="mirror-group"] .group-title').text()).toContain('Mirror drives');
+    // 对话框高度改由统一 scoped 样式控制，不再使用内联 :style。
+    expect(w.find('[data-test=create-drive-dialog]').attributes('style')).toBeUndefined();
     await w.find('.cancel-create-drive').trigger('click');
     await w.find('.add-menu-trigger').trigger('click');
     expect(w.findAll('.add-menu-list [role=menuitem]').map((item) => item.text())).toEqual(['New sync drive', 'Connect remote sync drive', 'Add local folder']);
@@ -84,6 +88,14 @@ describe("append settings through unified invoke", () => {
     await w.find('.add-menu-trigger').trigger('click');
     await w.find('.add-local-folder').trigger('click');
     expect(w.find('[data-test=mapping-dialog]').exists()).toBe(true);
+    w.unmount();
+  });
+  it("opens the mirror create dialog from the mirror section action", async () => {
+    const w = await mountSettings(); await w.find('.cancel-create-drive').trigger('click');
+    await w.find('[data-test="mirror-group"] .new-mirror-drive').trigger('click');
+    expect(w.find('[data-test=create-drive-dialog]').exists()).toBe(true);
+    expect(w.find('.mirror-cloud-prefix').exists()).toBe(true);
+    expect(w.find('.new-drive-local').exists()).toBe(false);
     w.unmount();
   });
   it("discovers existing drives before asking for a password", async () => {
@@ -108,7 +120,7 @@ describe("append settings through unified invoke", () => {
   it("shows the local mapping table without a statistics column", async () => {
     rows.mappings = [{ id: 'm1', connectionId: 'c1', repositoryId: 'cas-repo', localRoot: '/local', logicalPath: 'docs', schedule: {} }];
     const w = await mountSettings(); await w.find('.cancel-create-drive').trigger('click');
-    expect(w.findAll('.drive-table th').map((cell) => cell.text())).toEqual(['Local folder', 'Remote folder', 'Status', 'Manage']);
+    expect(w.findAll('[data-test="sync-group"] .drive-table th').map((cell) => cell.text())).toEqual(['Local folder', 'Remote folder', 'Status', 'Manage']);
     expect(w.find('.mapping-item').text()).toContain('/local');
     expect(w.find('.mapping-item').text()).toContain('Sync drive 1 · docs');
     expect(w.find('.mapping-status').text()).toBe('Idle');
@@ -305,7 +317,7 @@ describe("mirror sync settings through unified invoke", () => {
     rows.mirrorMappings = [{ id: "m1", connectionId: "c1", localRoot: "/local/mirror", cloudPrefix: "docs", schedule: { enabled: false, interval: 900 } }];
     nativeInvoke.mockImplementation(async (command) => command === "cloud_list" ? structuredClone(rows) : command === "mirror_sync" ? { uploaded: 2, downloaded: 0, deletedCloud: 0, deletedLocal: 0, restored: 0, conflicts: ["a.txt"], failures: [{ path: "b.txt", reason: "boom" }] } : {});
     const w = await mountSettings(); await openMirrorTab(w); await flushPromises();
-    expect(w.findAll('.drive-table th').map((cell) => cell.text())).toEqual(['Local folder', 'Cloud folder', 'Status', 'Statistics', 'Manage']);
+    expect(w.findAll('[data-test="mirror-group"] .drive-table th').map((cell) => cell.text())).toEqual(['Local folder', 'Cloud folder', 'Status', 'Statistics', 'Manage']);
     expect(w.text()).toContain("/local/mirror");
     expect(w.text()).toContain("_peerdav_mirror/docs");
     await w.findAll("button").find((b) => b.text() === "Sync now").trigger("click"); await flushPromises();

@@ -952,10 +952,10 @@ onBeforeUnmount(() => {
           <FileGlyph :entry="{ isDir: true, name: bucket }" /><span>{{ bucket }}</span>
         </button>
         <p v-if="!buckets.length" class="sidebar-empty">{{ t('cloudBrowser.noBuckets') }}</p>
-        <div class="sidebar-section-head">
-          <p class="sidebar-label">{{ t('cloudBrowser.syncDrives') }}</p>
-          <button type="button" class="add-sync-drive" :aria-label="t('drive.manage')" @click="openManagement()"><span aria-hidden="true">&gt;</span></button>
-        </div>
+        <button type="button" class="sidebar-section-head" :class="{ 'is-active': view === 'management' && !activeDriveId }" @click="openManagement()">
+          <span class="sidebar-label">{{ t('cloudBrowser.syncDrives') }}</span>
+          <span class="sidebar-section-manage">{{ t('drive.manageActions') }}</span>
+        </button>
         <button v-for="(drive, index) in drives" :key="index" type="button" class="share-link drive-link" :class="{ 'is-active': view === 'management' && activeDriveId === drive.id }" @click="openManagement(drive.id)">
           <FileGlyph :entry="{ isDir: true, name: drive.label }" /><span>{{ drive.label }}</span>
         </button>
@@ -963,7 +963,6 @@ onBeforeUnmount(() => {
       </aside>
       <main class="browser-main">
         <div v-if="view === 'management'" class="management-view">
-          <header class="cloud-toolbar"><el-button class="back-to-files" @click="view = 'files'; activeDriveId = ''">{{ t('cloudBrowser.allFiles') }}</el-button><h2>{{ t('drive.manage') }}</h2></header>
           <div class="management-content"><CloudSyncDrives :key="connectionId" :connection-id="connectionId" :focus-id="activeDriveId" @changed="refreshCatalog" /></div>
         </div>
         <template v-else>
@@ -1125,10 +1124,12 @@ onBeforeUnmount(() => {
 .browser-sidebar { min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 3px; padding: 14px 10px; overflow-y: auto; background: color-mix(in oklab, var(--app-surface-2) 72%, transparent); border-right: 1px solid var(--app-border); }
 .sidebar-label { margin: 0 8px 6px; font-size: 11px; font-weight: 600; color: var(--app-text-muted); }
 .sidebar-empty { margin: 6px 8px; font-size: 12px; line-height: 1.5; color: var(--app-text-muted); }
-.sidebar-section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 10px 8px 0; }
+.sidebar-section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; margin: 10px 0 0; padding: 6px 9px; border: 0; border-radius: 8px; background: transparent; cursor: pointer; text-align: left; }
+.sidebar-section-head:hover { background: var(--app-surface-3); }
+.sidebar-section-head.is-active { background: var(--app-surface-2); }
 .sidebar-section-head .sidebar-label { margin: 0; }
-.add-sync-drive { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; padding: 0; border: 1px solid var(--app-border); border-radius: 6px; background: transparent; color: var(--app-text-muted); font-size: 13px; line-height: 1; cursor: pointer; }
-.add-sync-drive:hover { background: var(--app-surface-3); color: var(--app-text); }
+.sidebar-section-manage { flex: 0 0 auto; font-size: 11px; color: var(--app-text-muted); }
+.sidebar-section-head:hover .sidebar-section-manage, .sidebar-section-head.is-active .sidebar-section-manage { color: var(--app-text); }
 .share-link { display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 9px; border: 0; border-radius: 8px; background: transparent; color: var(--app-text-secondary); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer; }
 .share-link :deep(.file-glyph) { width: 18px; height: 18px; }
 .share-link span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1137,7 +1138,7 @@ onBeforeUnmount(() => {
 
 .browser-main { min-width: 0; min-height: 0; overflow: hidden; padding: 14px 16px 18px; display: flex; flex-direction: column; gap: 12px; }
 .management-view { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 12px; overflow: hidden; }
-.management-content { flex: 1; min-height: 0; overflow: auto; }
+.management-content { flex: 1; min-height: 0; overflow: hidden; }
 
 .pathbar { flex: none; display: flex; align-items: center; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--app-border); }
 .breadcrumbs { flex: 1; min-width: 0; display: flex; align-items: center; gap: 2px; overflow-x: auto; overflow-y: hidden; white-space: nowrap; scrollbar-width: none; -ms-overflow-style: none; }
@@ -1232,13 +1233,11 @@ onBeforeUnmount(() => {
 }
 .management-view p, .management-view h2, .management-view h3 { margin: 0; }
 .management-view p { color: var(--app-text-muted); line-height: 1.6; }
-.cloud-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
-.cloud-toolbar :deep(.el-input), .cloud-toolbar :deep(.el-select) { width: 240px; max-width: 100%; min-width: 0; }
 .cloud-tree { margin: 0; padding: 0; list-style: none; }
 .cloud-tree li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px; border-bottom: 1px solid var(--app-border); }
 .cloud-tree li.is-selected { background: var(--app-surface-3); }
 .cloud-browser [role=alert], .cloud-browser li { min-width: 0; overflow-wrap: anywhere; }
 .cloud-browser :deep(.el-button + .el-button) { margin-left: 0; }
 .cloud-browser [role=alert] { color: var(--el-color-danger); }
-@media (max-width: 480px) { .cloud-tree li { flex-wrap: wrap; align-items: flex-start; } .cloud-toolbar :deep(.el-input), .cloud-toolbar :deep(.el-select) { width: 100%; } }
+@media (max-width: 480px) { .cloud-tree li { flex-wrap: wrap; align-items: flex-start; } }
 </style>

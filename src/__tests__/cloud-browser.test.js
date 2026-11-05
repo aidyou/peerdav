@@ -481,31 +481,32 @@ describe("CloudBrowser", () => {
     expect(wrapper.find('.browser-sidebar').exists()).toBe(true); expect(wrapper.find('.browser-main').exists()).toBe(true);
     expect(wrapper.find('.sync-management-entry').exists()).toBe(false); expect(wrapper.find('select').exists()).toBe(false);
     expect(wrapper.find('.bucket-link').classes()).toContain('is-active'); expect(wrapper.find('.sidebar-empty').text()).toBe(t('cloudBrowser.noSyncDrives'));
-    expect(wrapper.find('.add-sync-drive').text()).toBe('>');
-    await click(wrapper, '.add-sync-drive'); expect(wrapper.find('[data-test="sync-manager"]').text()).toContain('c1');
+    await click(wrapper, '.sidebar-section-head'); expect(wrapper.find('[data-test="sync-manager"]').text()).toContain('c1');
     expect(wrapper.find('[data-test="upload"]').exists()).toBe(false); expect(wrapper.text()).not.toMatch(/CAS|Append V2/);
     await wrapper.setProps({ connectionId: 'c2' }); await flushPromises();
     expect(wrapper.find('[data-test="sync-manager"]').exists()).toBe(false); expect(wrapper.find('[data-test="upload"]').exists()).toBe(true);
     expect(nativeInvoke.mock.calls.some(([name]) => name === 'cloud_sync' || name === 'cloud_create_repository')).toBe(false);
   });
-  it('numbers current-connection drives in manager order, highlights focus and returns to all files without preparing again', async () => {
+  it('numbers current-connection drives in manager order, highlights focus and returns to files via bucket selection', async () => {
     handlers.cloud_list = () => ({ connections: [{ id: 'c1', name: 'Main', bucket: 'main', buckets: ['main'] }], repositories: [{ id: 'cas', connectionId: 'c1' }, { id: 'other', connectionId: 'c2' }], appendRepositories: [{ connectionId: 'c1', binding: { repoId: 'append' } }] });
     const wrapper = await browser();
     expect(wrapper.findAll('.drive-link').map((item) => item.text())).toEqual(['Sync drive 1', 'Sync drive 2']);
     await wrapper.findAll('.drive-link')[1].trigger('click'); await flushPromises();
     expect(wrapper.findComponent('[data-test="sync-manager"]').props('focusId')).toBe('append');
     expect(wrapper.findAll('.drive-link')[1].classes()).toContain('is-active');
-    await click(wrapper, '.back-to-files'); expect(wrapper.find('.bucket-link').classes()).toContain('is-active');
+    // 进入管理视图只切换视图，不重复准备文件列表。
+    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_prepare')).toHaveLength(1);
+    // 侧边栏存储桶是返回文件视图的入口。
+    await click(wrapper, '.bucket-link');
+    expect(wrapper.find('.bucket-link').classes()).toContain('is-active');
+    expect(wrapper.findComponent('[data-test="sync-manager"]').exists()).toBe(false);
     await wrapper.findAll('.drive-link')[0].trigger('click'); await flushPromises();
     expect(wrapper.findComponent('[data-test="sync-manager"]').props('focusId')).toBe('cas');
-    await click(wrapper, '.back-to-files');
-    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_prepare')).toHaveLength(1);
-    expect(nativeInvoke.mock.calls.filter(([name]) => name === 'cloud_object_list')).toHaveLength(1);
   });
   it('refreshes sidebar after manager changes and drops a removed active drive', async () => {
     const catalog = { connections: [{ id: 'c1', name: 'Main', bucket: 'main', buckets: ['main'] }], repositories: [], appendRepositories: [] };
     handlers.cloud_list = () => structuredClone(catalog);
-    const wrapper = await browser(); await click(wrapper, '.add-sync-drive');
+    const wrapper = await browser(); await click(wrapper, '.sidebar-section-head');
     catalog.appendRepositories.push({ connectionId: 'c1', binding: { repoId: 'new' } });
     await click(wrapper, '[data-test="catalog-changed"]'); expect(wrapper.find('.drive-link').text()).toBe('Sync drive 1');
     await click(wrapper, '.drive-link'); catalog.appendRepositories = [];
