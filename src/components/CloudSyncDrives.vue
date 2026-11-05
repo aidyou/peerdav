@@ -13,11 +13,24 @@ const emit = defineEmits(["changed"]);
 const app = useAppContext();
 const data = ref({ repositories: [], appendRepositories: [], mappings: [], statuses: [], mirrorMappings: [] });
 const createDialogOpen = ref(false);
-const createTab = ref("create");
-// 新建同步盘的内容模式：开 = 加密同步盘（append），关 = 明文镜像同步。
-const encrypted = ref(true);
-function closeCreateDialog() { if (busy.value) return; createDialogOpen.value = false; resetNewDrive(); resetLink(); resetMirror(); }
-const mode = ref("encrypted");
+const connectDialogOpen = ref(false);
+const activeTab = ref("sync");
+const addMenuOpen = ref(false);
+// 新建同步盘的三种形态：加密 Append、认证明文 Append、明文镜像。
+const createMode = ref("encrypted");
+const isMirror = computed(() => createMode.value === "mirror");
+const needsPassword = computed(() => createMode.value !== "mirror");
+const createModeHint = computed(() => createMode.value === "mirror"
+  ? "drive.modeMirrorHint"
+  : createMode.value === "authenticated_plain" ? "drive.modeAuthenticatedPlainHint" : "drive.modeEncryptedHint");
+const passwordHint = computed(() => createMode.value === "authenticated_plain"
+  ? "drive.passwordHintAuthenticatedPlain" : "drive.passwordHintEncrypted");
+function resetCreateMode() { createMode.value = "encrypted"; }
+function closeAddMenu(event) { if (!event.target?.closest?.(".add-menu")) addMenuOpen.value = false; }
+function openCreateDialog() { addMenuOpen.value = false; connectDialogOpen.value = false; mappingEditorOpen.value = false; resetNewDrive(); resetCreateMode(); resetMirror(); state.value = "idle"; createDialogOpen.value = true; }
+function openConnectDialog() { addMenuOpen.value = false; createDialogOpen.value = false; mappingEditorOpen.value = false; resetLink(); state.value = "idle"; connectDialogOpen.value = true; void discover(); }
+function closeCreateDialog() { if (busy.value) return; createDialogOpen.value = false; resetNewDrive(); resetCreateMode(); resetMirror(); }
+function closeConnectDialog() { if (busy.value) return; connectDialogOpen.value = false; resetLink(); }
 const newDrive = ref({ localRoot: "", logicalPath: "", password: "", confirmation: "" });
 const password = ref("");
 const busy = ref(false);
@@ -71,6 +84,26 @@ const pickerBreadcrumbs = computed(() => {
   return crumbs;
 });
 const phaseLabel = (phase) => phase ? t(`cloud.phase${phase[0].toUpperCase()}${phase.slice(1)}`) : "";
+function mappingStatus(item) {
+  const status = statuses.value.find((s) => s.mappingId === item.id);
+  return status ? `${phaseLabel(status.phase)}${status.detail ? ` · ${status.detail}` : ""}` : t("cloud.phaseIdle");
+}
+function repositoryLabel(item) { return repositories.value.find((r) => r.id === item.repositoryId)?.label || item.repositoryId; }
+function repositoryType(repo) { return repo.binding?.appendMode === "authenticated_plain" ? t("drive.modeAuthenticatedPlain") : repo.mode === "plain" ? t("cloudAppend.plain") : t("cloud.encrypted"); }
+function candidateModeLabel(item) { return item.descriptor.mode === "encrypted" ? t("drive.modeEncrypted") : t("drive.modeAuthenticatedPlain"); }
+function candidateModeHint(item) { return item.descriptor.mode === "encrypted" ? t("drive.connectCandidateEncryptedHint") : t("drive.connectCandidatePlainHint"); }
+function mappingRemote(item) { return `${repositoryLabel(item)} · ${item.logicalPath || "/"}`; }
+function mirrorRemote(item) { return `_peerdav_mirror/${item.cloudPrefix || ""}`; }
+function mirrorStats(item) {
+  const result = mirrorResults.value[item.id];
+  if (!result) return t("drive.statsEmpty");
+  return t("drive.mirrorStats", {
+    uploaded: result.uploaded || 0,
+    downloaded: result.downloaded || 0,
+    conflicts: result.conflicts?.length || 0,
+    failures: result.failures?.length || 0,
+  });
+}
 function fail(error) { app.handleFailure(error); }
 function resetTrust() { trustedFingerprint.value = ""; acceptTofu.value = false; }
 function resetSecrets() { password.value = ""; resetTrust(); }
@@ -81,6 +114,7 @@ function resetMirror() { mirrorForm.value = { localRoot: "", cloudPrefix: "" }; 
 // one-step create usable without asking non-technical users to name things twice.
 function folderName(path) { const parts = String(path).split(/[\\/]+/).filter(Boolean); return parts.length ? parts[parts.length - 1] : t("drive.defaultFolder"); }
 watch(selectedCandidateKey, resetTrust);
+watch(() => props.focusId, (id) => { if (id) activeTab.value = "sync"; });
 watch(() => mapping.value.repositoryId, () => { if (!editingMappingId.value) mapping.value.logicalPath = ""; });
 async function refresh(scope = generation) { const result = await cloud.list(); if (!disposed && scope === generation) data.value = result; }
 async function run(operation) {
@@ -91,17 +125,17 @@ async function run(operation) {
   finally { if (!disposed && scope === generation) busy.value = false; }
 }
 watch(() => props.connectionId, () => {
-  generation++; busy.value = false; createDialogOpen.value = false; resetSecrets(); resetNewDrive(); resetLink(); resetMirror();
+  generation++; busy.value = false; createDialogOpen.value = false; connectDialogOpen.value = false; addMenuOpen.value = false; activeTab.value = "sync"; resetSecrets(); resetNewDrive(); resetCreateMode(); resetLink(); resetMirror();
   mapping.value = { ...blankMapping(), connectionId: props.connectionId }; editingMappingId.value = null; mappingEditorOpen.value = false;
   preview.value = null; recovery.value = []; state.value = "idle"; mirrorBusy.value = {}; mirrorStatus.value = {}; mirrorResults.value = {};
   void run((scope) => refresh(scope));
 }, { immediate: true });
 async function create() {
-  if (!canCreate.value) return;
+  if (!canCreate.value || isMirror.value) return;
   await run(async (scope) => {
     state.value = "loading";
     const logicalPath = newDrive.value.logicalPath.trim() || folderName(newDrive.value.localRoot);
-    const redacted = await cloud.createSyncDrive({ connectionId: props.connectionId, mode: mode.value, password: newDrive.value.password, passwordConfirmation: newDrive.value.confirmation });
+    const redacted = await cloud.createSyncDrive({ connectionId: props.connectionId, mode: createMode.value, password: newDrive.value.password, passwordConfirmation: newDrive.value.confirmation });
     if (scope !== generation || disposed) return;
     // Bind the first local folder in the same step so a new drive always has
     // something to sync instead of looking like a no-op. The drive already
@@ -114,7 +148,7 @@ async function create() {
       bindingError = error;
     }
     if (scope !== generation || disposed) return;
-    resetNewDrive(); createDialogOpen.value = false; await refresh(scope);
+    resetNewDrive(); resetMirror(); resetCreateMode(); createDialogOpen.value = false; activeTab.value = "sync"; await refresh(scope);
     if (scope !== generation || disposed) return;
     emit("changed");
     if (bindingError) throw bindingError;
@@ -122,17 +156,18 @@ async function create() {
   });
 }
 async function createMirror() {
-  if (!canCreateMirror.value) return;
+  if (!canCreateMirror.value || !isMirror.value) return;
   await run(async (scope) => {
     state.value = "loading";
     await cloud.mirrorSaveMapping({ id: null, connectionId: props.connectionId, localRoot: mirrorForm.value.localRoot.trim(), cloudPrefix: mirrorForm.value.cloudPrefix.trim(), schedule: { enabled: false, interval: 900 } });
     if (scope !== generation || disposed) return;
-    resetMirror(); createDialogOpen.value = false; await refresh(scope);
+    resetMirror(); resetNewDrive(); resetCreateMode(); createDialogOpen.value = false; activeTab.value = "mirror"; await refresh(scope);
     if (scope !== generation || disposed) return;
     emit("changed");
     state.value = "saved";
   });
 }
+function submitCreate() { return isMirror.value ? createMirror() : create(); }
 async function discover() {
   await run(async (scope) => {
     candidates.value = []; selectedCandidateKey.value = ""; resetTrust(); state.value = "loading";
@@ -167,7 +202,7 @@ async function bindLogicalPath(scope, logicalPath) {
   state.value = "loading";
   await cloud.appendSaveMapping(null, { connectionId: props.connectionId, repositoryId: joinedRepoId.value, localRoot: linkForm.value.localRoot, logicalPath, schedule: { enabled: false, interval: 900 } }, logicalPath);
   if (scope !== generation || disposed) return;
-  resetSecrets(); resetLink(); createDialogOpen.value = false; await refresh(scope);
+  resetSecrets(); resetLink(); connectDialogOpen.value = false; activeTab.value = "sync"; await refresh(scope);
   if (scope !== generation || disposed) return;
   state.value = "saved"; emit("changed");
 }
@@ -176,8 +211,15 @@ async function confirmBind() {
   if (!logicalPath || !joinedRepoId.value || !linkForm.value.localRoot.trim()) return;
   await run((scope) => bindLogicalPath(scope, logicalPath));
 }
-function editMapping(item) { editingMappingId.value = item.id; mapping.value = { ...blankMapping(), ...item, schedule: { ...blankMapping().schedule, ...item.schedule } }; mappingEditorOpen.value = true; preview.value = null; }
-function newMapping() { editingMappingId.value = null; mapping.value = { ...blankMapping(), connectionId: props.connectionId }; mappingEditorOpen.value = true; }
+function blankMappingForCurrentDrive() {
+  const focused = repositories.value.find((repo) => repo.id === props.focusId);
+  const repositoryId = focused?.id || (repositories.value.length === 1 ? repositories.value[0].id : "");
+  return { ...blankMapping(), connectionId: props.connectionId, repositoryId };
+}
+function resetMappingEditor() { editingMappingId.value = null; mapping.value = blankMappingForCurrentDrive(); preview.value = null; recovery.value = []; recoveryMappingId.value = ""; }
+function closeMappingDialog() { if (busy.value) return; mappingEditorOpen.value = false; resetMappingEditor(); }
+function editMapping(item) { addMenuOpen.value = false; createDialogOpen.value = false; connectDialogOpen.value = false; resetMappingEditor(); editingMappingId.value = item.id; mapping.value = { ...blankMapping(), ...item, schedule: { ...blankMapping().schedule, ...item.schedule } }; mappingEditorOpen.value = true; }
+function newMapping() { addMenuOpen.value = false; createDialogOpen.value = false; connectDialogOpen.value = false; resetMappingEditor(); mappingEditorOpen.value = true; }
 async function chooseNewRoot() {
   try {
     const value = await openDialog({ directory: true, multiple: false });
@@ -210,7 +252,7 @@ async function saveMapping() {
     if (isAppend) await cloud.appendSaveMapping(editingMappingId.value, input, input.logicalPath);
     else await cloud.saveMapping(editingMappingId.value, input);
     if (scope !== generation || disposed) return;
-    editingMappingId.value = null; mapping.value = { ...blankMapping(), connectionId: props.connectionId }; mappingEditorOpen.value = false;
+    resetMappingEditor(); mappingEditorOpen.value = false; activeTab.value = "sync";
     await refresh(scope);
   });
 }
@@ -337,21 +379,105 @@ onMounted(async () => {
     if (disposed) await cleanup(); else unlisten = cleanup;
   } catch (error) { if (!disposed) fail(error); }
 });
+onMounted(() => document.addEventListener("click", closeAddMenu));
+onBeforeUnmount(() => document.removeEventListener("click", closeAddMenu));
 onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.resolve().then(unlisten).catch(fail); });
 </script>
 
 <template>
   <section class="sync-drives" :aria-label="t('drive.manage')">
-    <h3>{{ t('drive.manage') }}</h3>
-
-    <!-- 主流程：tab 化的「新建 / 链接已有」对话框。 -->
-    <el-button class="open-create-drive" type="primary" :disabled="busy" @click="createDialogOpen = true">{{ t('drive.createTitle') }}</el-button>
+    <header class="drives-header">
+      <h3>{{ t('drive.manage') }}</h3>
+      <div class="add-menu" @keydown.esc="addMenuOpen = false">
+        <button type="button" class="add-menu-trigger" :aria-label="t('drive.addMenu')" :aria-expanded="addMenuOpen" aria-haspopup="menu" @click.stop="addMenuOpen = !addMenuOpen">+</button>
+        <div v-if="addMenuOpen" class="add-menu-list" role="menu">
+          <button type="button" role="menuitem" class="open-create-drive add-create-drive" @click="openCreateDialog">{{ t('drive.createTitle') }}</button>
+          <button type="button" role="menuitem" class="add-connect-drive" @click="openConnectDialog">{{ t('drive.connectRemote') }}</button>
+          <button type="button" role="menuitem" class="new-mapping add-local-folder" @click="newMapping">{{ t('drive.addFolder') }}</button>
+        </div>
+      </div>
+    </header>
     <p class="append-state" role="status">{{ t(`drive.${state}`) }}</p>
-    <el-dialog :model-value="createDialogOpen" @update:model-value="closeCreateDialog" width="600" align-center
+
+    <div class="drive-tabs" role="tablist" :aria-label="t('drive.manage')">
+      <button type="button" role="tab" class="drive-tab" :aria-selected="activeTab === 'sync'" :class="{ 'is-active': activeTab === 'sync' }" @click="activeTab = 'sync'">{{ t('drive.tabSync') }}</button>
+      <button type="button" role="tab" class="drive-tab" :aria-selected="activeTab === 'mirror'" :class="{ 'is-active': activeTab === 'mirror' }" @click="activeTab = 'mirror'">{{ t('drive.tabMirror') }}</button>
+    </div>
+
+    <!-- 同步盘：一行对应一个本地目录映射；盘本身通过上方列表和云端目录列体现。 -->
+    <div v-if="activeTab === 'sync'" class="drive-table-wrap">
+      <ul class="drive-list"><li v-for="repo in repositories" :key="repo.id" :class="{ 'is-active': repo.id === focusId }">{{ repo.label }} · {{ repositoryType(repo) }}</li></ul>
+      <table class="drive-table">
+        <thead><tr><th>{{ t('cloud.localRoot') }}</th><th>{{ t('drive.remoteFolder') }}</th><th>{{ t('drive.status') }}</th><th>{{ t('drive.manageActions') }}</th></tr></thead>
+        <tbody>
+          <tr v-for="item in mappings" :key="item.id" class="mapping-item" :class="{ 'is-active': item.repositoryId === focusId }">
+            <td class="mapping-local-cell">{{ item.localRoot }}</td>
+            <td class="mapping-remote-cell">{{ mappingRemote(item) }}</td>
+            <td class="mapping-status" role="status">{{ mappingStatus(item) }}</td>
+            <td class="mapping-actions">
+              <el-button class="mapping-edit" :disabled="busy" @click="editMapping(item)">{{ t('cloud.edit') }}</el-button>
+              <el-button class="mapping-preview" :disabled="busy" @click="showPreview(item)">{{ t('cloud.preview') }}</el-button>
+              <el-button class="mapping-cancel" :disabled="busy" @click="cancel(item)">{{ t('cloud.cancel') }}</el-button>
+              <el-button class="mapping-recovery" :disabled="busy" @click="loadRecovery(item)">{{ t('cloud.recovery') }}</el-button>
+              <el-button class="mapping-remove" :disabled="busy" @click="deleteMapping(item)">{{ t('drive.removeMapping') }}</el-button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-if="!mappings.length" class="hint">{{ t('drive.noLocalFolders') }}</p>
+      <div v-if="preview" class="cloud-preview">
+        <p>{{ t('cloud.confirmPreview') }}</p>
+        <p>{{ t('cloud.previewUploads') }}: {{ preview.summary?.uploads ?? 0 }} · {{ t('cloud.previewDownloads') }}: {{ preview.summary?.downloads ?? 0 }} · {{ t('cloud.previewDeletes') }}: {{ preview.summary?.deletes ?? 0 }} · {{ t('cloud.previewConflicts') }}: {{ preview.summary?.conflicts ?? 0 }}</p>
+        <pre v-if="typeof preview.summary === 'string'">{{ preview.summary }}</pre>
+        <el-button :disabled="busy" @click="applyPreview">{{ t('cloud.sync') }}</el-button>
+      </div>
+      <div v-if="recovery.length" class="recovery-list">
+        <p class="hint">{{ t('drive.recoveryFor', { path: recoveryMappingId }) }}</p>
+        <ul><li v-for="record in recovery" :key="record.id">{{ record.relativePath }} · {{ record.phase }}<el-button :disabled="busy" @click="restore(record)">{{ t('cloud.restore') }}</el-button></li></ul>
+      </div>
+    </div>
+
+    <!-- 镜像盘：保持目录结构的明文双向镜像，独立于加密同步盘。 -->
+    <div v-else class="drive-table-wrap">
+      <table class="drive-table">
+        <thead><tr><th>{{ t('cloud.localRoot') }}</th><th>{{ t('drive.mirrorCloudFolder') }}</th><th>{{ t('drive.status') }}</th><th>{{ t('drive.stats') }}</th><th>{{ t('drive.manageActions') }}</th></tr></thead>
+        <tbody>
+          <tr v-for="item in mirrorMappings" :key="item.id" class="mirror-item" :class="{ 'is-active': item.id === focusId }">
+            <td>{{ item.localRoot }}</td>
+            <td class="mono">{{ mirrorRemote(item) }}</td>
+            <td class="mirror-status" role="status">{{ mirrorStatusText(item) }}</td>
+            <td class="mirror-stats">{{ mirrorStats(item) }}</td>
+            <td class="mirror-actions">
+              <el-button v-if="!mirrorBusy[item.id]" :disabled="busy" @click="syncMirror(item.id)">{{ t('drive.mirrorSync') }}</el-button>
+              <el-button v-else @click="cancelMirror(item.id)">{{ t('drive.mirrorCancel') }}</el-button>
+              <el-button :disabled="mirrorBusy[item.id] || busy" @click="deleteMirror(item)">{{ t('drive.mirrorDelete') }}</el-button>
+              <label class="mirror-schedule">
+                <el-switch :model-value="!!item.schedule?.enabled" :disabled="busy || mirrorBusy[item.id]" @update:model-value="toggleMirrorSchedule(item, $event)" />
+                <span>{{ t('cloud.schedule') }}</span>
+                <input :value="item.schedule?.interval || 900" class="mirror-interval" type="number" min="60" step="60" :disabled="busy || mirrorBusy[item.id] || !item.schedule?.enabled" @change="changeMirrorInterval(item, $event.target.value)" />
+              </label>
+              <details v-if="mirrorResults[item.id]?.conflicts?.length" class="mirror-conflicts">
+                <summary>{{ t('drive.mirrorConflicts', { count: mirrorResults[item.id].conflicts.length }) }}</summary>
+                <ul><li v-for="path in mirrorResults[item.id].conflicts" :key="path">{{ path }}</li></ul>
+              </details>
+              <details v-if="mirrorResults[item.id]?.failures?.length" class="mirror-failures">
+                <summary>{{ t('drive.mirrorFailures', { count: mirrorResults[item.id].failures.length }) }}</summary>
+                <ul><li v-for="failure in mirrorResults[item.id].failures" :key="failure.path">{{ failure.path }} · {{ failure.reason }}</li></ul>
+              </details>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-if="!mirrorMappings.length" class="hint">{{ t('drive.noMirrorDrives') }}</p>
+    </div>
+
+    <!-- 新建同步盘：加密 / 认证明文 / 明文镜像三选一。 -->
+    <el-dialog :model-value="createDialogOpen" @update:model-value="closeCreateDialog" width="600" align-center class="create-drive-dialog"
+      :style="{ maxHeight: 'calc(100vh - var(--titlebar-height, 42px) - 30px)', minHeight: '400px' }"
       :show-close="!busy" :close-on-click-modal="false" :close-on-press-escape="!busy" data-test="create-drive-dialog">
       <template #header="{ titleId, titleClass }">
         <div class="create-header">
-          <span :id="titleId" :class="titleClass">{{ t('drive.createOrConnect') }}</span>
+          <span :id="titleId" :class="titleClass">{{ t('drive.createTitle') }}</span>
           <el-popover placement="bottom-start" trigger="click" :width="320" :show-after="0" popper-class="queue-help-popper">
             <div class="queue-help"><p>{{ t('cloud.safetyHint') }}</p></div>
             <template #reference>
@@ -360,15 +486,25 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
           </el-popover>
         </div>
       </template>
-      <div class="drive-tabs" role="tablist" :aria-label="t('drive.createOrConnect')">
-        <button type="button" role="tab" class="drive-tab" data-test="tab-create" :aria-selected="createTab === 'create'" :class="{ 'is-active': createTab === 'create' }" @click="createTab = 'create'">{{ t('drive.tabCreate') }}</button>
-        <button type="button" role="tab" class="drive-tab" data-test="tab-link" :aria-selected="createTab === 'link'" :class="{ 'is-active': createTab === 'link' }" @click="createTab = 'link'">{{ t('drive.tabLink') }}</button>
-      </div>
-      <!-- 新建：加密开关切换「加密同步盘」与「明文镜像同步」。 -->
-      <div v-if="createTab === 'create'">
-        <label class="settings-row"><el-switch v-model="encrypted" class="create-encrypted-toggle" :disabled="busy" /><span>{{ t('drive.encryptedToggle') }}</span></label>
-        <p class="hint">{{ t(encrypted ? 'drive.modeEncryptedHint' : 'drive.modeMirrorHint') }}</p>
-        <form v-if="!encrypted" class="drive-create" @submit.prevent="createMirror">
+      <label class="settings-row"><span>{{ t('drive.createMode') }}</span>
+        <el-select v-model="createMode" class="create-mode" :disabled="busy">
+          <el-option value="encrypted" :label="t('drive.modeEncrypted')" />
+          <el-option value="authenticated_plain" :label="t('drive.modeAuthenticatedPlain')" />
+          <el-option value="mirror" :label="t('drive.modeMirror')" />
+        </el-select>
+      </label>
+      <p class="hint create-mode-hint">{{ t(createModeHint) }}</p>
+      <form class="drive-create" @submit.prevent="submitCreate">
+        <template v-if="needsPassword">
+          <label class="settings-row"><span>{{ t('cloud.password') }}</span>
+            <el-input v-model="newDrive.password" class="append-password" type="password" autocomplete="new-password" :disabled="busy" />
+          </label>
+          <label class="settings-row"><span>{{ t('cloud.passwordConfirm') }}</span>
+            <el-input v-model="newDrive.confirmation" class="append-confirmation" type="password" autocomplete="new-password" :disabled="busy" />
+          </label>
+          <p class="hint">{{ t(passwordHint) }}</p>
+        </template>
+        <template v-if="isMirror">
           <label class="settings-row"><span>{{ t('drive.mirrorCloudFolder') }}</span>
             <el-input v-model="mirrorForm.cloudPrefix" class="mirror-cloud-prefix" :placeholder="t('drive.mirrorCloudFolderHint')" :disabled="busy" />
             <el-button class="pick-cloud-folder" :disabled="busy" @click="openPicker">{{ t('drive.pickCloudFolder') }}</el-button>
@@ -377,8 +513,8 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
             <el-input v-model="mirrorForm.localRoot" class="mirror-local-root" :placeholder="t('drive.chooseFolderHint')" :disabled="busy" />
             <el-button class="choose-mirror-root" :disabled="busy" @click="chooseMirrorRoot">{{ t('cloud.choose') }}</el-button>
           </label>
-        </form>
-        <form v-else class="drive-create" @submit.prevent="create">
+        </template>
+        <template v-else>
           <label class="settings-row"><span>{{ t('drive.localFolder') }}</span>
             <el-input v-model="newDrive.localRoot" class="new-drive-local" :placeholder="t('drive.chooseFolderHint')" :disabled="busy" />
             <el-button class="choose-new-root" :disabled="busy" @click="chooseNewRoot">{{ t('cloud.choose') }}</el-button>
@@ -386,53 +522,82 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
           <label class="settings-row"><span>{{ t('drive.remoteFolder') }}</span>
             <el-input v-model="newDrive.logicalPath" class="new-drive-folder" :placeholder="t('drive.folderDefaultHint')" :disabled="busy" />
           </label>
-          <label class="settings-row"><span>{{ t('cloud.password') }}</span>
-            <el-input v-model="newDrive.password" class="append-password" type="password" autocomplete="new-password" :disabled="busy" />
-          </label>
-          <label class="settings-row"><span>{{ t('cloud.passwordConfirm') }}</span>
-            <el-input v-model="newDrive.confirmation" class="append-confirmation" type="password" autocomplete="new-password" :disabled="busy" />
-          </label>
-          <p class="hint">{{ t('drive.passwordHint') }}</p>
-          <details class="create-advanced">
-            <summary>{{ t('drive.createAdvanced') }}</summary>
-            <label class="settings-row"><span>{{ t('cloudAppend.mode') }}</span><el-select v-model="mode" class="append-mode" :disabled="busy"><el-option value="encrypted" :label="t('cloud.encrypted')" /><el-option value="authenticated_plain" :label="t('cloudAppend.plain')" /></el-select></label>
-            <p>{{ t(mode === 'encrypted' ? 'cloudAppend.encryptedHint' : 'cloudAppend.plainHint') }}</p>
-          </details>
-        </form>
-      </div>
-      <!-- 链接已有同步盘：密码 + 已有同步盘下拉（旁有刷新）+ 本地目录。 -->
-      <div v-else>
-        <p class="hint">{{ t('drive.linkPasswordHint') }}</p>
-        <div class="settings-rows append-settings" :aria-busy="busy">
+        </template>
+      </form>
+      <template #footer>
+        <el-button class="cancel-create-drive" :disabled="busy" @click="closeCreateDialog">{{ t('common.cancel') }}</el-button>
+        <el-button v-if="isMirror" class="mirror-create" type="primary" :disabled="!canCreateMirror" :loading="busy" @click="createMirror">{{ t('drive.createMirror') }}</el-button>
+        <el-button v-else class="append-create" type="primary" :disabled="!canCreate" :loading="busy" @click="create">{{ t('drive.createAndBind') }}</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 连接远端同步盘：发现 anchor、校验密码/指纹，再绑定本地目录。 -->
+    <el-dialog :model-value="connectDialogOpen" @update:model-value="closeConnectDialog" width="600" align-center
+      :style="{ maxHeight: 'calc(100vh - var(--titlebar-height, 42px) - 30px)' }"
+      :show-close="!busy" :close-on-click-modal="false" :close-on-press-escape="!busy" data-test="connect-drive-dialog">
+      <template #header="{ titleId, titleClass }">
+        <div class="create-header">
+          <span :id="titleId" :class="titleClass">{{ t('drive.connectRemote') }}</span>
+          <el-popover placement="bottom-start" trigger="click" :width="320" :show-after="0" popper-class="queue-help-popper">
+            <div class="queue-help"><p>{{ t('cloud.safetyHint') }}</p></div>
+            <template #reference>
+              <button type="button" class="create-header__help" :aria-label="t('drive.helpLabel')">?</button>
+            </template>
+          </el-popover>
+        </div>
+      </template>
+      <p class="hint">{{ t('drive.connectRemoteHint') }}</p>
+      <div class="settings-rows append-settings" :aria-busy="busy">
+        <label class="settings-row"><span>{{ t('drive.discoveredDrives') }}</span>
+          <el-select v-if="candidates.length" v-model="selectedCandidateKey" class="append-candidate" :disabled="busy">
+            <el-option v-for="(item, index) in candidates" :key="item.key" :value="item.key" :label="`${t('drive.number', { number: index + 1 })} · ${candidateModeLabel(item)}`" />
+          </el-select>
+          <el-button class="append-discover" :disabled="busy || !connectionId" @click="discover">{{ candidates.length ? t('drive.refresh') : t('drive.discover') }}</el-button>
+        </label>
+        <p v-if="state === 'empty' && !busy" class="hint">{{ t('drive.empty') }}</p>
+        <div v-if="candidate" class="append-trust">
+          <p class="connect-candidate-type">{{ candidateModeLabel(candidate) }}</p>
+          <p class="hint">{{ candidateModeHint(candidate) }}</p>
           <label class="settings-row"><span>{{ t('cloud.password') }}</span><el-input v-model="password" class="append-join-password" type="password" autocomplete="current-password" :disabled="busy" /></label>
-          <el-button class="append-discover" :disabled="busy || !connectionId" @click="discover">{{ t('drive.discover') }}</el-button>
-          <label v-if="candidates.length" class="settings-row"><span>{{ t('drive.select') }}</span>
-            <el-select v-model="selectedCandidateKey" class="append-candidate" :disabled="busy">
-              <el-option v-for="(item, index) in candidates" :key="item.key" :value="item.key" :label="t('drive.number', { number: index + 1 })" />
-            </el-select>
-            <el-button class="append-refresh" :disabled="busy" @click="discover">{{ t('drive.refresh') }}</el-button>
-          </label>
-          <div v-if="candidate" class="append-trust">
-            <p>{{ candidate.descriptor.mode === 'encrypted' ? t('cloud.encrypted') : t('cloudAppend.plain') }}</p>
-            <details class="advanced-security"><summary>{{ t('drive.advancedSecurity') }}</summary>
-              <p>{{ t('drive.fingerprint') }}: {{ candidate.fingerprint }}</p>
-              <label class="settings-row"><span>{{ t('cloudAppend.trustedFingerprint') }}</span><el-input v-model="trustedFingerprint" class="append-fingerprint" :disabled="busy" /></label>
-              <label class="settings-row"><el-switch v-model="acceptTofu" class="append-tofu" :disabled="busy" /><span>{{ t('drive.tofu') }}</span></label>
-            </details>
-            <label class="settings-row"><span>{{ t('drive.linkLocalFolder') }}</span><el-input v-model="linkForm.localRoot" class="link-local-root" :placeholder="t('drive.chooseFolderHint')" :disabled="busy" /><el-button class="choose-link-root" :disabled="busy" @click="chooseLinkRoot">{{ t('cloud.choose') }}</el-button></label>
-            <label v-if="joinedRepoId && linkRoots.length > 1" class="settings-row"><span>{{ t('drive.folder') }}</span><el-select v-model="linkForm.selectedRoot" class="link-root" :disabled="busy"><el-option v-for="root in linkRoots" :key="root" :value="root" :label="root" /></el-select></label>
-            <p v-if="joinedRepoId && linkRoots.length > 1" class="hint">{{ t('drive.linkRootHint') }}</p>
-            <label v-if="joinedRepoId && linkRoots.length === 0" class="settings-row"><span>{{ t('drive.folder') }}</span><el-input v-model="linkForm.newRoot" class="link-new-root" :placeholder="t('cloudAppend.newRoot')" :disabled="busy" /></label>
-            <p v-if="joinedRepoId && linkRoots.length === 0" class="hint">{{ t('drive.linkNewRootHint') }}</p>
-            <el-button v-if="!joinedRepoId || linkRoots.length === 1" class="append-join" :disabled="!canJoin" @click="join">{{ t('drive.connect') }}</el-button>
-            <el-button v-else class="append-bind" :disabled="!linkForm.selectedRoot && !linkForm.newRoot.trim()" @click="confirmBind">{{ t('drive.linkBind') }}</el-button>
-          </div>
+          <p class="hint">{{ t(candidate.descriptor.mode === 'encrypted' ? 'drive.passwordHintEncrypted' : 'drive.passwordHintAuthenticatedPlain') }}</p>
+          <details class="advanced-security"><summary>{{ t('drive.advancedSecurity') }}</summary>
+            <p>{{ t('drive.fingerprint') }}: {{ candidate.fingerprint }}</p>
+            <label class="settings-row"><span>{{ t('cloudAppend.trustedFingerprint') }}</span><el-input v-model="trustedFingerprint" class="append-fingerprint" :disabled="busy" /></label>
+            <label class="settings-row"><el-switch v-model="acceptTofu" class="append-tofu" :disabled="busy" /><span>{{ t('drive.tofu') }}</span></label>
+          </details>
+          <label class="settings-row"><span>{{ t('drive.linkLocalFolder') }}</span><el-input v-model="linkForm.localRoot" class="link-local-root" :placeholder="t('drive.chooseFolderHint')" :disabled="busy" /><el-button class="choose-link-root" :disabled="busy" @click="chooseLinkRoot">{{ t('cloud.choose') }}</el-button></label>
+          <label v-if="joinedRepoId && linkRoots.length > 1" class="settings-row"><span>{{ t('drive.folder') }}</span><el-select v-model="linkForm.selectedRoot" class="link-root" :disabled="busy"><el-option v-for="root in linkRoots" :key="root" :value="root" :label="root" /></el-select></label>
+          <p v-if="joinedRepoId && linkRoots.length > 1" class="hint">{{ t('drive.linkRootHint') }}</p>
+          <label v-if="joinedRepoId && linkRoots.length === 0" class="settings-row"><span>{{ t('drive.folder') }}</span><el-input v-model="linkForm.newRoot" class="link-new-root" :placeholder="t('cloudAppend.newRoot')" :disabled="busy" /></label>
+          <p v-if="joinedRepoId && linkRoots.length === 0" class="hint">{{ t('drive.linkNewRootHint') }}</p>
         </div>
       </div>
       <template #footer>
-        <el-button class="cancel-create-drive" :disabled="busy" @click="closeCreateDialog">{{ t('common.cancel') }}</el-button>
-        <el-button v-if="createTab === 'create' && !encrypted" class="mirror-create" type="primary" :disabled="!canCreateMirror" :loading="busy" @click="createMirror">{{ t('drive.createMirror') }}</el-button>
-        <el-button v-if="createTab === 'create' && encrypted" class="append-create" type="primary" :disabled="!canCreate" :loading="busy" @click="create">{{ t('drive.createAndBind') }}</el-button>
+        <el-button class="cancel-connect-drive" :disabled="busy" @click="closeConnectDialog">{{ t('common.cancel') }}</el-button>
+        <el-button v-if="!joinedRepoId || linkRoots.length === 1" class="append-join" :disabled="!canJoin" @click="join">{{ t('drive.connect') }}</el-button>
+        <el-button v-else class="append-bind" :disabled="!linkForm.selectedRoot && !linkForm.newRoot.trim()" @click="confirmBind">{{ t('drive.linkBind') }}</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 本地目录：给本机已有同步盘新增或编辑一个映射。 -->
+    <el-dialog :model-value="mappingEditorOpen" @update:model-value="closeMappingDialog" :title="editingMappingId ? t('drive.editLocalFolder') : t('drive.addFolder')" width="560" align-center
+      :style="{ maxHeight: 'calc(100vh - var(--titlebar-height, 42px) - 30px)' }"
+      :show-close="!busy" :close-on-click-modal="false" :close-on-press-escape="!busy" data-test="mapping-dialog">
+      <div class="settings-rows mapping-editor">
+        <label class="settings-row"><span>{{ t('drive.targetDrive') }}</span>
+          <el-select v-if="repositories.length > 1" v-model="mapping.repositoryId" class="mapping-repository" :disabled="busy || !!editingMappingId"><el-option v-for="repo in repositories" :key="repo.id" :value="repo.id" :label="repo.label + ' · ' + repositoryType(repo)" /></el-select>
+          <span v-else class="mapping-drive-static">{{ repositories[0] ? `${repositories[0].label} · ${repositoryType(repositories[0])}` : t('drive.noDrivesForMapping') }}</span>
+        </label>
+        <p class="hint">{{ t('drive.mappingScopeHint') }}</p>
+        <label class="settings-row"><span>{{ t('cloud.localRoot') }}</span><el-input v-model="mapping.localRoot" class="mapping-local" :disabled="busy" /><el-button class="choose-mapping-root" :disabled="busy" @click="chooseRoot">{{ t('cloud.choose') }}</el-button></label>
+        <label class="settings-row"><span>{{ t('drive.folder') }}</span><el-select v-if="selectedRepository?.append && roots.length" v-model="mapping.logicalPath" class="append-root" :disabled="busy"><el-option v-for="(root, index) in roots" :key="root" :value="root" :label="t('drive.folderNumber', { number: index + 1, name: root })" /></el-select><el-input v-else v-model="mapping.logicalPath" class="mapping-remote" :placeholder="t('drive.newFolder')" :disabled="busy" /></label>
+        <p>{{ t('drive.folderHint') }}</p>
+        <!-- 新映射的自动同步由后端在首次保存时保持关闭，仅在编辑现有映射时提供开关。 -->
+        <label v-if="editingMappingId" class="settings-row"><span>{{ t('cloud.schedule') }}</span><el-switch v-model="mapping.schedule.enabled" :disabled="busy" /><input v-model.number="mapping.schedule.interval" :disabled="busy" type="number" min="60" step="60" /></label>
+      </div>
+      <template #footer>
+        <el-button class="cancel-mapping" :disabled="busy" @click="closeMappingDialog">{{ t('common.cancel') }}</el-button>
+        <el-button class="mapping-save" type="primary" :disabled="busy" @click="saveMapping">{{ editingMappingId ? t('cloud.update') : t('cloud.save') }}</el-button>
       </template>
     </el-dialog>
 
@@ -451,61 +616,34 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
         <el-button class="picker-select" type="primary" @click="confirmPicker">{{ t('drive.pickerSelect') }}</el-button>
       </template>
     </el-dialog>
-
-    <ul class="drive-list"><li v-for="repo in repositories" :key="repo.id" :class="{ 'is-active': repo.id === focusId }">{{ repo.label }} · {{ repo.binding?.appendMode === 'authenticated_plain' || repo.mode === 'plain' ? t('cloudAppend.plain') : t('cloud.encrypted') }}</li></ul>
-
-    <h4>{{ t('drive.mirrorList') }}</h4>
-    <p v-if="!mirrorMappings.length" class="hint">{{ t('cloudBrowser.noSyncDrives') }}</p>
-    <div v-for="item in mirrorMappings" :key="item.id" class="cloud-item mirror-item" :class="{ 'is-active': item.id === focusId }">
-      <span>{{ item.localRoot }} → _peerdav_mirror/{{ item.cloudPrefix || '' }}</span>
-      <span class="mirror-status" role="status">{{ mirrorStatusText(item) }}</span>
-      <span class="mirror-actions">
-        <el-button v-if="!mirrorBusy[item.id]" :disabled="busy" @click="syncMirror(item.id)">{{ t('drive.mirrorSync') }}</el-button>
-        <el-button v-else @click="cancelMirror(item.id)">{{ t('drive.mirrorCancel') }}</el-button>
-        <el-button :disabled="mirrorBusy[item.id] || busy" @click="deleteMirror(item)">{{ t('drive.mirrorDelete') }}</el-button>
-      </span>
-      <label class="mirror-schedule">
-        <el-switch :model-value="!!item.schedule?.enabled" :disabled="busy || mirrorBusy[item.id]" @update:model-value="toggleMirrorSchedule(item, $event)" />
-        <span>{{ t('cloud.schedule') }}</span>
-        <input :value="item.schedule?.interval || 900" class="mirror-interval" type="number" min="60" step="60" :disabled="busy || mirrorBusy[item.id] || !item.schedule?.enabled" @change="changeMirrorInterval(item, $event.target.value)" />
-      </label>
-      <details v-if="mirrorResults[item.id]?.conflicts?.length" class="mirror-conflicts">
-        <summary>{{ t('drive.mirrorConflicts', { count: mirrorResults[item.id].conflicts.length }) }}</summary>
-        <ul><li v-for="path in mirrorResults[item.id].conflicts" :key="path">{{ path }}</li></ul>
-      </details>
-      <details v-if="mirrorResults[item.id]?.failures?.length" class="mirror-failures">
-        <summary>{{ t('drive.mirrorFailures', { count: mirrorResults[item.id].failures.length }) }}</summary>
-        <ul><li v-for="failure in mirrorResults[item.id].failures" :key="failure.path">{{ failure.path }} · {{ failure.reason }}</li></ul>
-      </details>
-    </div>
-
-    <h4>{{ t('drive.localFolders') }}</h4>
-    <el-button class="new-mapping" :disabled="busy" @click="newMapping">{{ t('drive.addFolder') }}</el-button>
-    <div v-if="mappingEditorOpen" class="settings-rows mapping-editor">
-      <label class="settings-row"><span>{{ t('drive.select') }}</span><el-select v-model="mapping.repositoryId" class="mapping-repository" :disabled="busy || !!editingMappingId"><el-option v-for="repo in repositories" :key="repo.id" :value="repo.id" :label="repo.label" /></el-select></label>
-      <label class="settings-row"><span>{{ t('cloud.localRoot') }}</span><el-input v-model="mapping.localRoot" class="mapping-local" :disabled="busy" /><el-button class="choose-mapping-root" :disabled="busy" @click="chooseRoot">{{ t('cloud.choose') }}</el-button></label>
-      <label class="settings-row"><span>{{ t('drive.folder') }}</span><el-select v-if="selectedRepository?.append && roots.length" v-model="mapping.logicalPath" class="append-root" :disabled="busy"><el-option v-for="(root, index) in roots" :key="root" :value="root" :label="t('drive.folderNumber', { number: index + 1, name: root })" /></el-select><el-input v-else v-model="mapping.logicalPath" class="mapping-remote" :placeholder="t('drive.newFolder')" :disabled="busy" /></label>
-      <p>{{ t('drive.folderHint') }}</p>
-      <!-- 新映射的自动同步由后端在首次保存时保持关闭，仅在编辑现有映射时提供开关。 -->
-      <label v-if="editingMappingId" class="settings-row"><span>{{ t('cloud.schedule') }}</span><el-switch v-model="mapping.schedule.enabled" :disabled="busy" /><input v-model.number="mapping.schedule.interval" :disabled="busy" type="number" min="60" step="60" /></label>
-      <el-button class="mapping-save" :disabled="busy" @click="saveMapping">{{ editingMappingId ? t('cloud.update') : t('cloud.save') }}</el-button>
-    </div>
-    <div v-for="item in mappings" :key="item.id" class="cloud-item mapping-item"><span>{{ item.localRoot }} → {{ item.logicalPath || '/' }}</span><el-button :disabled="busy" @click="editMapping(item)">{{ t('cloud.edit') }}</el-button><el-button :disabled="busy" @click="deleteMapping(item)">{{ t('drive.removeMapping') }}</el-button><el-button :disabled="busy" @click="showPreview(item)">{{ t('cloud.preview') }}</el-button><el-button :disabled="busy" @click="cancel(item)">{{ t('cloud.cancel') }}</el-button><el-button :disabled="busy" @click="loadRecovery(item)">{{ t('cloud.recovery') }}</el-button></div>
-    <div v-if="preview" class="cloud-preview"><p>{{ t('cloud.confirmPreview') }}</p><p>{{ t('cloud.previewUploads') }}: {{ preview.summary?.uploads ?? 0 }} · {{ t('cloud.previewDownloads') }}: {{ preview.summary?.downloads ?? 0 }} · {{ t('cloud.previewDeletes') }}: {{ preview.summary?.deletes ?? 0 }} · {{ t('cloud.previewConflicts') }}: {{ preview.summary?.conflicts ?? 0 }}</p><pre v-if="typeof preview.summary === 'string'">{{ preview.summary }}</pre><el-button :disabled="busy" @click="applyPreview">{{ t('cloud.sync') }}</el-button></div>
-    <ul v-if="recovery.length"><li v-for="record in recovery" :key="record.id">{{ record.relativePath }} · {{ record.phase }}<el-button :disabled="busy" @click="restore(record)">{{ t('cloud.restore') }}</el-button></li></ul>
-    <p v-for="status in statuses" :key="status.mappingId" class="cloud-progress">{{ phaseLabel(status.phase) }} {{ status.detail }}</p>
   </section>
 </template>
 
 <style scoped>
-.drive-list { padding: 0; list-style: none; }
-.drive-list li { padding: 8px; border-radius: 6px; }
-.drive-list .is-active { background: var(--app-surface-2); box-shadow: inset 3px 0 var(--el-color-primary); }
+.drives-header { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
+.add-menu { position: relative; }
+.add-menu-trigger { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; border: 1px solid var(--app-border); border-radius: 6px; background: transparent; color: var(--app-text-secondary); font-size: 16px; line-height: 1; cursor: pointer; }
+.add-menu-trigger:hover, .add-menu-trigger[aria-expanded="true"] { background: var(--app-surface-2); color: var(--app-text); }
+.add-menu-list { position: absolute; right: 0; top: calc(100% + 4px); z-index: 30; display: grid; min-width: 190px; padding: 4px; border: 1px solid var(--app-border); border-radius: 10px; background: var(--app-surface); box-shadow: 0 12px 28px rgba(22, 32, 46, 0.16); }
+.add-menu-list button { padding: 8px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--app-text); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.add-menu-list button:hover, .add-menu-list button:focus-visible { background: var(--app-surface-2); outline: none; }
 .sync-drives { min-width: 0; overflow-wrap: anywhere; }
+.drive-list { padding: 0; margin: 0 0 .6rem; list-style: none; }
+.drive-list li { padding: 6px 8px; border-radius: 6px; }
+.drive-list .is-active { background: var(--app-surface-2); box-shadow: inset 3px 0 var(--el-color-primary); }
 .drive-create { padding: 12px; margin: .6rem 0; border-radius: 10px; background: var(--app-surface-2); }
 .drive-create h4 { margin: 0 0 .4rem; }
-.settings-row, .cloud-item { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin: .6rem 0; }
+.settings-row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin: .6rem 0; }
 .sync-drives :deep(.el-input), .sync-drives :deep(.el-select) { min-width: 0; max-width: 100%; }
+.drive-table-wrap { overflow-x: auto; }
+.drive-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.drive-table th, .drive-table td { padding: 8px; border-bottom: 1px solid var(--app-border); text-align: left; vertical-align: top; }
+.drive-table th { color: var(--app-text-muted); font-weight: 500; white-space: nowrap; }
+.drive-table tr.is-active { background: var(--app-surface-2); box-shadow: inset 3px 0 var(--el-color-primary); }
+.mapping-actions, .mirror-actions { display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; }
+.mapping-actions :deep(.el-button), .mirror-actions :deep(.el-button) { margin-left: 0; }
+.mirror-actions { flex-direction: column; align-items: flex-start; }
+.recovery-list ul { padding-left: 1.2rem; }
 .cloud-preview pre { white-space: pre-wrap; }
 summary { cursor: pointer; padding: .7rem 0; }
 .create-header { display: flex; align-items: center; gap: .5rem; }
@@ -520,9 +658,13 @@ summary { cursor: pointer; padding: .7rem 0; }
 .picker-list { list-style: none; padding: 0; margin: .4rem 0; max-height: 220px; overflow: auto; }
 .picker-folder { width: 100%; text-align: left; padding: 6px 10px; border: 1px solid var(--app-border); border-radius: 6px; background: var(--app-surface-2); cursor: pointer; }
 .picker-folder:hover { background: var(--app-surface-3); }
-.mirror-item { flex-wrap: wrap; }
-.mirror-status { color: var(--app-text-muted); font-size: 12.5px; }
-.mirror-actions { display: inline-flex; gap: .4rem; }
+.mirror-status, .mapping-status { color: var(--app-text-muted); font-size: 12.5px; }
+.connect-candidate-type { font-weight: 600; color: var(--app-text); }
+.mapping-drive-static { color: var(--app-text-secondary); }
+.mirror-stats { color: var(--app-text-muted); white-space: nowrap; }
 .mirror-schedule { display: inline-flex; align-items: center; gap: .4rem; font-size: 12.5px; color: var(--app-text-muted); }
 .mirror-interval { width: 76px; padding: 2px 6px; border: 1px solid var(--app-border); border-radius: 6px; background: var(--app-surface-2); color: var(--app-text); }
+:deep(.el-overlay-dialog) { box-sizing: border-box; display: flex; align-items: center; justify-content: center; padding-top: var(--titlebar-height, 42px); padding-bottom: 30px; }
+:deep(.el-dialog) { box-sizing: border-box; display: flex; flex-direction: column; max-height: calc(100vh - var(--titlebar-height, 42px) - 30px); margin: 0 auto; }
+:deep(.el-dialog__body) { overflow: auto; }
 </style>

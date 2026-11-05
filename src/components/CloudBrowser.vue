@@ -954,7 +954,7 @@ onBeforeUnmount(() => {
         <p v-if="!buckets.length" class="sidebar-empty">{{ t('cloudBrowser.noBuckets') }}</p>
         <div class="sidebar-section-head">
           <p class="sidebar-label">{{ t('cloudBrowser.syncDrives') }}</p>
-          <button type="button" class="add-sync-drive" :aria-label="t('drive.addFolder')" @click="openManagement()"><span aria-hidden="true">+</span></button>
+          <button type="button" class="add-sync-drive" :aria-label="t('drive.manage')" @click="openManagement()"><span aria-hidden="true">&gt;</span></button>
         </div>
         <button v-for="(drive, index) in drives" :key="index" type="button" class="share-link drive-link" :class="{ 'is-active': view === 'management' && activeDriveId === drive.id }" @click="openManagement(drive.id)">
           <FileGlyph :entry="{ isDir: true, name: drive.label }" /><span>{{ drive.label }}</span>
