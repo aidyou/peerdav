@@ -77,6 +77,41 @@ async fn dropping_handle_aborts_worker() {
 }
 
 #[tokio::test]
+async fn paused_guard_error_does_not_terminate_enabled_schedule() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (resumed, resumed_rx) = tokio::sync::oneshot::channel();
+    let resumed = Arc::new(std::sync::Mutex::new(Some(resumed)));
+    let tick_source: TickSource = {
+        let calls = Arc::clone(&calls);
+        Arc::new(move |_mapping| {
+            let calls = Arc::clone(&calls);
+            let resumed = Arc::clone(&resumed);
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(peerdav_lib::AppError {
+                        code: "CLOUD_ROOT_NEEDS_BASELINE".into(),
+                        message: "First sync requires confirmation".into(),
+                        detail: None,
+                        context: None,
+                    });
+                }
+                if let Some(sender) = resumed.lock().expect("notification lock").take() {
+                    assert!(sender.send(()).is_ok());
+                }
+                Ok(())
+            }
+            .boxed()
+        })
+    };
+    let handle = ScheduleHandle::start_for_test("mapping", Duration::from_millis(10), tick_source);
+    tokio::time::timeout(Duration::from_secs(1), resumed_rx)
+        .await.expect("later tick resumes").expect("notification");
+    assert!(calls.load(Ordering::SeqCst) >= 2);
+    assert!(!handle.is_finished());
+    handle.stop_and_join().await.expect("schedule joins");
+}
+
+#[tokio::test]
 async fn source_receives_mapping_id() {
     let seen = Arc::new(std::sync::Mutex::new(String::new()));
     let seen_source = {

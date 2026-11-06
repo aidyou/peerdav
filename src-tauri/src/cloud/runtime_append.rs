@@ -1,4 +1,5 @@
 use super::*;
+use crate::cloud::types::S3Config;
 use crate::sync::{
     append_discovery, append_engine, append_engine_types::AppendPullRequest,
     append_index::AppendIndex, append_repository::AppendRepository, append_types::*,
@@ -36,7 +37,7 @@ fn trust(binding: &AppendRepositoryBinding) -> TrustBinding {
     }
 }
 fn revisions(
-    closure: &ValidatedClosure,
+    closure: &AuthenticatedMetadata,
 ) -> Result<crate::sync::merge_types::RevisionMap, AppError> {
     let mut revisions = BTreeMap::new();
     for tree in closure.trees().values() {
@@ -50,21 +51,37 @@ fn revisions(
     }
     Ok(revisions)
 }
-fn roots(closure: &ValidatedClosure) -> Result<Vec<String>, AppError> {
-    let projection = merge::project(&revisions(closure)?).map_err(append_error)?;
-    let mut roots = std::collections::BTreeSet::new();
-    for entry in projection.entries {
-        if let Some(root) = entry.logical_path.first() {
-            roots.insert(root.clone());
-        }
-    }
-    Ok(roots.into_iter().collect())
-}
 impl CloudRuntime {
+    fn append_config(&self, connection: &str, bucket: Option<&str>) -> Result<S3Config, AppError> {
+        let mut config = self.connection(connection)?.config;
+        if let Some(bucket) = bucket {
+            if bucket != config.bucket && !config.buckets.iter().any(|item| item == bucket) {
+                return Err(runtime_error("CLOUD_CONFIG_INVALID", "请选择已配置的存储桶 / Select a configured bucket"));
+            }
+            config.bucket = bucket.to_owned();
+        }
+        Ok(config)
+    }
     fn append_store(&self, connection: &str) -> Result<Arc<dyn ObjectStore>, AppError> {
-        Ok(Arc::new(
-            S3Store::new(self.connection(connection)?.config).map_err(cloud_error)?,
-        ))
+        Ok(Arc::new(S3Store::new(self.append_config(connection, None)?).map_err(cloud_error)?))
+    }
+    fn bound_append_store(&self, cached: &CachedAppendRepository) -> Result<Arc<dyn ObjectStore>, AppError> {
+        let mut config = self.connection(&cached.connection_id)?.config;
+        if let Some(storage) = &cached.binding.storage {
+            if config.endpoint != storage.endpoint {
+                return Err(runtime_error("CLOUD_CONFIG_INVALID", "同步盘端点已变化，请重新连接 / Drive endpoint changed; reconnect the drive"));
+            }
+            config.bucket = storage.bucket.clone();
+            config.prefix = storage.prefix.clone();
+        }
+        Ok(Arc::new(S3Store::new(config).map_err(cloud_error)?))
+    }
+    pub async fn discover_append_in_bucket(&self, connection: &str, bucket: Option<&str>) -> Result<Vec<Candidate>, AppError> {
+        self.admit()?;
+        let _permit = self.network.read().await;
+        self.admit()?;
+        let store = S3Store::new(self.append_config(connection, bucket)?).map_err(cloud_error)?;
+        AppendRepository::discover_anchors(&store).await.map_err(append_error)
     }
     pub async fn discover_append_repositories(
         &self,
@@ -95,10 +112,10 @@ impl CloudRuntime {
         self.admit()?;
         let password = Zeroizing::new(input.password);
         let confirmation = Zeroizing::new(input.password_confirmation);
-        if password.is_empty() || password.as_str() != confirmation.as_str() {
+        if password.chars().count() < 6 || password.as_str() != confirmation.as_str() {
             return Err(runtime_error(
                 "CLOUD_APPEND_PASSWORD",
-                "密码不能为空且确认必须一致 / Password is required and confirmation must match",
+                "新密码至少需要 6 位且确认必须一致 / New passwords require at least 6 characters and matching confirmation",
             ));
         }
         let descriptor = Descriptor {
@@ -120,7 +137,9 @@ impl CloudRuntime {
             AppendRepository::prepare_anchor(descriptor, password.as_bytes())
                 .map_err(append_error)?;
         selected.source = TrustSource::AcceptedTofu;
-        let store = self.append_store(&input.connection_id)?;
+        let config = self.append_config(&input.connection_id, input.bucket.as_deref())?;
+        let storage = Some(AppendStorage { endpoint: config.endpoint.clone(), bucket: config.bucket.clone(), prefix: config.prefix.clone() });
+        let store: Arc<dyn ObjectStore> = Arc::new(S3Store::new(config).map_err(cloud_error)?);
         store
             .put(
                 object.key(),
@@ -136,6 +155,7 @@ impl CloudRuntime {
             connection_id: input.connection_id,
             password: password.to_string(),
             binding: AppendRepositoryBinding {
+                storage,
                 repo_id: selected.repo_id,
                 anchor_key: selected.key,
                 anchor_fingerprint: selected.fingerprint,
@@ -174,7 +194,9 @@ impl CloudRuntime {
             mode: input.mode,
             source,
         };
-        let store = self.append_store(&input.connection_id)?;
+        let config = self.append_config(&input.connection_id, input.bucket.as_deref())?;
+        let storage = Some(AppendStorage { endpoint: config.endpoint.clone(), bucket: config.bucket.clone(), prefix: config.prefix.clone() });
+        let store: Arc<dyn ObjectStore> = Arc::new(S3Store::new(config).map_err(cloud_error)?);
         AppendRepository::open_selected(store.clone(), selected.clone(), password.as_bytes())
             .await
             .map_err(append_error)?;
@@ -187,7 +209,7 @@ impl CloudRuntime {
             selected.repo_id.clone(),
         )
         .map_err(append_error)?;
-        let closure = append_discovery::discover(
+        let root_candidates = append_discovery::discover_roots(
             store,
             &selected,
             password.as_bytes(),
@@ -200,12 +222,13 @@ impl CloudRuntime {
             connection_id: input.connection_id,
             password: password.to_string(),
             binding: AppendRepositoryBinding {
+                storage,
                 repo_id: selected.repo_id,
                 anchor_key: selected.key,
                 anchor_fingerprint: selected.fingerprint,
                 append_mode: selected.mode,
                 trust_source: selected.source,
-                root_candidates: roots(&closure)?,
+                root_candidates,
                 selected_root: None,
             },
         };
@@ -248,14 +271,9 @@ impl CloudRuntime {
         cached.binding.selected_root = Some(input.selected_root);
         let _permit = self.network.write().await;
         self.admit()?;
-        let mut mapping = input.mapping;
+        let mapping = input.mapping;
         if let Some(id) = input.mapping_id.as_deref() {
             self.manager.stop_mapping(id).await?;
-            if self.mapping(id)?.local_root != mapping.local_root {
-                mapping.schedule.enabled = false;
-            }
-        } else {
-            mapping.schedule.enabled = false;
         }
         let saved = self
             .config
@@ -294,12 +312,71 @@ impl CloudRuntime {
             .load_append_repository(&mapping.connection_id, &mapping.repository_id)
             .map_err(config_error)?;
         if trust(&cached.binding) != trust(&binding)
+            || cached.binding.storage != binding.storage
             || binding.selected_root.as_deref() != Some(mapping.logical_path.as_str())
         {
             return Err(append_error(AppendError::TrustRejected));
         }
         Ok(cached)
     }
+    /// Compare local contents with the last acknowledged epoch, without accessing
+    /// the network or treating an in-flight publication as synchronized.
+    pub async fn local_sync_entries(&self, mapping_id: &str) -> Result<Vec<LocalSyncEntry>, AppError> {
+        self.admit()?;
+        let _permit = self.network.read().await;
+        self.admit()?;
+        let mapping = self.mapping(mapping_id)?;
+        let epoch = Self::root_epoch(&mapping.local_root)?;
+        let revisions = if mapping.protocol == StorageProtocol::AppendV2 {
+            self.append_cached(&mapping)?;
+            let index = self.open_append_index(&mapping, &epoch)?;
+            match index.active_epoch().map_err(append_error)? {
+                Some(epoch) => index.epoch_revisions(&epoch).map_err(append_error)?,
+                None => BTreeMap::new(),
+            }
+        } else {
+            let index = SyncIndex::open(
+                &self.data_dir.join("cloud-sync.sqlite"),
+                self.config.get_or_create_index_key().map_err(config_error)?,
+                mapping.repository_id.clone(), Self::index_scope(&mapping, &epoch),
+            ).map_err(append_error)?;
+            index.load::<MergeSet>("engine", "materialized").map_err(append_error)?
+                .map(|set| set.revisions).unwrap_or_default()
+        };
+        let projection = crate::sync::namespace::project_scoped(
+            &merge::project(&revisions).map_err(append_error)?, &mapping.logical_path,
+        ).map_err(append_error)?;
+        let root = mapping.local_root.clone();
+        let cancel = Arc::clone(&self.cancel);
+        let report = tokio::task::spawn_blocking(move || scan(&root, &ScanOptions { cancel, ..Default::default() }))
+            .await.map_err(append_error)?.map_err(append_error)?;
+        if Self::root_epoch(&mapping.local_root)? != epoch || !report.complete {
+            return Err(runtime_error("CLOUD_ROOT_CHANGED", "本地目录已变化，请刷新 / Local root changed; refresh the listing"));
+        }
+        let base: BTreeMap<_, _> = projection.entries.iter()
+            .map(|entry| (entry.projection_path.join("/"), &entry.value)).collect();
+        let mut entries = Vec::new();
+        for file in &report.files {
+            let synced = matches!(base.get(&file.path), Some(RevisionValue::Live { node: Node::File(saved), .. })
+                if saved.length == file.size && saved.digest == file.whole_file_hash);
+            entries.push(LocalSyncEntry { path: file.path.clone(), name: file.path.rsplit('/').next().unwrap_or("").to_owned(), is_dir: false, size: file.size, synced });
+        }
+        for path in report.directories.iter().filter(|path| !path.is_empty()) {
+            let synced = matches!(base.get(path), Some(RevisionValue::Live { node: Node::Dir, .. }));
+            entries.push(LocalSyncEntry { path: path.clone(), name: path.rsplit('/').next().unwrap_or("").to_owned(), is_dir: true, size: 0, synced });
+        }
+        // Propagate changes (including locally deleted descendants) to folders.
+        let local: std::collections::BTreeSet<_> = entries.iter().map(|e| e.path.as_str()).collect();
+        let changed: Vec<_> = entries.iter().filter(|e| !e.synced).map(|e| e.path.clone())
+            .chain(base.keys().filter(|path| !local.contains(path.as_str())).cloned()).collect();
+        for entry in entries.iter_mut().filter(|e| e.is_dir) {
+            let prefix = format!("{}/", entry.path);
+            if changed.iter().any(|path| path.starts_with(&prefix)) { entry.synced = false; }
+        }
+        entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.path.cmp(&b.path)));
+        Ok(entries)
+    }
+
     pub(super) async fn append_preview_state(
         &self,
         mapping: &CloudMapping,
@@ -307,11 +384,14 @@ impl CloudRuntime {
     ) -> Result<(PreviewCounts, String), AppError> {
         let cached = self.append_cached(mapping)?;
         let mut index = self.open_append_index(mapping, epoch)?;
+        // Separate metadata-only previews from older full-discovery attempts:
+        // an exhausted legacy payload budget must not poison metadata browsing.
+        // Retries within this slot still retain every reservation.
         let operation = index
-            .begin_run("preview", &hex::encode(rand::random::<[u8; 16]>()))
+            .begin_run("preview-metadata-v1", &hex::encode(rand::random::<[u8; 16]>()))
             .map_err(append_error)?;
-        let closure = append_discovery::discover(
-            self.append_store(&mapping.connection_id)?,
+        let closure = append_discovery::discover_metadata(
+            self.bound_append_store(&cached)?,
             &trust(&cached.binding),
             cached.password.as_bytes(),
             &mut index,
@@ -353,7 +433,7 @@ impl CloudRuntime {
             serde_json::to_vec(&closure).map_err(append_error)?,
         ));
         index
-            .complete_run("preview", &operation)
+            .complete_run("preview-metadata-v1", &operation)
             .map_err(append_error)?;
         Ok((preview_counts(&report, &base, &projection), signature))
     }
@@ -385,7 +465,7 @@ impl CloudRuntime {
         }
         crate::sync::root_state::bind_initial(&private).map_err(append_error)?;
         let worker = Arc::new(AppendWorker {
-            store: self.append_store(&mapping.connection_id)?,
+            store: self.bound_append_store(&cached)?,
             index: Mutex::new(Some(self.open_append_index(&mapping, epoch)?)),
             cached,
             root: mapping.local_root,

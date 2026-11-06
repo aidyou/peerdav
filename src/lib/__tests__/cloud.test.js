@@ -18,6 +18,7 @@ describe("cloud API wrappers", () => {
     await cloud.joinRepository({ connectionId: "c", repositoryId: "r" });
     await cloud.saveMapping("m", { localRoot: "/x" });
     await cloud.deleteMapping("m");
+    await cloud.localEntries("m");
     await cloud.preview("m");
     await cloud.sync("m", "p");
     await cloud.cancel("m");
@@ -34,6 +35,7 @@ describe("cloud API wrappers", () => {
       ["cloud_join_repository", { connectionId: "c", repositoryId: "r" }],
       ["cloud_save_mapping", { mappingId: "m", input: { localRoot: "/x" } }],
       ["cloud_delete_mapping", { mappingId: "m" }],
+      ["cloud_local_entries", { mappingId: "m" }],
       ["cloud_preview", { mappingId: "m" }],
       ["cloud_sync", { mappingId: "m", previewId: "p" }],
       ["cloud_cancel", { mappingId: "m" }],
@@ -93,7 +95,7 @@ describe("cloud API wrappers", () => {
     expect(Object.keys(cloud)).toEqual([
       "list", "probeBuckets", "connectionCredentials", "saveConnection", "testConnection", "deleteConnection",
       "createRepository", "joinRepository", "saveMapping", "appendDiscover", "createSyncDrive", "appendCreate", "appendJoin", "appendSaveMapping", "deleteMapping",
-      "preview", "sync", "cancel", "recoveryRecords", "restore", "status",
+      "localEntries", "preview", "sync", "cancel", "recoveryRecords", "restore", "status",
       "mirrorSaveMapping", "mirrorDeleteMapping", "mirrorSync", "mirrorCancel",
     ]);
   });

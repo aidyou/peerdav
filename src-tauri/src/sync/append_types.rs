@@ -26,14 +26,35 @@ pub const MAX_DISCOVERY_ALLOCATION: usize = 256 * 1024 * 1024;
 /// including failed and interrupted requests, not actual received bytes.
 /// `requests` includes stat/HEAD, GET and LIST attempts.
 /// `pages` counts actual attempted LIST page requests only.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Metadata allocation is cumulative; sequential block decoding has a separate
+/// live-workspace bound. Legacy allocation remains available for audit only.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiscoveryBudget {
+    #[serde(default)]
+    pub accounting_version: u32,
+    #[serde(default)]
+    pub legacy_allocation_bytes: usize,
     pub requests: usize,
     pub pages: usize,
     pub bytes_read: usize,
     pub raw_entries: usize,
     pub tree_plaintext: usize,
     pub allocation_bytes: usize,
+}
+
+impl Default for DiscoveryBudget {
+    fn default() -> Self {
+        Self {
+            accounting_version: 2,
+            legacy_allocation_bytes: 0,
+            requests: 0,
+            pages: 0,
+            bytes_read: 0,
+            raw_entries: 0,
+            tree_plaintext: 0,
+            allocation_bytes: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +116,22 @@ impl ValidatedClosure {
     }
     pub fn trees(&self) -> &BTreeMap<String, Tree> {
         &self.trees
+    }
+}
+
+/// Authenticated directory history only: never evidence that file blocks were
+/// read or authenticated, and intentionally not accepted by the sync engine.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct AuthenticatedMetadata {
+    closure: ValidatedClosure,
+}
+impl AuthenticatedMetadata {
+    pub(crate) fn new(closure: ValidatedClosure) -> Self {
+        Self { closure }
+    }
+    pub fn trees(&self) -> &BTreeMap<String, Tree> {
+        self.closure.trees()
     }
 }
 

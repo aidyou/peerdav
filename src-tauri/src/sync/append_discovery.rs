@@ -41,6 +41,60 @@ pub async fn discover<S: ObjectStore + ?Sized>(
     index: &mut AppendIndex,
     operation: &str,
 ) -> Result<ValidatedClosure, AppendError> {
+    discover_inner(store, binding, password, index, operation, true).await
+}
+
+/// Authenticate history for a preview or linking without reading file blocks.
+/// No full-validation markers are persisted; applying data still requires full
+/// discovery in the sync engine.
+pub async fn discover_metadata<S: ObjectStore + ?Sized>(
+    store: Arc<S>,
+    binding: &TrustBinding,
+    password: &[u8],
+    index: &mut AppendIndex,
+    operation: &str,
+) -> Result<AuthenticatedMetadata, AppendError> {
+    discover_inner(store, binding, password, index, operation, false)
+        .await
+        .map(AuthenticatedMetadata::new)
+}
+
+/// Authenticate directory metadata for linking without downloading file payloads.
+/// This is not full closure validation and must never mark objects as validated.
+/// The sync engine still authenticates all referenced blocks before applying data.
+pub async fn discover_roots<S: ObjectStore + ?Sized>(
+    store: Arc<S>,
+    binding: &TrustBinding,
+    password: &[u8],
+    index: &mut AppendIndex,
+    operation: &str,
+) -> Result<Vec<String>, AppendError> {
+    let closure = discover_metadata(store, binding, password, index, operation).await?;
+    let mut revisions = BTreeMap::new();
+    for tree in closure.trees().values() {
+        for revision in &tree.entries {
+            if let Some(old) = revisions.insert(revision.revision_id.clone(), revision.clone()) {
+                if old != *revision {
+                    return Err(AppendError::Invalid("revision collision"));
+                }
+            }
+        }
+    }
+    let projection = crate::sync::merge::project(&revisions)
+        .map_err(|_| AppendError::Invalid("root projection"))?;
+    Ok(projection.entries.into_iter()
+        .filter_map(|entry| entry.logical_path.into_iter().next())
+        .collect::<BTreeSet<_>>().into_iter().collect())
+}
+
+async fn discover_inner<S: ObjectStore + ?Sized>(
+    store: Arc<S>,
+    binding: &TrustBinding,
+    password: &[u8],
+    index: &mut AppendIndex,
+    operation: &str,
+    validate_blocks: bool,
+) -> Result<ValidatedClosure, AppendError> {
     if operation.is_empty() || index.repository_id() != binding.repo_id.as_bytes() {
         return Err(AppendError::Invalid("discovery binding"));
     }
@@ -125,7 +179,13 @@ pub async fn discover<S: ObjectStore + ?Sized>(
         roots.push(commit_reference(&key, &prefix)?);
         after = key;
     }
-    let result = validate_metered(store, repo.repo_id(), &repo, &roots, &mut meter, &limits).await;
+    let result = validate_metered(store, repo.repo_id(), &repo, &roots, &mut meter, &limits, validate_blocks).await;
+    if !validate_blocks {
+        // Linking only authenticates metadata. Do not persist full-validation
+        // markers or let the metadata-only result escape into the sync engine.
+        meter.checkpoint()?;
+        return result;
+    }
     if let Err(AppendError::ResourceLimit(_)) = &result {
         // The persisted meter already contains all completed reservations.
         return result;
@@ -426,7 +486,18 @@ async fn get<S: ObjectStore + ?Sized>(
             MAX_DISCOVERY_READ_BYTES,
             "read bytes",
         )?;
-        if bytes != 0 {
+        budget.checkpoint()?;
+        // Payloads are consumed one at a time and released before the next
+        // block. Bound their live decoding workspace, not the sum of historical
+        // allocations. Network work remains cumulative and durable above.
+        if bytes != 0 && key.contains("/blocks/") {
+            let workspace = bytes.checked_mul(8).and_then(|n| n.checked_add(4096))
+                .ok_or(AppendError::ResourceLimit("block workspace"))?;
+            if workspace > limits.max_allocation.min(MAX_DISCOVERY_ALLOCATION) {
+                return Err(AppendError::ResourceLimit("block workspace"));
+            }
+        }
+        if bytes != 0 && !key.contains("/blocks/") {
             allocation(
                 budget,
                 bytes
@@ -517,7 +588,7 @@ pub async fn validate_closure_with_limits<S: ObjectStore + ?Sized>(
         budget,
         journal: None,
     };
-    validate_metered(store, repo_id, repo, &roots, &mut meter, limits).await
+    validate_metered(store, repo_id, repo, &roots, &mut meter, limits, true).await
 }
 
 async fn validate_metered<S: ObjectStore + ?Sized>(
@@ -527,6 +598,7 @@ async fn validate_metered<S: ObjectStore + ?Sized>(
     roots: &[CommitRef],
     budget: &mut Meter<'_>,
     limits: &DiscoveryLimits,
+    validate_blocks: bool,
 ) -> Result<ValidatedClosure, AppendError> {
     if repo.repo_id() != repo_id {
         return Err(AppendError::Invalid("repository binding"));
@@ -537,6 +609,8 @@ async fn validate_metered<S: ObjectStore + ?Sized>(
     let mut commits: BTreeMap<String, Commit> = BTreeMap::new();
     let mut trees: BTreeMap<String, Tree> = BTreeMap::new();
     let mut snapshots: BTreeMap<String, Snapshot> = BTreeMap::new();
+    // Invocation-local evidence only: never trust persisted validation markers.
+    let mut verified_blocks = BTreeMap::<String, BlockBinding>::new();
     let mut candidates = roots.iter();
     let mut stack: Vec<(CommitRef, usize, Visit)> = Vec::new();
     let mut active = BTreeSet::new();
@@ -616,9 +690,11 @@ async fn validate_metered<S: ObjectStore + ?Sized>(
                     tree,
                     &commit.root.digest,
                     &mut trees,
+                    &mut verified_blocks,
                     budget,
                     depth,
                     limits,
+                    validate_blocks,
                 )
                 .await?;
                 // Pending DFS work is not a maximal frontier. Bound its node
@@ -672,9 +748,11 @@ async fn validate_tree_objects<S: ObjectStore + ?Sized>(
     root: Tree,
     root_digest: &str,
     trees: &mut BTreeMap<String, Tree>,
+    verified_blocks: &mut BTreeMap<String, BlockBinding>,
     budget: &mut Meter<'_>,
     depth: usize,
     limits: &DiscoveryLimits,
+    validate_blocks: bool,
 ) -> Result<Snapshot, AppendError> {
     let mut stack = vec![(root, root_digest.to_owned(), depth, Visit::Enter)];
     let mut active = BTreeSet::new();
@@ -733,11 +811,21 @@ async fn validate_tree_objects<S: ObjectStore + ?Sized>(
                 if trees.len() >= MAX_DISCOVERY_NODES {
                     return Err(AppendError::ResourceLimit("nodes"));
                 }
-                for binding in &tree.bindings {
+                for binding in tree.bindings.iter().filter(|_| validate_blocks) {
+                    if let Some(verified) = verified_blocks.get(&binding.object.digest) {
+                        if verified != binding {
+                            return Err(AppendError::Invalid("binding mismatch"));
+                        }
+                        continue;
+                    }
+                    if verified_blocks.len() >= MAX_DISCOVERY_NODES {
+                        return Err(AppendError::ResourceLimit("nodes"));
+                    }
+                    allocation(budget, expansion(256)?, limits)?;
                     let key = format!("{APPEND_ROOT}/{repo_id}/blocks/{}", binding.object.digest);
                     let bytes = get(store.as_ref(), &key, budget, limits).await?;
-                    allocation(budget, expansion(bytes.len())?, limits)?;
                     repo.open_block_with_ref(&bytes, Some(binding))?;
+                    verified_blocks.insert(binding.object.digest.clone(), binding.clone());
                 }
                 let mut writer = CountingWriter(0);
                 serde_json::to_writer(&mut writer, &tree)?;

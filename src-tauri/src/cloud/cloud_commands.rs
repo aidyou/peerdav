@@ -131,6 +131,14 @@ pub async fn cloud_cancel(
     cloud.0.manager.stop_mapping(&mapping_id).await
 }
 #[tauri::command]
+pub async fn cloud_local_entries(
+    mapping_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<Vec<LocalSyncEntry>, AppError> {
+    cloud.0.local_sync_entries(&mapping_id).await
+}
+
+#[tauri::command]
 pub async fn cloud_preview(
     mapping_id: String,
     cloud: tauri::State<'_, SharedCloud>,
@@ -189,9 +197,10 @@ pub fn mirror_cancel(
 #[tauri::command]
 pub async fn cloud_append_discover(
     connection_id: String,
+    bucket: Option<String>,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<Vec<crate::sync::append_types::Candidate>, AppError> {
-    cloud.0.discover_append_repositories(&connection_id).await
+    cloud.0.discover_append_in_bucket(&connection_id, bucket.as_deref()).await
 }
 #[tauri::command]
 pub async fn cloud_create_sync_drive(

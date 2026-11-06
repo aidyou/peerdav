@@ -690,7 +690,10 @@ async fn sync_drive_defaults_to_append_preserves_cas_and_deletes_only_local_asso
         }))
         .expect("sync-drive input contract")
     };
-    for (password, confirmation) in [("", ""), ("password", "different")] {
+    for (password, confirmation) in [
+        ("", ""), ("Ab1!x", "Ab1!x"), ("😀😀😀", "😀😀😀"),
+        ("密码不足六", "密码不足六"), ("password", "different"),
+    ] {
         let error = runtime
             .create_sync_drive(input(password, confirmation))
             .await
@@ -700,7 +703,7 @@ async fn sync_drive_defaults_to_append_preserves_cas_and_deletes_only_local_asso
     }
     assert!(fixture.state.requests.lock().expect("requests").is_empty());
     let append = runtime
-        .create_sync_drive(input("append password", "append password"))
+        .create_sync_drive(input("Ab1!xy", "Ab1!xy"))
         .await
         .expect("default Append creation");
     let requests = fixture.state.requests.lock().expect("requests").clone();
@@ -797,6 +800,7 @@ async fn sync_drive_create_join_sync_both_modes_without_cas_probe_or_control_hea
             .unwrap();
         let created = runtime
             .create_sync_drive(CreateAppendRepositoryInput {
+                bucket: None,
                 connection_id: connection.id.clone(),
                 mode: mode.clone(),
                 password: "append password".into(),
@@ -815,6 +819,7 @@ async fn sync_drive_create_join_sync_both_modes_without_cas_probe_or_control_hea
         );
         let join = |password: &str, accepted: bool, fingerprint: Option<String>| {
             JoinAppendRepositoryInput {
+                bucket: None,
                 connection_id: connection.id.clone(),
                 anchor_key: created.binding.anchor_key.clone(),
                 anchor_fingerprint: created.binding.anchor_fingerprint.clone(),
@@ -866,6 +871,8 @@ async fn sync_drive_create_join_sync_both_modes_without_cas_probe_or_control_hea
             })
             .await
             .unwrap();
+        let before_sync = runtime.local_sync_entries(&mapping.id).await.unwrap();
+        assert!(before_sync.iter().any(|e| e.path == "file.txt" && !e.synced));
         let preview = runtime.preview(&mapping.id).await.unwrap();
         assert!(preview.counts.uploads >= 1);
         runtime
@@ -873,6 +880,14 @@ async fn sync_drive_create_join_sync_both_modes_without_cas_probe_or_control_hea
             .await
             .unwrap();
         wait_completed(&runtime, &mapping.id).await;
+        let after_sync = runtime.local_sync_entries(&mapping.id).await.unwrap();
+        assert!(after_sync.iter().any(|e| e.path == "file.txt" && e.synced));
+        std::fs::create_dir(local.path().join("pending")).unwrap();
+        std::fs::write(local.path().join("pending/new.txt"), b"new").unwrap();
+        let pending = runtime.local_sync_entries(&mapping.id).await.unwrap();
+        assert!(pending.iter().filter(|e| e.path.starts_with("pending")).all(|e| !e.synced));
+        std::fs::remove_file(local.path().join("pending/new.txt")).unwrap();
+        std::fs::remove_dir(local.path().join("pending")).unwrap();
         let second = runtime.preview(&mapping.id).await.unwrap();
         assert_eq!(second.counts.uploads, 0);
         assert_eq!(second.counts.downloads, 0);
@@ -905,13 +920,25 @@ async fn sync_drive_create_join_sync_both_modes_without_cas_probe_or_control_hea
             })
             .await
             .unwrap();
+        // Browsing an existing drive and planning sync must not read payloads,
+        // even when the remote blocks are temporarily unavailable.
+        let blocks: Vec<_> = fixture.state.objects.lock().unwrap().iter()
+            .filter(|(key, _)| key.contains("/blocks/"))
+            .map(|(key, bytes)| (key.clone(), bytes.clone())).collect();
+        assert!(!blocks.is_empty());
+        for (key, _) in &blocks { fixture.state.objects.lock().unwrap().remove(key); }
+        fixture.state.requests.lock().unwrap().clear();
         let preview = reader.preview(&reader_mapping.id).await.unwrap();
         assert_eq!(preview.counts.downloads, 1);
+        assert!(fixture.state.requests.lock().unwrap().iter().all(|(_, path)| !path.contains("/blocks/")));
+        for (key, bytes) in blocks { fixture.state.objects.lock().unwrap().insert(key, bytes); }
+        fixture.state.requests.lock().unwrap().clear();
         reader
             .manual_sync(&reader_mapping.id, &preview.preview_id)
             .await
             .unwrap();
         wait_completed(&reader, &reader_mapping.id).await;
+        assert!(fixture.state.requests.lock().unwrap().iter().any(|(method, path)| *method == Method::GET && path.contains("/blocks/")));
         assert_eq!(
             std::fs::read(destination.path().join("file.txt")).unwrap(),
             b"append runtime payload"
@@ -993,6 +1020,64 @@ async fn sync_drive_create_join_sync_both_modes_without_cas_probe_or_control_hea
         runtime.stop_and_clear().await.unwrap();
         fixture.shutdown().await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_drive_storage_stays_bound_after_connection_changes() {
+    use peerdav_lib::cloud::runtime_types::{CreateAppendRepositoryInput, SaveAppendMappingInput};
+    use peerdav_lib::sync::append_types::{APPEND_ROOT, AppendMode};
+    let fixture = Fixture::start(true).await;
+    let data = tempfile::tempdir().expect("data");
+    let runtime = runtime_for(&data);
+    runtime.resume().expect("resume");
+    let mut input = runtime_connection(&fixture);
+    input.bucket = "other".into();
+    input.buckets = vec!["other".into(), "fixture".into()];
+    let connection = runtime.save_connection(input).expect("connection");
+    let created = runtime.create_sync_drive(CreateAppendRepositoryInput {
+        connection_id: connection.id.clone(), bucket: Some("fixture".into()),
+        mode: AppendMode::Encrypted, password: "bound password".into(),
+        password_confirmation: "bound password".into(),
+    }).await.expect("create in selected bucket");
+    let storage = created.binding.storage.as_ref().expect("durable binding");
+    assert_eq!(storage.bucket, "fixture");
+    assert_eq!(storage.prefix, "runtime");
+    assert_eq!(runtime.discover_append_in_bucket(&connection.id, Some("fixture")).await.expect("discover").len(), 1);
+    assert_eq!(runtime.discover_append_in_bucket(&connection.id, Some("unknown")).await.expect_err("unconfigured bucket").code, "CLOUD_CONFIG_INVALID");
+    let local = tempfile::tempdir().expect("root");
+    std::fs::create_dir(local.path().join("docs")).expect("folder");
+    let payload = b"private payload must never be stored as plaintext";
+    std::fs::write(local.path().join("docs/private.txt"), payload).expect("file");
+    let mapping = runtime.save_append_mapping(SaveAppendMappingInput {
+        mapping_id: None, selected_root: "root".into(), mapping: AddMappingInput {
+            connection_id: connection.id.clone(), repository_id: created.binding.repo_id.clone(),
+            local_root: local.path().to_owned(), logical_path: "root".into(),
+            schedule: ScheduleConfig { enabled: true, interval: 60 },
+        },
+    }).await.expect("mapping");
+    assert!(runtime.validate_scheduled_root(&mapping).is_err(), "automatic sync cannot bypass first confirmation");
+    let mut updated = runtime_connection(&fixture);
+    updated.id = Some(connection.id.clone());
+    updated.bucket = "other".into();
+    updated.buckets = vec!["other".into(), "fixture".into()];
+    updated.prefix = "unrelated-prefix".into();
+    runtime.save_connection(updated).expect("change default storage");
+    fixture.state.requests.lock().expect("requests").clear();
+    let preview = runtime.preview(&mapping.id).await.expect("bound preview");
+    runtime.manual_sync(&mapping.id, &preview.preview_id).await.expect("confirmed sync");
+    wait_completed(&runtime, &mapping.id).await;
+    runtime.validate_scheduled_root(&mapping).expect("baseline permits later automatic ticks");
+    assert!(runtime.local_sync_entries(&mapping.id).await.expect("synced entries").iter().all(|entry| entry.synced));
+    let requests = fixture.state.requests.lock().expect("requests").clone();
+    assert!(requests.iter().all(|(_, path)| path.starts_with("/fixture/") || path == "/fixture"), "{requests:?}");
+    let objects = fixture.state.objects.lock().expect("objects").clone();
+    assert!(objects.keys().all(|key| key.starts_with(&format!("runtime/{APPEND_ROOT}/"))));
+    assert!(objects.values().all(|bytes| !bytes.windows(payload.len()).any(|window| window == payload)));
+    std::fs::remove_file(local.path().join("docs/private.txt")).expect("delete child");
+    let entries = runtime.local_sync_entries(&mapping.id).await.expect("pending delete");
+    assert!(entries.iter().any(|entry| entry.path == "docs" && !entry.synced));
+    runtime.stop_and_clear().await.expect("stop");
+    fixture.shutdown().await;
 }
 
 async fn wait_completed(runtime: &CloudRuntime, mapping_id: &str) {

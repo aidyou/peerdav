@@ -110,6 +110,95 @@ describe("selection-bar action reset", () => {
   });
 });
 
+describe("local sync-drive contents", () => {
+  const catalog = () => ({ connections: [{ id: 'c1', name: 'Main', bucket: 'main', buckets: ['main', 'photos'] }], mappings: [{ id: 'm1', connectionId: 'c1', repositoryId: 'r1', localRoot: '/local/Documents' }, { id: 'm2', connectionId: 'c1', repositoryId: 'r2', localRoot: '/local/Pictures' }] });
+  const contents = () => [{ path: 'docs', name: 'docs', isDir: true, size: 0, synced: false }, { path: 'docs/new.txt', name: 'new.txt', isDir: false, size: 4, synced: false }, { path: 'done.txt', name: 'done.txt', isDir: false, size: 2, synced: true }];
+  beforeEach(() => { handlers.cloud_list = catalog; handlers.cloud_local_entries = contents; handlers.cloud_status = () => []; handlers.cloud_preview = () => ({ previewId: 'plan', summary: { uploads: 1, downloads: 0, deletes: 0, conflicts: 0 } }); handlers.cloud_sync = () => ({ runId: 1 }); });
+  it.each(['icons', 'list', 'columns', 'gallery'])('reuses the shared %s view with real local paths and sync markers', async (mode) => {
+    const wrapper = await browser(mode); await click(wrapper, '.drive-link');
+    expect(wrapper.findAll('.drive-link').map(link => link.text())).toEqual(['Documents', 'Pictures']);
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_entries', { mappingId: 'm1' });
+    const manager = wrapper.findComponent({ name: 'FileManagerView' });
+    expect(manager.props('entries').map(entry => entry.path)).toEqual(['docs', 'done.txt']);
+    expect(wrapper.findAll('.entry-status')).toHaveLength(1);
+    await click(wrapper, '.entry-status');
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_preview', { mappingId: 'm1' });
+    expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_sync')).toBe(false);
+    expect(wrapper.find('.local-plan').text()).toContain('1');
+    expect(wrapper.text()).toContain(t('drive.syncWholeHint'));
+    await textButton(wrapper, t('drive.applyPlan')).trigger('click'); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_sync', { mappingId: 'm1', previewId: 'plan' });
+    handlers.cloud_status = () => [{ mappingId: 'm1', phase: 'completed', runId: 1 }];
+    handlers.cloud_local_entries = () => contents().map(entry => ({ ...entry, synced: true }));
+    await vi.advanceTimersByTimeAsync(1500); await flushPromises();
+    expect(wrapper.find('.entry-status').exists()).toBe(false);
+  });
+  it('ignores reselecting the active drive while loading and preserves its folder, selection and sync plan', async () => {
+    const listing = deferred(); handlers.cloud_local_entries = () => listing.promise;
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    await click(wrapper, '.drive-link');
+    expect(nativeInvoke.mock.calls.filter(([command]) => command === 'cloud_local_entries')).toHaveLength(1);
+    listing.resolve(contents()); await flushPromises();
+    await wrapper.find('[data-path="docs"]').trigger('dblclick'); await flushPromises();
+    await wrapper.find('[data-path="docs/new.txt"]').trigger('click'); await flushPromises();
+    await textButton(wrapper, t('drive.syncNow')).trigger('click'); await flushPromises();
+    const calls = nativeInvoke.mock.calls.length;
+    await click(wrapper, '.drive-link');
+    expect(nativeInvoke.mock.calls).toHaveLength(calls);
+    expect(wrapper.find('[data-path="docs/new.txt"]').exists()).toBe(true);
+    expect(wrapper.findComponent({ name: 'FileManagerView' }).props('selection').map(entry => entry.path)).toEqual(['docs/new.txt']);
+    expect(wrapper.find('.local-plan').exists()).toBe(true);
+    await wrapper.findAll('.drive-link')[1].trigger('click'); await flushPromises();
+    expect(nativeInvoke).toHaveBeenLastCalledWith('cloud_local_entries', { mappingId: 'm2' });
+  });
+  it('navigates local folders and changes modes without requesting S3 listings', async () => {
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    const calls = nativeInvoke.mock.calls.filter(([command]) => command === 'cloud_object_list').length;
+    await wrapper.find('[data-path="docs"]').trigger('dblclick'); await flushPromises();
+    expect(wrapper.find('[data-path="docs/new.txt"]').exists()).toBe(true);
+    await click(wrapper, '[aria-label="Columns"]');
+    expect(wrapper.findAll('.column')).toHaveLength(2);
+    expect(nativeInvoke.mock.calls.filter(([command]) => command === 'cloud_object_list')).toHaveLength(calls);
+    await click(wrapper, '.breadcrumb'); expect(wrapper.find('[data-path="done.txt"]').exists()).toBe(true);
+  });
+  it('discards stale listings and previews when switching drives or connections', async () => {
+    const listing = deferred(); handlers.cloud_local_entries = ({ mappingId }) => mappingId === 'm1' ? listing.promise : contents();
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    await wrapper.findAll('.drive-link')[1].trigger('click'); await flushPromises();
+    listing.resolve([{ path: 'stale', name: 'stale', synced: false }]); await flushPromises();
+    expect(wrapper.find('[data-path="stale"]').exists()).toBe(false);
+    const plan = deferred(); handlers.cloud_preview = () => plan.promise;
+    await click(wrapper, '.entry-status');
+    await wrapper.setProps({ connectionId: 'c2' }); await flushPromises();
+    plan.resolve({ previewId: 'stale-plan', summary: { uploads: 9 } }); await flushPromises();
+    expect(wrapper.find('.local-plan').exists()).toBe(false);
+  });
+  it('blocks duplicate sync previews while an automatic upload is running', async () => {
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    handlers.cloud_status = () => [{ mappingId: 'm1', phase: 'uploading', runId: 7 }];
+    await vi.advanceTimersByTimeAsync(1500); await flushPromises();
+    expect(textButton(wrapper, t('drive.syncNow')).attributes('disabled')).toBeDefined();
+    await click(wrapper, '.entry-status');
+    expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_preview')).toBe(false);
+  });
+  it('returns to the local root if refresh removes the open directory', async () => {
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    await wrapper.find('[data-path="docs"]').trigger('dblclick'); await flushPromises();
+    handlers.cloud_local_entries = () => contents().filter(entry => entry.path === 'done.txt');
+    await textButton(wrapper, t('cloudBrowser.refresh')).trigger('click'); await flushPromises();
+    expect(wrapper.find('[data-path="done.txt"]').exists()).toBe(true);
+    expect(wrapper.findAll('.breadcrumb')).toHaveLength(1);
+  });
+  it.each(['list', 'columns'])('does not show an empty %s folder after a failed local scan', async mode => {
+    const failure = error('CLOUD_ROOT_CHANGED', 'Local root changed'); handlers.cloud_local_entries = () => { throw failure; };
+    const wrapper = await browser(mode); await click(wrapper, '.drive-link');
+    expect(wrapper.find('[role=alert]').text()).toBe(failure.message);
+    expect(wrapper.find('.file-empty').exists()).toBe(false);
+    expect(wrapper.find('.column-empty').exists()).toBe(false);
+    expect(app.handleFailure).toHaveBeenCalledWith(failure);
+  });
+});
+
 describe("streaming directory upload", () => {
   const calls = (command) => nativeInvoke.mock.calls.filter(([name]) => name === `cloud_object_${command}_upload_directory`);
   const summary = (phase = 'running', extra = {}) => ({ batchId: 'batch', connectionId: 'c1', connectionRevision: 1, bucket: 'main', prefix: '', rootName: 'tree', phase, currentRelativePath: null, completedFiles: 0, completedBytes: 0, skippedFiles: 0, skippedSymlinks: 1, skippedEmptyDirectories: 2, conflict: null, error: null, recoveryRequired: false, ...extra });

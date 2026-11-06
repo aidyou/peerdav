@@ -20,6 +20,72 @@ mod run_budget_tests {
     use super::*;
 
     #[test]
+    fn metadata_preview_slot_does_not_reuse_exhausted_payload_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("index");
+        let mut index = AppendIndex::open(&path, Zeroizing::new([7; 32]), "preview-test".into())?;
+        let legacy = index.begin_run("preview", "legacy-full-discovery")?;
+        let exhausted = DiscoveryBudget {
+            allocation_bytes: super::super::append_types::MAX_DISCOVERY_ALLOCATION,
+            ..Default::default()
+        };
+        index.save_discovery_budget(&legacy, &exhausted)?;
+        drop(index);
+        let mut index = AppendIndex::open(&path, Zeroizing::new([7; 32]), "preview-test".into())?;
+        let metadata = index.begin_run("preview-metadata-v1", "metadata-only")?;
+        assert_ne!(metadata, legacy);
+        assert_eq!(index.discovery_budget(&metadata)?.allocation_bytes, 0);
+        index.save_discovery_budget(&metadata, &exhausted)?;
+        assert_eq!(index.begin_run("preview-metadata-v1", "retry")?, metadata);
+        assert_eq!(index.discovery_budget(&metadata)?.allocation_bytes, exhausted.allocation_bytes);
+        assert_eq!(index.discovery_budget(&legacy)?.allocation_bytes, exhausted.allocation_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_budget_migration_retains_work_and_does_not_reset_on_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("index");
+        let mut index = AppendIndex::open(&path, Zeroizing::new([7; 32]), "migration".into())?;
+        let old = serde_json::json!({
+            "requests": 23, "pages": 2, "bytes_read": 123456,
+            "raw_entries": 7, "tree_plaintext": 4567,
+            "allocation_bytes": super::super::append_types::MAX_DISCOVERY_ALLOCATION
+        });
+        let tx = Transaction::new_unchecked(&index.connection, TransactionBehavior::Immediate)?;
+        index.write_raw_tx(&tx, "discovery-budget", "operation", &serde_json::to_vec(&old)?)?;
+        tx.execute("INSERT INTO append_ledger(scope,name,used,reserved) VALUES(?1,?2,?3,?3)",
+            params![&index.scope, "discover:9:operation:staging", super::super::append_types::MAX_DISCOVERY_ALLOCATION as i64])?;
+        tx.commit()?;
+        assert_eq!(index.begin_run("engine", "operation")?, "operation");
+        let mut migrated = index.discovery_budget("operation")?;
+        assert_eq!(migrated.accounting_version, 2);
+        assert_eq!(migrated.allocation_bytes, 0);
+        assert_eq!(migrated.legacy_allocation_bytes, super::super::append_types::MAX_DISCOVERY_ALLOCATION);
+        assert_eq!(migrated.requests, 23);
+        assert_eq!(migrated.bytes_read, 123456);
+        assert_eq!(migrated.tree_plaintext, 4567);
+        migrated.allocation_bytes = 4096;
+        index.save_discovery_budget("operation", &migrated)?;
+        drop(index);
+        let mut index = AppendIndex::open(&path, Zeroizing::new([7; 32]), "migration".into())?;
+        let mut retried = index.discovery_budget("operation")?;
+        assert_eq!(index.begin_run("engine", "new-attempt")?, "operation");
+        let legacy_ledger: i64 = index.connection.query_row(
+            "SELECT used FROM append_ledger WHERE scope=?1 AND name=?2",
+            params![&index.scope, "discover:9:operation:staging"], |row| row.get(0))?;
+        assert_eq!(legacy_ledger, super::super::append_types::MAX_DISCOVERY_ALLOCATION as i64);
+        assert_eq!(retried.allocation_bytes, 4096);
+        assert_eq!(retried.legacy_allocation_bytes, migrated.legacy_allocation_bytes);
+        assert_eq!(retried.requests, 23);
+        retried.allocation_bytes = 4095;
+        assert!(index.save_discovery_budget("operation", &retried).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn unfinished_run_survives_outer_ids_and_completed_run_releases_slot()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
@@ -400,10 +466,21 @@ impl AppendIndex {
     }
 
     pub fn discovery_budget(&self, operation: &str) -> Result<DiscoveryBudget, IndexError> {
-        self.read_raw("discovery-budget", operation)?
+        let mut budget: DiscoveryBudget = self.read_raw("discovery-budget", operation)?
             .map(|b| serde_json::from_slice(&b).map_err(IndexError::Serialization))
-            .transpose()
-            .map(|b| b.unwrap_or_default())
+            .transpose()?
+            .unwrap_or_default();
+        if budget.accounting_version == 0 {
+            // One-time accounting migration, not a retry reset. Keep all network
+            // work and the old allocation total, including frozen-run budgets.
+            budget.legacy_allocation_bytes = budget.allocation_bytes;
+            budget.allocation_bytes = 0;
+            budget.accounting_version = 2;
+        }
+        if budget.accounting_version != 2 {
+            return Err(IndexError::InvalidRecord);
+        }
+        Ok(budget)
     }
 
     pub(crate) fn save_discovery_budget(
@@ -411,11 +488,16 @@ impl AppendIndex {
         operation: &str,
         budget: &DiscoveryBudget,
     ) -> Result<(), IndexError> {
-        if operation.is_empty() {
+        if operation.is_empty() || budget.accounting_version != 2 {
             return Err(IndexError::InvalidRecord);
         }
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         for (metric, amount, limit) in [
+            (
+                "legacy-allocation-v1",
+                budget.legacy_allocation_bytes,
+                super::append_types::MAX_DISCOVERY_ALLOCATION,
+            ),
             (
                 "requests",
                 budget.requests,
@@ -437,7 +519,7 @@ impl AppendIndex {
                 super::append_types::MAX_DISCOVERY_READ_BYTES,
             ),
             (
-                "staging",
+                "metadata-allocation-v2",
                 budget.allocation_bytes,
                 super::append_types::MAX_DISCOVERY_ALLOCATION,
             ),

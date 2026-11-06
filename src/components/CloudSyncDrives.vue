@@ -8,7 +8,7 @@ import { confirmAction } from "../lib/confirm";
 import { useAppContext } from "../lib/appContext";
 import { t } from "../lib/i18n";
 
-const props = defineProps({ connectionId: { type: String, required: true }, focusId: { type: String, default: "" } });
+const props = defineProps({ bucket: { type: String, default: "" }, connectionId: { type: String, required: true }, focusId: { type: String, default: "" } });
 const emit = defineEmits(["changed"]);
 const app = useAppContext();
 const data = ref({ repositories: [], appendRepositories: [], mappings: [], statuses: [], mirrorMappings: [] });
@@ -24,12 +24,13 @@ const createModeHint = computed(() => createMode.value === "mirror"
   : createMode.value === "authenticated_plain" ? "drive.modeAuthenticatedPlainHint" : "drive.modeEncryptedHint");
 const passwordHint = computed(() => createMode.value === "authenticated_plain"
   ? "drive.passwordHintAuthenticatedPlain" : "drive.passwordHintEncrypted");
-function resetCreateMode() { createMode.value = "encrypted"; }
+const createSchedule = ref({ enabled: false, interval: 900 });
+function resetCreateMode() { createMode.value = "encrypted"; createSchedule.value = { enabled: false, interval: 900 }; }
 function closeAddMenu(event) { if (!event.target?.closest?.(".add-menu")) addMenuOpen.value = false; }
 function openCreateDialog() { addMenuOpen.value = false; connectDialogOpen.value = false; mappingEditorOpen.value = false; resetNewDrive(); resetCreateMode(); resetMirror(); state.value = "idle"; createDialogOpen.value = true; }
 function openConnectDialog() { addMenuOpen.value = false; createDialogOpen.value = false; mappingEditorOpen.value = false; resetLink(); state.value = "idle"; connectDialogOpen.value = true; void discover(); }
 // 镜像盘块的独立新建入口：复用新建对话框，但直接锁定为镜像形态，免去小白再选类型。
-function openMirrorCreate() { addMenuOpen.value = false; connectDialogOpen.value = false; mappingEditorOpen.value = false; resetNewDrive(); resetMirror(); createMode.value = "mirror"; state.value = "idle"; createDialogOpen.value = true; }
+function openMirrorCreate() { addMenuOpen.value = false; connectDialogOpen.value = false; mappingEditorOpen.value = false; resetNewDrive(); resetCreateMode(); resetMirror(); createMode.value = "mirror"; state.value = "idle"; createDialogOpen.value = true; }
 function closeCreateDialog() { if (busy.value) return; createDialogOpen.value = false; resetNewDrive(); resetCreateMode(); resetMirror(); }
 function closeConnectDialog() { if (busy.value) return; connectDialogOpen.value = false; resetLink(); }
 const newDrive = ref({ localRoot: "", logicalPath: "", password: "", confirmation: "" });
@@ -38,8 +39,6 @@ const busy = ref(false);
 const state = ref("idle");
 const candidates = ref([]);
 const selectedCandidateKey = ref("");
-const trustedFingerprint = ref("");
-const acceptTofu = ref(false);
 const editingMappingId = ref(null);
 const mapping = ref(blankMapping());
 const mappingEditorOpen = ref(false);
@@ -79,8 +78,20 @@ watch(mappings, (list) => { activeSyncIds.value = list.map((m) => m.id); }, { im
 watch(mirrorMappings, (list) => { activeMirrorIds.value = list.map((m) => m.id); }, { immediate: true });
 const statuses = computed(() => (data.value.statuses || []).filter((s) => mappings.value.some((m) => m.id === s.mappingId)));
 const candidate = computed(() => candidates.value.find((c) => c.key === selectedCandidateKey.value));
-const canJoin = computed(() => !busy.value && !!candidate.value && !!password.value && (!!trustedFingerprint.value.trim() || acceptTofu.value) && !!linkForm.value.localRoot.trim());
-const canCreate = computed(() => !busy.value && !!props.connectionId && !!newDrive.value.localRoot.trim() && !!newDrive.value.password && newDrive.value.password === newDrive.value.confirmation);
+const canJoin = computed(() => !busy.value && !!candidate.value && !!password.value && !!linkForm.value.localRoot.trim());
+// This creation-only estimate is not an entropy or breach-resistance guarantee.
+const creationPasswordStrength = computed(() => {
+  const value = newDrive.value.password;
+  const length = Array.from(value).length;
+  if (!length) return { score: 0, label: 'drive.passwordStrengthEmpty' };
+  if (length < 6) return { score: 0, label: 'drive.passwordStrengthTooShort' };
+  const classes = [/[\p{Ll}\p{Lo}]/u, /\p{Lu}/u, /\p{N}/u, /[^\p{L}\p{N}\s]/u].filter(pattern => pattern.test(value)).length;
+  if (classes <= 1 || /^[\p{L}\s]+$/u.test(value)) return { score: 1, label: 'drive.passwordStrengthUnsafe' };
+  if (length > 8 && classes >= 3) return { score: 4, label: 'drive.passwordStrengthHigh' };
+  if (classes === 4) return { score: 3, label: 'drive.passwordStrengthMediumHigh' };
+  return { score: 2, label: classes >= 3 ? 'drive.passwordStrengthMediumLow' : 'drive.passwordStrengthLow' };
+});
+const canCreate = computed(() => !busy.value && !!props.connectionId && !!newDrive.value.localRoot.trim() && Array.from(newDrive.value.password).length >= 6 && newDrive.value.password === newDrive.value.confirmation);
 const canCreateMirror = computed(() => !busy.value && !!props.connectionId && !!mirrorForm.value.localRoot.trim());
 const pickerBreadcrumbs = computed(() => {
   const crumbs = [{ name: "_peerdav_mirror", prefix: "" }];
@@ -111,15 +122,14 @@ function mirrorStats(item) {
   });
 }
 function fail(error) { app.handleFailure(error); }
-function resetTrust() { trustedFingerprint.value = ""; acceptTofu.value = false; }
-function resetSecrets() { password.value = ""; resetTrust(); }
+function resetSecrets() { password.value = ""; }
 function resetNewDrive() { newDrive.value = { localRoot: "", logicalPath: "", password: "", confirmation: "" }; }
 function resetLink() { linkForm.value = { localRoot: "", selectedRoot: "", newRoot: "" }; linkRoots.value = []; joinedRepoId.value = ""; candidates.value = []; selectedCandidateKey.value = ""; resetSecrets(); }
 function resetMirror() { mirrorForm.value = { localRoot: "", cloudPrefix: "" }; }
 // Remote folder defaults to the chosen local folder's name, which keeps the
 // one-step create usable without asking non-technical users to name things twice.
 function folderName(path) { const parts = String(path).split(/[\\/]+/).filter(Boolean); return parts.length ? parts[parts.length - 1] : t("drive.defaultFolder"); }
-watch(selectedCandidateKey, resetTrust);
+watch(selectedCandidateKey, () => { password.value = ""; joinedRepoId.value = ""; linkRoots.value = []; linkForm.value.selectedRoot = ""; linkForm.value.newRoot = ""; });
 watch(() => mapping.value.repositoryId, () => { if (!editingMappingId.value) mapping.value.logicalPath = ""; });
 async function refresh(scope = generation) { const result = await cloud.list(); if (!disposed && scope === generation) data.value = result; }
 async function run(operation) {
@@ -140,7 +150,7 @@ async function create() {
   await run(async (scope) => {
     state.value = "loading";
     const logicalPath = newDrive.value.logicalPath.trim() || folderName(newDrive.value.localRoot);
-    const redacted = await cloud.createSyncDrive({ connectionId: props.connectionId, mode: createMode.value, password: newDrive.value.password, passwordConfirmation: newDrive.value.confirmation });
+    const redacted = await cloud.createSyncDrive({ connectionId: props.connectionId, bucket: props.bucket, mode: createMode.value, password: newDrive.value.password, passwordConfirmation: newDrive.value.confirmation });
     if (scope !== generation || disposed) return;
     // Bind the first local folder in the same step so a new drive always has
     // something to sync instead of looking like a no-op. The drive already
@@ -148,7 +158,8 @@ async function create() {
     // form filled (retrying create would otherwise duplicate the drive).
     let bindingError = null;
     try {
-      await cloud.appendSaveMapping(null, { connectionId: props.connectionId, repositoryId: redacted.binding.repoId, localRoot: newDrive.value.localRoot, logicalPath, schedule: { enabled: false, interval: 900 } }, logicalPath);
+      const saved = await cloud.appendSaveMapping(null, { connectionId: props.connectionId, repositoryId: redacted.binding.repoId, localRoot: newDrive.value.localRoot, logicalPath, schedule: { enabled: createSchedule.value.enabled, interval: Math.max(60, Number(createSchedule.value.interval) || 900) } }, logicalPath);
+      if (createSchedule.value.enabled && saved?.id && scope === generation && !disposed) await showInitialPlan(saved, scope);
     } catch (error) {
       bindingError = error;
     }
@@ -164,7 +175,7 @@ async function createMirror() {
   if (!canCreateMirror.value || !isMirror.value) return;
   await run(async (scope) => {
     state.value = "loading";
-    await cloud.mirrorSaveMapping({ id: null, connectionId: props.connectionId, localRoot: mirrorForm.value.localRoot.trim(), cloudPrefix: mirrorForm.value.cloudPrefix.trim(), schedule: { enabled: false, interval: 900 } });
+    await cloud.mirrorSaveMapping({ id: null, connectionId: props.connectionId, localRoot: mirrorForm.value.localRoot.trim(), cloudPrefix: mirrorForm.value.cloudPrefix.trim(), schedule: { ...createSchedule.value, interval: Math.max(60, Number(createSchedule.value.interval) || 900) } });
     if (scope !== generation || disposed) return;
     resetMirror(); resetNewDrive(); resetCreateMode(); createDialogOpen.value = false; await refresh(scope);
     if (scope !== generation || disposed) return;
@@ -175,8 +186,8 @@ async function createMirror() {
 function submitCreate() { return isMirror.value ? createMirror() : create(); }
 async function discover() {
   await run(async (scope) => {
-    candidates.value = []; selectedCandidateKey.value = ""; resetTrust(); state.value = "loading";
-    const result = await cloud.appendDiscover(props.connectionId);
+    candidates.value = []; selectedCandidateKey.value = ""; state.value = "loading";
+    const result = await cloud.appendDiscover(props.connectionId, props.bucket);
     if (scope !== generation || disposed) return;
     candidates.value = result; state.value = result.length ? "ready" : "empty";
   });
@@ -186,7 +197,7 @@ async function join() {
   const item = candidate.value;
   await run(async (scope) => {
     state.value = "loading";
-    const redacted = await cloud.appendJoin({ connectionId: props.connectionId, anchorKey: item.key, anchorFingerprint: item.fingerprint, repositoryId: item.repo_id, mode: item.descriptor.mode, acceptTofu: acceptTofu.value, trustedFingerprint: trustedFingerprint.value.trim() || null, password: password.value });
+    const redacted = await cloud.appendJoin({ connectionId: props.connectionId, bucket: props.bucket, anchorKey: item.key, anchorFingerprint: item.fingerprint, repositoryId: item.repo_id, mode: item.descriptor.mode, acceptTofu: true, trustedFingerprint: null, password: password.value });
     if (scope !== generation || disposed) return;
     await refresh(scope);
     if (scope !== generation || disposed) return;
@@ -205,11 +216,22 @@ async function join() {
 // 不能再套一层 run()：join 已经持有 busy 锁，二次进入会被守卫吞掉。
 async function bindLogicalPath(scope, logicalPath) {
   state.value = "loading";
-  await cloud.appendSaveMapping(null, { connectionId: props.connectionId, repositoryId: joinedRepoId.value, localRoot: linkForm.value.localRoot, logicalPath, schedule: { enabled: false, interval: 900 } }, logicalPath);
+  const saved = await cloud.appendSaveMapping(null, { connectionId: props.connectionId, repositoryId: joinedRepoId.value, localRoot: linkForm.value.localRoot, logicalPath, schedule: { enabled: false, interval: 900 } }, logicalPath);
   if (scope !== generation || disposed) return;
   resetSecrets(); resetLink(); connectDialogOpen.value = false; await refresh(scope);
   if (scope !== generation || disposed) return;
   state.value = "saved"; emit("changed");
+  if (saved?.id) {
+    // Persist and close before preparing the initial transfer. The backend owns
+    // the sync worker; destructive/conflicting plans still need confirmation.
+    const plan = await cloud.preview(String(saved.id));
+    if (scope !== generation || disposed) return;
+    if ((plan.summary?.deletes || 0) > 0 || (plan.summary?.conflicts || 0) > 0) {
+      preview.value = { mappingId: String(saved.id), previewId: String(plan.previewId), summary: plan.summary };
+    } else {
+      await cloud.sync(String(saved.id), String(plan.previewId));
+    }
+  }
 }
 async function confirmBind() {
   const logicalPath = linkForm.value.selectedRoot || linkForm.value.newRoot.trim();
@@ -346,6 +368,10 @@ function confirmPicker() {
   mirrorForm.value.cloudPrefix = combined.replace(/^\/+|\/+$/g, "");
   pickerOpen.value = false;
 }
+async function showInitialPlan(item, scope) {
+  const result = await cloud.preview(String(item.id));
+  if (scope === generation && !disposed) preview.value = { mappingId: String(item.id), previewId: String(result.previewId), summary: result.summary };
+}
 async function showPreview(item) { await run(async (scope) => { const result = await cloud.preview(String(item.id)); if (scope === generation && !disposed) preview.value = { mappingId: String(item.id), previewId: String(result.previewId), summary: result.summary }; }); }
 async function applyPreview() { if (!preview.value?.previewId || !preview.value?.mappingId) return; const target = { ...preview.value }; await run(async (scope) => { await cloud.sync(target.mappingId, target.previewId); if (scope !== generation || disposed) return; preview.value = null; await refresh(scope); }); }
 async function cancel(item) { await run(async (scope) => { await cloud.cancel(String(item.id)); await refresh(scope); }); }
@@ -428,8 +454,8 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
               <el-tag class="mapping-status row-tag" role="status" effect="plain" round size="small">{{ mappingStatus(item) }}</el-tag>
             </div>
             <div class="client-item__actions" @click.stop>
-              <el-button class="mapping-preview list-pill" type="primary" round size="small" :disabled="busy" @click="showPreview(item)">{{ t('cloud.preview') }}</el-button>
-              <el-button class="mapping-cancel list-pill" round size="small" :disabled="busy" @click="cancel(item)">{{ t('cloud.cancel') }}</el-button>
+              <el-button class="mapping-preview list-pill" type="primary" round size="small" :disabled="busy" @click="showPreview(item)">{{ t('drive.preflight') }}</el-button>
+              <el-button class="mapping-cancel list-pill" round size="small" :disabled="busy" @click="cancel(item)">{{ t('drive.stopSync') }}</el-button>
             </div>
           </template>
           <ul class="client-item__detail">
@@ -445,7 +471,7 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
             <p>{{ t('cloud.confirmPreview') }}</p>
             <p>{{ t('cloud.previewUploads') }}: {{ preview.summary?.uploads ?? 0 }} · {{ t('cloud.previewDownloads') }}: {{ preview.summary?.downloads ?? 0 }} · {{ t('cloud.previewDeletes') }}: {{ preview.summary?.deletes ?? 0 }} · {{ t('cloud.previewConflicts') }}: {{ preview.summary?.conflicts ?? 0 }}</p>
             <pre v-if="typeof preview.summary === 'string'">{{ preview.summary }}</pre>
-            <el-button :disabled="busy" @click="applyPreview">{{ t('cloud.sync') }}</el-button>
+            <el-button :disabled="busy" @click="applyPreview">{{ t('drive.applyPlan') }}</el-button>
           </div>
           <div v-if="recovery.length && recoveryMappingId === item.id" class="recovery-list">
             <p class="hint">{{ t('drive.recoveryFor', { path: recoveryMappingId }) }}</p>
@@ -537,10 +563,17 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
       </label>
       <p class="hint create-mode-hint">{{ t(createModeHint) }}</p>
       <form class="drive-create" @submit.prevent="submitCreate">
+        <label class="settings-row create-schedule"><span>{{ t('cloud.schedule') }}</span><el-switch v-model="createSchedule.enabled" :disabled="busy" /><input v-model="createSchedule.interval" type="number" min="60" step="60" :disabled="busy || !createSchedule.enabled" /></label>
+        <p v-if="createSchedule.enabled && !isMirror" class="hint">{{ t('drive.initialSyncHint') }}</p>
         <template v-if="needsPassword">
           <label class="settings-row"><span>{{ t('cloud.password') }}</span>
             <el-input v-model="newDrive.password" class="append-password" type="password" autocomplete="new-password" :disabled="busy" />
           </label>
+          <div class="password-strength" role="status" aria-live="polite" aria-atomic="true">
+            <meter min="0" max="4" low="2" high="3" optimum="4" :value="creationPasswordStrength.score" :aria-label="t('drive.passwordStrength')" :aria-valuetext="t(creationPasswordStrength.label)" />
+            <span>{{ t('drive.passwordStrength') }}：{{ t(creationPasswordStrength.label) }}</span>
+            <p class="hint">{{ t('drive.passwordStrengthHint') }}</p>
+          </div>
           <label class="settings-row"><span>{{ t('cloud.passwordConfirm') }}</span>
             <el-input v-model="newDrive.confirmation" class="append-confirmation" type="password" autocomplete="new-password" :disabled="busy" />
           </label>
@@ -609,11 +642,7 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
           <p class="hint">{{ candidateModeHint(candidate) }}</p>
           <label class="settings-row"><span>{{ t('cloud.password') }}</span><el-input v-model="password" class="append-join-password" type="password" autocomplete="current-password" :disabled="busy" /></label>
           <p class="hint">{{ t(candidate.descriptor.mode === 'encrypted' ? 'drive.passwordHintEncrypted' : 'drive.passwordHintAuthenticatedPlain') }}</p>
-          <details class="advanced-security"><summary>{{ t('drive.advancedSecurity') }}</summary>
-            <p>{{ t('drive.fingerprint') }}: {{ candidate.fingerprint }}</p>
-            <label class="settings-row"><span>{{ t('cloudAppend.trustedFingerprint') }}</span><el-input v-model="trustedFingerprint" class="append-fingerprint" :disabled="busy" /></label>
-            <label class="settings-row switch-row"><el-switch v-model="acceptTofu" class="append-tofu" :disabled="busy" /><span>{{ t('drive.tofu') }}</span></label>
-          </details>
+          <p class="hint connect-security-hint">{{ t('drive.connectionSecurityHint') }}</p>
           <label class="settings-row"><span>{{ t('drive.linkLocalFolder') }}</span><div class="field-inline"><el-input v-model="linkForm.localRoot" class="link-local-root" :placeholder="t('drive.chooseFolderHint')" :disabled="busy" /><el-button class="choose-link-root" :disabled="busy" @click="chooseLinkRoot">{{ t('cloud.choose') }}</el-button></div></label>
           <label v-if="joinedRepoId && linkRoots.length > 1" class="settings-row"><span>{{ t('drive.folder') }}</span><el-select v-model="linkForm.selectedRoot" class="link-root" :disabled="busy"><el-option v-for="root in linkRoots" :key="root" :value="root" :label="root" /></el-select></label>
           <p v-if="joinedRepoId && linkRoots.length > 1" class="hint">{{ t('drive.linkRootHint') }}</p>
@@ -623,8 +652,8 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
       </div>
       <template #footer>
         <el-button class="cancel-connect-drive" :disabled="busy" @click="closeConnectDialog">{{ t('common.cancel') }}</el-button>
-        <el-button v-if="!joinedRepoId || linkRoots.length === 1" class="append-join" :disabled="!canJoin" @click="join">{{ t('drive.connect') }}</el-button>
-        <el-button v-else class="append-bind" :disabled="!linkForm.selectedRoot && !linkForm.newRoot.trim()" @click="confirmBind">{{ t('drive.linkBind') }}</el-button>
+        <el-button v-if="!joinedRepoId || linkRoots.length === 1" class="append-join" type="primary" :disabled="!canJoin" :loading="busy" @click="join">{{ t('drive.connect') }}</el-button>
+        <el-button v-else class="append-bind" type="primary" :disabled="busy || (!linkForm.selectedRoot && !linkForm.newRoot.trim())" :loading="busy" @click="confirmBind">{{ t('drive.linkBind') }}</el-button>
       </template>
     </el-dialog>
 
@@ -688,6 +717,9 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
 .drive-create { margin: 0; }
 .drive-create h4 { margin: 0 0 .4rem; }
 .settings-row { display: flex; flex-direction: column; gap: 6px; align-items: stretch; margin: .6rem 0; font-size: 13px; font-weight: 600; color: var(--app-text-strong); }
+.password-strength { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; font-size: 12px; }
+.password-strength meter { flex: 1 1 100px; max-width: 180px; height: 12px; }
+.password-strength .hint { flex-basis: 100%; margin: 0; }
 .switch-row { flex-direction: row; align-items: center; gap: 8px; }
 .field-inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .field-inline :deep(.el-input), .field-inline :deep(.el-select) { flex: 1 1 0; min-width: 0; width: auto; }

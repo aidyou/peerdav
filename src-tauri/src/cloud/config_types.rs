@@ -147,7 +147,17 @@ pub enum StorageProtocol {
 /// This is metadata only; repository keys/passwords remain in the vault's existing secret path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AppendStorage {
+    pub endpoint: String,
+    pub bucket: String,
+    pub prefix: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AppendRepositoryBinding {
+    #[serde(default)]
+    pub storage: Option<AppendStorage>,
     pub repo_id: String,
     pub anchor_key: String,
     pub anchor_fingerprint: String,

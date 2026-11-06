@@ -117,9 +117,10 @@ fn spawn_schedule(
                     match result {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
-                            let paused = error.code == "CLOUD_SCHEDULE_PAUSED";
+                            // A missing first baseline or a paused root must not
+                            // permanently kill an enabled schedule. Every later
+                            // tick still revalidates the durable safety guard.
                             (report_error)(error);
-                            if paused { break; }
                         }
                         Err(_) => (report_error)(schedule_error(
                             "CLOUD_SCHEDULE_PANIC",

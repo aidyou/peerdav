@@ -47,6 +47,19 @@ describe("shared FileManagerView", () => {
     }
   }
 
+  it.each(['icons', 'list', 'columns', 'gallery'])('keeps %s sync actions separate from navigation and avoids nested buttons', async mode => {
+    const entries = entriesFor('path');
+    const onStatusAction = vi.fn(); const onActivate = vi.fn(); const onSelect = vi.fn(); const onColumnSelect = vi.fn(); const onPreview = vi.fn();
+    const wrapper = view({ entries, mode, columns: [{ path: '', entries, complete: true }], entryStatus: entry => entry.path === entries[0].path ? 'Not synced · Sync' : '', onStatusAction, onActivate, onSelect, onColumnSelect, onPreview });
+    const status = wrapper.find('.entry-status');
+    expect(status.element.tagName).toBe('BUTTON');
+    expect(status.element.parentElement.closest('button')).toBeNull();
+    await status.trigger('click'); await status.trigger('dblclick');
+    expect(toRaw(onStatusAction.mock.calls[0][0])).toBe(entries[0]);
+    expect(onSelect).not.toHaveBeenCalled(); expect(onColumnSelect).not.toHaveBeenCalled();
+    expect(onActivate).not.toHaveBeenCalled(); expect(onPreview).not.toHaveBeenCalled();
+  });
+
   it("keeps the provider's selection as the sole state through plain, additive and range clicks", async () => {
     const entries = entriesFor("key");
     const Host = defineComponent({ setup() {

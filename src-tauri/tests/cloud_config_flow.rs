@@ -137,6 +137,7 @@ fn append_binding_roundtrip_preserves_selection_mode_trust_and_encryption() {
         .expect("mapping");
     let fingerprint = "ab".repeat(32);
     let mut binding = AppendRepositoryBinding {
+        storage: None,
         repo_id: "repo".into(),
         anchor_key: format!("{APPEND_ANCHORS}repo-{fingerprint}"),
         anchor_fingerprint: fingerprint,
@@ -177,7 +178,12 @@ fn append_binding_roundtrip_preserves_selection_mode_trust_and_encryption() {
     assert!(store.load_trusted_append_binding(&mapping.id).is_err());
     binding.selected_root = Some("root-b".into());
     binding.append_mode = AppendMode::Encrypted;
-    save(binding.clone()).expect("encrypted mode");
+    binding.storage = Some(peerdav_lib::cloud::config_types::AppendStorage {
+        endpoint: "https://s3.example".into(),
+        bucket: "bound-bucket".into(),
+        prefix: "bound-prefix/".into(),
+    });
+    save(binding.clone()).expect("encrypted mode with storage binding");
     let edited = store
         .edit_mapping(&mapping.id, mapping_input, &[])
         .expect("edit preserves binding");

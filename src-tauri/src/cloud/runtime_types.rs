@@ -66,6 +66,16 @@ pub struct CloudPreview {
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LocalSyncEntry {
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub synced: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CloudSyncResult {
     pub run_id: u64,
 }
@@ -108,6 +118,8 @@ pub struct CloudRestoreInput {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateAppendRepositoryInput {
+    #[serde(default)]
+    pub bucket: Option<String>,
     pub connection_id: String,
     pub mode: crate::sync::append_types::AppendMode,
     pub password: String,
@@ -116,6 +128,8 @@ pub struct CreateAppendRepositoryInput {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct JoinAppendRepositoryInput {
+    #[serde(default)]
+    pub bucket: Option<String>,
     pub connection_id: String,
     pub anchor_key: String,
     pub anchor_fingerprint: String,

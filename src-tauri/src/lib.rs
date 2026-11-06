@@ -325,6 +325,7 @@ pub fn run() {
                     cloud::cloud_commands::cloud_delete_mapping,
                     cloud::cloud_commands::cloud_status,
                     cloud::cloud_commands::cloud_cancel,
+                    cloud::cloud_commands::cloud_local_entries,
                     cloud::cloud_commands::cloud_preview,
                     cloud::cloud_commands::cloud_sync,
                     cloud::cloud_commands::mirror_save_mapping,

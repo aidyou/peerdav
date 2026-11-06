@@ -24,8 +24,9 @@ const props = defineProps({
   entryKind: { type: Function, required: true },
   formatSize: { type: Function, required: true },
   formatModified: { type: Function, default: () => "" },
+  entryStatus: { type: Function, default: () => "" },
 });
-const emit = defineEmits(["select", "activate", "column-select", "preview", "column-element", "column-wheel"]);
+const emit = defineEmits(["select", "activate", "column-select", "preview", "column-element", "column-wheel", "status-action"]);
 const identity = (entry) => entry[props.identityField];
 const selected = (entry) => props.selection.some((item) => identity(item) === identity(entry));
 const attributes = (entry) => ({
@@ -40,15 +41,16 @@ const attributes = (entry) => ({
   </div>
   <p v-else-if="!entries.length && complete && !error && mode !== 'columns'" class="file-empty">{{ emptyLabel || t('peer.emptyDir') }}</p>
   <div v-else-if="mode === 'icons'" class="icon-grid" :aria-busy="loading">
-    <button v-for="entry in entries" :key="identity(entry)" v-bind="attributes(entry)" type="button" class="file-tile" :class="{ 'is-selected': selected(entry) }" :aria-pressed="selected(entry)" :title="entry.name" @click="emit('select', entry, $event)" @dblclick="emit('activate', entry)">
-      <FileGlyph :entry="entry" size="lg" /><span class="file-tile__name" :title="entry.name">{{ entry.name }}</span>
-    </button>
+    <component :is="entryStatus(entry) ? 'div' : 'button'" v-for="entry in entries" :key="identity(entry)" v-bind="attributes(entry)" :type="entryStatus(entry) ? undefined : 'button'" :role="entryStatus(entry) ? 'group' : undefined" class="file-tile" :class="{ 'is-selected': selected(entry) }" :aria-pressed="entryStatus(entry) ? undefined : selected(entry)" :title="entry.name" @click="emit('select', entry, $event)" @dblclick="emit('activate', entry)">
+      <component :is="entryStatus(entry) ? 'button' : 'span'" class="entry-main entry-main--tile" :type="entryStatus(entry) ? 'button' : undefined" :aria-pressed="entryStatus(entry) ? selected(entry) : undefined"><FileGlyph :entry="entry" size="lg" /><span class="file-tile__name" :title="entry.name">{{ entry.name }}</span></component>
+      <button v-if="entryStatus(entry)" type="button" class="entry-status" @click.stop="emit('status-action', entry)" @dblclick.stop>{{ entryStatus(entry) }}</button>
+    </component>
   </div>
   <div v-else-if="mode === 'list'" class="file-table-wrap">
     <table class="file-table">
       <thead><tr><th scope="col">{{ t('peer.name') }}</th><th scope="col">{{ t('peer.kind') }}</th><th scope="col">{{ t('peer.size') }}</th><th v-if="timeColumn" scope="col">{{ timeLabel || t('peer.modified') }}</th></tr></thead>
       <tbody><tr v-for="entry in entries" :key="identity(entry)" v-bind="attributes(entry)" tabindex="0" :data-test="entry.isDir ? 'folder-row' : 'file-row'" :class="{ 'is-selected': selected(entry) }" :aria-selected="selected(entry)" @click="emit('select', entry, $event)" @dblclick="emit('activate', entry)" @keydown.enter.stop="emit('activate', entry)">
-        <td><span class="table-name"><FileGlyph :entry="entry" /><span>{{ entry.name }}</span><span v-if="entry.protected" class="table-protected">{{ t('cloudBrowser.protected') }}</span></span></td>
+        <td><span class="table-name"><FileGlyph :entry="entry" /><span>{{ entry.name }}</span><span v-if="entry.protected" class="table-protected">{{ t('cloudBrowser.protected') }}</span><button v-if="entryStatus(entry)" type="button" class="entry-status" @click.stop="emit('status-action', entry)" @dblclick.stop @keydown.enter.stop @keydown.space.stop>{{ entryStatus(entry) }}</button></span></td>
         <td>{{ entryKind(entry) }}</td><td>{{ formatSize(entry) }}</td><td v-if="timeColumn">{{ formatModified(entry[timeColumn]) }}</td>
       </tr></tbody>
     </table>
@@ -56,9 +58,9 @@ const attributes = (entry) => ({
   <div v-else-if="mode === 'columns'" :ref="element => emit('column-element', element)" class="column-view" :aria-busy="columnLoading ? 'true' : 'false'" @wheel="emit('column-wheel', $event)">
     <div v-for="(column, index) in columns" :key="column[columnIdentityField]" class="column" :class="{ 'column-loading': column.loading && !column.entries.length }">
       <BrowserSkeleton v-if="column.loading && !column.entries.length" mode="columns" />
-      <button v-for="entry in column.entries" :key="identity(entry)" v-bind="attributes(entry)" type="button" class="column-row" :class="{ 'is-selected': selected(entry) }" :aria-pressed="selected(entry)" :title="entry.name" @click="emit('column-select', entry, $event, column, index)" @dblclick="emit('preview', entry)">
-        <FileGlyph :entry="entry" /><span class="column-name">{{ entry.name }}</span><span v-if="entry.isDir" class="column-chevron" aria-hidden="true">›</span>
-      </button>
+      <component :is="entryStatus(entry) ? 'div' : 'button'" v-for="entry in column.entries" :key="identity(entry)" v-bind="attributes(entry)" :type="entryStatus(entry) ? undefined : 'button'" :role="entryStatus(entry) ? 'group' : undefined" class="column-row" :class="{ 'is-selected': selected(entry) }" :aria-pressed="entryStatus(entry) ? undefined : selected(entry)" :title="entry.name" @click="emit('column-select', entry, $event, column, index)" @dblclick="emit('preview', entry)">
+        <component :is="entryStatus(entry) ? 'button' : 'span'" class="entry-main entry-main--column" :type="entryStatus(entry) ? 'button' : undefined" :aria-pressed="entryStatus(entry) ? selected(entry) : undefined"><FileGlyph :entry="entry" /><span class="column-name">{{ entry.name }}</span></component><button v-if="entryStatus(entry)" type="button" class="entry-status" @click.stop="emit('status-action', entry)" @dblclick.stop>{{ entryStatus(entry) }}</button><span v-if="entry.isDir" class="column-chevron" aria-hidden="true">›</span>
+      </component>
       <p v-if="!column.entries.length && !column.loading && !column.failed && column.complete !== false" class="column-empty">{{ t('peer.emptyDir') }}</p>
     </div>
     <div v-if="appendLoadingColumn" class="column column-loading"><BrowserSkeleton mode="columns" /></div>
@@ -66,7 +68,7 @@ const attributes = (entry) => ({
   <div v-else class="gallery-view" data-testid="gallery-view">
     <div class="gallery-stage"><slot name="gallery-preview" /></div>
     <div class="gallery-strip">
-      <button v-for="entry in entries" :key="identity(entry)" v-bind="attributes(entry)" type="button" class="gallery-thumb" :class="{ 'is-selected': selected(entry) }" :aria-pressed="selected(entry)" :title="entry.name" @click="emit('select', entry, $event)" @dblclick="emit('activate', entry)"><FileGlyph :entry="entry" /><span>{{ entry.name }}</span></button>
+      <component :is="entryStatus(entry) ? 'div' : 'button'" v-for="entry in entries" :key="identity(entry)" v-bind="attributes(entry)" :type="entryStatus(entry) ? undefined : 'button'" :role="entryStatus(entry) ? 'group' : undefined" class="gallery-thumb" :class="{ 'is-selected': selected(entry) }" :aria-pressed="entryStatus(entry) ? undefined : selected(entry)" :title="entry.name" @click="emit('select', entry, $event)" @dblclick="emit('activate', entry)"><component :is="entryStatus(entry) ? 'button' : 'span'" class="entry-main entry-main--tile" :type="entryStatus(entry) ? 'button' : undefined" :aria-pressed="entryStatus(entry) ? selected(entry) : undefined"><FileGlyph :entry="entry" /><span>{{ entry.name }}</span></component><button v-if="entryStatus(entry)" type="button" class="entry-status" @click.stop="emit('status-action', entry)" @dblclick.stop>{{ entryStatus(entry) }}</button></component>
     </div>
   </div>
   <slot name="pagination" />
@@ -74,6 +76,12 @@ const attributes = (entry) => ({
 </template>
 
 <style scoped>
+.entry-main { min-width: 0; max-width: 100%; padding: 0; border: 0; background: transparent; color: inherit; font: inherit; cursor: inherit; }
+.entry-main--tile { display: flex; flex-direction: column; align-items: center; gap: 5px; width: 100%; }
+.entry-main--column { display: flex; flex: 1; align-items: center; gap: 7px; text-align: left; }
+.entry-main:focus-visible { outline: 2px solid var(--el-color-primary); }
+.entry-status { box-sizing: border-box; min-height: 24px; border: 0; border-radius: 4px; padding: 4px 6px; background: var(--app-surface-2); color: var(--app-text-secondary); font: inherit; font-size: 11px; cursor: pointer; }
+.entry-status:focus-visible { outline: 2px solid var(--el-color-primary); }
 .icon-grid, .file-table-wrap, .column-view, .gallery-view { flex: 1 1 auto; min-height: 0; }
 .icon-grid { overflow: auto; align-content: start; display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 10px; }
 .file-tile { min-height: 106px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; padding: 12px 8px; border: 1px solid transparent; border-radius: 10px; background: transparent; color: var(--app-text); font: inherit; cursor: pointer; }

@@ -21,7 +21,47 @@ fn discovery_index(path: &std::path::Path, binding: &TrustBinding) -> AppendInde
     AppendIndex::open(path, Zeroizing::new([7; 32]), binding.repo_id.clone()).unwrap()
 }
 fn commit_key(r: &AppendRepository, c: &CommitRef) -> String {
-    format!("v2/{}/commits/{}-{}", r.repo_id(), c.operation_id, c.digest)
+    format!("_peerdav_encrypt/{}/commits/{}-{}", r.repo_id(), c.operation_id, c.digest)
+}
+
+#[tokio::test]
+async fn linking_reads_metadata_only_and_never_records_full_validation() {
+    use peerdav_lib::sync::append_discovery::{discover_metadata, discover_roots};
+    use peerdav_lib::sync::append_types::{BlockBinding, APPEND_ROOT};
+    let (f, r, binding) = discovery_fixture().await;
+    let mut tree = empty_tree(&r);
+    tree.bindings.push(BlockBinding {
+        block_id: "ab".repeat(32),
+        len: 1024,
+        object: ObjectRef { kind: "block".into(), digest: "cd".repeat(32) },
+    });
+    let tree_ref = put_tree(&f, &r, &tree);
+    let reference = put_commit(&f, &r, &commit(&r, "00000000000000000000000000000001", vec![], tree_ref.clone()));
+    let dir = tempfile::tempdir().unwrap();
+    let mut index = discovery_index(&dir.path().join("index.db"), &binding);
+    assert!(discover_roots(f.clone(), &binding, b"wrong", &mut index, "wrong").await.is_err());
+    let before = f.gets.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(discover_roots(f.clone(), &binding, b"p", &mut index, "link").await.unwrap().is_empty());
+    assert_eq!(f.gets.load(std::sync::atomic::Ordering::SeqCst) - before, 3);
+    let record = index.records().unwrap().into_iter().find(|record| record.key == commit_key(&r, &reference)).unwrap();
+    assert_eq!(record.state, DiscoveryState::Observed);
+    let before = f.gets.load(std::sync::atomic::Ordering::SeqCst);
+    let metadata = discover_metadata(f.clone(), &binding, b"p", &mut index, "preview-metadata").await.unwrap();
+    assert_eq!(metadata.trees().len(), 1);
+    assert_eq!(f.gets.load(std::sync::atomic::Ordering::SeqCst) - before, 3);
+    assert!(index.records().unwrap().iter().all(|record| record.state == DiscoveryState::Observed));
+    // Retries retain cumulative reservations even for metadata-only discovery.
+    let budget = index.discovery_budget("preview-metadata").unwrap();
+    discover_metadata(f.clone(), &binding, b"p", &mut index, "preview-metadata").await.unwrap();
+    assert_eq!(index.discovery_budget("preview-metadata").unwrap().requests, budget.requests * 2);
+    assert_eq!(index.discovery_budget("preview-metadata").unwrap().allocation_bytes, budget.allocation_bytes * 2);
+    // The same authenticated metadata is not enough to apply files: full sync
+    // still requires the missing block, and all original budgets remain active.
+    assert!(matches!(discover(f.clone(), &binding, b"p", &mut index, "sync").await,
+        Err(AppendError::PendingDependency(CloudError::NotFound))));
+    f.objects.lock().unwrap().remove(&format!("{APPEND_ROOT}/{}/trees/{}", r.repo_id(), tree_ref.digest));
+    assert!(matches!(discover_roots(f, &binding, b"p", &mut index, "missing-tree").await,
+        Err(AppendError::PendingDependency(CloudError::NotFound))));
 }
 
 #[tokio::test]
@@ -616,7 +656,7 @@ fn put_commit(f: &Fake, r: &AppendRepository, c: &Commit) -> CommitRef {
     let (cr, cb) = r.seal_commit(c).unwrap();
     f.put(
         format!(
-            "v2/{}/commits/{}-{}",
+            "_peerdav_encrypt/{}/commits/{}-{}",
             r.repo_id(),
             cr.operation_id,
             cr.digest
@@ -627,7 +667,7 @@ fn put_commit(f: &Fake, r: &AppendRepository, c: &Commit) -> CommitRef {
 }
 fn put_tree(f: &Fake, r: &AppendRepository, t: &Tree) -> ObjectRef {
     let (tr, tb) = r.seal_tree(t).unwrap();
-    f.put(format!("v2/{}/trees/{}", r.repo_id(), tr.digest), tb);
+    f.put(format!("_peerdav_encrypt/{}/trees/{}", r.repo_id(), tr.digest), tb);
     tr
 }
 fn commit(r: &AppendRepository, id: &str, parents: Vec<CommitRef>, root: ObjectRef) -> Commit {
@@ -741,7 +781,7 @@ async fn empty_page_token_continues_successfully() {
     f.page(
         Some("next".into()),
         ObjectPage {
-            objects: vec![meta("v2/r/commits/a", &[])],
+            objects: vec![meta("_peerdav_encrypt/r/commits/a", &[])],
             next_token: None,
         },
     );
@@ -785,7 +825,7 @@ async fn reference_operation_mismatch_is_rejected() {
     };
     f.put(
         format!(
-            "v2/{}/commits/{}-{}",
+            "_peerdav_encrypt/{}/commits/{}-{}",
             r.repo_id(),
             bad.operation_id,
             bad.digest
@@ -883,7 +923,7 @@ async fn repository_binding_rejects_caller_repo() {
 #[tokio::test]
 async fn candidate_listing_uses_page_api() {
     let f = Fake::default();
-    f.put("v2/r/commits/a".into(), vec![1]);
+    f.put("_peerdav_encrypt/r/commits/a".into(), vec![1]);
     let mut b = DiscoveryBudget::default();
     assert_eq!(list_candidates(&f, "r", &mut b).await.unwrap().len(), 1);
     assert_eq!(b.pages, 1);
@@ -927,7 +967,7 @@ async fn page_and_request_exact_limit_and_one_over() {
 #[tokio::test]
 async fn real_second_page_and_duplicate_raw_entries_are_charged() {
     let f = Fake::default();
-    let duplicate = meta("v2/r/commits/a", &[]);
+    let duplicate = meta("_peerdav_encrypt/r/commits/a", &[]);
     f.page(
         None,
         ObjectPage {
@@ -1288,6 +1328,97 @@ async fn small_depth_limit_rejects_real_parent_chain() {
 }
 
 #[tokio::test]
+async fn maximum_legal_blocks_and_shared_history_fit_discovery_budget() {
+    use peerdav_lib::sync::append_types::{BlockBinding, MAX_BLOCK_SIZE, MAX_DISCOVERY_ALLOCATION};
+    use sha2::{Digest, Sha256};
+    for mode in [AppendMode::Encrypted, AppendMode::AuthenticatedPlain] {
+        let f = Arc::new(Fake::default());
+        let mut desc = descriptor("00112233445566778899aabbccddeeff");
+        desc.mode = mode;
+        let (anchor, _) = AppendRepository::create_anchor(desc, b"p").unwrap();
+        let r = AppendRepository::new(f.clone(), anchor, b"p").unwrap();
+        let (key, bytes) = r.seal_block(&vec![7; MAX_BLOCK_SIZE]).unwrap();
+        let digest = hex::encode(Sha256::digest(&bytes));
+        let block_id = r.block_id(&vec![7; MAX_BLOCK_SIZE]).unwrap();
+        f.put(key, bytes);
+        let mut tree = empty_tree(&r);
+        tree.bindings.push(BlockBinding {
+            block_id,
+            len: MAX_BLOCK_SIZE as u64,
+            object: ObjectRef { kind: "block".into(), digest },
+        });
+        let tree_ref = put_tree(&f, &r, &tree);
+        let parent = put_commit(&f, &r, &commit(&r, "00000000000000000000000000000001", vec![], tree_ref.clone()));
+        let child = put_commit(&f, &r, &commit(&r, "00000000000000000000000000000002", vec![parent], tree_ref));
+        let before = f.gets.load(std::sync::atomic::Ordering::SeqCst);
+        let mut budget = DiscoveryBudget::default();
+        let result = validate_closure(f.clone(), r.repo_id(), &r, vec![child], &mut budget).await;
+        assert!(result.is_ok(), "legal block failed: {result:?}");
+        // Each commit/tree is authenticated; the shared file block only once.
+        assert_eq!(f.gets.load(std::sync::atomic::Ordering::SeqCst) - before, 5);
+        assert!(budget.allocation_bytes < MAX_DISCOVERY_ALLOCATION);
+    }
+}
+
+#[tokio::test]
+async fn block_workspace_boundary_and_reauthentication_remain_enforced() {
+    use peerdav_lib::sync::append_types::BlockBinding;
+    use sha2::{Digest, Sha256};
+    let (f, r) = repo().await;
+    let (key, bytes) = r.seal_block(&vec![9; 65536]).unwrap();
+    let workspace = bytes.len() * 8 + 4096;
+    let mut tree = empty_tree(&r);
+    tree.bindings.push(BlockBinding {
+        block_id: r.block_id(&vec![9; 65536]).unwrap(),
+        len: 65536,
+        object: ObjectRef { kind: "block".into(), digest: hex::encode(Sha256::digest(&bytes)) },
+    });
+    f.put(key.clone(), bytes.clone());
+    let tree_ref = put_tree(&f, &r, &tree);
+    let root = put_commit(&f, &r, &commit(&r, "00000000000000000000000000000001", vec![], tree_ref));
+    for extra in [0, 1] {
+        let limits = DiscoveryLimits { max_allocation: workspace - extra, ..Default::default() };
+        let mut budget = DiscoveryBudget::default();
+        let before = f.gets.load(std::sync::atomic::Ordering::SeqCst);
+        let result = validate_closure_with_limits(f.clone(), r.repo_id(), &r, vec![root.clone()], &mut budget, &limits).await;
+        if extra == 0 {
+            assert!(result.is_ok());
+        } else {
+            assert!(matches!(result, Err(AppendError::ResourceLimit("block workspace"))));
+            assert_eq!(f.gets.load(std::sync::atomic::Ordering::SeqCst) - before, 2);
+        }
+    }
+    // Successful evidence is invocation-local: corrupting the object afterwards
+    // must never be hidden by a persistent or cross-run validation cache.
+    let mut corrupt = bytes;
+    corrupt[0] ^= 1;
+    f.put(key, corrupt);
+    assert!(validate_closure(f, r.repo_id(), &r, vec![root], &mut DiscoveryBudget::default()).await.is_err());
+}
+
+#[tokio::test]
+async fn shared_block_digest_with_conflicting_binding_is_rejected() {
+    use peerdav_lib::sync::append_types::BlockBinding;
+    use sha2::{Digest, Sha256};
+    let (f, r) = repo().await;
+    let (key, bytes) = r.seal_block(b"shared").unwrap();
+    let mut tree = empty_tree(&r);
+    tree.bindings.push(BlockBinding {
+        block_id: r.block_id(b"shared").unwrap(),
+        len: 6,
+        object: ObjectRef { kind: "block".into(), digest: hex::encode(Sha256::digest(&bytes)) },
+    });
+    f.put(key, bytes);
+    let root_tree = put_tree(&f, &r, &tree);
+    let parent = put_commit(&f, &r, &commit(&r, "00000000000000000000000000000001", vec![], root_tree));
+    tree.bindings[0].len = 5;
+    let conflict = put_tree(&f, &r, &tree);
+    let child = put_commit(&f, &r, &commit(&r, "00000000000000000000000000000002", vec![parent.clone()], conflict));
+    assert!(matches!(validate_closure(f, r.repo_id(), &r, vec![parent, child], &mut DiscoveryBudget::default()).await,
+        Err(AppendError::Invalid("binding mismatch"))));
+}
+
+#[tokio::test]
 async fn missing_tree_and_block_preserve_pending_source_and_failed_get_charge() {
     use peerdav_lib::sync::append_types::{BlockBinding, DirectoryRef};
     let (f, r) = repo().await;
@@ -1341,7 +1472,7 @@ async fn missing_tree_and_block_preserve_pending_source_and_failed_get_charge() 
         Err(AppendError::PendingDependency(CloudError::NotFound))
     ));
     assert_eq!(b.requests, 7); // three HEAD + GET pairs, missing block HEAD
-    f.put(format!("v2/{}/blocks/{digest}", r.repo_id()), bytes);
+    f.put(format!("_peerdav_encrypt/{}/blocks/{digest}", r.repo_id()), bytes);
     let closure = validate_closure(
         f,
         r.repo_id(),
@@ -1405,7 +1536,7 @@ async fn same_revision_id_different_content_is_rejected() {
         &r,
         &commit(&r, "00000000000000000000000000000001", vec![], good.clone()),
     );
-    let key = format!("v2/{}/trees/{}", r.repo_id(), good.digest);
+    let key = format!("_peerdav_encrypt/{}/trees/{}", r.repo_id(), good.digest);
     let bytes = f.objects.lock().unwrap().get(&key).cloned().unwrap();
     let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     tree.entries[0].change_id = ChangeId("altered".into());
@@ -1418,7 +1549,7 @@ async fn same_revision_id_different_content_is_rejected() {
         digest: hex::encode(sha2::Sha256::digest(&bad_bytes)),
     };
     f.put(
-        format!("v2/{}/trees/{}", r.repo_id(), bad.digest),
+        format!("_peerdav_encrypt/{}/trees/{}", r.repo_id(), bad.digest),
         bad_bytes,
     );
     let child = put_commit(
