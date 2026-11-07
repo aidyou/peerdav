@@ -63,6 +63,63 @@ beforeEach(() => {
 });
 afterEach(() => { wrappers.splice(0).forEach((wrapper) => { if (wrapper.exists()) wrapper.unmount(); }); document.body.innerHTML = ''; vi.useRealTimers(); });
 
+describe("sync directory labels", () => {
+  it.each(["list", "icons", "columns", "gallery"])("localizes exact directory names in %s without changing keys", async (mode) => {
+    handlers.cloud_object_list = ({ prefix }) => prefix ? page([{ key: `${prefix}file.txt`, size: 1 }]) : page([
+      { key: "_peerdav_encrypt/repo/block", size: 1 },
+      { key: "_peerdav_mirror/docs/a.txt", size: 1 },
+      { key: "_peerdav_encrypt-backup/file.txt", size: 1 },
+      { key: "_peerdav_mirror.txt", size: 1 },
+    ]);
+    const wrapper = await browser(mode);
+    expect(wrapper.text()).toContain("Encrypted sync drive");
+    expect(wrapper.text()).toContain("Mirror sync drive");
+    expect(wrapper.find('[data-key="_peerdav_encrypt/"] .file-glyph--encrypted-drive').exists()).toBe(true);
+    expect(wrapper.find('[data-key="_peerdav_mirror/"] .file-glyph--mirror-drive').exists()).toBe(true);
+    expect(wrapper.find('[data-key="_peerdav_encrypt-backup/"] .file-glyph--folder').exists()).toBe(true);
+    expect(wrapper.text()).toContain("_peerdav_encrypt-backup");
+    expect(wrapper.text()).toContain("_peerdav_mirror.txt");
+    setLocale("zh-CN"); await flushPromises();
+    expect(wrapper.text()).toContain("加密同步盘");
+    expect(wrapper.text()).toContain("镜像同步盘");
+    const folder = wrapper.find('[data-key="_peerdav_encrypt/"]');
+    await folder.trigger(mode === "columns" ? "click" : "dblclick"); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith("cloud_object_list", { connectionId: "c1", prefix: "_peerdav_encrypt/", next: null });
+    expect(wrapper.find(".breadcrumbs").text()).toContain("加密同步盘");
+  });
+  it.each(['list', 'icons', 'columns', 'gallery'])('hides deletion throughout the encrypted drive in %s while preserving ordinary siblings', async (mode) => {
+    handlers.cloud_object_list = ({ prefix }) => page(prefix === '_peerdav_encrypt/'
+      ? [{ key: '_peerdav_encrypt/repo/block', size: 1 }]
+      : prefix === '_peerdav_encrypt/repo/'
+        ? [{ key: '_peerdav_encrypt/repo/block', size: 1 }]
+        : [{ key: '_peerdav_encrypt/repo/block', size: 1 }, { key: '_peerdav_encrypt-backup/keep.txt', size: 1 }]);
+    const wrapper = await browser(mode);
+    await wrapper.find('[data-key="_peerdav_encrypt-backup/"]').trigger('click'); await flushPromises();
+    expect(wrapper.find('[data-test=delete-file]').exists()).toBe(true);
+    expect(wrapper.find('[data-test=delete-prefix]').exists()).toBe(true);
+    const encrypted = wrapper.find('[data-key="_peerdav_encrypt/"]');
+    await encrypted.trigger('click'); await flushPromises();
+    expect(wrapper.find('[data-test=delete-file]').exists()).toBe(false);
+    if (mode !== 'columns') { await encrypted.trigger('dblclick'); await flushPromises(); }
+    expect(wrapper.find('[data-test=delete-prefix]').exists()).toBe(false);
+    const repo = wrapper.find('[data-key="_peerdav_encrypt/repo/"]');
+    await repo.trigger('click'); await flushPromises();
+    expect(wrapper.find('[data-test=delete-file]').exists()).toBe(false);
+    if (mode !== 'columns') { await repo.trigger('dblclick'); await flushPromises(); }
+    await wrapper.find('[data-key="_peerdav_encrypt/repo/block"]').trigger('click'); await flushPromises();
+    expect(wrapper.find('[data-test=delete-file]').exists()).toBe(false);
+    expect(wrapper.find('[data-test=delete-prefix]').exists()).toBe(false);
+    expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_object_delete_plan')).toBe(false);
+  });
+  it("does not rename files that have a reserved directory name", async () => {
+    handlers.cloud_object_list = () => page([{ key: "_peerdav_encrypt", size: 1 }, { key: "_peerdav_mirror", size: 1 }]);
+    const wrapper = await browser();
+    expect(wrapper.text()).toContain("_peerdav_encrypt");
+    expect(wrapper.text()).toContain("_peerdav_mirror");
+    expect(wrapper.text()).not.toContain("Encrypted sync drive");
+  });
+});
+
 describe("selection-bar action reset", () => {
   it.each(['list', 'gallery'].flatMap((view) => ['single', 'folder', 'files'].map((mode) => [view, mode])))('captures %s %s downloads before clearing, including picker cancellation', async (view, mode) => {
     handlers.cloud_object_list = () => page(mode === 'folder' ? [{ key: 'docs/a.txt' }] : [file, { key: 'b.txt', size: 2 }]);
@@ -113,7 +170,46 @@ describe("selection-bar action reset", () => {
 describe("local sync-drive contents", () => {
   const catalog = () => ({ connections: [{ id: 'c1', name: 'Main', bucket: 'main', buckets: ['main', 'photos'] }], mappings: [{ id: 'm1', connectionId: 'c1', repositoryId: 'r1', localRoot: '/local/Documents' }, { id: 'm2', connectionId: 'c1', repositoryId: 'r2', localRoot: '/local/Pictures' }] });
   const contents = () => [{ path: 'docs', name: 'docs', isDir: true, size: 0, synced: false }, { path: 'docs/new.txt', name: 'new.txt', isDir: false, size: 4, synced: false }, { path: 'done.txt', name: 'done.txt', isDir: false, size: 2, synced: true }];
-  beforeEach(() => { handlers.cloud_list = catalog; handlers.cloud_local_entries = contents; handlers.cloud_status = () => []; handlers.cloud_preview = () => ({ previewId: 'plan', summary: { uploads: 1, downloads: 0, deletes: 0, conflicts: 0 } }); handlers.cloud_sync = () => ({ runId: 1 }); });
+  beforeEach(() => { handlers.cloud_list = catalog; handlers.cloud_local_entries = contents; handlers.cloud_local_status = contents; handlers.cloud_status = () => []; handlers.cloud_preview = () => ({ previewId: 'plan', summary: { uploads: 1, downloads: 0, deletes: 0, conflicts: 0 } }); handlers.cloud_sync = () => ({ runId: 1 }); });
+  it('opens a mirror drive in its bucket and remote folder instead of management', async () => {
+    handlers.cloud_list = () => ({ ...catalog(), mirrorMappings: [{ id: 'mirror1', connectionId: 'c1', bucket: 'photos', localRoot: '/local/Mirror', cloudPrefix: 'pictures' }] });
+    const wrapper = await browser('list');
+    await wrapper.findAll('.drive-link').at(-1).trigger('click'); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_select_bucket', { connectionId: 'c1', bucket: 'photos' });
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_object_list', expect.objectContaining({ prefix: '_peerdav_mirror/pictures/' }));
+    expect(wrapper.find('.management-view').exists()).toBe(false);
+    expect(wrapper.find('.drive-link .file-glyph--encrypted-drive').exists()).toBe(true);
+    expect(wrapper.find('.drive-link .file-glyph--mirror-drive').exists()).toBe(true);
+  });
+  it('renders local contents before the expensive sync comparison completes', async () => {
+    const comparison = deferred();
+    handlers.cloud_local_entries = contents;
+    handlers.cloud_local_status = () => comparison.promise;
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    expect(wrapper.find('[data-path="done.txt"]').exists()).toBe(true);
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_status', { mappingId: 'm1' });
+    comparison.resolve(contents().map(entry => ({ ...entry, synced: true }))); await flushPromises();
+    expect(wrapper.find('.entry-status').exists()).toBe(false);
+  });
+  it('timestamps an empty local preview without offering an apply action', async () => {
+    handlers.cloud_preview = () => ({ previewId: 'empty', summary: { uploads: 0, downloads: 0, deletes: 0, conflicts: 0 } });
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    await textButton(wrapper, t('drive.syncNow')).trigger('click'); await flushPromises();
+    expect(wrapper.find('.local-plan time').attributes('datetime')).toBeTruthy();
+    expect(wrapper.find('.local-plan').text()).toContain(t('drive.upToDate'));
+    expect(wrapper.find('.local-plan').text()).not.toContain(t('drive.applyPlan'));
+    expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_sync')).toBe(false);
+  });
+  it('ignores a late mirror bucket selection after the connection changes', async () => {
+    handlers.cloud_list = () => ({ ...catalog(), mirrorMappings: [{ id: 'mirror1', connectionId: 'c1', bucket: 'photos', localRoot: '/local/Mirror', cloudPrefix: 'pictures' }] });
+    const pending = deferred();
+    const wrapper = await browser('list');
+    handlers.cloud_object_select_bucket = ({ connectionId, bucket }) => connectionId === 'c1' && bucket === 'photos' ? pending.promise : {};
+    await wrapper.findAll('.drive-link').at(-1).trigger('click'); await flushPromises();
+    await wrapper.setProps({ connectionId: 'c2' }); await flushPromises();
+    pending.resolve({}); await flushPromises();
+    expect(nativeInvoke.mock.calls.some(([command, input]) => command === 'cloud_object_list' && input.connectionId === 'c2' && input.prefix.startsWith('_peerdav_mirror/'))).toBe(false);
+  });
   it.each(['icons', 'list', 'columns', 'gallery'])('reuses the shared %s view with real local paths and sync markers', async (mode) => {
     const wrapper = await browser(mode); await click(wrapper, '.drive-link');
     expect(wrapper.findAll('.drive-link').map(link => link.text())).toEqual(['Documents', 'Pictures']);

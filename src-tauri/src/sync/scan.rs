@@ -139,6 +139,9 @@ fn walk(
         if options.ignored.iter().any(|v| v == name_text) {
             continue;
         }
+        if crate::ignore_rules::is_sync_temporary_path(name_text) {
+            continue;
+        }
         let child = rel.join(&name);
         validate_relative(&child)?;
         let path = display_root.join(&child);
@@ -247,4 +250,28 @@ fn walk(
         return Err(ScanError::RootChanged);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temporary_files_are_excluded_without_hiding_normal_neighbors() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [".notes.swp", "video.mp4.part", "report.tmp", "#notes#", ".#notes"] {
+            std::fs::write(root.path().join(name), b"in progress").unwrap();
+        }
+        std::fs::create_dir(root.path().join("cache.tmp")).unwrap();
+        std::fs::write(root.path().join("cache.tmp/secret.txt"), b"temporary").unwrap();
+        for name in ["notes.txt", "notes.swp", "report.tmp.txt", ".env", "part", "template"] {
+            std::fs::write(root.path().join(name), b"complete").unwrap();
+        }
+        let report = scan(root.path(), &ScanOptions::default()).unwrap();
+        assert!(report.complete);
+        assert!(report.ignored_paths.is_empty());
+        assert_eq!(report.files.len(), 6);
+        assert_eq!(report.directories, [""]);
+        assert!(report.files.iter().all(|file| file.size == 8));
+    }
 }

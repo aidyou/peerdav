@@ -174,6 +174,16 @@ impl ObjectStore for CoreS3ReadBridge {
             result.entry.map(metadata).ok_or(CloudError::Unsupported)
         })
     }
+    fn delete_if_match<'a>(
+        &'a self,
+        key: &'a str,
+        etag: &'a str,
+    ) -> BoxFuture<'a, Result<(), CloudError>> {
+        // Conditional deletion includes its own provider probe. Do not route it
+        // through the core adapter's unconditional-delete capability snapshot.
+        self.0.store.delete_if_match(key, etag)
+    }
+
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), CloudError>> {
         Box::pin(async move {
             FileBackend::delete(&self.0, context(), DeleteRequest {

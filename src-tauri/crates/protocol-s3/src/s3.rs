@@ -57,6 +57,8 @@ pub struct S3Store {
     backend: Arc<dyn Backend>,
     paginated: Option<Arc<object_store::aws::AmazonS3>>,
     verified: Arc<AtomicBool>,
+    delete_verified: Arc<tokio::sync::Mutex<Option<bool>>>,
+    transport: ConnectionTransport,
     #[cfg(test)]
     multipart_factory: Option<MultipartFactory>,
     #[cfg(test)]
@@ -124,7 +126,7 @@ impl S3Store {
             .with_endpoint(&config.endpoint)
             .with_virtual_hosted_style_request(!config.path_style)
             .with_allow_http(url.scheme() == "http")
-            .with_http_connector(transport.qiniu_compatibility());
+            .with_http_connector(transport.clone().qiniu_compatibility());
         if let Some(token) = &config.session_token {
             builder = builder.with_token(token);
         }
@@ -133,7 +135,9 @@ impl S3Store {
             config,
             backend: Arc::new(backend.clone()),
             paginated: Some(Arc::new(backend)),
+            transport,
             verified: Arc::new(AtomicBool::new(false)),
+            delete_verified: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(test)]
             multipart_factory: None,
             #[cfg(test)]
@@ -161,7 +165,9 @@ impl S3Store {
             },
             backend,
             paginated: None,
+            transport: ConnectionTransport::new(&super::types::ProxyMode::Direct).expect("test transport"),
             verified: Arc::new(AtomicBool::new(false)),
+            delete_verified: Arc::new(tokio::sync::Mutex::new(None)),
             multipart_factory: Some(factory),
             multipart_budget: None,
             multipart_peak_buffer: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -211,6 +217,83 @@ impl S3Store {
         ObjectPath::parse(format!("{}{}", self.config.prefix, key))
             .map_err(object_store::Error::from)
             .map_err(map_err)
+    }
+
+    async fn delete_revision_request(&self, key: &str, etag: &str) -> Result<(), CloudError> {
+        // object_store 0.14 has no conditional DELETE primitive. Reuse its
+        // S3 signing and the configured transport; never emulate this with
+        // HEAD followed by an unconditional delete.
+        use object_store::signer::Signer;
+        let backend = self.paginated.as_ref().ok_or(CloudError::Unsupported)?;
+        let url = backend
+            .signed_url(
+                reqwest::Method::DELETE,
+                &self.path(key)?,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .map_err(map_err)?;
+        let response = self.transport.client()
+            .delete(url)
+            .header(reqwest::header::IF_MATCH, etag)
+            .send()
+            .await
+            .map_err(|source| CloudError::Transport { source: source.without_url() })?;
+        match response.status().as_u16() {
+            200 | 204 => Ok(()),
+            412 => Err(CloudError::Precondition),
+            404 => Err(CloudError::NotFound),
+            status => {
+                let mut body = response.bytes_stream();
+                let mut detail = Vec::new();
+                while let Some(chunk) = body.next().await {
+                    let chunk = chunk.map_err(|source| CloudError::Transport { source: source.without_url() })?;
+                    let count = chunk.len().min(4096 - detail.len());
+                    detail.extend_from_slice(&chunk[..count]);
+                    if detail.len() == 4096 { break; }
+                }
+                Err(CloudError::Service { status, detail: String::from_utf8_lossy(&detail).into_owned() })
+            }
+        }
+    }
+
+    async fn verify_delete_precondition(&self) -> Result<(), CloudError> {
+        let mut verified = self.delete_verified.lock().await;
+        if let Some(supported) = *verified {
+            return if supported { Ok(()) } else { Err(CloudError::Unsupported) };
+        }
+        let mut random = [0; 16];
+        rand::rngs::OsRng.try_fill_bytes(&mut random).map_err(|source| CloudError::Random { source })?;
+        let key = format!("probes/{}/conditional-delete", hex::encode(random));
+        let original = self.put(&key, body(b"delete-probe"), PutCondition::CreateOnly).await?;
+        let revision = original.etag.as_deref().filter(|etag| !etag.is_empty()).ok_or(CloudError::Unsupported)?;
+        // A provider that ignores If-Match may delete this isolated random probe,
+        // but must never be allowed to delete any user object.
+        match self.delete_revision_request(&key, "\"peerdav-impossible-revision\"").await {
+            Err(CloudError::Precondition) => {}
+            Err(error) => return Err(error),
+            Ok(()) => {
+                // Do not create another probe for every item in this folder.
+                *verified = Some(false);
+                return Err(CloudError::Unsupported);
+            }
+        }
+        let retained = self.stat(&key).await?;
+        if retained.etag.as_deref() != Some(revision) || retained.size != original.size {
+            *verified = Some(false);
+            return Err(CloudError::Unsupported);
+        }
+        self.delete_revision_request(&key, revision).await?;
+        match self.stat(&key).await {
+            Err(CloudError::NotFound) => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                *verified = Some(false);
+                return Err(CloudError::Unsupported);
+            }
+        }
+        *verified = Some(true);
+        Ok(())
     }
 
     fn list_prefix(&self, prefix: &str) -> Result<String, CloudError> {
@@ -819,6 +902,20 @@ impl ObjectStore for S3Store {
                 size: size as u64,
                 etag: result.e_tag,
             })
+        })
+    }
+
+    fn delete_if_match<'a>(&'a self, key: &'a str, etag: &'a str) -> BoxFuture<'a, Result<(), CloudError>> {
+        Box::pin(async move {
+            validate_key(key)?;
+            if etag.trim().is_empty() || etag.trim() == "*"
+                || reqwest::header::HeaderValue::from_str(etag).is_err()
+            {
+                return Err(CloudError::InvalidConfig("valid delete revision is required".into()));
+            }
+            self.path(key)?;
+            self.verify_delete_precondition().await?;
+            self.delete_revision_request(key, etag).await
         })
     }
 

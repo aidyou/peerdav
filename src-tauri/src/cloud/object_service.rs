@@ -609,6 +609,12 @@ impl ObjectService {
         }
         Ok(self.guard.is_protected(&self.target_identity(key))?)
     }
+    pub(crate) fn is_within_protected(&self, key: &str) -> Result<bool, ObjectServiceError> {
+        if !key.is_empty() {
+            valid_key(key)?;
+        }
+        Ok(self.guard.is_within_protected(&self.target_identity(key))?)
+    }
     /// One active continuation chain per prefix. A terminal chain can be
     /// restarted with no token; failed requests retain their operation budget.
     /// S3 tokens additionally carry the provider chain's page/entry counters.
@@ -694,7 +700,11 @@ impl ObjectService {
                     continue;
                 };
                 // Persist the protection before interpreting untrusted marker bytes.
-                let identity = self.identity_with_prefix(root);
+                let identity = self.identity_with_prefix(&if append {
+                    join_prefix(root, crate::sync::append_types::APPEND_ROOT)
+                } else {
+                    root.to_owned()
+                });
                 let already_protected = self.guard.is_protected(&identity)?;
                 if !already_protected {
                     register_discovered_protection(&self.guard, identity, key)?;
@@ -965,11 +975,9 @@ impl ObjectService {
                 return Err(ObjectServiceError::StaleDeletePlan);
             }
             valid_key(&e.key)?;
-            // Every entry needs a usable version before any deletion is attempted.
-            // A preflight HEAD is not atomic protection against concurrent replacement.
-            if e.etag.as_deref().is_none_or(str::is_empty) {
-                return Err(CloudError::Unsupported.into());
-            }
+            // Recheck the complete snapshot before the first mutation. Ordinary
+            // objects use key deletion, not provider-dependent If-Match semantics.
+            // Other clients may still replace a key after this preflight.
             let m = self.store.stat(&e.key).await?;
             if *size != m.size || m.etag != e.etag {
                 return Err(ObjectServiceError::StaleDeletePlan);
@@ -982,11 +990,7 @@ impl ObjectService {
             .ok_or(ObjectServiceError::StaleDeletePlan)?;
         let mut result = Vec::with_capacity(plan.entries.len());
         for e in &plan.entries {
-            let outcome = match e.etag.as_deref().filter(|etag| !etag.is_empty()) {
-                Some(etag) => self.store.delete_if_match(&e.key, etag).await,
-                None => Err(CloudError::Unsupported),
-            };
-            result.push(outcome.map(|_| e.key.clone()));
+            result.push(self.store.delete(&e.key).await.map(|_| e.key.clone()));
         }
         Ok(result)
     }

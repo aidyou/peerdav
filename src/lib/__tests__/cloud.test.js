@@ -96,7 +96,7 @@ describe("cloud API wrappers", () => {
       "list", "probeBuckets", "connectionCredentials", "saveConnection", "testConnection", "deleteConnection",
       "createRepository", "joinRepository", "saveMapping", "appendDiscover", "createSyncDrive", "appendCreate", "appendJoin", "appendSaveMapping", "deleteMapping",
       "localEntries", "preview", "sync", "cancel", "recoveryRecords", "restore", "status",
-      "mirrorSaveMapping", "mirrorDeleteMapping", "mirrorSync", "mirrorCancel",
+      "mirrorFolders", "mirrorSaveMapping", "mirrorDeleteMapping", "mirrorSync", "mirrorCancel",
     ]);
   });
 

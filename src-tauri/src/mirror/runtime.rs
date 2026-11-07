@@ -99,8 +99,8 @@ pub async fn list_cloud(
     Ok(files)
 }
 
-/// Read a bounded local snapshot without following links, then publish with
-/// a provider-enforced condition; local I/O failures retain their original cause.
+/// Read and validate a bounded local snapshot before publishing. Plain mirrors
+/// use ordinary S3 keys with a last-moment remote snapshot check, not CAS.
 async fn upload_file(
     store: &dyn ObjectStore,
     path: &Path,
@@ -109,17 +109,6 @@ async fn upload_file(
     scanned: &LocalFile,
     cancel: Arc<AtomicBool>,
 ) -> Result<ObjectMetadata, MirrorError> {
-    let capabilities = store.capabilities();
-    if !capabilities.conditional_writes_verified
-        || !capabilities.create_only
-        || (expected.is_some() && !capabilities.conditional_replace)
-    {
-        return Err(CloudError::Unsupported.into());
-    }
-    let condition = match expected {
-        Some(file) => PutCondition::MatchEtag(file.etag.clone().ok_or(CloudError::Unsupported)?),
-        None => PutCondition::CreateOnly,
-    };
     if scanned.size > crate::cloud::types::MAX_PUT_BYTES as u64 {
         return Err(CloudError::PayloadTooLarge.into());
     }
@@ -155,12 +144,28 @@ async fn upload_file(
     if data.len() as u64 != scanned.size || !local_state_matches(path, scanned) {
         return Err(CloudError::Precondition.into());
     }
+    verify_remote_snapshot(store, key, expected).await?;
     canceled(&cancel)?;
     let body = stream::once(async move { Ok(data.into()) });
     store
-        .put(key, Box::pin(body), condition)
+        .put(key, Box::pin(body), PutCondition::Any)
         .await
         .map_err(MirrorError::from)
+}
+
+async fn verify_remote_snapshot(
+    store: &dyn ObjectStore,
+    key: &str,
+    expected: Option<&CloudFile>,
+) -> Result<(), CloudError> {
+    match (store.stat(key).await, expected) {
+        (Err(CloudError::NotFound), None) => Ok(()),
+        (Ok(current), Some(expected))
+            if expected.etag.as_deref().is_some_and(|etag| !etag.is_empty())
+                && current.etag == expected.etag && current.size == expected.size => Ok(()),
+        (Err(CloudError::NotFound), Some(_)) | (Ok(_), _) => Err(CloudError::Precondition),
+        (Err(error), _) => Err(error),
+    }
 }
 
 /// 从本地根逐级打开相对路径的父目录；每级都 `nofollow`，缺失目录逐级创建。
@@ -414,6 +419,9 @@ pub async fn run_sync(
         };
     }
 
+    // Exclusions are not user deletions. Retire only their comparison state;
+    // never delete or restore existing local/remote temporary objects.
+    baseline.retain(|path| !types::is_artifact(path));
     let mut result = MirrorSyncResult::default();
     let scan::ScanReport {
         files: local,
@@ -621,10 +629,16 @@ pub async fn run_sync(
                     continue;
                 }
                 let key = types::cloud_key(&mapping.cloud_prefix, &path);
-                let expected = cloud.get(&path).and_then(|file| file.etag.as_deref());
-                let deletion = match expected {
-                    Some(etag) => store.delete_if_match(&key, etag).await,
-                    None => Err(CloudError::Unsupported),
+                let deletion = match verify_remote_snapshot(store.as_ref(), &key, cloud.get(&path)).await {
+                    Ok(()) => {
+                        canceled(&cancel)?;
+                        if mapping.local_root.join(&path).try_exists()? {
+                            Err(CloudError::Precondition)
+                        } else {
+                            store.delete(&key).await
+                        }
+                    }
+                    Err(error) => Err(error),
                 };
                 match deletion {
                     Ok(()) => {
@@ -960,6 +974,7 @@ mod tests {
         MirrorMapping {
             id: "map1".to_owned(),
             connection_id: "c1".to_owned(),
+            bucket: None,
             local_root: local_root.to_path_buf(),
             cloud_prefix: cloud_prefix.to_owned(),
             schedule: Default::default(),
@@ -1028,6 +1043,39 @@ mod tests {
         std::fs::create_dir_all(&local).unwrap();
         std::fs::create_dir_all(&data).unwrap();
         (local, data)
+    }
+
+    #[tokio::test]
+    async fn temporary_files_never_transfer_or_propagate_old_baseline_deletes() {
+        let local = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        write(local.path(), "keep.txt", "keep");
+        let mapping = mapping(local.path(), "docs");
+        let store = Arc::new(MemoryStore::new(vec![]));
+        run_sync(store.clone(), &mapping, data.path(), &context(), Arc::new(AtomicBool::new(false))).await.unwrap();
+        write(local.path(), ".notes.swp", "editor");
+        write(local.path(), "local.tmp", "temporary local");
+        write(local.path(), "folder.part/inside.txt", "temporary subtree");
+        write(local.path(), "report.tmp.txt", "normal");
+        // Simulate a pre-upgrade baseline: each side has lost a different old temporary file.
+        let mut old = baseline::load(data.path(), &mapping.id).unwrap();
+        for name in ["remote.part", "local.tmp"] {
+            old.record_upload(name, 0, 5, Some("old".into()), 5);
+        }
+        baseline::save(data.path(), &mapping.id, &old).unwrap();
+        store.objects.lock().unwrap().insert("_peerdav_mirror/docs/remote.part".into(), (b"remote".to_vec(), "old".into()));
+        for _ in 0..2 {
+            let result = super::run_sync(store.clone(), &mapping, data.path(), &context(), Arc::new(AtomicBool::new(false))).await.unwrap();
+            assert!(result.failures.is_empty(), "{:?}", result.failures);
+            assert_eq!((result.deleted_local, result.deleted_cloud, result.downloaded), (0, 0, 0));
+            assert!(result.conflicts.is_empty());
+        }
+        assert_eq!(store.get_value("_peerdav_mirror/docs/remote.part"), b"remote");
+        assert!(!store.keys().contains(&"_peerdav_mirror/docs/local.tmp".into()));
+        assert!(!store.keys().iter().any(|key| key.contains("folder.part") || key.ends_with(".swp")));
+        assert!(!local.path().join("remote.part").exists());
+        assert_eq!(std::fs::read(local.path().join("local.tmp")).unwrap(), b"temporary local");
+        assert_eq!(store.get_value("_peerdav_mirror/docs/report.tmp.txt"), b"normal");
     }
 
     #[tokio::test]
@@ -1905,7 +1953,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_delete_and_truncated_download_preserve_originals() {
+    async fn key_delete_without_cas_and_truncated_download_preserve_safety() {
         let (local, data) = test_dirs();
         write(&local, "a.txt", "precious");
         let mut store = MemoryStore::new(vec![]);
@@ -1931,9 +1979,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.deleted_cloud, 0);
-        assert_eq!(result.failures.len(), 1);
-        assert_eq!(store.get_value("_peerdav_mirror/docs/a.txt"), b"precious");
+        assert_eq!(result.deleted_cloud, 1);
+        assert!(result.failures.is_empty());
+        assert!(store.keys().is_empty());
         let mut truncated = MemoryStore::new(vec![("a", b"remote".to_vec())]);
         truncated.truncated_read = true;
         let meta = truncated.stat("a").await.unwrap();
@@ -1957,6 +2005,29 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"keep local");
+        std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mirror_upload_rejects_stale_missing_and_new_remote_snapshots() {
+        let (local, _) = test_dirs();
+        write(&local, "a.txt", "local");
+        let scanned = scan::scan(&local, &AtomicBool::new(false)).unwrap();
+        let store = MemoryStore::new(vec![("a", b"remote".to_vec())]);
+        let expected = CloudFile { etag: Some("stale".into()), size: 6 };
+        for expected in [None, Some(&expected)] {
+            assert!(matches!(upload_file(&store, &local.join("a.txt"), "a", expected,
+                &scanned.files["a.txt"], Arc::new(AtomicBool::new(false))).await,
+                Err(MirrorError::Cloud(CloudError::Precondition))));
+            assert_eq!(store.get_value("a"), b"remote");
+        }
+        assert!(matches!(verify_remote_snapshot(&store, "missing", Some(&expected)).await, Err(CloudError::Precondition)));
+        let missing_revision = CloudFile { etag: None, size: 6 };
+        assert!(matches!(verify_remote_snapshot(&store, "a", Some(&missing_revision)).await, Err(CloudError::Precondition)));
+        let mut oversized = scanned.files["a.txt"].clone();
+        oversized.size = crate::cloud::types::MAX_PUT_BYTES as u64 + 1;
+        assert!(matches!(upload_file(&store, &local.join("a.txt"), "new", None, &oversized,
+            Arc::new(AtomicBool::new(false))).await, Err(MirrorError::Cloud(CloudError::PayloadTooLarge))));
         std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
     }
 

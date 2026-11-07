@@ -159,9 +159,16 @@ impl ObjectStore for FakeStore {
     }
     fn delete<'a>(
         &'a self,
-        _key: &'a str,
+        key: &'a str,
     ) -> futures_util::future::BoxFuture<'a, Result<(), CloudError>> {
-        Box::pin(async { panic!("object service must never use unconditional DELETE") })
+        Box::pin(async move {
+            let mut calls = self.calls.lock().unwrap();
+            if calls.delete_fail.as_deref() == Some(key) {
+                return Err(CloudError::Precondition);
+            }
+            calls.deletes.push(key.into());
+            Ok(())
+        })
     }
     fn delete_if_match<'a>(
         &'a self,
@@ -934,7 +941,7 @@ fn protection_query_reports_ancestors_and_validates_path_segments() {
 }
 
 #[tokio::test]
-async fn delete_requires_nonempty_etag_before_any_mutation() {
+async fn delete_without_etag_uses_confirmed_key_semantics() {
     for etag in [None, Some(String::new())] {
         let mut metadata = FakeStore::meta("folder/b");
         metadata.etag = etag;
@@ -945,41 +952,33 @@ async fn delete_requires_nonempty_etag_before_any_mutation() {
         let svc = service(store, "");
         svc.discover("").await.unwrap();
         let plan = svc.delete_plan("folder", 4_000_000_000).await.unwrap();
-        assert!(matches!(
-            svc.execute_delete(&plan, true).await,
-            Err(ObjectServiceError::Cloud(CloudError::Unsupported))
-        ));
-        assert!(calls.lock().unwrap().deletes.is_empty());
+        assert!(svc.execute_delete(&plan, true).await.unwrap().iter().all(Result::is_ok));
+        assert_eq!(calls.lock().unwrap().deletes, ["folder/a", "folder/b"]);
     }
 }
 
 #[tokio::test]
-async fn delete_racing_replacement_is_preserved_and_plan_consumed() {
-    let (store, calls) = FakeStore::new(vec![page(&["a"], None)]);
+async fn delete_changed_snapshot_is_rejected_before_any_key_delete() {
+    let (store, calls) = FakeStore::new(vec![page(&["folder/a", "folder/b"], None)]);
     let svc = service(store.clone(), "");
     svc.discover("").await.unwrap();
-    let plan = svc.delete_plan("a", 4_000_000_000).await.unwrap();
-    calls.lock().unwrap().delete_race = true;
-    let result = svc.execute_delete(&plan, true).await.unwrap();
-    assert!(matches!(result[0], Err(CloudError::Precondition)));
+    let plan = svc.delete_plan("folder", 4_000_000_000).await.unwrap();
+    store.pages.lock().unwrap()[0].objects[1].etag = Some("concurrent-replacement".into());
+    assert!(matches!(svc.execute_delete(&plan, true).await, Err(ObjectServiceError::StaleDeletePlan)));
     assert!(calls.lock().unwrap().deletes.is_empty());
-    assert_eq!(
-        store.pages.lock().unwrap()[0].objects[0].etag.as_deref(),
-        Some("concurrent-replacement")
-    );
-    assert!(svc.execute_delete(&plan, true).await.is_err());
 }
 
 #[tokio::test]
-async fn delete_unsupported_atomic_operation_never_falls_back() {
+async fn delete_unsupported_atomic_operation_uses_key_delete_once() {
     let (store, calls) = FakeStore::new(vec![page(&["a"], None)]);
     let svc = service(store, "");
     svc.discover("").await.unwrap();
     let plan = svc.delete_plan("a", 4_000_000_000).await.unwrap();
     calls.lock().unwrap().conditional_delete_unsupported = true;
     let result = svc.execute_delete(&plan, true).await.unwrap();
-    assert!(matches!(result[0], Err(CloudError::Unsupported)));
-    assert!(calls.lock().unwrap().deletes.is_empty());
+    assert!(result[0].is_ok());
+    assert_eq!(calls.lock().unwrap().deletes, ["a"]);
+    assert!(svc.execute_delete(&plan, true).await.is_err());
 }
 
 #[tokio::test]
@@ -1193,16 +1192,12 @@ async fn assert_marker_protection(mode: peerdav_lib::sync::append_types::AppendM
         install_marker(&store, &key, bytes.clone());
         let (svc, guard, directory) = discovery_fixture(store);
         svc.discover("").await.unwrap();
-        assert!(
-            guard
-                .is_protected(&identity(root, "different-alias"))
-                .unwrap()
-        );
-        let target = if root.is_empty() {
-            "file".into()
-        } else {
-            format!("{root}/file")
-        };
+        let protected = if root.is_empty() { "_peerdav_encrypt".to_owned() } else { format!("{root}/_peerdav_encrypt") };
+        assert!(guard.is_protected(&identity(&protected, "different-alias")).unwrap());
+        let ordinary = if root.is_empty() { "_peerdav_mirror/docs/file".to_owned() } else { format!("{root}/ordinary/file") };
+        assert!(!guard.is_protected(&identity(&ordinary, "ordinary")).unwrap());
+        assert!(guard.begin_mutation(&identity(&ordinary, "ordinary")).is_ok());
+        let target = format!("{protected}/file");
         assert!(matches!(
             svc.upload_stream_with_control(&target, body(), Arc::new(AtomicBool::new(false)), None)
                 .await,
@@ -1212,7 +1207,7 @@ async fn assert_marker_protection(mode: peerdav_lib::sync::append_types::AppendM
         assert_eq!(calls.lock().unwrap().upload, 0);
         let mappings = guard.mappings().unwrap();
         assert_eq!(mappings.len(), 1);
-        assert_eq!(mappings[0].identity.prefix, root);
+        assert_eq!(mappings[0].identity.prefix, protected);
         drop(svc);
         drop(guard);
         let reopened = ObjectGuard::open(directory.path().join("guard.db"), &[73; 32]).unwrap();
@@ -1222,6 +1217,25 @@ async fn assert_marker_protection(mode: peerdav_lib::sync::append_types::AppendM
                 .unwrap()
         );
     }
+}
+
+#[test]
+fn historical_v2_discovery_protection_recovers_after_reopen_without_losing_sync_guards() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("guard.db");
+    let guard = ObjectGuard::open(&path, &[73; 32]).unwrap();
+    let (marker, _) = append_marker(peerdav_lib::sync::append_types::AppendMode::Encrypted);
+    guard.register(ProtectedMapping { identity: identity("nested", "old-discovery"), repository_id: format!("nested/{marker}") }).unwrap();
+    guard.register(ProtectedMapping { identity: identity("cas", "cas"), repository_id: "cas/control/HEAD".into() }).unwrap();
+    drop(guard);
+    let reopened = ObjectGuard::open(&path, &[73; 32]).unwrap();
+    reopened.ensure_storage_identity(&identity("", "scope")).unwrap();
+    reopened.mark_discovery_complete(&identity("", "scope")).unwrap();
+    assert!(!reopened.is_protected(&identity("nested/ordinary/file", "ordinary")).unwrap());
+    assert!(reopened.begin_mutation(&identity("nested/_peerdav_mirror/docs/file", "mirror")).is_ok());
+    assert!(reopened.begin_mutation(&identity("nested/_peerdav_encrypt/repo/file", "encrypted")).is_err());
+    assert!(reopened.begin_mutation(&identity("nested", "parent-delete")).is_err());
+    assert!(reopened.begin_mutation(&identity("cas/file", "cas")).is_err());
 }
 
 #[tokio::test]
@@ -1288,7 +1302,7 @@ async fn assert_invalid_marker_still_protects(case: &str) {
         svc.discover("").await,
         Err(ObjectServiceError::DiscoveryIncomplete)
     ));
-    assert!(guard.is_protected(&identity("repo/file", "probe")).unwrap());
+    assert!(guard.is_protected(&identity("repo/_peerdav_encrypt/file", "probe")).unwrap());
     assert_eq!(guard.mappings().unwrap().len(), 1);
     assert!(
         guard
@@ -1296,7 +1310,7 @@ async fn assert_invalid_marker_still_protects(case: &str) {
             .is_err()
     );
     assert!(
-        svc.upload_stream_with_control("repo/file", body(), Arc::new(AtomicBool::new(false)), None)
+        svc.upload_stream_with_control("repo/_peerdav_encrypt/file", body(), Arc::new(AtomicBool::new(false)), None)
             .await
             .is_err()
     );
@@ -1343,7 +1357,7 @@ async fn second_page_append_marker_protects_root() {
     let (svc, guard, _directory) = discovery_fixture(store);
     svc.discover("").await.unwrap();
     assert_eq!(calls.lock().unwrap().list, 2);
-    assert!(guard.is_protected(&identity("repo/file", "probe")).unwrap());
+    assert!(guard.is_protected(&identity("repo/_peerdav_encrypt/file", "probe")).unwrap());
     assert!(
         guard
             .begin_mutation(&identity("ordinary/file", "probe"))

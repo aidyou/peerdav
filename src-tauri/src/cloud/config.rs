@@ -415,12 +415,15 @@ impl CloudConfigStore {
     ) -> Result<crate::mirror::MirrorMapping, ConfigError> {
         let _guard = self.guard()?;
         let mut snapshot = self.load_locked()?;
-        if !snapshot
-            .connections
-            .iter()
-            .any(|c| c.id == input.connection_id)
-        {
-            return Err(ConfigError::NotFound("connection".into()));
+        let connection = snapshot.connections.iter()
+            .find(|c| c.id == input.connection_id)
+            .ok_or_else(|| ConfigError::NotFound("connection".into()))?;
+        let bucket = input.bucket.as_deref()
+            .or_else(|| input.id.as_ref().and_then(|id| snapshot.mirror_mappings.iter()
+                .find(|m| &m.id == id).and_then(|m| m.bucket.as_deref())))
+            .unwrap_or(&connection.config.bucket).to_owned();
+        if bucket != connection.config.bucket && !connection.config.buckets.contains(&bucket) {
+            return Err(ConfigError::Validation("请选择已配置的存储桶 / Select a configured bucket".into()));
         }
         let cloud_prefix = crate::mirror::normalize_cloud_prefix(&input.cloud_prefix)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
@@ -459,6 +462,7 @@ impl CloudConfigStore {
         let mapping = crate::mirror::MirrorMapping {
             id: id.clone(),
             connection_id: input.connection_id.clone(),
+            bucket: Some(bucket.clone()),
             local_root,
             cloud_prefix,
             schedule: input.schedule,
@@ -479,6 +483,7 @@ impl CloudConfigStore {
                 ));
             }
             if existing.connection_id == mapping.connection_id
+                && existing.bucket.as_deref().unwrap_or(&connection.config.bucket) == bucket
                 && mirror_prefix_overlap(&existing.cloud_prefix, &mapping.cloud_prefix)
             {
                 return Err(ConfigError::Validation(
@@ -719,6 +724,7 @@ mod tests {
         SaveMirrorMappingInput {
             id: None,
             connection_id: connection_id.to_owned(),
+            bucket: None,
             local_root: local_root.to_path_buf(),
             cloud_prefix: cloud_prefix.to_owned(),
             schedule: ScheduleConfig {
@@ -726,6 +732,33 @@ mod tests {
                 interval: 900,
             },
         }
+    }
+
+    #[test]
+    fn mirror_bucket_selection_persists_and_scopes_overlap_checks() {
+        let (dir, store) = store();
+        let mut input = connection_input();
+        input.buckets = vec!["bucket".into(), "photos".into()];
+        let connection = store.save_connection(input).unwrap();
+        let save = |name: &str, bucket: Option<&str>| {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+            let mut value = serde_json::to_value(mirror_input(&connection.id, &dir.path().join(name), "docs")).unwrap();
+            if let Some(bucket) = bucket { value["bucket"] = bucket.into(); }
+            store.save_mirror_mapping(serde_json::from_value(value).unwrap())
+        };
+        let first = save("a", None).unwrap();
+        let second = save("b", Some("photos")).unwrap();
+        assert_eq!(serde_json::to_value(&second).unwrap()["bucket"], "photos");
+        assert!(save("c", Some("photos")).is_err());
+        assert!(save("d", Some("unknown")).is_err());
+        let mut edit = mirror_input(&connection.id, &dir.path().join("b"), "docs");
+        edit.id = Some(second.id.clone());
+        let updated = store.save_mirror_mapping(edit).unwrap();
+        assert_eq!(serde_json::to_value(updated).unwrap()["bucket"], "photos");
+        let saved = store.snapshot().unwrap();
+        assert_eq!(saved.mirror_mappings.len(), 2);
+        assert_eq!(serde_json::to_value(&saved.mirror_mappings[0]).unwrap()["bucket"], "bucket");
+        assert_eq!(saved.mirror_mappings[0].id, first.id);
     }
 
     #[test]

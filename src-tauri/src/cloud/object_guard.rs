@@ -426,6 +426,14 @@ impl ObjectGuard {
         let id = self.project(&id, false)?;
         Ok(self.projected_rows()?.iter().any(|m| overlaps(m, &id)))
     }
+    /// Whether the target itself is inside protection. Parent directories may
+    /// contain protected children without forbidding ordinary sibling uploads.
+    pub fn is_within_protected(&self, identity: &ProtectedIdentity) -> Result<bool, ObjectGuardError> {
+        let id = canonical(identity.clone())?;
+        let _g = self.guard_lock()?;
+        let id = self.project(&id, false)?;
+        Ok(self.projected_rows()?.iter().any(|m| contains(m, &id)))
+    }
     fn insert(
         &self,
         m: ProtectedMapping,
@@ -483,7 +491,28 @@ impl ObjectGuard {
             if s != 0 && s != 1 {
                 return Err(ObjectGuardError::KeyOrCorruption);
             };
-            out.push((open(&self.key, &b)?, s, d));
+            let mut mapping = open(&self.key, &b)?;
+            // Older discovery records protected the parent of Append v2. Only
+            // re-scope records whose marker proves this exact historical layout;
+            // manually registered roots and CAS protection remain unchanged.
+            if s == 1 && !d {
+                if let Some((root, anchor)) = mapping.repository_id.rsplit_once(crate::sync::append_types::APPEND_ANCHORS) {
+                    let root = root.trim_end_matches('/');
+                    if mapping.identity.prefix == root
+                        && anchor.split_once('-').is_some_and(|(repo, digest)| {
+                            repo.len() == 32 && digest.len() == 64
+                                && repo.bytes().chain(digest.bytes()).all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                        })
+                    {
+                        mapping.identity.prefix = if root.is_empty() {
+                            crate::sync::append_types::APPEND_ROOT.to_owned()
+                        } else {
+                            format!("{root}/{}", crate::sync::append_types::APPEND_ROOT)
+                        };
+                    }
+                }
+            }
+            out.push((mapping, s, d));
         }
         Ok(out)
     }

@@ -308,6 +308,105 @@ mod tests {
         assert!(paths[6].contains("space%20image.png"));
     }
 
+    #[tokio::test]
+    async fn conditional_delete_sends_revision_and_preserves_provider_errors() {
+        use crate::{CloudError, ObjectStore, S3Config, S3Store};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in [
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"probe\"\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nETag: \"probe\"\r\nLast-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: close\r\n\r\ndenied",
+            ] {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    bytes.push(socket.read_u8().await.expect("header"));
+                }
+                let request = String::from_utf8(bytes).expect("request");
+                let length = request.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().expect("length"))
+                }).unwrap_or(0);
+                socket.read_exact(&mut vec![0; length]).await.expect("body");
+                requests.push(request);
+                socket.write_all(response.as_bytes()).await.expect("response");
+            }
+            requests
+        });
+        let store = S3Store::new(S3Config {
+            endpoint: format!("http://{address}"), bucket: "fixture".into(),
+            region: "test".into(), prefix: "owned/".into(), path_style: true,
+            access_key: "fake".into(), secret_key: "fake".into(), session_token: None,
+            buckets: vec![], allow_insecure_http: true, proxy: ProxyMode::Direct,
+        }).expect("store");
+        let store = crate::CoreS3ReadBridge(crate::CoreS3Backend::new(Arc::new(store), 1).expect("bridge"));
+        for revision in ["", " ", "*", "bad\r\nheader"] {
+            assert!(matches!(store.delete_if_match("图片/keep.png", revision).await, Err(CloudError::InvalidConfig(_))));
+        }
+        assert!(matches!(store.delete_if_match("../outside", "\"revision\"").await, Err(CloudError::InvalidConfig(_))));
+        let result = store.delete_if_match("图片/literal%2F image.png", "\"revision\"").await;
+        if result.is_err() {
+            server.abort();
+        }
+        assert!(result.is_ok(), "production adapter refused conditional delete: {result:?}");
+        assert!(matches!(store.delete_if_match("图片/literal%2F image.png", "\"stale\"").await, Err(CloudError::Precondition)));
+        assert!(matches!(store.delete_if_match("图片/literal%2F image.png", "\"revision\"").await,
+            Err(CloudError::Service { status: 403, detail }) if detail == "denied"));
+        let requests = timeout(Duration::from_secs(5), server).await.expect("server timeout").expect("server");
+        assert_eq!(requests.len(), 8);
+        assert!(requests[0].starts_with("PUT /fixture/owned/probes/"));
+        assert!(requests[1].contains("if-match: \"peerdav-impossible-revision\""));
+        for request in requests.into_iter().skip(5) {
+            assert!(request.starts_with("DELETE /fixture/owned/%E5%9B%BE%E7%89%87/literal%252F%20image.png?"));
+            assert!(request.to_ascii_lowercase().contains("if-match: \""));
+            assert!(request.contains("X-Amz-Signature="));
+            assert!(request.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_delete_refuses_provider_ignoring_precondition() {
+        use crate::{CloudError, ObjectStore, S3Config, S3Store};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            for response in [
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"probe\"\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ] {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") { bytes.push(socket.read_u8().await.expect("header")); }
+                let request = String::from_utf8(bytes).expect("request");
+                assert!(request.lines().next().expect("line").contains("/owned/probes/"));
+                let length = request.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().expect("length"))
+                }).unwrap_or(0);
+                socket.read_exact(&mut vec![0; length]).await.expect("body");
+                socket.write_all(response.as_bytes()).await.expect("response");
+            }
+            assert!(timeout(Duration::from_millis(100), listener.accept()).await.is_err(), "must not delete user object");
+        });
+        let store = S3Store::new(S3Config {
+            endpoint: format!("http://{address}"), bucket: "fixture".into(), region: "test".into(), prefix: "owned/".into(),
+            path_style: true, access_key: "fake".into(), secret_key: "fake".into(), session_token: None,
+            buckets: vec![], allow_insecure_http: true, proxy: ProxyMode::Direct,
+        }).expect("store");
+        for key in ["图片/keep.png", "图片/keep2.png"] {
+            assert!(matches!(store.delete_if_match(key, "\"revision\"").await, Err(CloudError::Unsupported)));
+        }
+        timeout(Duration::from_secs(5), server).await.expect("timeout").expect("server");
+    }
+
     async fn http_proxy(
         require_auth: bool,
     ) -> (SocketAddr, tokio::task::JoinHandle<(bool, String)>) {

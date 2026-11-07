@@ -15,5 +15,5 @@ pub use baseline::remove as remove_baseline;
 pub use runtime::{MirrorRunContext, run_sync};
 pub(crate) use types::{MASS_DELETE_ABSOLUTE, MASS_DELETE_MINIMUM, MASS_DELETE_PERCENT};
 pub use types::{
-    MirrorError, MirrorMapping, MirrorSyncResult, SaveMirrorMappingInput, normalize_cloud_prefix,
+    MirrorError, MirrorMapping, MirrorSyncResult, SaveMirrorMappingInput, cloud_key, normalize_cloud_prefix,
 };

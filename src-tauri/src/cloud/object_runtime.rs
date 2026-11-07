@@ -253,8 +253,12 @@ mod tests {
                 Ok(())
             })
         }
-        fn delete<'a>(&'a self, _key: &'a str) -> BoxFuture<'a, Result<(), CloudError>> {
-            Box::pin(async { panic!("unconditional delete must not be used") })
+        fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), CloudError>> {
+            Box::pin(async move {
+                self.deleted_keys.lock().await.push(key.to_owned());
+                self.mutations.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
         }
         fn upload_stream_with_control<'a>(
             &'a self,
@@ -1621,7 +1625,7 @@ mod tests {
         let epoch = guard.registry_epoch()?;
         drop(state);
         let root = f.runtime.object_list("connection", "", None).await?;
-        assert!(root.prefix_protected);
+        assert!(!root.prefix_protected && root.objects.iter().any(|entry| entry.protected));
         let page = f.runtime.object_list("connection", "data", None).await?;
         assert!(page.prefix_protected && page.objects[0].protected);
         assert_eq!(f.store.probes.load(Ordering::SeqCst), 0);
@@ -2615,7 +2619,7 @@ impl CloudRuntime {
         // protection query speaks precise keys, so trim it like the store does.
         let prefix_protected = session
             .service
-            .is_protected(page.prefix.trim_end_matches('/'))
+            .is_within_protected(page.prefix.trim_end_matches('/'))
             .map_err(app)?;
         let objects = page
             .objects

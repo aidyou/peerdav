@@ -135,6 +135,14 @@ pub async fn cloud_local_entries(
     mapping_id: String,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<Vec<LocalSyncEntry>, AppError> {
+    cloud.0.local_directory_entries(&mapping_id).await
+}
+
+#[tauri::command]
+pub async fn cloud_local_status(
+    mapping_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<Vec<LocalSyncEntry>, AppError> {
     cloud.0.local_sync_entries(&mapping_id).await
 }
 
@@ -152,6 +160,14 @@ pub async fn cloud_sync(
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<CloudSyncResult, AppError> {
     cloud.0.manual_sync(&mapping_id, &preview_id).await
+}
+
+#[tauri::command]
+pub async fn mirror_folders(
+    connection_id: String, bucket: Option<String>, prefix: String, next: Option<String>,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<super::object_runtime_types::ObjectPageDto, AppError> {
+    cloud.0.mirror_folders(&connection_id, bucket.as_deref(), &prefix, next.as_deref()).await
 }
 
 #[tauri::command]

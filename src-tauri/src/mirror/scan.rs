@@ -100,6 +100,9 @@ fn walk(
     for name in names {
         canceled(cancel)?;
         let child = relative.join(&name);
+        if is_artifact(&skipped_path(&child)) {
+            continue;
+        }
         if let Err(reason) = validate_relative(&child) {
             report.skipped.push((
                 skipped_path(&child),

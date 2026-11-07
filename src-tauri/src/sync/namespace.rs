@@ -53,6 +53,14 @@ pub fn project_scoped(full: &Projection, mapping: &str) -> Result<Projection, Me
         let mut projected = entry.clone();
         projected.logical_path = entry.logical_path[prefix.len()..].to_vec();
         projected.projection_path = entry.projection_path[prefix.len()..].to_vec();
+        // Keep authenticated history intact, but exclude temporary paths from
+        // local views, deletion authority, conflict application, and previews.
+        // Check logical names too: conflict projection can add a suffix.
+        if crate::ignore_rules::is_sync_temporary_path(&projected.logical_path.join("/"))
+            || crate::ignore_rules::is_sync_temporary_path(&projected.projection_path.join("/"))
+        {
+            continue;
+        }
         entries.push(projected);
     }
     Ok(Projection { entries })

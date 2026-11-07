@@ -73,11 +73,11 @@ pub(crate) fn fixture() -> (
     let objects = vec![
         PreparedObject::new(block_key, block),
         PreparedObject::new(
-            format!("v2/{}/trees/{}", repo.repo_id(), root.digest),
+            format!("{APPEND_ROOT}/{}/trees/{}", repo.repo_id(), root.digest),
             tree_bytes,
         ),
         PreparedObject::new(
-            format!("v2/{}/commits/{}-{}", repo.repo_id(), id, reference.digest),
+            format!("{APPEND_ROOT}/{}/commits/{}-{}", repo.repo_id(), id, reference.digest),
             commit,
         ),
     ];
@@ -226,11 +226,11 @@ fn authenticated_binding_identity_and_length_mismatch_fail_before_freeze() {
         let closure = vec![
             objects[0].clone(),
             PreparedObject::new(
-                format!("v2/{}/trees/{}", repo.repo_id(), root.digest),
+                format!("{APPEND_ROOT}/{}/trees/{}", repo.repo_id(), root.digest),
                 bytes,
             ),
             PreparedObject::new(
-                format!("v2/{}/commits/{}-{}", repo.repo_id(), id, reference.digest),
+                format!("{APPEND_ROOT}/{}/commits/{}-{}", repo.repo_id(), id, reference.digest),
                 commit,
             ),
         ];
@@ -264,9 +264,9 @@ fn missing_child_duplicate_keys_unreachable_objects_and_intent_are_rejected() {
         .unwrap();
     let closure = vec![
         objects[0].clone(),
-        PreparedObject::new(format!("v2/{}/trees/{}", repo.repo_id(), root.digest), wire),
+        PreparedObject::new(format!("{APPEND_ROOT}/{}/trees/{}", repo.repo_id(), root.digest), wire),
         PreparedObject::new(
-            format!("v2/{}/commits/{}-{}", repo.repo_id(), id, reference.digest),
+            format!("{APPEND_ROOT}/{}/commits/{}-{}", repo.repo_id(), id, reference.digest),
             commit,
         ),
     ];

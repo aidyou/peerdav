@@ -42,6 +42,27 @@ pub(crate) fn is_system_ignored(name: &str) -> bool {
         || lower.starts_with(".trash-")
 }
 
+/// Sync-only exclusions. Apply to every relative component so temporary directories
+/// cannot leak their contents. Keep ordinary dotfiles, backup archives, and names
+/// merely containing these words; directory transfers retain their own policy.
+pub(crate) fn is_sync_temporary_path(path: &str) -> bool {
+    path.split('/').any(|name| {
+        let lower = name.to_ascii_lowercase();
+        let suffix = lower.rsplit_once('.').map(|(_, suffix)| suffix);
+        let transfer = matches!(suffix, Some("tmp" | "temp" | "part" | "partial" | "crdownload" | "download" | "filepart" | "opdownload"));
+        let vim = name.starts_with('.') && name.len() > 5
+            && suffix.is_some_and(|suffix| suffix.len() == 3 && suffix.starts_with("sw")
+                && matches!(suffix.as_bytes()[2], b'a'..=b'p'));
+        transfer || vim
+            || (name.len() > 1 && name.ends_with('~'))
+            || (name.len() > 2 && name.starts_with('#') && name.ends_with('#'))
+            || (name.len() > 2 && name.starts_with(".#"))
+            || (name.len() > 2 && name.starts_with("~$"))
+            || (name.starts_with(".~lock.") && name.ends_with('#'))
+            || name.starts_with(".goutputstream-")
+    })
+}
+
 pub(crate) fn is_builtin_ignored(name: &str, _is_dir: bool) -> bool {
     is_system_ignored(name)
 }
@@ -84,6 +105,17 @@ fn relative_to<'a>(base: &str, path: &'a str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_temporary_rules_are_precise_and_shared_for_nested_paths() {
+        for name in [".file.swp", ".file.swo", ".file.swn", ".file.swa", "#file#", ".#file", "file~", "~$report.docx", ".~lock.report.odt#", ".goutputstream-123", "video.part", "video.PART", "file.partial", "file.crdownload", "file.download", "file.filepart", "file.opdownload", "file.tmp", "file.temp"] {
+            assert!(is_sync_temporary_path(name), "{name}");
+            assert!(is_sync_temporary_path(&format!("docs/{name}/child.txt")), "{name}");
+        }
+        for name in [".env", ".gitignore", "file.swp", ".swp", ".file.swq", ".file.swpx", "file.part.txt", "tmp", "part", "download", "templates", "file.bak", "backup.zip", "#topic", "~user.txt", "report.tmp.txt"] {
+            assert!(!is_sync_temporary_path(name), "{name}");
+        }
+    }
 
     #[test]
     fn system_rules_are_cross_platform_and_do_not_hide_user_dotfiles() {

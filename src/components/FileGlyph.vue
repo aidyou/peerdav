@@ -8,13 +8,22 @@ const props = defineProps({
   size: { type: String, default: "md" },
 });
 
-const kind = computed(() => fileKind(props.entry));
+const kind = computed(() => props.entry.isDir && ["encrypted-drive", "plain-drive", "mirror-drive"].includes(props.entry.driveKind) ? props.entry.driveKind : fileKind(props.entry));
 const badge = computed(() => fileIconBadge(props.entry));
 </script>
 
 <template>
   <span class="file-glyph" :class="[`file-glyph--${kind}`, `file-glyph--${size}`, badge && `file-glyph--${badge.tone}`]" aria-hidden="true">
-    <svg v-if="kind === 'folder'" viewBox="0 0 24 24" aria-hidden="true">
+    <svg v-if="kind === 'encrypted-drive'" viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="3" y="11" width="18" height="10" rx="2" /><path d="M8 11V7a4 4 0 0 1 8 0v4M12 15v2M6 18h1" />
+    </svg>
+    <svg v-else-if="kind === 'plain-drive'" viewBox="0 0 24 24" aria-hidden="true">
+      <rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" />
+    </svg>
+    <svg v-else-if="kind === 'mirror-drive'" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3 7V4h6l2 2h7v4M6 10h6l2 2h7v9H6z" />
+    </svg>
+    <svg v-else-if="kind === 'folder'" viewBox="0 0 24 24" aria-hidden="true">
       <path
         d="M3.5 7.2c0-.9.7-1.6 1.6-1.6h4l1.8 2h8c.9 0 1.6.7 1.6 1.6v8.5c0 .9-.7 1.6-1.6 1.6H5.1c-.9 0-1.6-.7-1.6-1.6z"
       />

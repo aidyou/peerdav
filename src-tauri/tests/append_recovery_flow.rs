@@ -70,11 +70,11 @@ mod publish {
         let objects = vec![
             PreparedObject::new(key, bytes),
             PreparedObject::new(
-                format!("v2/{}/trees/{}", repo.repo_id(), root.digest),
+                format!("{APPEND_ROOT}/{}/trees/{}", repo.repo_id(), root.digest),
                 tree_bytes,
             ),
             PreparedObject::new(
-                format!("v2/{}/commits/{}-{}", repo.repo_id(), id, reference.digest),
+                format!("{APPEND_ROOT}/{}/commits/{}-{}", repo.repo_id(), id, reference.digest),
                 commit,
             ),
         ];

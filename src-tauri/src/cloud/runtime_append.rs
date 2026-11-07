@@ -52,7 +52,7 @@ fn revisions(
     Ok(revisions)
 }
 impl CloudRuntime {
-    fn append_config(&self, connection: &str, bucket: Option<&str>) -> Result<S3Config, AppError> {
+    pub(super) fn append_config(&self, connection: &str, bucket: Option<&str>) -> Result<S3Config, AppError> {
         let mut config = self.connection(connection)?.config;
         if let Some(bucket) = bucket {
             if bucket != config.bucket && !config.buckets.iter().any(|item| item == bucket) {
@@ -321,6 +321,51 @@ impl CloudRuntime {
     }
     /// Compare local contents with the last acknowledged epoch, without accessing
     /// the network or treating an in-flight publication as synchronized.
+    /// Metadata-only listing: never reads file contents or opens the sync index.
+    pub async fn local_directory_entries(&self, mapping_id: &str) -> Result<Vec<LocalSyncEntry>, AppError> {
+        self.admit()?;
+        let _permit = self.network.read().await;
+        self.admit()?;
+        let mapping = self.mapping(mapping_id)?;
+        let epoch = Self::root_epoch(&mapping.local_root)?;
+        let root = mapping.local_root.clone();
+        let cancel = Arc::clone(&self.cancel);
+        let entries = tokio::task::spawn_blocking(move || {
+            fn walk(dir: &cap_std::fs::Dir, prefix: &str, cancel: &std::sync::atomic::AtomicBool, entries: &mut Vec<LocalSyncEntry>, depth: usize) -> Result<(), AppError> {
+                use cap_fs_ext::DirExt;
+                if depth > 128 || entries.len() >= 100_000 {
+                    return Err(runtime_error("CLOUD_LIST_LIMIT", "目录过大，请选择更小的同步目录 / Directory listing limit exceeded"));
+                }
+                for item in dir.entries().map_err(append_error)? {
+                    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        return Err(runtime_error("CLOUD_CANCELLED", "目录读取已取消 / Directory listing cancelled"));
+                    }
+                    let item = item.map_err(append_error)?;
+                    let name = item.file_name().into_string().map_err(|_| runtime_error("CLOUD_PATH_INVALID", "文件名称无效 / Invalid file name"))?;
+                    let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+                    if crate::ignore_rules::is_sync_temporary_path(&path) { continue; }
+                    let metadata = dir.symlink_metadata(&name).map_err(append_error)?;
+                    if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) { continue; }
+                    if entries.len() >= 100_000 { return Err(runtime_error("CLOUD_LIST_LIMIT", "目录条目过多 / Too many directory entries")); }
+                    entries.push(LocalSyncEntry { path: path.clone(), name: name.clone(), is_dir: metadata.is_dir(), size: metadata.len(), synced: false });
+                    if metadata.is_dir() {
+                        walk(&dir.open_dir_nofollow(&name).map_err(append_error)?, &path, cancel, entries, depth + 1)?;
+                    }
+                }
+                Ok(())
+            }
+            let dir = crate::sync::materialize::open_root(&root).map_err(append_error)?;
+            let mut entries = Vec::new();
+            walk(&dir, "", &cancel, &mut entries, 0)?;
+            entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.path.cmp(&b.path)));
+            Ok::<_, AppError>(entries)
+        }).await.map_err(append_error)??;
+        if Self::root_epoch(&mapping.local_root)? != epoch {
+            return Err(runtime_error("CLOUD_ROOT_CHANGED", "本地目录已变化，请刷新 / Local root changed; refresh the listing"));
+        }
+        Ok(entries)
+    }
+
     pub async fn local_sync_entries(&self, mapping_id: &str) -> Result<Vec<LocalSyncEntry>, AppError> {
         self.admit()?;
         let _permit = self.network.read().await;

@@ -1,4 +1,134 @@
 //! End-to-end S3 protocol coverage against an in-process HTTP fixture.
+
+/// Production-adapter acceptance. Credentials remain in process memory; errors
+/// expose stable codes only. Cleanup is confined to this run's random prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live writes: explicit PEERDAV_QINIU_LIVE=1 and Cargo-injected credentials required"]
+async fn qiniu_production_crud_mirror_append_acceptance() {
+    use peerdav_lib::cloud::{ObjectGuard, ObjectService, PhysicalRoot, ProtectedIdentity, StorageIdentityAssociation};
+    use peerdav_lib::cloud::runtime_types::{CreateAppendRepositoryInput, SaveAppendMappingInput};
+    use peerdav_lib::sync::append_types::AppendMode;
+    use std::sync::atomic::AtomicBool;
+    assert_eq!(std::env::var("PEERDAV_QINIU_LIVE").ok().as_deref(), Some("1"), "live authorization required");
+    let access = std::env::var("PEERDAV_QINIU_ACCESS_KEY").expect("Cargo-injected access key missing");
+    let secret = std::env::var("PEERDAV_QINIU_SECRET_KEY").expect("Cargo-injected secret key missing");
+    let prefix = format!("peerdav-contract/{}", hex::encode(rand::random::<[u8; 16]>()));
+    let config = S3Config {
+        endpoint: "https://peerdav.s3.cn-east-1.qiniucs.com".into(), bucket: "peerdav".into(),
+        region: "cn-east-1".into(), prefix: prefix.clone(), path_style: false,
+        access_key: access.clone(), secret_key: secret.clone(), session_token: None,
+        buckets: vec![], allow_insecure_http: false, proxy: ProxyMode::Direct,
+    };
+    let raw = Arc::new(S3Store::new(config).map_err(|_| "store configuration").unwrap());
+    let data = tempfile::tempdir().unwrap();
+    let runtime = runtime_for(&data);
+    runtime.resume().map_err(|e| e.code).unwrap();
+    let connection = runtime.save_connection(SaveS3Input {
+        id: None, name: "isolated live acceptance".into(), endpoint: "https://peerdav.s3.cn-east-1.qiniucs.com".into(),
+        bucket: "peerdav".into(), buckets: vec!["peerdav".into()], region: "cn-east-1".into(), prefix: prefix.clone(),
+        path_style: false, access_key: Some(access), secret_key: Some(secret), session_token: None,
+        clear_credentials: false, clear_session_token: false, clear_proxy_auth: false,
+        allow_insecure_http: false, proxy: ProxyMode::Direct, schedule: None,
+    }).map_err(|e| e.code).unwrap();
+    eprintln!("qiniu production prefix={prefix}/");
+    let work = async {
+        let identity = ProtectedIdentity { endpoint: "https://peerdav.s3.cn-east-1.qiniucs.com".into(), bucket: "peerdav".into(), prefix: prefix.clone(), alias: String::new() };
+        let guard = ObjectGuard::open(data.path().join("live-guard"), &[9; 32]).map_err(|_| "guard")?;
+        guard.register_storage_identity(&identity, StorageIdentityAssociation::New).map_err(|_| "identity")?;
+        let bridge = Arc::new(peerdav_protocol_s3::CoreS3ReadBridge(peerdav_protocol_s3::CoreS3Backend::new(raw.clone(), 1).map_err(|_| "bridge")?));
+        let downloads = tempfile::tempdir().map_err(|_| "downloads")?;
+        let service = ObjectService::try_new(bridge, guard, identity, "live").map_err(|_| "service")?
+            .with_physical_root(PhysicalRoot::open(downloads.path()).map_err(|_| "download root")?);
+        service.discover("").await.map_err(|_| "discovery")?;
+        let keys = ["普通/中文 100%.txt", "普通/literal%2F.txt", "普通/space file.txt", "普通邻居/keep.txt"];
+        for key in keys {
+            service.upload_stream_with_control(key, body(b"first"), Arc::new(AtomicBool::new(false)), None).await.map_err(|_| "upload")?;
+        }
+        let old = raw.stat(keys[0]).await.map_err(|_| "stat")?;
+        if service.upload_stream_with_control(keys[0], body(b"bad"), Arc::new(AtomicBool::new(false)), None).await.is_ok() { return Err("overwrite guard"); }
+        service.upload_stream_with_control(keys[0], body(b"replacement"), Arc::new(AtomicBool::new(false)), old.etag).await.map_err(|_| "overwrite")?;
+        service.download_to(keys[0], "download.txt", None, false, None).await.map_err(|_| "download")?;
+        if std::fs::read(downloads.path().join("download.txt")).map_err(|_| "read download")? != b"replacement" { return Err("download bytes"); }
+        let expiry = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_| "clock")?.as_secs() + 120;
+        let plan = service.delete_plan("普通/", expiry).await.map_err(|_| "delete plan")?;
+        if plan.entries.len() != 3 { return Err("directory boundary"); }
+        let deleted = service.execute_delete(&plan, true).await.map_err(|_| "delete")?;
+        if deleted.iter().any(Result::is_err) || raw.stat(keys[3]).await.is_err() { return Err("delete sibling"); }
+        eprintln!("qiniu production stage=crud passed");
+        let local = tempfile::tempdir().map_err(|_| "mirror local")?;
+        std::fs::write(local.path().join("正式 100%.txt"), b"mirror").map_err(|_| "write mirror")?;
+        std::fs::write(local.path().join(".notes.swp"), b"temporary").map_err(|_| "write temporary")?;
+        raw.put("_peerdav_mirror/docs/remote.part", body(b"partial"), PutCondition::Any).await.map_err(|_| "seed temporary")?;
+        let mapping = runtime.save_mirror_mapping(serde_json::from_value(serde_json::json!({
+            "id": null, "connectionId": connection.id, "bucket": "peerdav", "localRoot": local.path(),
+            "cloudPrefix": "docs", "schedule": { "enabled": false, "interval": 900 }
+        })).map_err(|_| "mirror input")?).map_err(|_| "mirror mapping")?;
+        for _ in 0..2 {
+            let result = match runtime.mirror_sync(&mapping.id, false, None).await {
+                Ok(result) => result,
+                Err(error) if error.code == "MIRROR_CONFIRM_MERGE" => {
+                    let plan = error.context.as_ref().and_then(|c| c["planId"].as_str()).ok_or("mirror confirmation plan")?;
+                    runtime.mirror_sync(&mapping.id, false, Some(plan.into())).await.map_err(|_| "mirror confirmed sync")?
+                }
+                Err(error) => { eprintln!("qiniu mirror error code={}", error.code); return Err("mirror sync"); }
+            };
+            if !result.failures.is_empty() || local.path().join("remote.part").exists() { return Err("mirror exclusion"); }
+        }
+        if raw.stat("_peerdav_mirror/docs/.notes.swp").await.is_ok() { return Err("mirror temporary upload"); }
+        eprintln!("qiniu production stage=mirror passed");
+        let root = tempfile::tempdir().map_err(|_| "append root")?;
+        std::fs::write(root.path().join("正式.txt"), b"encrypted final").map_err(|_| "write append")?;
+        std::fs::write(root.path().join("video.part"), b"temporary").map_err(|_| "write append temporary")?;
+        let repo = runtime.create_sync_drive(CreateAppendRepositoryInput {
+            connection_id: connection.id.clone(), bucket: Some("peerdav".into()), mode: AppendMode::Encrypted,
+            password: "acceptance-only-password".into(), password_confirmation: "acceptance-only-password".into(),
+        }).await.map_err(|_| "create append")?;
+        let mapping = runtime.save_append_mapping(SaveAppendMappingInput {
+            mapping_id: None, selected_root: "docs".into(), mapping: AddMappingInput {
+                connection_id: connection.id.clone(), repository_id: repo.binding.repo_id, local_root: root.path().into(), logical_path: "docs".into(), schedule: ScheduleConfig::default(),
+            },
+        }).await.map_err(|_| "append mapping")?;
+        let preview = runtime.preview(&mapping.id).await.map_err(|_| "append preview")?;
+        if preview.summary.uploads != 1 { return Err("append temporary preview"); }
+        runtime.manual_sync(&mapping.id, &preview.preview_id).await.map_err(|_| "append start")?;
+        // Avoid panic paths so every remote failure reaches cleanup.
+        let mut completed = false;
+        for _ in 0..600 {
+            let phase = runtime.snapshot().map_err(|_| "snapshot")?.statuses.into_iter().find(|s| s.mapping_id == mapping.id).map(|s| s.phase);
+            match phase {
+                Some(SyncPhase::Completed) => { completed = true; break; },
+                Some(SyncPhase::Failed | SyncPhase::PendingRecovery) => return Err("append worker"),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            }
+        }
+        if !completed { return Err("append timeout"); }
+        let preview = runtime.preview(&mapping.id).await.map_err(|_| "append steady preview")?;
+        if preview.summary.uploads != 0 || preview.summary.deletes != 0 { return Err("append steady"); }
+        if runtime.object_delete_plan(&connection.id, "_peerdav_mirror/").await.is_ok() { return Err("mirror protection"); }
+        eprintln!("qiniu production stage=append passed");
+        Ok::<(), &'static str>(())
+    };
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(300), work).await;
+    let stopped = runtime.stop_and_clear().await.is_ok();
+    // List only this unpredictable run-owned prefix; collect before deleting so
+    // pagination cannot skip objects as its underlying keyset changes.
+    let mut token = None;
+    let mut keys = Vec::new();
+    let mut cleanup_ok = true;
+    loop {
+        match raw.list_page("", token.as_deref()).await {
+            Ok(page) => { keys.extend(page.objects.into_iter().map(|m| m.key)); token = page.next_token; if token.is_none() { break; } }
+            Err(_) => { cleanup_ok = false; break; }
+        }
+        if keys.len() > 1000 { cleanup_ok = false; break; }
+    }
+    let count = keys.len();
+    for key in keys { if raw.delete(&key).await.is_err() { cleanup_ok = false; } }
+    cleanup_ok &= raw.list_page("", None).await.is_ok_and(|p| p.objects.is_empty() && p.next_token.is_none());
+    eprintln!("qiniu production cleanup objects={count} confirmed_empty={cleanup_ok}");
+    assert!(stopped && cleanup_ok, "cleanup or worker stop failed");
+    assert!(matches!(outcome, Ok(Ok(()))), "production acceptance failed stage={:?}", outcome);
+}
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use http_body_util::{BodyExt, Full};
@@ -131,7 +261,9 @@ fn key_from_path(path: &str) -> Option<String> {
     if bucket != "fixture" {
         return None;
     };
-    Some(parts.next().unwrap_or_default().to_string())
+    // HTTP paths are encoded once; storage keys (including literal %2F) are raw.
+    Some(percent_encoding::percent_decode_str(parts.next().unwrap_or_default())
+        .decode_utf8().ok()?.into_owned())
 }
 
 async fn handle(
@@ -320,7 +452,13 @@ async fn handle(
                 .expect("get response"))
         }
         Method::DELETE => {
-            state.objects.lock().expect("fixture lock").remove(&key);
+            let mut objects = state.objects.lock().expect("fixture lock");
+            if !state.ignore_conditions && request.headers().get("if-match").is_some_and(|expected| {
+                objects.get(&key).is_none_or(|body| expected.to_str().ok() != Some(etag(body).as_str()))
+            }) {
+                return Ok(response(StatusCode::PRECONDITION_FAILED, "condition failed"));
+            }
+            objects.remove(&key);
             Ok(response(StatusCode::NO_CONTENT, Bytes::new()))
         }
         _ => Ok(response(StatusCode::METHOD_NOT_ALLOWED, "method")),
@@ -608,6 +746,48 @@ async fn file_browser_backend_cloud_contract() {
     runtime.stop_and_clear().await.expect("stop runtime");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_directory_delete_uses_production_bridge_and_preserves_siblings() {
+    for ignore_conditions in [false, true] {
+        let fixture = Fixture::start(ignore_conditions).await;
+        let data = tempfile::tempdir().expect("data");
+        let vault = Arc::new(Vault::open(&data.path().join("vault.pd")).expect("vault"));
+        vault.initialize(data.path().to_str().expect("path"), "admin", "password 123").expect("initialize");
+        let config = peerdav_lib::cloud::config::CloudConfigStore::new(vault.clone());
+        let guard = peerdav_lib::cloud::ObjectGuard::open(data.path().join("cloud-object-guard.sqlite"),
+            config.get_or_create_index_key().expect("key").as_ref()).expect("guard");
+        guard.register_storage_identity(&peerdav_lib::cloud::ProtectedIdentity {
+            endpoint: fixture.endpoint.clone(), bucket: "fixture".into(), prefix: "runtime/".into(), alias: String::new(),
+        }, peerdav_lib::cloud::StorageIdentityAssociation::New).expect("confirm identity");
+        drop(guard);
+        let runtime = CloudRuntime::new(vault, Arc::new(NoopSyncEvents), data.path().to_owned());
+        runtime.resume().expect("resume");
+        let connection = runtime.save_connection(runtime_connection(&fixture)).expect("connection");
+        {
+            let mut objects = fixture.state.objects.lock().expect("objects");
+            for index in 0..8 {
+                objects.insert(format!("runtime/图片/{index}.png"), b"image".to_vec());
+            }
+            objects.insert("runtime/图片-backup/keep.png".into(), b"keep".to_vec());
+        }
+        runtime.object_discover(&connection.id, "").await.expect("discover protection roots");
+        let plan = runtime.object_delete_plan(&connection.id, "图片/").await.expect("plan");
+        assert_eq!(plan.object_count, 8);
+        let result = runtime.object_delete_execute(&connection.id, &plan.plan_id, true).await.expect("execute");
+        assert_eq!(result.deleted.len(), 8);
+        assert!(result.failed.is_empty());
+        {
+            let objects = fixture.state.objects.lock().expect("objects");
+            assert!(objects.contains_key("runtime/图片-backup/keep.png"));
+            for index in 0..8 {
+                assert!(!objects.contains_key(&format!("runtime/图片/{index}.png")));
+            }
+        }
+        runtime.stop_and_clear().await.expect("stop");
+        fixture.shutdown().await;
+    }
+}
+
 fn runtime_connection(fixture: &Fixture) -> SaveS3Input {
     SaveS3Input {
         id: None,
@@ -628,6 +808,62 @@ fn runtime_connection(fixture: &Fixture) -> SaveS3Input {
         proxy: ProxyMode::Direct,
         schedule: None,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mirror_runtime_works_without_conditional_writes_and_recovers_baseline() {
+    let fixture = Fixture::start(true).await;
+    let data = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    std::fs::write(local.path().join("中文 100%.txt"), b"local first").unwrap();
+    let runtime = runtime_for(&data);
+    runtime.resume().unwrap();
+    let mut input = runtime_connection(&fixture);
+    input.bucket = "other".into();
+    input.buckets = vec!["other".into(), "fixture".into()];
+    let connection = runtime.save_connection(input).unwrap();
+    fixture.state.objects.lock().unwrap().insert("runtime/_peerdav_mirror/docs/remote.txt".into(), b"remote first".to_vec());
+    let folders = runtime.mirror_folders(&connection.id, Some("fixture"), "docs", None).await.unwrap();
+    assert_eq!(folders.objects.len(), 1);
+    assert_eq!(runtime.mirror_folders(&connection.id, Some("unknown"), "", None).await.unwrap_err().code, "CLOUD_CONFIG_INVALID");
+    assert!(runtime.mirror_folders(&connection.id, Some("fixture"), "../escape", None).await.is_err());
+    let mapping = runtime.save_mirror_mapping(serde_json::from_value(serde_json::json!({
+        "id": null, "connectionId": connection.id, "bucket": "fixture", "localRoot": local.path(),
+        "cloudPrefix": "docs", "schedule": { "enabled": false, "interval": 900 }
+    })).unwrap()).unwrap();
+    let first = runtime.mirror_sync(&mapping.id, false, None).await.unwrap_err();
+    assert_eq!(first.code, "MIRROR_CONFIRM_MERGE");
+    let plan = first.context.unwrap()["planId"].as_str().unwrap().to_owned();
+    let merged = runtime.mirror_sync(&mapping.id, false, Some(plan)).await.unwrap();
+    assert!(merged.failures.is_empty());
+    assert_eq!((merged.uploaded, merged.downloaded), (1, 1));
+    assert_eq!(std::fs::read(local.path().join("remote.txt")).unwrap(), b"remote first");
+    std::fs::write(local.path().join("中文 100%.txt"), b"local replacement longer").unwrap();
+    let replaced = runtime.mirror_sync(&mapping.id, false, None).await.unwrap();
+    assert!(replaced.failures.is_empty());
+    assert_eq!(replaced.uploaded, 1);
+    runtime.stop_and_clear().await.unwrap();
+    runtime.resume().unwrap();
+    let steady = runtime.mirror_sync(&mapping.id, false, None).await.unwrap();
+    assert!(steady.failures.is_empty());
+    assert_eq!((steady.uploaded, steady.downloaded), (0, 0));
+    std::fs::remove_file(local.path().join("中文 100%.txt")).unwrap();
+    let deletion = runtime.mirror_sync(&mapping.id, false, None).await;
+    let deleted = match deletion {
+        Ok(result) => result,
+        Err(error) => {
+            assert_eq!(error.code, "MIRROR_MASS_DELETE");
+            let plan = error.context.unwrap()["planId"].as_str().unwrap().to_owned();
+            runtime.mirror_sync(&mapping.id, true, Some(plan)).await.unwrap()
+        }
+    };
+    assert!(deleted.failures.is_empty());
+    assert_eq!(deleted.deleted_cloud, 1);
+    assert!(!fixture.state.objects.lock().unwrap().contains_key("runtime/_peerdav_mirror/docs/中文 100%.txt"));
+    assert!(fixture.state.conditional_puts.lock().unwrap().is_empty());
+    assert!(fixture.state.requests.lock().unwrap().iter().all(|(_, key)| !key.contains(".probe")));
+    runtime.stop_and_clear().await.unwrap();
+    fixture.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

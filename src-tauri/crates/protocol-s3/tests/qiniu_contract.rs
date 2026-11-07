@@ -369,8 +369,9 @@ async fn contract(store: Arc<S3Store>, owned: &mut BTreeSet<String>) -> Check {
     // names. This probe does NOT forge the production verified capability epoch.
     let key = "probe/cas";
     let first = create(&store, key, b"first", owned).await?;
+    eprintln!("qiniu stage=create_only_duplicate");
     rejected(
-        bridge
+        store
             .put(key, body(b"bad"), PutCondition::CreateOnly)
             .await,
     )
@@ -429,6 +430,98 @@ async fn qiniu_contract() {
         panic!("qiniu contract failed: {code}");
     }
 }
+#[derive(Clone, Debug)]
+struct LiveTrace {
+    client: reqwest::Client,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl object_store::client::HttpService for LiveTrace {
+    async fn call(&self, request: object_store::client::HttpRequest) -> Result<object_store::client::HttpResponse, object_store::client::HttpError> {
+        use object_store::client::{HttpError, HttpErrorKind, HttpService};
+        if self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 160
+            || request.uri().host() != Some("peerdav.s3.cn-east-1.qiniucs.com")
+        {
+            return Err(HttpError::new(HttpErrorKind::Unknown, std::io::Error::other("live request budget or origin")));
+        }
+        let method = request.method().to_string();
+        let condition = ["if-match", "if-none-match"].into_iter()
+            .filter(|name| request.headers().contains_key(*name)).collect::<Vec<_>>();
+        let header_auth = request.headers().contains_key("authorization");
+        let response = HttpService::call(&self.client, request).await?;
+        eprintln!("qiniu SDK method={method} header_auth={header_auth} conditions={condition:?} status={}", response.status().as_u16());
+        Ok(response)
+    }
+}
+impl object_store::client::HttpConnector for LiveTrace {
+    fn connect(&self, _: &object_store::ClientOptions) -> object_store::Result<object_store::client::HttpClient> {
+        Ok(object_store::client::HttpClient::new(self.clone()))
+    }
+}
+
+async fn diagnose_live(access_key: String, secret_key: String) -> Check {
+    use object_store::signer::Signer;
+    let trace = LiveTrace {
+        client: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(20)).build().map_err(|_| "CLIENT_BUILD")?,
+        attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    let backend = object_store::aws::AmazonS3Builder::new()
+        .with_endpoint("https://peerdav.s3.cn-east-1.qiniucs.com")
+        .with_bucket_name("peerdav").with_region("cn-east-1")
+        .with_access_key_id(access_key).with_secret_access_key(secret_key)
+        .with_virtual_hosted_style_request(true).build()
+        .map_err(|source| cloud(CloudError::Storage { source }))?;
+    let key = format!("peerdav-contract/{}/diagnostic.bin", hex::encode(rand::random::<[u8; 16]>()));
+    eprintln!("qiniu diagnostic key={key}");
+    let client = reqwest::Client::builder().no_proxy()
+        .redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(20))
+        .build().map_err(|_| "CLIENT_BUILD")?;
+    let mut owned = false;
+    let mut revision = String::new();
+    let result: Check = async {
+        for (stage, method, condition, value) in [
+            ("create", reqwest::Method::PUT, None, "first"),
+            ("duplicate-create", reqwest::Method::PUT, Some(("if-none-match", "*")), "duplicate"),
+            ("read-after-create", reqwest::Method::GET, None, ""),
+            ("stale-update", reqwest::Method::PUT, Some(("if-match", "\"impossible-revision\"")), "stale"),
+            ("read-after-update", reqwest::Method::GET, None, ""),
+            ("stale-delete", reqwest::Method::DELETE, Some(("if-match", "\"impossible-revision\"")), ""),
+            ("head-after-delete", reqwest::Method::HEAD, None, ""),
+        ] {
+            let url = backend.signed_url(method.clone(), &object_store::path::Path::from(key.as_str()), Duration::from_secs(60)).await
+                .map_err(|source| cloud(CloudError::Storage { source }))?;
+            let mut request = client.request(method.clone(), url);
+            if let Some((name, value)) = condition { request = request.header(name, value); }
+            if method == reqwest::Method::PUT { request = request.body(value.to_owned()); }
+            let response = request.send().await.map_err(|_| "DIAGNOSTIC_TRANSPORT")?;
+            let status = response.status().as_u16();
+            if method == reqwest::Method::PUT && (200..300).contains(&status) { owned = true; }
+            if let Some(etag) = response.headers().get("etag").and_then(|v| v.to_str().ok()) { revision = etag.to_owned(); }
+            let mut payload = Vec::new();
+            let mut chunks = response.bytes_stream();
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk.map_err(|_| "DIAGNOSTIC_BODY")?;
+                payload.extend_from_slice(&chunk[..chunk.len().min(4096 - payload.len())]);
+                if payload.len() == 4096 { break; }
+            }
+            let mut text = String::from_utf8_lossy(&payload).into_owned();
+            for secret in DIAGNOSTIC_SECRETS.get().into_iter().flatten() { text = text.replace(secret, "[redacted]"); }
+            if text.to_ascii_lowercase().contains("signature") || text.contains("://") { text = "[withheld: auth/url response]".into(); }
+            eprintln!("qiniu raw stage={stage} condition={condition:?} status={status} etag={revision} body={text:?}");
+        }
+        Ok(())
+    }.await;
+    if owned {
+        let url = backend.signed_url(reqwest::Method::DELETE, &object_store::path::Path::from(key.as_str()), Duration::from_secs(60)).await
+            .map_err(|source| cloud(CloudError::Storage { source }))?;
+        let response = client.delete(url).send().await.map_err(|_| "DIAGNOSTIC_CLEANUP")?;
+        require(response.status().is_success(), "DIAGNOSTIC_CLEANUP_STATUS")?;
+        eprintln!("qiniu diagnostic cleanup status={}", response.status().as_u16());
+    }
+    result
+}
+
 async fn live() -> Check {
     require(
         std::env::var("PEERDAV_QINIU_LIVE").ok().as_deref() == Some("1"),
@@ -441,6 +534,9 @@ async fn live() -> Check {
     DIAGNOSTIC_SECRETS
         .set(vec![access_key.clone(), secret_key.clone()])
         .map_err(|_| "DIAGNOSTICS_ALREADY_INITIALIZED")?;
+    if std::env::var("PEERDAV_QINIU_DIAGNOSE").ok().as_deref() == Some("1") {
+        return diagnose_live(access_key, secret_key).await;
+    }
     let mut random = [0u8; 16];
     rand::rngs::OsRng
         .try_fill_bytes(&mut random)
@@ -448,8 +544,8 @@ async fn live() -> Check {
     let prefix = format!("peerdav-contract/{}/", hex::encode(random));
     let store = Arc::new(
         S3Store::new(S3Config {
-            endpoint: "https://peerdav-test.s3.cn-east-1.qiniucs.com".into(),
-            bucket: "peerdav-test".into(),
+            endpoint: "https://peerdav.s3.cn-east-1.qiniucs.com".into(),
+            bucket: "peerdav".into(),
             region: "cn-east-1".into(),
             prefix: prefix.clone(),
             path_style: false,

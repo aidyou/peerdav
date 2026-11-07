@@ -124,11 +124,15 @@ fn index(path: &Path, binding: &TrustBinding) -> AppendIndex {
     .unwrap()
 }
 async fn fixture() -> (Remote, AppendRepository, TrustBinding, String) {
+    named_fixture("hello.txt", AppendMode::Encrypted).await
+}
+
+async fn named_fixture(name: &str, mode: AppendMode) -> (Remote, AppendRepository, TrustBinding, String) {
     let remote = Remote::new(1);
     let descriptor = Descriptor {
         version: 2,
         repo_id: "00112233445566778899aabbccddeeff".into(),
-        mode: AppendMode::Encrypted,
+        mode,
         chunker: Chunker {
             name: "fastcdc".into(),
             version: "5.0.0".into(),
@@ -165,7 +169,7 @@ async fn fixture() -> (Remote, AppendRepository, TrustBinding, String) {
         parents: vec![],
         value: RevisionValue::Live {
             parent_dir: EntityId("docs".into()),
-            name: "hello.txt".into(),
+            name: name.into(),
             node: Node::File(FileNode {
                 blocks: vec![BlockRef {
                     id: repo.block_id(b"hello").unwrap(),
@@ -545,6 +549,44 @@ async fn freeze_budget_is_durable_before_get_and_survives_reopen() {
         std::fs::read(device.root.path().join("hello.txt")).unwrap(),
         b"hello"
     );
+}
+
+#[tokio::test]
+async fn temporary_files_are_excluded_across_remote_history_local_publish_and_reopen() {
+    for mode in [AppendMode::Encrypted, AppendMode::AuthenticatedPlain] {
+        let (remote, _, binding, _) = named_fixture("old.part", mode).await;
+        let device = Device::new();
+        std::fs::write(device.root.path().join(".notes.swp"), b"editor").unwrap();
+        std::fs::create_dir(device.root.path().join("cache.tmp")).unwrap();
+        std::fs::write(device.root.path().join("cache.tmp/file.txt"), b"partial").unwrap();
+        let mut idx = device.index(&binding);
+        sync(&remote, &binding, &device, &mut idx, "old-remote").await;
+        assert!(!device.root.path().join("old.part").exists());
+        // Historical revisions remain in the active epoch, not tombstoned by exclusion.
+        let active = idx.active_epoch().unwrap().unwrap();
+        assert_eq!(active.revision_count, 2);
+        drop(idx);
+        let mut idx = device.index(&binding);
+        std::fs::write(device.root.path().join("normal.tmp.txt"), b"final").unwrap();
+        sync(&remote, &binding, &device, &mut idx, "new-local").await;
+        let closure = peerdav_lib::sync::append_discovery::discover(store(&remote), &binding, b"p", &mut idx, "inspect-temporary").await.unwrap();
+        let revisions: Vec<_> = closure.trees().values().flat_map(|tree| tree.entries.iter()).collect();
+        assert!(revisions.iter().all(|r| !matches!(r.value, RevisionValue::Tombstone)));
+        assert!(revisions.iter().any(|r| matches!(&r.value, RevisionValue::Live { name, .. } if name == "old.part")));
+        assert!(!revisions.iter().any(|r| matches!(&r.value, RevisionValue::Live { name, .. } if name == ".notes.swp" || name == "cache.tmp")));
+        // Promotion to a final name is a new ordinary upload, not lost forever.
+        std::fs::write(device.root.path().join("video.part"), b"finished").unwrap();
+        std::fs::rename(device.root.path().join("video.part"), device.root.path().join("video.mp4")).unwrap();
+        sync(&remote, &binding, &device, &mut idx, "promoted").await;
+        let other = Device::new();
+        let mut other_index = other.index(&binding);
+        sync(&remote, &binding, &other, &mut other_index, "other-device").await;
+        assert!(!other.root.path().join("old.part").exists());
+        assert!(!other.root.path().join(".notes.swp").exists());
+        assert_eq!(std::fs::read(other.root.path().join("video.mp4")).unwrap(), b"finished");
+        assert_eq!(std::fs::read(other.root.path().join("normal.tmp.txt")).unwrap(), b"final");
+        assert_eq!(std::fs::read(device.root.path().join(".notes.swp")).unwrap(), b"editor");
+    }
 }
 
 #[tokio::test]

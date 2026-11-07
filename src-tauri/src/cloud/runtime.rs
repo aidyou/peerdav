@@ -504,6 +504,25 @@ impl CloudRuntime {
             },
         })
     }
+    /// Read-only, explicitly bucket-scoped picker. Never rebind the browser session.
+    pub async fn mirror_folders(
+        &self, connection_id: &str, bucket: Option<&str>, prefix: &str, next: Option<&str>,
+    ) -> Result<super::object_runtime_types::ObjectPageDto, AppError> {
+        self.object_admit()?;
+        let _permit = self.network.read().await;
+        self.object_admit()?;
+        let relative = crate::mirror::normalize_cloud_prefix(prefix).map_err(AppError::from)?;
+        let full_prefix = crate::mirror::cloud_key(&relative, "");
+        let store = S3Store::new(self.append_config(connection_id, bucket)?).map_err(cloud_error)?;
+        let page = store.list_page(&full_prefix, next).await.map_err(cloud_error)?;
+        Ok(super::object_runtime_types::ObjectPageDto {
+            prefix: full_prefix, complete: page.next_token.is_none(), next: page.next_token,
+            prefix_protected: false,
+            objects: page.objects.into_iter().map(|item| super::object_runtime_types::ObjectEntryDto {
+                key: item.key, size: item.size, etag: item.etag, protected: false,
+            }).collect(),
+        })
+    }
     pub fn save_mirror_mapping(
         &self,
         input: crate::mirror::SaveMirrorMappingInput,
@@ -595,7 +614,13 @@ impl CloudRuntime {
         force_mass_delete: bool,
         confirmed_plan: Option<String>,
     ) -> Result<crate::mirror::MirrorSyncResult, AppError> {
-        let connection = self.connection(&mapping.connection_id)?;
+        let mut connection = self.connection(&mapping.connection_id)?;
+        if let Some(bucket) = &mapping.bucket {
+            if bucket != &connection.config.bucket && !connection.config.buckets.contains(bucket) {
+                return Err(runtime_error("CLOUD_CONFIG_INVALID", "请选择已配置的存储桶 / Select a configured bucket"));
+            }
+            connection.config.bucket = bucket.clone();
+        }
         let context = crate::mirror::MirrorRunContext {
             endpoint: connection.config.endpoint.clone(),
             bucket: connection.config.bucket.clone(),
@@ -603,7 +628,6 @@ impl CloudRuntime {
             confirmed_plan,
         };
         let store = S3Store::new(connection.config).map_err(cloud_error)?;
-        store.verify_capabilities().await.map_err(cloud_error)?;
         let store: Arc<dyn ObjectStore> = Arc::new(store);
         let _ = self.object_events.progress(SyncStatus {
             mapping_id: mapping.id.clone(),

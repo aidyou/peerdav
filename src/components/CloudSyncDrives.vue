@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { ElMessageBox } from "element-plus";
-import { cloud, cloudObjects, blankMapping, objectChildren } from "../lib/cloud";
+import { cloud, blankMapping, objectChildren } from "../lib/cloud";
 import { confirmAction } from "../lib/confirm";
 import { useAppContext } from "../lib/appContext";
 import { t } from "../lib/i18n";
@@ -12,6 +12,15 @@ const props = defineProps({ bucket: { type: String, default: "" }, connectionId:
 const emit = defineEmits(["changed"]);
 const app = useAppContext();
 const data = ref({ repositories: [], appendRepositories: [], mappings: [], statuses: [], mirrorMappings: [] });
+const selectedBucket = ref("");
+const availableBuckets = computed(() => {
+  const connection = data.value.connections?.find((item) => item.id === props.connectionId);
+  return [...new Set([...(connection?.buckets || []), connection?.bucket, props.bucket].filter(Boolean))];
+});
+watch([() => props.bucket, availableBuckets], () => {
+  if (!availableBuckets.value.includes(selectedBucket.value)) selectedBucket.value = availableBuckets.value.includes(props.bucket) ? props.bucket : availableBuckets.value[0] || "";
+}, { immediate: true });
+function resetBucket() { selectedBucket.value = availableBuckets.value.includes(props.bucket) ? props.bucket : availableBuckets.value[0] || ""; }
 const createDialogOpen = ref(false);
 const connectDialogOpen = ref(false);
 const addMenuOpen = ref(false);
@@ -36,6 +45,11 @@ function closeConnectDialog() { if (busy.value) return; connectDialogOpen.value 
 const newDrive = ref({ localRoot: "", logicalPath: "", password: "", confirmation: "" });
 const password = ref("");
 const busy = ref(false);
+const activeOperation = ref(null);
+const operationLoading = (kind, id) => activeOperation.value?.kind === kind && activeOperation.value?.id === String(id);
+const previewHasChanges = computed(() => ['uploads', 'downloads', 'deletes', 'conflicts'].some((key) => Number(preview.value?.summary?.[key]) > 0));
+const recoveryByMapping = ref({});
+let recoveryScan = 0;
 const state = ref("idle");
 const candidates = ref([]);
 const selectedCandidateKey = ref("");
@@ -43,6 +57,9 @@ const editingMappingId = ref(null);
 const mapping = ref(blankMapping());
 const mappingEditorOpen = ref(false);
 const preview = ref(null);
+const previewCheckedAt = ref('');
+watch(preview, (value) => { if (value) previewCheckedAt.value = new Date().toISOString(); });
+const editingMirrorId = ref(null);
 const recovery = ref([]);
 const recoveryMappingId = ref("");
 // 链接已有同步盘：join 之后需要绑定本地目录；多根目录时选择，空仓库时命名。
@@ -51,8 +68,11 @@ const linkRoots = ref([]);
 const joinedRepoId = ref("");
 // 镜像同步：创建表单与运行状态。
 const mirrorForm = ref({ localRoot: "", cloudPrefix: "" });
+const remoteFolderEdited = ref(false);
+const mirrorFolderEdited = ref(false);
 const mirrorBusy = ref({});
 const mirrorStatus = ref({});
+const mirrorCheckedAt = ref({});
 const mirrorResults = ref({});
 // 云端目录选择器。
 const pickerOpen = ref(false);
@@ -62,6 +82,7 @@ const pickerLoading = ref(false);
 const pickerNewName = ref("");
 let disposed = false;
 let generation = 0;
+let pickerGeneration = 0;
 let unlisten;
 const repositories = computed(() => [
   ...(data.value.repositories || []).filter((r) => r.connectionId === props.connectionId).map((r, i) => ({ ...r, label: t("drive.number", { number: i + 1 }), append: false })),
@@ -101,16 +122,24 @@ const pickerBreadcrumbs = computed(() => {
   return crumbs;
 });
 const phaseLabel = (phase) => phase ? t(`cloud.phase${phase[0].toUpperCase()}${phase.slice(1)}`) : "";
+const dismissedFailures = ref({});
 function mappingStatus(item) {
   const status = statuses.value.find((s) => s.mappingId === item.id);
+  if (status?.phase === 'failed') return t(dismissedFailures.value[item.id] ? 'cloud.phaseIdle' : 'drive.lastSyncFailed');
   return status ? `${phaseLabel(status.phase)}${status.detail ? ` · ${status.detail}` : ""}` : t("cloud.phaseIdle");
 }
 function repositoryLabel(item) { return repositories.value.find((r) => r.id === item.repositoryId)?.label || item.repositoryId; }
 function repositoryType(repo) { return repo.binding?.appendMode === "authenticated_plain" ? t("drive.modeAuthenticatedPlain") : repo.mode === "plain" ? t("cloudAppend.plain") : t("cloud.encrypted"); }
 function candidateModeLabel(item) { return item.descriptor.mode === "encrypted" ? t("drive.modeEncrypted") : t("drive.modeAuthenticatedPlain"); }
 function candidateModeHint(item) { return item.descriptor.mode === "encrypted" ? t("drive.connectCandidateEncryptedHint") : t("drive.connectCandidatePlainHint"); }
+function mappingRepository(item) {
+  const append = item.protocol ? item.protocol === 'append_v2' : (data.value.appendRepositories || []).some((entry) => entry.binding.repoId === item.repositoryId);
+  return repositories.value.find((repo) => repo.id === item.repositoryId && repo.append === append);
+}
+function mappingPlain(item) { const repo = mappingRepository(item); return repo?.binding?.appendMode === 'authenticated_plain' || repo?.mode === 'plain'; }
+function mappingType(item) { const repo = mappingRepository(item); return repo ? repositoryType(repo) : t('cloud.encrypted'); }
 function mappingRemote(item) { return `${repositoryLabel(item)} · ${item.logicalPath || "/"}`; }
-function mirrorRemote(item) { return `_peerdav_mirror/${item.cloudPrefix || ""}`; }
+function mirrorRemote(item) { return `${item.bucket ? `${item.bucket}/` : ""}_peerdav_mirror/${item.cloudPrefix || ""}`; }
 function mirrorStats(item) {
   const result = mirrorResults.value[item.id];
   if (!result) return t("drive.statsEmpty");
@@ -123,26 +152,50 @@ function mirrorStats(item) {
 }
 function fail(error) { app.handleFailure(error); }
 function resetSecrets() { password.value = ""; }
-function resetNewDrive() { newDrive.value = { localRoot: "", logicalPath: "", password: "", confirmation: "" }; }
+function resetNewDrive() { resetBucket(); remoteFolderEdited.value = false; newDrive.value = { localRoot: "", logicalPath: "", password: "", confirmation: "" }; }
 function resetLink() { linkForm.value = { localRoot: "", selectedRoot: "", newRoot: "" }; linkRoots.value = []; joinedRepoId.value = ""; candidates.value = []; selectedCandidateKey.value = ""; resetSecrets(); }
-function resetMirror() { mirrorForm.value = { localRoot: "", cloudPrefix: "" }; }
+function resetMirror() { editingMirrorId.value = null; mirrorFolderEdited.value = false; mirrorForm.value = { localRoot: "", cloudPrefix: "" }; }
 // Remote folder defaults to the chosen local folder's name, which keeps the
 // one-step create usable without asking non-technical users to name things twice.
 function folderName(path) { const parts = String(path).split(/[\\/]+/).filter(Boolean); return parts.length ? parts[parts.length - 1] : t("drive.defaultFolder"); }
 watch(selectedCandidateKey, () => { password.value = ""; joinedRepoId.value = ""; linkRoots.value = []; linkForm.value.selectedRoot = ""; linkForm.value.newRoot = ""; });
 watch(() => mapping.value.repositoryId, () => { if (!editingMappingId.value) mapping.value.logicalPath = ""; });
-async function refresh(scope = generation) { const result = await cloud.list(); if (!disposed && scope === generation) data.value = result; }
-async function run(operation) {
+watch(() => newDrive.value.localRoot, (value) => {
+  if (value && !remoteFolderEdited.value) newDrive.value.logicalPath = folderName(value);
+});
+watch(() => mirrorForm.value.localRoot, (value) => {
+  if (value && !mirrorFolderEdited.value) mirrorForm.value.cloudPrefix = folderName(value);
+});
+async function scanRecovery(scope = generation) {
+  const scan = ++recoveryScan;
+  for (const item of mappings.value) {
+    if (disposed || scope !== generation || scan !== recoveryScan) return;
+    try {
+      const records = await cloud.recoveryRecords(String(item.id));
+      if (disposed || scope !== generation || scan !== recoveryScan) return;
+      recoveryByMapping.value = { ...recoveryByMapping.value, [item.id]: Array.isArray(records) ? records : [] };
+      if (recoveryMappingId.value === String(item.id)) recovery.value = recoveryByMapping.value[item.id];
+    } catch (error) { if (!disposed && scope === generation && scan === recoveryScan) fail(error); }
+  }
+}
+async function refresh(scope = generation) {
+  const result = await cloud.list();
+  if (!disposed && scope === generation) { data.value = result; void scanRecovery(scope); }
+}
+async function run(operation, action = null) {
   if (busy.value) return;
   const scope = generation;
+  activeOperation.value = action;
+  state.value = 'idle';
+  if (action?.id) dismissedFailures.value = { ...dismissedFailures.value, [action.id]: true };
   busy.value = true;
-  try { await operation(scope); } catch (error) { if (!disposed && scope === generation) { state.value = "failed"; fail(error); } }
-  finally { if (!disposed && scope === generation) busy.value = false; }
+  try { await operation(scope); } catch (error) { if (!disposed && scope === generation) { state.value = action ? 'idle' : 'failed'; fail(error); } }
+  finally { if (!disposed && scope === generation) { busy.value = false; activeOperation.value = null; } }
 }
 watch(() => props.connectionId, () => {
-  generation++; busy.value = false; createDialogOpen.value = false; connectDialogOpen.value = false; addMenuOpen.value = false; resetSecrets(); resetNewDrive(); resetCreateMode(); resetLink(); resetMirror();
+  generation++; pickerGeneration++; pickerLoading.value = false; busy.value = false; createDialogOpen.value = false; connectDialogOpen.value = false; addMenuOpen.value = false; resetSecrets(); resetNewDrive(); resetCreateMode(); resetLink(); resetMirror();
   mapping.value = { ...blankMapping(), connectionId: props.connectionId }; editingMappingId.value = null; mappingEditorOpen.value = false;
-  preview.value = null; recovery.value = []; state.value = "idle"; mirrorBusy.value = {}; mirrorStatus.value = {}; mirrorResults.value = {};
+  preview.value = null; recovery.value = []; recoveryMappingId.value = ''; recoveryByMapping.value = {}; recoveryScan++; activeOperation.value = null; dismissedFailures.value = {}; mirrorCheckedAt.value = {}; state.value = "idle"; mirrorBusy.value = {}; mirrorStatus.value = {}; mirrorResults.value = {};
   void run((scope) => refresh(scope));
 }, { immediate: true });
 async function create() {
@@ -150,7 +203,7 @@ async function create() {
   await run(async (scope) => {
     state.value = "loading";
     const logicalPath = newDrive.value.logicalPath.trim() || folderName(newDrive.value.localRoot);
-    const redacted = await cloud.createSyncDrive({ connectionId: props.connectionId, bucket: props.bucket, mode: createMode.value, password: newDrive.value.password, passwordConfirmation: newDrive.value.confirmation });
+    const redacted = await cloud.createSyncDrive({ connectionId: props.connectionId, bucket: selectedBucket.value, mode: createMode.value, password: newDrive.value.password, passwordConfirmation: newDrive.value.confirmation });
     if (scope !== generation || disposed) return;
     // Bind the first local folder in the same step so a new drive always has
     // something to sync instead of looking like a no-op. The drive already
@@ -171,11 +224,19 @@ async function create() {
     state.value = "saved";
   });
 }
+function editMirror(item) {
+  openMirrorCreate();
+  editingMirrorId.value = item.id;
+  selectedBucket.value = item.bucket || availableBuckets.value[0] || '';
+  mirrorFolderEdited.value = true;
+  mirrorForm.value = { localRoot: item.localRoot, cloudPrefix: item.cloudPrefix || '' };
+  createSchedule.value = { enabled: !!item.schedule?.enabled, interval: item.schedule?.interval || 900 };
+}
 async function createMirror() {
   if (!canCreateMirror.value || !isMirror.value) return;
   await run(async (scope) => {
     state.value = "loading";
-    await cloud.mirrorSaveMapping({ id: null, connectionId: props.connectionId, localRoot: mirrorForm.value.localRoot.trim(), cloudPrefix: mirrorForm.value.cloudPrefix.trim(), schedule: { ...createSchedule.value, interval: Math.max(60, Number(createSchedule.value.interval) || 900) } });
+    await cloud.mirrorSaveMapping({ id: editingMirrorId.value, connectionId: props.connectionId, bucket: selectedBucket.value || undefined, localRoot: mirrorForm.value.localRoot.trim(), cloudPrefix: mirrorForm.value.cloudPrefix.trim(), schedule: { ...createSchedule.value, interval: Math.max(60, Number(createSchedule.value.interval) || 900) } });
     if (scope !== generation || disposed) return;
     resetMirror(); resetNewDrive(); resetCreateMode(); createDialogOpen.value = false; await refresh(scope);
     if (scope !== generation || disposed) return;
@@ -252,7 +313,6 @@ async function chooseNewRoot() {
     const value = await openDialog({ directory: true, multiple: false });
     if (!disposed && typeof value === "string") {
       newDrive.value.localRoot = value;
-      if (!newDrive.value.logicalPath.trim()) newDrive.value.logicalPath = folderName(value);
     }
   } catch (error) { fail(error); }
 }
@@ -297,13 +357,17 @@ async function deleteMirror(item) {
 }
 async function syncMirror(id, force = false, planId = null) {
   if (mirrorBusy.value[id] || busy.value) return;
+  const scope = generation;
   mirrorBusy.value = { ...mirrorBusy.value, [id]: true };
   try {
     const result = await cloud.mirrorSync(id, force, planId);
+    if (disposed || scope !== generation) return;
     mirrorResults.value = { ...mirrorResults.value, [id]: result };
+    mirrorCheckedAt.value = { ...mirrorCheckedAt.value, [id]: new Date().toISOString() };
+    mirrorStatus.value = { ...mirrorStatus.value, [id]: { phase: 'completed' } };
     if (!disposed) emit("changed");
   } catch (error) {
-    if (disposed) return;
+    if (disposed || scope !== generation) return;
     // The backend binds approval to the displayed immutable snapshot. Never
     // automatically approve a changed plan or retry without its plan token.
     const merge = error?.code === "MIRROR_CONFIRM_MERGE";
@@ -314,7 +378,7 @@ async function syncMirror(id, force = false, planId = null) {
         t(merge ? "drive.mirrorMergeTitle" : "drive.mirrorMassDeleteTitle"),
         { danger: !merge, confirmText: t(merge ? "confirm.ok" : "common.delete") },
       );
-      if (confirmed && !disposed) {
+      if (confirmed && !disposed && scope === generation) {
         mirrorBusy.value = { ...mirrorBusy.value, [id]: false };
         await syncMirror(id, !merge, error.context.planId);
       }
@@ -322,16 +386,26 @@ async function syncMirror(id, force = false, planId = null) {
     }
     fail(error);
   } finally {
-    if (!disposed) mirrorBusy.value = { ...mirrorBusy.value, [id]: false };
+    if (!disposed && scope === generation) mirrorBusy.value = { ...mirrorBusy.value, [id]: false };
   }
 }
 async function cancelMirror(id) {
   try { await cloud.mirrorCancel(id); } catch (error) { fail(error); }
 }
 // 镜像映射的自动同步开关与间隔：直接回写后端，调度器随后会按新配置重建定时任务。
+async function changeMappingSchedule(item, enabled, interval) {
+  await run(async (scope) => {
+    const input = { connectionId: item.connectionId, repositoryId: item.repositoryId, localRoot: item.localRoot, logicalPath: item.logicalPath, schedule: { enabled, interval: Math.max(60, Number(interval) || 900) } };
+    if (mappingRepository(item)?.append) await cloud.appendSaveMapping(item.id, input, item.logicalPath);
+    else await cloud.saveMapping(item.id, input);
+    if (scope !== generation || disposed) return;
+    await refresh(scope);
+    emit('changed');
+  });
+}
 async function toggleMirrorSchedule(item, enabled) {
   await run(async (scope) => {
-    await cloud.mirrorSaveMapping({ id: item.id, connectionId: item.connectionId, localRoot: item.localRoot, cloudPrefix: item.cloudPrefix, schedule: { enabled, interval: item.schedule?.interval || 900 } });
+    await cloud.mirrorSaveMapping({ id: item.id, connectionId: item.connectionId, bucket: item.bucket, localRoot: item.localRoot, cloudPrefix: item.cloudPrefix, schedule: { enabled, interval: item.schedule?.interval || 900 } });
     if (scope !== generation || disposed) return;
     await refresh(scope);
   });
@@ -339,7 +413,7 @@ async function toggleMirrorSchedule(item, enabled) {
 async function changeMirrorInterval(item, interval) {
   const value = Math.max(60, Number(interval) || 900);
   await run(async (scope) => {
-    await cloud.mirrorSaveMapping({ id: item.id, connectionId: item.connectionId, localRoot: item.localRoot, cloudPrefix: item.cloudPrefix, schedule: { enabled: !!item.schedule?.enabled, interval: value } });
+    await cloud.mirrorSaveMapping({ id: item.id, connectionId: item.connectionId, bucket: item.bucket, localRoot: item.localRoot, cloudPrefix: item.cloudPrefix, schedule: { enabled: !!item.schedule?.enabled, interval: value } });
     if (scope !== generation || disposed) return;
     await refresh(scope);
   });
@@ -348,14 +422,24 @@ async function openPicker() {
   pickerOpen.value = true; pickerPrefix.value = ""; pickerNewName.value = "";
   await loadPicker("");
 }
+watch(selectedBucket, () => { pickerGeneration++; pickerLoading.value = false; pickerOpen.value = false; pickerEntries.value = []; pickerPrefix.value = ''; mirrorFolderEdited.value = false; mirrorForm.value.cloudPrefix = mirrorForm.value.localRoot ? folderName(mirrorForm.value.localRoot) : ''; }, { flush: 'sync' });
 async function loadPicker(prefix) {
-  pickerLoading.value = true;
+  const scope = ++pickerGeneration;
+  const bucket = selectedBucket.value;
+  pickerLoading.value = true; pickerEntries.value = [];
   try {
     const fullPrefix = `_peerdav_mirror/${prefix}`;
-    const page = await cloudObjects.list({ connectionId: props.connectionId, prefix: fullPrefix, next: null });
-    pickerEntries.value = objectChildren(page.objects || [], fullPrefix).filter((entry) => entry.directory);
-  } catch (error) { fail(error); pickerEntries.value = []; }
-  finally { pickerLoading.value = false; }
+    let next = null;
+    const objects = [];
+    do {
+      const page = await cloud.mirrorFolders({ connectionId: props.connectionId, bucket, prefix, next });
+      if (disposed || scope !== pickerGeneration) return;
+      objects.push(...page.objects || []);
+      next = page.next || null;
+    } while (next);
+    pickerEntries.value = objectChildren(objects, fullPrefix).filter((entry) => entry.directory);
+  } catch (error) { if (scope === pickerGeneration && !disposed) { fail(error); pickerEntries.value = []; } }
+  finally { if (scope === pickerGeneration) pickerLoading.value = false; }
 }
 async function openPickerFolder(entry) {
   const next = entry.key.replace(/^_peerdav_mirror\//, "");
@@ -365,6 +449,7 @@ async function openPickerFolder(entry) {
 function confirmPicker() {
   const trimmed = pickerNewName.value.trim().replace(/^\/+|\/+$/g, "");
   const combined = trimmed ? (pickerPrefix.value ? `${pickerPrefix.value}${trimmed}` : trimmed) : pickerPrefix.value;
+  mirrorFolderEdited.value = true;
   mirrorForm.value.cloudPrefix = combined.replace(/^\/+|\/+$/g, "");
   pickerOpen.value = false;
 }
@@ -372,10 +457,29 @@ async function showInitialPlan(item, scope) {
   const result = await cloud.preview(String(item.id));
   if (scope === generation && !disposed) preview.value = { mappingId: String(item.id), previewId: String(result.previewId), summary: result.summary };
 }
-async function showPreview(item) { await run(async (scope) => { const result = await cloud.preview(String(item.id)); if (scope === generation && !disposed) preview.value = { mappingId: String(item.id), previewId: String(result.previewId), summary: result.summary }; }); }
-async function applyPreview() { if (!preview.value?.previewId || !preview.value?.mappingId) return; const target = { ...preview.value }; await run(async (scope) => { await cloud.sync(target.mappingId, target.previewId); if (scope !== generation || disposed) return; preview.value = null; await refresh(scope); }); }
+function mappingRunning(item) { return ['scanning', 'uploading', 'publishing', 'applying'].includes(statuses.value.find((s) => s.mappingId === item.id)?.phase); }
+async function syncNow(item) {
+  await run(async (scope) => {
+    const result = await cloud.preview(String(item.id));
+    if (scope !== generation || disposed) return;
+    if (!['uploads', 'downloads', 'deletes', 'conflicts'].some((key) => Number(result.summary?.[key]) > 0)) {
+      preview.value = { mappingId: String(item.id), previewId: String(result.previewId), summary: result.summary };
+      return;
+    }
+    if (result.summary?.deletes || result.summary?.conflicts) {
+      preview.value = { mappingId: String(item.id), previewId: String(result.previewId), summary: result.summary };
+      return;
+    }
+    await cloud.sync(String(item.id), String(result.previewId));
+    if (scope !== generation || disposed) return;
+    preview.value = null;
+    await refresh(scope);
+  }, { kind: 'sync', id: String(item.id) });
+}
+async function showPreview(item) { await run(async (scope) => { preview.value = null; const result = await cloud.preview(String(item.id)); if (scope === generation && !disposed) preview.value = { mappingId: String(item.id), previewId: String(result.previewId), summary: result.summary }; }, { kind: 'preview', id: String(item.id) }); }
+async function applyPreview() { if (!previewHasChanges.value || !preview.value?.previewId || !preview.value?.mappingId) return; const target = { ...preview.value }; await run(async (scope) => { await cloud.sync(target.mappingId, target.previewId); if (scope !== generation || disposed) return; preview.value = null; await refresh(scope); }, { kind: 'apply', id: target.mappingId }); }
 async function cancel(item) { await run(async (scope) => { await cloud.cancel(String(item.id)); await refresh(scope); }); }
-async function loadRecovery(item) { await run(async (scope) => { const result = await cloud.recoveryRecords(String(item.id)); if (scope === generation && !disposed) { recoveryMappingId.value = String(item.id); recovery.value = result; } }); }
+function loadRecovery(item) { recoveryMappingId.value = String(item.id); recovery.value = recoveryByMapping.value[item.id] || []; }
 async function restore(record) {
   if (!record.relativePath || !recoveryMappingId.value) return;
   const scope = generation;
@@ -383,11 +487,12 @@ async function restore(record) {
   try { const result = await ElMessageBox.prompt(t("cloud.destinationPrompt"), t("cloud.restore"), { inputValue: record.relativePath, closeOnClickModal: false, confirmButtonText: t("confirm.ok"), cancelButtonText: t("confirm.cancel") }); destination = result.value; }
   catch (error) { if (error !== "cancel" && error !== "close") fail(error); return; }
   if (!destination || scope !== generation || disposed || !await confirmAction(t("cloud.restoreConfirm"), t("cloud.restore"))) return;
-  await run(async () => { await cloud.restore(recoveryMappingId.value, String(record.id), destination); const result = await cloud.recoveryRecords(recoveryMappingId.value); if (scope === generation && !disposed) recovery.value = result; });
+  await run(async () => { await cloud.restore(recoveryMappingId.value, String(record.id), destination); const result = await cloud.recoveryRecords(recoveryMappingId.value); if (scope === generation && !disposed) { recovery.value = result; recoveryByMapping.value = { ...recoveryByMapping.value, [recoveryMappingId.value]: result }; } });
 }
 function mirrorStatusText(item) {
   const status = mirrorStatus.value[item.id];
   if (mirrorBusy.value[item.id]) return t("cloud.phaseScanning");
+  if (status?.phase === 'failed') return t('drive.lastSyncFailed');
   if (status) return `${phaseLabel(status.phase)}${status.detail ? ` · ${status.detail}` : ""}`;
   return t("cloud.phaseIdle");
 }
@@ -399,6 +504,8 @@ onMounted(async () => {
       // append 映射：状态进入下方进度行；镜像映射：状态进入镜像条目。
       if (mappings.value.some((m) => m.id === id)) {
         data.value.statuses = [...(data.value.statuses || []).filter((s) => s.mappingId !== id), event.payload];
+        if (event.payload.phase === 'failed') dismissedFailures.value = { ...dismissedFailures.value, [id]: false };
+        if (['completed', 'cancelled', 'failed', 'pending_recovery'].includes(event.payload?.phase)) void scanRecovery();
       }
       if ((data.value.mirrorMappings || []).some((m) => m.id === id)) {
         mirrorStatus.value = { ...mirrorStatus.value, [id]: event.payload };
@@ -437,13 +544,13 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
           </div>
         </header>
         <div class="drive-table-wrap">
-      <ul class="drive-list"><li v-for="repo in repositories" :key="repo.id" :class="{ 'is-active': repo.id === focusId }">{{ repo.label }} · {{ repositoryType(repo) }}</li></ul>
       <el-collapse v-if="mappings.length" v-model="activeSyncIds" class="client-collapse">
         <el-collapse-item v-for="item in mappings" :key="item.id" :name="item.id" class="mapping-item">
           <template #title>
             <div class="client-item__main">
-              <span class="client-item__icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 13.7-5.6" /><path d="M20 12a8 8 0 0 1-13.7 5.6" /><path d="M17.6 3.4v3.4h-3.4" /><path d="M6.4 20.6v-3.4h3.4" /></svg>
+              <span class="client-item__icon" role="img" :aria-label="mappingType(item)" :title="mappingType(item)">
+                <svg v-if="mappingPlain(item)" data-test="plain-drive-icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></svg>
+                <svg v-else data-test="encrypted-drive-icon" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3" /></svg>
               </span>
               <div class="client-item__title">
                 <strong class="mapping-local-cell">{{ item.localRoot }}</strong>
@@ -454,8 +561,8 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
               <el-tag class="mapping-status row-tag" role="status" effect="plain" round size="small">{{ mappingStatus(item) }}</el-tag>
             </div>
             <div class="client-item__actions" @click.stop>
-              <el-button class="mapping-preview list-pill" type="primary" round size="small" :disabled="busy" @click="showPreview(item)">{{ t('drive.preflight') }}</el-button>
-              <el-button class="mapping-cancel list-pill" round size="small" :disabled="busy" @click="cancel(item)">{{ t('drive.stopSync') }}</el-button>
+              <el-button class="mapping-sync list-pill" type="primary" round size="small" :loading="operationLoading('sync', item.id) || mappingRunning(item)" :disabled="busy || mappingRunning(item)" @click="syncNow(item)">{{ t('drive.syncNow') }}</el-button>
+              <el-button v-if="mappingRunning(item)" class="mapping-cancel list-pill" round size="small" :disabled="busy && !operationLoading('sync', item.id)" @click="operationLoading('sync', item.id) ? cloud.cancel(String(item.id)).catch(fail) : cancel(item)">{{ t('drive.stopSync') }}</el-button>
             </div>
           </template>
           <ul class="client-item__detail">
@@ -463,15 +570,22 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
             <li><span>{{ t('drive.remoteFolder') }}</span><strong>{{ mappingRemote(item) }}</strong></li>
           </ul>
           <div class="client-item__block mapping-actions">
+            <label class="mapping-schedule mirror-schedule">
+              <el-switch :model-value="!!item.schedule?.enabled" :disabled="busy || mappingRunning(item)" @update:model-value="changeMappingSchedule(item, $event, item.schedule?.interval)" />
+              <span>{{ t('cloud.schedule') }}</span>
+              <input :value="item.schedule?.interval || 900" :aria-label="t('drive.syncInterval')" type="number" min="60" step="60" :disabled="busy || mappingRunning(item) || !item.schedule?.enabled" @change="changeMappingSchedule(item, !!item.schedule?.enabled, $event.target.value)" />
+            </label>
+            <el-button class="mapping-preview" :loading="operationLoading('preview', item.id)" :disabled="busy || mappingRunning(item)" @click="showPreview(item)">{{ t('drive.preflight') }}</el-button>
             <el-button class="mapping-edit" :disabled="busy" @click="editMapping(item)">{{ t('cloud.edit') }}</el-button>
-            <el-button class="mapping-recovery" :disabled="busy" @click="loadRecovery(item)">{{ t('cloud.recovery') }}</el-button>
+            <el-button v-if="recoveryByMapping[item.id]?.length" class="mapping-recovery" :disabled="busy" @click="loadRecovery(item)">{{ t('cloud.recovery') }}</el-button>
             <el-button class="mapping-remove" :disabled="busy" @click="deleteMapping(item)">{{ t('drive.removeMapping') }}</el-button>
           </div>
           <div v-if="preview && preview.mappingId === item.id" class="cloud-preview">
-            <p>{{ t('cloud.confirmPreview') }}</p>
+            <p class="hint">{{ t('drive.checkedAt') }} <time :datetime="previewCheckedAt">{{ new Date(previewCheckedAt).toLocaleString() }}</time></p>
+            <p role="status">{{ t(previewHasChanges ? 'cloud.confirmPreview' : 'drive.upToDate') }}</p>
             <p>{{ t('cloud.previewUploads') }}: {{ preview.summary?.uploads ?? 0 }} · {{ t('cloud.previewDownloads') }}: {{ preview.summary?.downloads ?? 0 }} · {{ t('cloud.previewDeletes') }}: {{ preview.summary?.deletes ?? 0 }} · {{ t('cloud.previewConflicts') }}: {{ preview.summary?.conflicts ?? 0 }}</p>
             <pre v-if="typeof preview.summary === 'string'">{{ preview.summary }}</pre>
-            <el-button :disabled="busy" @click="applyPreview">{{ t('drive.applyPlan') }}</el-button>
+            <el-button v-if="previewHasChanges" :loading="operationLoading('apply', item.id)" :disabled="busy" @click="applyPreview">{{ t('drive.applyPlan') }}</el-button>
           </div>
           <div v-if="recovery.length && recoveryMappingId === item.id" class="recovery-list">
             <p class="hint">{{ t('drive.recoveryFor', { path: recoveryMappingId }) }}</p>
@@ -497,8 +611,8 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
         <el-collapse-item v-for="item in mirrorMappings" :key="item.id" :name="item.id" class="mirror-item">
           <template #title>
             <div class="client-item__main">
-              <span class="client-item__icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24"><path d="M12 3v18" /><path d="M9 7 4 12l5 5" /><path d="M15 7l5 5-5 5" /></svg>
+              <span class="client-item__icon" role="img" :aria-label="t('drive.modeMirror')" :title="t('drive.modeMirror')">
+                <svg data-test="mirror-drive-icon" viewBox="0 0 24 24"><path d="M3 7V4h6l2 2h7v4M6 10h6l2 2h7v9H6z" /></svg>
               </span>
               <div class="client-item__title">
                 <strong>{{ item.localRoot }}</strong>
@@ -509,15 +623,17 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
               <el-tag class="mirror-status row-tag" role="status" effect="plain" round size="small">{{ mirrorStatusText(item) }}</el-tag>
             </div>
             <div class="client-item__actions" @click.stop>
-              <el-button v-if="!mirrorBusy[item.id]" class="mirror-sync list-pill" type="primary" round size="small" :disabled="busy" @click="syncMirror(item.id)">{{ t('drive.mirrorSync') }}</el-button>
-              <el-button v-else class="mirror-cancel list-pill" round size="small" @click="cancelMirror(item.id)">{{ t('drive.mirrorCancel') }}</el-button>
+              <el-button class="mirror-sync list-pill" type="primary" round size="small" :loading="!!mirrorBusy[item.id]" :disabled="busy || mirrorBusy[item.id]" @click="syncMirror(item.id)">{{ t('drive.mirrorSync') }}</el-button>
+              <el-button v-if="mirrorBusy[item.id]" class="mirror-cancel list-pill" round size="small" @click="cancelMirror(item.id)">{{ t('drive.mirrorCancel') }}</el-button>
             </div>
           </template>
           <ul class="client-item__detail">
             <li><span>{{ t('drive.mirrorCloudFolder') }}</span><strong class="mono">{{ mirrorRemote(item) }}</strong></li>
+            <li v-if="mirrorCheckedAt[item.id]"><span>{{ t('drive.checkedAt') }}</span><time :datetime="mirrorCheckedAt[item.id]">{{ new Date(mirrorCheckedAt[item.id]).toLocaleString() }}</time></li>
             <li><span>{{ t('drive.stats') }}</span><strong class="mirror-stats">{{ mirrorStats(item) }}</strong></li>
           </ul>
           <div class="client-item__block mirror-actions">
+            <el-button class="mirror-edit" :disabled="mirrorBusy[item.id] || busy" @click="editMirror(item)">{{ t('cloud.edit') }}</el-button>
             <el-button class="mirror-delete" :disabled="mirrorBusy[item.id] || busy" @click="deleteMirror(item)">{{ t('drive.mirrorDelete') }}</el-button>
             <label class="mirror-schedule">
               <el-switch :model-value="!!item.schedule?.enabled" :disabled="busy || mirrorBusy[item.id]" @update:model-value="toggleMirrorSchedule(item, $event)" />
@@ -545,7 +661,7 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
       :show-close="!busy" :close-on-click-modal="false" :close-on-press-escape="!busy" data-test="create-drive-dialog">
       <template #header="{ titleId, titleClass }">
         <div class="create-header">
-          <span :id="titleId" :class="titleClass">{{ t('drive.createTitle') }}</span>
+          <span :id="titleId" :class="titleClass">{{ t(editingMirrorId ? 'drive.editMirror' : 'drive.createTitle') }}</span>
           <el-popover placement="bottom-start" trigger="click" :width="320" :show-after="0" popper-class="queue-help-popper">
             <div class="queue-help"><p>{{ t('cloud.safetyHint') }}</p></div>
             <template #reference>
@@ -555,7 +671,7 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
         </div>
       </template>
       <label class="settings-row"><span>{{ t('drive.createMode') }}</span>
-        <el-select v-model="createMode" class="create-mode" :disabled="busy">
+        <el-select v-model="createMode" class="create-mode" :disabled="busy || !!editingMirrorId">
           <el-option value="encrypted" :label="t('drive.modeEncrypted')" />
           <el-option value="authenticated_plain" :label="t('drive.modeAuthenticatedPlain')" />
           <el-option value="mirror" :label="t('drive.modeMirror')" />
@@ -563,6 +679,36 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
       </label>
       <p class="hint create-mode-hint">{{ t(createModeHint) }}</p>
       <form class="drive-create" @submit.prevent="submitCreate">
+        <label class="settings-row"><span>{{ t('cloud.bucket') }}</span>
+          <el-select v-model="selectedBucket" class="create-bucket" :aria-label="t('cloud.bucket')" :disabled="busy || availableBuckets.length < 2">
+            <el-option v-for="bucket in availableBuckets" :key="bucket" :value="bucket" :label="bucket" />
+          </el-select>
+        </label>
+        <template v-if="isMirror">
+          <label class="settings-row"><span>{{ t('drive.mirrorLocalFolder') }}</span>
+            <div class="field-inline">
+              <el-input v-model="mirrorForm.localRoot" class="mirror-local-root" :placeholder="t('drive.chooseFolderHint')" :disabled="busy" />
+              <el-button class="choose-mirror-root" :disabled="busy" @click="chooseMirrorRoot">{{ t('cloud.choose') }}</el-button>
+            </div>
+          </label>
+          <label class="settings-row"><span>{{ t('drive.mirrorCloudFolder') }}</span>
+            <div class="field-inline">
+              <el-input v-model="mirrorForm.cloudPrefix" @update:model-value="mirrorFolderEdited = true" class="mirror-cloud-prefix" :placeholder="t('drive.mirrorCloudFolderHint')" :disabled="busy" />
+              <el-button class="pick-cloud-folder" :disabled="busy" @click="openPicker">{{ t('drive.pickCloudFolder') }}</el-button>
+            </div>
+          </label>
+        </template>
+        <template v-else>
+          <label class="settings-row"><span>{{ t('drive.localFolder') }}</span>
+            <div class="field-inline">
+              <el-input v-model="newDrive.localRoot" class="new-drive-local" :placeholder="t('drive.chooseFolderHint')" :disabled="busy" />
+              <el-button class="choose-new-root" :disabled="busy" @click="chooseNewRoot">{{ t('cloud.choose') }}</el-button>
+            </div>
+          </label>
+          <label class="settings-row"><span>{{ t('drive.remoteFolder') }}</span>
+            <el-input v-model="newDrive.logicalPath" @update:model-value="remoteFolderEdited = true" class="new-drive-folder" :placeholder="t('drive.folderDefaultHint')" :disabled="busy" />
+          </label>
+        </template>
         <label class="settings-row create-schedule"><span>{{ t('cloud.schedule') }}</span><el-switch v-model="createSchedule.enabled" :disabled="busy" /><input v-model="createSchedule.interval" type="number" min="60" step="60" :disabled="busy || !createSchedule.enabled" /></label>
         <p v-if="createSchedule.enabled && !isMirror" class="hint">{{ t('drive.initialSyncHint') }}</p>
         <template v-if="needsPassword">
@@ -579,35 +725,10 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
           </label>
           <p class="hint">{{ t(passwordHint) }}</p>
         </template>
-        <template v-if="isMirror">
-          <label class="settings-row"><span>{{ t('drive.mirrorCloudFolder') }}</span>
-            <div class="field-inline">
-              <el-input v-model="mirrorForm.cloudPrefix" class="mirror-cloud-prefix" :placeholder="t('drive.mirrorCloudFolderHint')" :disabled="busy" />
-              <el-button class="pick-cloud-folder" :disabled="busy" @click="openPicker">{{ t('drive.pickCloudFolder') }}</el-button>
-            </div>
-          </label>
-          <label class="settings-row"><span>{{ t('drive.mirrorLocalFolder') }}</span>
-            <div class="field-inline">
-              <el-input v-model="mirrorForm.localRoot" class="mirror-local-root" :placeholder="t('drive.chooseFolderHint')" :disabled="busy" />
-              <el-button class="choose-mirror-root" :disabled="busy" @click="chooseMirrorRoot">{{ t('cloud.choose') }}</el-button>
-            </div>
-          </label>
-        </template>
-        <template v-else>
-          <label class="settings-row"><span>{{ t('drive.localFolder') }}</span>
-            <div class="field-inline">
-              <el-input v-model="newDrive.localRoot" class="new-drive-local" :placeholder="t('drive.chooseFolderHint')" :disabled="busy" />
-              <el-button class="choose-new-root" :disabled="busy" @click="chooseNewRoot">{{ t('cloud.choose') }}</el-button>
-            </div>
-          </label>
-          <label class="settings-row"><span>{{ t('drive.remoteFolder') }}</span>
-            <el-input v-model="newDrive.logicalPath" class="new-drive-folder" :placeholder="t('drive.folderDefaultHint')" :disabled="busy" />
-          </label>
-        </template>
       </form>
       <template #footer>
         <el-button class="cancel-create-drive" :disabled="busy" @click="closeCreateDialog">{{ t('common.cancel') }}</el-button>
-        <el-button v-if="isMirror" class="mirror-create" type="primary" :disabled="!canCreateMirror" :loading="busy" @click="createMirror">{{ t('drive.createMirror') }}</el-button>
+        <el-button v-if="isMirror" class="mirror-create" type="primary" :disabled="!canCreateMirror" :loading="busy" @click="createMirror">{{ t(editingMirrorId ? 'cloud.update' : 'drive.createMirror') }}</el-button>
         <el-button v-else class="append-create" type="primary" :disabled="!canCreate" :loading="busy" @click="create">{{ t('drive.createAndBind') }}</el-button>
       </template>
     </el-dialog>
@@ -711,9 +832,6 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
 .add-menu-list button { padding: 8px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--app-text); font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
 .add-menu-list button:hover, .add-menu-list button:focus-visible { background: var(--app-surface-2); outline: none; }
 .sync-drives { display: flex; flex-direction: column; min-width: 0; height: 100%; min-height: 0; overflow-wrap: anywhere; }
-.drive-list { padding: 0; margin: 0 0 .6rem; list-style: none; }
-.drive-list li { padding: 6px 8px; border-radius: 6px; }
-.drive-list .is-active { background: var(--app-surface-2); box-shadow: inset 3px 0 var(--el-color-primary); }
 .drive-create { margin: 0; }
 .drive-create h4 { margin: 0 0 .4rem; }
 .settings-row { display: flex; flex-direction: column; gap: 6px; align-items: stretch; margin: .6rem 0; font-size: 13px; font-weight: 600; color: var(--app-text-strong); }

@@ -31,6 +31,9 @@ pub const MASS_DELETE_PERCENT: usize = 25;
 pub struct MirrorMapping {
     pub id: String,
     pub connection_id: String,
+    /// Explicit target bucket; old configurations without this field use the connection default.
+    #[serde(default)]
+    pub bucket: Option<String>,
     pub local_root: PathBuf,
     /// 云端子目录（相对 `MIRROR_ROOT`，无前后导斜杠）；空串表示直接镜像到 `_peerdav_mirror/` 下。
     #[serde(default)]
@@ -45,6 +48,9 @@ pub struct SaveMirrorMappingInput {
     /// 编辑已有映射时传入其 id；留空表示新建。
     pub id: Option<String>,
     pub connection_id: String,
+    /// Explicit target bucket; old configurations without this field use the connection default.
+    #[serde(default)]
+    pub bucket: Option<String>,
     pub local_root: PathBuf,
     #[serde(default)]
     pub cloud_prefix: String,
@@ -185,6 +191,7 @@ pub struct LocalFile {
 /// 判断相对路径是否为同步产物（冲突副本或下载临时文件），两侧均跳过。
 pub fn is_artifact(path: &str) -> bool {
     path.contains(CONFLICT_MARKER) || path.contains(TEMP_MARKER)
+        || crate::ignore_rules::is_sync_temporary_path(path)
 }
 
 /// 校验镜像相对路径：UTF-8、非绝对、无反斜杠/控制字符、折叠后无空段，
