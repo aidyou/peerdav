@@ -31,6 +31,24 @@ impl std::fmt::Debug for OfficialConnection {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateOfficialConnectionInput {
+    pub id: String,
+    pub revision: u64,
+    pub name: String,
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub clear_client_secret: bool,
+    pub direct: bool,
+}
+
+impl std::fmt::Debug for UpdateOfficialConnectionInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateOfficialConnectionInput").field("id", &self.id).field("revision", &self.revision).finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OfficialConnectionRedacted {

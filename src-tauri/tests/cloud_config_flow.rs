@@ -128,6 +128,40 @@ fn official_connections_are_encrypted_redacted_and_revision_checked() {
 }
 
 #[test]
+fn official_basic_edit_preserves_identity_tokens_and_rejects_stale_or_invalid_changes() {
+    use peerdav_lib::cloud::{official_types::{OfficialConnection, UpdateOfficialConnectionInput}, oauth_types::OfficialProvider};
+    let (_dir, store) = store();
+    let saved = store.save_official_connection_with_proxy(OfficialConnection {
+        id: String::new(), name: "Drive".into(), provider: OfficialProvider::GoogleDrive,
+        config_version: 1, revision: 0, client_id: "client".into(), client_secret: Some("private".into()),
+        refresh_token: "refresh".into(), root_id: "root".into(),
+    }, Some(true)).expect("create atomically with proxy");
+    assert_eq!(store.snapshot().expect("snapshot").drive_proxies.get(&saved.id), Some(&true));
+    let input = |revision, name: &str, secret, clear| UpdateOfficialConnectionInput {
+        id: saved.id.clone(), revision, name: name.into(), client_secret: secret, clear_client_secret: clear, direct: false,
+    };
+    store.rotate_official_token(&saved.id, 1, "rotated").expect("rotate");
+    let edited = store.update_official_connection(input(1, "Renamed", None, false)).expect("edit");
+    assert_eq!(edited.revision, 2);
+    let snapshot = store.snapshot().expect("edited");
+    let item = &snapshot.official_connections[0];
+    assert_eq!((item.name.as_str(), item.client_id.as_str(), item.root_id.as_str(), item.refresh_token.as_str()), ("Renamed", "client", "root", "rotated"));
+    assert_eq!(item.client_secret.as_deref(), Some("private"));
+    assert_eq!(snapshot.drive_proxies.get(&saved.id), Some(&false));
+    assert!(store.update_official_connection(input(1, "stale", None, false)).is_err());
+    assert!(store.update_official_connection(input(2, " ", None, false)).is_err());
+    assert!(store.update_official_connection(input(2, "over", Some("x".repeat(16385)), false)).is_err());
+    store.update_official_connection(input(2, "Renamed", Some("x".repeat(16384)), false)).expect("exact secret limit");
+    let unchanged = store.update_official_connection(input(3, "Renamed again", Some(String::new()), false)).expect("empty preserves");
+    assert_eq!(unchanged.revision, 3, "display-only edits preserve admitted sessions");
+    assert_eq!(store.snapshot().expect("preserved").official_connections[0].client_secret.as_ref().map(String::len), Some(16384));
+    store.update_official_connection(input(3, "Renamed again", None, true)).expect("explicit clear");
+    assert!(store.snapshot().expect("cleared").official_connections[0].client_secret.is_none());
+    let forged = serde_json::json!({ "id": saved.id, "revision": 5, "name": "forged", "direct": false, "provider": "onedrive", "rootId": "elsewhere" });
+    assert!(serde_json::from_value::<UpdateOfficialConnectionInput>(forged).is_err(), "identity fields cannot be modified");
+}
+
+#[test]
 fn legacy_connections_gain_explicit_protocol_without_changing_identity() {
     use peerdav_lib::cloud::config_types::CloudConnection;
     let (_dir, store) = store();

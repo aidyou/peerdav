@@ -97,6 +97,7 @@ impl FileSessions {
         }
         let session_id = crate::local_upload::token()?;
         let capabilities = backend.capabilities();
+        let supports_move = backend.supports_move();
         sessions.insert(
             session_id.clone(),
             Arc::new(FileSession {
@@ -108,6 +109,7 @@ impl FileSessions {
         );
         Ok(FileSessionDto {
             session_id,
+            supports_move,
             root,
             capabilities,
         })
@@ -152,6 +154,17 @@ impl FileSessions {
     ) -> Result<FilePageDto, AppError> {
         let session = self.admitted(peers, cloud, id).await?;
         let mut page = session.backend.list(peers, cloud, path, next).await?;
+        let root_name = match &session.location {
+            FileLocation::Peerdav { peer_id, share_id } => peers.shares(peer_id).await.map_err(AppError::from)?.into_iter().find(|share| share.id == *share_id).map(|share| share.name).ok_or_else(invalid)?,
+            FileLocation::Cloud { connection_id, root_id } => {
+                let config = cloud.config.snapshot().map_err(crate::cloud::runtime::config_error)?;
+                if let Some(connection) = config.official_connections.iter().find(|entry| entry.id == *connection_id) { connection.name.clone() }
+                else { root_id.clone().filter(|id| !id.is_empty()).unwrap_or(cloud.connection(connection_id)?.config.bucket) }
+            }
+            FileLocation::S3 { bucket, .. } => bucket.clone(),
+        };
+        page.breadcrumbs.retain(|crumb| crumb.id != session.root);
+        page.breadcrumbs.insert(0, FileBreadcrumbDto { id: session.root.clone(), name: root_name });
         // Shared presentation contract, independent of provider listing order.
         page.entries.sort_by_key(|entry| !entry.is_dir);
         // Reconfiguration while I/O was in flight must not publish old data into
@@ -243,6 +256,13 @@ impl FileSessions {
             deleted: result.deleted,
             failed: result.failed.into_iter().map(|failure| FileDeleteFailureDto { id: failure.key, error: failure.error }).collect(),
         })
+    }
+
+    pub async fn move_entry(&self, peers: &PeerManager, cloud: &CloudRuntime, session_id: &str, id: &str, destination: &str) -> Result<(), AppError> {
+        let session = self.admitted(peers, cloud, session_id).await?;
+        if !session.backend.supports_move() { return Err(unavailable()); }
+        ensure_delete_target(id, &session.root)?;
+        session.backend.move_entry(peers, cloud, id, destination).await
     }
 
     pub async fn create_directory(&self, peers: &PeerManager, cloud: &CloudRuntime, id: &str, path: &str, name: &str) -> Result<FileEntryDto, AppError> {

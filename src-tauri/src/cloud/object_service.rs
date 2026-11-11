@@ -799,6 +799,10 @@ impl ObjectService {
         Ok(())
     }
 
+    pub(crate) fn move_lease(&self, key: &str) -> Result<super::object_guard::ObjectLease, ObjectServiceError> {
+        valid_key(key)?;
+        Ok(self.guard.begin_mutation(&self.target_identity(key))?)
+    }
     pub(crate) fn preflight_upload(&self, key: &str) -> Result<(), ObjectServiceError> {
         valid_key(key)?;
         let _lease = self.guard.begin_mutation(&self.target_identity(key))?;

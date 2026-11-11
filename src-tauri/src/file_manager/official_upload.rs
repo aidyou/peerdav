@@ -16,6 +16,23 @@ impl crate::traits::UploadQueueAdapter for OfficialUploadAdapter<'_> {
             let end = start.saturating_add(limit.unwrap_or(100).clamp(1, 128)).min(job.page.entries.len());
             let mut page = job.page.clone();
             page.entries = job.page.entries[start..end].to_vec();
+            for entry in &mut page.entries {
+                if let Some((phase, bytes, _)) = job.entry_states.get(&entry.relative_path) { entry.phase = phase.clone(); entry.transferred = Some(*bytes); }
+                if entry.kind == "directory" {
+                    let prefix = format!("{}/", entry.relative_path);
+                    let children: Vec<_> = job.entry_states.iter().filter(|(path, _)| path.starts_with(&prefix)).collect();
+                    entry.size = children.iter().map(|(_, (_, _, size))| *size).sum();
+                    entry.transferred = Some(children.iter().map(|(_, (_, bytes, _))| *bytes).sum());
+                    let completed = children.iter().all(|(_, (phase, _, _))| matches!(phase.as_str(), "completed" | "skipped"));
+                    entry.phase = if completed && children.iter().all(|(_, (phase, _, _))| phase == "skipped") { "skipped" } else if completed { "completed" } else if children.iter().any(|(_, (phase, _, _))| phase == "failed") { "failed" } else if children.iter().any(|(_, (phase, _, _))| phase == "cancelled") { "cancelled" } else if job.status.current_relative_path.as_ref().is_some_and(|path| path.starts_with(&prefix)) { "active" } else { "selected" }.into();
+                    if let Some(path) = job.status.current_relative_path.as_ref().filter(|path| path.starts_with(&prefix)) {
+                        if let Some((phase, _, size)) = job.entry_states.get(path) { if phase == "active" { entry.transferred = Some(entry.transferred.unwrap_or(0).saturating_add(job.progress.load(std::sync::atomic::Ordering::Relaxed).min(*size))); } }
+                    }
+                }
+                if job.status.current_relative_path.as_deref() == Some(entry.relative_path.as_str()) && entry.phase == "active" {
+                    entry.transferred = Some(job.progress.load(std::sync::atomic::Ordering::Relaxed).min(entry.size));
+                }
+            }
             page.next_cursor = (end < job.page.entries.len()).then(|| end.to_string());
             Ok(page)
         })
@@ -120,7 +137,15 @@ pub(crate) async fn action(backend: &OfficialBrowserBackend, cloud: &Arc<CloudRu
                         }
                         current = next;
                     }
-                    jobs.lock().await.get_mut(&id).ok_or_else(super::service::invalid)?.status.current_relative_path = Some(file.relative.clone());
+                    let progress = {
+                        let mut jobs = jobs.lock().await;
+                        let job = jobs.get_mut(&id).ok_or_else(super::service::invalid)?;
+                        job.status.current_relative_path = Some(file.relative.clone());
+                        job.progress.store(0, std::sync::atomic::Ordering::Relaxed);
+                        job.entry_states.insert(file.relative.clone(), ("active".into(), 0, file.size));
+                        if let Some(entry) = job.page.entries.iter_mut().find(|entry| entry.relative_path == file.relative) { entry.phase = "active".into(); }
+                        job.progress.clone()
+                    };
                     let destination = folders.get(&current).ok_or_else(super::service::invalid)?;
                     let mut cursor = None;
                     let mut seen = std::collections::HashSet::new();
@@ -157,21 +182,30 @@ pub(crate) async fn action(backend: &OfficialBrowserBackend, cloud: &Arc<CloudRu
                             let expected = expected.as_deref().ok_or_else(super::service::invalid)?;
                             validate(&cloud, &connection, revision)?;
                             // Version compatibility check is not an atomic conditional write.
-                            api.replace_file_stream(&target.id, file.file, file.size, Some(expected)).await.map_err(crate::cloud::official_runtime::api_error)?;
+                            api.replace_file_stream_progress(&target.id, file.file, file.size, Some(expected), Some(progress)).await.map_err(crate::cloud::official_runtime::api_error)?;
+                            validate(&cloud, &connection, revision)?;
                             let mut jobs = jobs.lock().await;
                             let job = jobs.get_mut(&id).ok_or_else(super::service::invalid)?;
                             job.status.completed_files += 1;
+                            if let Some(entry) = job.page.entries.iter_mut().find(|entry| entry.relative_path == file.relative) { entry.phase = "completed".into(); entry.transferred = Some(file.size); }
+                            job.entry_states.insert(file.relative.clone(), ("completed".into(), file.size, file.size));
                             job.status.completed_bytes = job.status.completed_bytes.saturating_add(file.size);
                         } else {
-                            jobs.lock().await.get_mut(&id).ok_or_else(super::service::invalid)?.status.skipped_files += 1;
+                            let mut jobs = jobs.lock().await;
+                            let job = jobs.get_mut(&id).ok_or_else(super::service::invalid)?;
+                            job.status.skipped_files += 1;
+                            job.entry_states.insert(file.relative.clone(), ("skipped".into(), 0, file.size));
+                            if let Some(entry) = job.page.entries.iter_mut().find(|entry| entry.relative_path == file.relative) { entry.phase = "skipped".into(); }
                         }
                         continue;
                     }
-                    api.upload_new(destination, name, file.file, file.size).await.map_err(crate::cloud::official_runtime::api_error)?;
+                    api.upload_new_progress(destination, name, file.file, file.size, progress).await.map_err(crate::cloud::official_runtime::api_error)?;
                     validate(&cloud, &connection, revision)?;
                     let mut jobs = jobs.lock().await;
                     let job = jobs.get_mut(&id).ok_or_else(super::service::invalid)?;
                     job.status.completed_files += 1;
+                    if let Some(entry) = job.page.entries.iter_mut().find(|entry| entry.relative_path == file.relative) { entry.phase = "completed".into(); entry.transferred = Some(file.size); }
+                    job.entry_states.insert(file.relative.clone(), ("completed".into(), file.size, file.size));
                     job.status.completed_bytes = job.status.completed_bytes.saturating_add(file.size);
                 }
                 Ok::<(), AppError>(())
@@ -193,6 +227,17 @@ pub(crate) async fn action(backend: &OfficialBrowserBackend, cloud: &Arc<CloudRu
             if let Err(error) = &result { cloud.object_report(error.clone()); }
             if let Some(job) = jobs.lock().await.get_mut(&id) {
                 job.status.phase = if cancel.is_cancelled() { "cancelled" } else if result.is_ok() { "completed" } else { "failed" }.into();
+                for entry in &mut job.page.entries {
+                    if entry.phase == "active" {
+                        entry.phase = job.status.phase.clone();
+                        entry.transferred = Some(job.progress.load(std::sync::atomic::Ordering::Relaxed).min(entry.size));
+                    }
+                }
+                if let Some(path) = &job.status.current_relative_path {
+                    if let Some((phase, bytes, size)) = job.entry_states.get_mut(path) {
+                        if phase == "active" { *phase = job.status.phase.clone(); *bytes = job.progress.load(std::sync::atomic::Ordering::Relaxed).min(*size); }
+                    }
+                }
                 job.status.error = result.err();
                 job.status.conflict = None;
                 job.resolution = None;

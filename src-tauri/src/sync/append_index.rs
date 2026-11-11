@@ -160,7 +160,7 @@ fn frame(parts: &[&[u8]]) -> Vec<u8> {
 impl AppendIndex {
     pub fn open(path: &Path, key: Zeroizing<[u8; 32]>, repo: String) -> Result<Self, IndexError> {
         if repo.is_empty() {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         let mut options = std::fs::OpenOptions::new();
         options.create(true).read(true).write(true);
@@ -173,7 +173,7 @@ impl AppendIndex {
         }
         let file = options.open(path)?;
         if !file.metadata()?.is_file() {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         let connection = Connection::open(path)?;
         #[cfg(unix)]
@@ -253,7 +253,7 @@ impl AppendIndex {
         plain: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), IndexError> {
         if plain.len() > MAX_RECORD {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         let mut n = [0u8; 24];
         rand::rngs::OsRng
@@ -341,7 +341,7 @@ impl AppendIndex {
     }
     pub fn save(&mut self, record: &KnownRecord) -> Result<(), IndexError> {
         if record.key.is_empty() {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let mut incoming = record.clone();
@@ -349,7 +349,7 @@ impl AppendIndex {
             // Fingerprints are opaque conflict markers, not validation context.
             if let (Some(previous), Some(next)) = (&old.fingerprint, &record.fingerprint) {
                 if !previous.is_empty() && previous != next {
-                    return Err(IndexError::InvalidRecord);
+                    return Err(IndexError::invalid_record());
                 }
             }
             if old.state == DiscoveryState::Validated && incoming.state != DiscoveryState::Validated
@@ -379,7 +379,7 @@ impl AppendIndex {
         for n in names {
             out.push(
                 self.load(&n?)
-                    .and_then(|x| x.ok_or(IndexError::InvalidRecord))?,
+                    .and_then(|x| x.ok_or_else(|| IndexError::invalid_record()))?,
             );
         }
         Ok(out)
@@ -391,7 +391,7 @@ impl AppendIndex {
             params![&self.scope, after], |r| r.get(0),
         ).optional()?;
         length
-            .map(|n| usize::try_from(n).map_err(|_| IndexError::InvalidRecord))
+            .map(|n| usize::try_from(n).map_err(|_| IndexError::invalid_record()))
             .transpose()
     }
 
@@ -419,12 +419,12 @@ impl AppendIndex {
         context: &VerificationContext,
     ) -> Result<(), IndexError> {
         if context.repo_id.as_bytes() != self.repo_id {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         if let Some(old) = self.verification(key)? {
             if old.object_digest != context.object_digest {
-                return Err(IndexError::InvalidRecord);
+                return Err(IndexError::invalid_record());
             }
         }
         self.write_raw_tx(&tx, "verification", key, &serde_json::to_vec(context)?)?;
@@ -440,7 +440,7 @@ impl AppendIndex {
             || !proposed.is_ascii()
             || proposed.contains(':')
         {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         if let Some(bytes) = self.read_raw("active-run", slot)? {
@@ -466,7 +466,7 @@ impl AppendIndex {
     ) -> Result<(), IndexError> {
         if let Some(bytes) = self.read_raw("active-run", slot)? {
             if serde_json::from_slice::<String>(&bytes)? != id {
-                return Err(IndexError::InvalidRecord);
+                return Err(IndexError::invalid_record());
             }
             tx.execute(
                 "DELETE FROM append_records WHERE scope=?1 AND token=?2",
@@ -496,7 +496,7 @@ impl AppendIndex {
             budget.accounting_version = 2;
         }
         if budget.accounting_version != 2 {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         Ok(budget)
     }
@@ -507,7 +507,7 @@ impl AppendIndex {
         budget: &DiscoveryBudget,
     ) -> Result<(), IndexError> {
         if operation.is_empty() || budget.accounting_version != 2 {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         for (metric, amount, limit) in [
@@ -548,9 +548,9 @@ impl AppendIndex {
             ),
         ] {
             if amount > limit {
-                return Err(IndexError::InvalidRecord);
+                return Err(IndexError::invalid_record());
             }
-            let amount = i64::try_from(amount).map_err(|_| IndexError::InvalidRecord)?;
+            let amount = i64::try_from(amount).map_err(|_| IndexError::invalid_record())?;
             let name = format!("discover:{}:{operation}:{metric}", operation.len());
             let previous: Option<i64> = tx
                 .query_row(
@@ -560,7 +560,11 @@ impl AppendIndex {
                 )
                 .optional()?;
             if previous.is_some_and(|previous| previous < 0 || previous > amount) {
-                return Err(IndexError::InvalidRecord);
+                log::error!(
+                    "sync discovery budget regression: metric={metric} stored={previous:?} incoming={amount} accounting_version={}",
+                    budget.accounting_version,
+                );
+                return Err(IndexError::invalid_record());
             }
             tx.execute("INSERT INTO append_ledger(scope,name,used,reserved) VALUES(?1,?2,?3,?3) ON CONFLICT(scope,name) DO UPDATE SET used=excluded.used,reserved=excluded.reserved", params![&self.scope, name, amount])?;
         }
@@ -583,7 +587,7 @@ impl AppendIndex {
         bytes_digest: &str,
     ) -> Result<(), IndexError> {
         if operation_id.is_empty() || objects.iter().any(|o| o.bytes().len() > MAX_CHUNK) {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         let incoming = PreparedOperation {
             operation_id: operation_id.into(),
@@ -600,7 +604,7 @@ impl AppendIndex {
                 || old.bytes_digest != incoming.bytes_digest
                 || old.objects != incoming.objects
             {
-                return Err(IndexError::InvalidRecord);
+                return Err(IndexError::invalid_record());
             }
             tx.commit()?;
             return Ok(());
@@ -632,7 +636,7 @@ impl AppendIndex {
     ) -> Result<(), IndexError> {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let Some(mut op) = self.load_operation(id)? else {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         };
         if op.state == state {
             tx.commit()?;
@@ -646,7 +650,7 @@ impl AppendIndex {
                 | (OperationState::Published, OperationState::ApplyPending)
                 | (OperationState::ApplyPending, OperationState::Applied)
         ) {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         op.state = state;
         self.write_raw_tx(&tx, "operation", id, &serde_json::to_vec(&op)?)?;
@@ -662,7 +666,7 @@ impl AppendIndex {
         objects: &[PreparedObject],
     ) -> Result<(), IndexError> {
         self.freeze_publication_source(frozen, |_, i| {
-            objects.get(i).cloned().ok_or(IndexError::InvalidRecord)
+            objects.get(i).cloned().ok_or_else(|| IndexError::invalid_record())
         })
     }
 
@@ -682,12 +686,12 @@ impl AppendIndex {
                 || old.root != frozen.root
                 || old.objects != frozen.objects
             {
-                return Err(IndexError::InvalidRecord);
+                return Err(IndexError::invalid_record());
             }
             for i in 0..frozen.objects.len() {
                 let object = object_at(self, i)?;
                 if self.frozen_bytes(&old, i)? != object.bytes() {
-                    return Err(IndexError::InvalidRecord);
+                    return Err(IndexError::invalid_record());
                 }
             }
             tx.commit()?;
@@ -729,11 +733,11 @@ impl AppendIndex {
         ordinal: usize,
     ) -> Result<Vec<u8>, IndexError> {
         use sha2::Digest;
-        let object = op.objects.get(ordinal).ok_or(IndexError::InvalidRecord)?;
+        let object = op.objects.get(ordinal).ok_or_else(|| IndexError::invalid_record())?;
         if object.len > 2 * (super::append_types::MAX_METADATA_SIZE + 16) + 4096
             || object.chunks != object.len.div_ceil(MAX_CHUNK)
         {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         let mut bytes = Vec::with_capacity(object.len);
         for chunk in 0..object.chunks {
@@ -742,14 +746,14 @@ impl AppendIndex {
                     "publish-chunk",
                     &format!("{}:{ordinal}:{chunk}", op.operation_id),
                 )?
-                .ok_or(IndexError::InvalidRecord)?;
+                .ok_or_else(|| IndexError::invalid_record())?;
             if part.len() > MAX_CHUNK || bytes.len() + part.len() > object.len {
-                return Err(IndexError::InvalidRecord);
+                return Err(IndexError::invalid_record());
             }
             bytes.extend_from_slice(&part);
         }
         if bytes.len() != object.len || hex::encode(sha2::Sha256::digest(&bytes)) != object.digest {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         Ok(bytes)
     }
@@ -762,7 +766,7 @@ impl AppendIndex {
         if op.requests > super::append_types::MAX_PUBLISH_REQUESTS
             || op.bytes_written > super::append_types::MAX_PUBLISH_WRITE
         {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         if let Some(old) = self.frozen_operation(&op.operation_id)? {
             if old.closure_validation_version != op.closure_validation_version
@@ -774,10 +778,10 @@ impl AppendIndex {
                 || old.bytes_written > op.bytes_written
                 || (matches!(old.state, OperationState::Applied) && old.state != op.state)
             {
-                return Err(IndexError::InvalidRecord);
+                return Err(IndexError::invalid_record());
             }
         } else {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         for (metric, amount) in [("requests", op.requests), ("write", op.bytes_written)] {
             let name = format!(
@@ -792,9 +796,9 @@ impl AppendIndex {
                     |r| r.get(0),
                 )
                 .optional()?;
-            let amount = i64::try_from(amount).map_err(|_| IndexError::InvalidRecord)?;
+            let amount = i64::try_from(amount).map_err(|_| IndexError::invalid_record())?;
             if previous.is_some_and(|previous| previous < 0 || previous > amount) {
-                return Err(IndexError::InvalidRecord);
+                return Err(IndexError::invalid_record());
             }
             tx.execute("INSERT INTO append_ledger(scope,name,used,reserved) VALUES(?1,?2,?3,?3) ON CONFLICT(scope,name) DO UPDATE SET used=excluded.used,reserved=excluded.reserved", params![&self.scope, name, amount])?;
         }
@@ -837,15 +841,15 @@ impl AppendIndex {
         epoch: &super::append_engine_types::LocalEpoch,
     ) -> Result<super::merge_types::RevisionMap, IndexError> {
         if epoch.revision_count > super::merge_types::MAX_REVISIONS {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         let mut out = super::merge_types::RevisionMap::new();
         for i in 0..epoch.revision_count {
             let revision: super::merge_types::Revision = self
                 .engine_record("revision", &format!("{}:{i}", epoch.id))?
-                .ok_or(IndexError::InvalidRecord)?;
+                .ok_or_else(|| IndexError::invalid_record())?;
             if out.insert(revision.revision_id.clone(), revision).is_some() {
-                return Err(IndexError::InvalidRecord);
+                return Err(IndexError::invalid_record());
             }
         }
         Ok(out)
@@ -859,10 +863,10 @@ impl AppendIndex {
         if ordinal >= epoch.binding_count
             || epoch.binding_count > super::append_types::MAX_DISCOVERY_NODES
         {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         self.engine_record("binding", &format!("{}:{ordinal}", epoch.id))?
-            .ok_or(IndexError::InvalidRecord)
+            .ok_or_else(|| IndexError::invalid_record())
     }
 
     pub(crate) fn stage_epoch(
@@ -879,7 +883,7 @@ impl AppendIndex {
                 .active_epoch()?
                 .is_some_and(|active| active.id == epoch.id)
         {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         let prefix = format!("{}:", epoch.id);
         let reused: bool = self.connection.query_row(
@@ -887,7 +891,7 @@ impl AppendIndex {
             params![&self.scope, prefix.len(), prefix], |row| row.get(0),
         )?;
         if reused {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         for (i, revision) in revisions.values().enumerate() {
@@ -917,9 +921,9 @@ impl AppendIndex {
         intent: &super::apply_types::ApplyIntent,
     ) -> Result<(), IndexError> {
         use sha2::Digest;
-        let pending = self.pending_epoch()?.ok_or(IndexError::InvalidRecord)?;
+        let pending = self.pending_epoch()?.ok_or_else(|| IndexError::invalid_record())?;
         if pending.id != operation {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         let suffix = hex::encode(sha2::Sha256::digest(serde_json::to_vec(
             &intent.relative_target,
@@ -943,14 +947,14 @@ impl AppendIndex {
         limit: usize,
     ) -> Result<Vec<String>, IndexError> {
         if limit == 0 || limit > super::merge_types::MAX_ENTITIES {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         let mut query = self.connection.prepare("SELECT name FROM append_records WHERE scope=?1 AND (kind='engine-apply' OR kind='engine-apply-completed') AND name>?2 ORDER BY name LIMIT ?3")?;
         let rows = query.query_map(
             params![
                 &self.scope,
                 after,
-                i64::try_from(limit).map_err(|_| IndexError::InvalidRecord)?
+                i64::try_from(limit).map_err(|_| IndexError::invalid_record())?
             ],
             |row| row.get::<_, String>(0),
         )?;
@@ -989,7 +993,7 @@ impl AppendIndex {
         for name in names {
             let intent = self
                 .read_raw("engine-apply", &name)?
-                .ok_or(IndexError::InvalidRecord)?;
+                .ok_or_else(|| IndexError::invalid_record())?;
             self.write_raw_tx(tx, "engine-apply-completed", &name, &intent)?;
             tx.execute(
                 "DELETE FROM append_records WHERE scope=?1 AND kind='engine-apply' AND name=?2",
@@ -1011,12 +1015,12 @@ impl AppendIndex {
         let mut out = Vec::new();
         for row in rows {
             if out.len() >= super::merge_types::MAX_ENTITIES {
-                return Err(IndexError::InvalidRecord);
+                return Err(IndexError::invalid_record());
             }
             let id = row?;
             let intent = self
                 .engine_record("apply", &id)?
-                .ok_or(IndexError::InvalidRecord)?;
+                .ok_or_else(|| IndexError::invalid_record())?;
             out.push((id, intent));
         }
         Ok(out)
@@ -1028,23 +1032,23 @@ impl AppendIndex {
         &mut self,
         epoch: &super::append_engine_types::LocalEpoch,
     ) -> Result<(), IndexError> {
-        let pending = self.pending_epoch()?.ok_or(IndexError::InvalidRecord)?;
+        let pending = self.pending_epoch()?.ok_or_else(|| IndexError::invalid_record())?;
         if pending.id != epoch.id
             || pending.sequence != epoch.sequence
             || pending.frontier != epoch.frontier
         {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         if let Some(id) = &epoch.publication {
             let mut publication = self
                 .frozen_operation(id)?
-                .ok_or(IndexError::InvalidRecord)?;
+                .ok_or_else(|| IndexError::invalid_record())?;
             if !matches!(
                 publication.state,
                 OperationState::Published | OperationState::ApplyPending
             ) {
-                return Err(IndexError::InvalidRecord);
+                return Err(IndexError::invalid_record());
             }
             publication.state = OperationState::Applied;
             self.write_raw_tx(&tx, "publication", id, &serde_json::to_vec(&publication)?)?;
@@ -1088,22 +1092,22 @@ impl AppendIndex {
         let name = format!("{run}:{ordinal}");
         if let Some(record) = self.read_raw("engine-object-v2", &name)? {
             let (key, len, chunks): (String, usize, usize) = serde_json::from_slice(&record)?;
-            if len > 2 * (super::append_types::MAX_METADATA_SIZE + 16) + 4096 || chunks != len.div_ceil(MAX_CHUNK) { return Err(IndexError::InvalidRecord); }
+            if len > 2 * (super::append_types::MAX_METADATA_SIZE + 16) + 4096 || chunks != len.div_ceil(MAX_CHUNK) { return Err(IndexError::invalid_record()); }
             let mut bytes = Vec::with_capacity(len);
             for part in 0..chunks {
-                let data = self.read_raw("engine-object-part", &format!("{name}:{part}"))?.ok_or(IndexError::InvalidRecord)?;
-                if data.len() > MAX_CHUNK || bytes.len().saturating_add(data.len()) > len { return Err(IndexError::InvalidRecord); }
+                let data = self.read_raw("engine-object-part", &format!("{name}:{part}"))?.ok_or_else(|| IndexError::invalid_record())?;
+                if data.len() > MAX_CHUNK || bytes.len().saturating_add(data.len()) > len { return Err(IndexError::invalid_record()); }
                 bytes.extend_from_slice(&data);
             }
-            if bytes.len() != len { return Err(IndexError::InvalidRecord); }
+            if bytes.len() != len { return Err(IndexError::invalid_record()); }
             return Ok(PreparedObject::new(key, bytes));
         }
         // Frozen/retry operations created by older versions remain readable.
-        self.engine_record("object", &name)?.ok_or(IndexError::InvalidRecord)
+        self.engine_record("object", &name)?.ok_or_else(|| IndexError::invalid_record())
     }
 
     pub fn reserve(&mut self, name: &str, amount: u64, limit: u64) -> Result<(), IndexError> {
-        let amount = i64::try_from(amount).map_err(|_| IndexError::InvalidRecord)?;
+        let amount = i64::try_from(amount).map_err(|_| IndexError::invalid_record())?;
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let (used, reserved): (i64, i64) = tx
             .query_row(
@@ -1114,14 +1118,14 @@ impl AppendIndex {
             .optional()?
             .unwrap_or((0, 0));
         if used < 0 || reserved < 0 {
-            return Err(IndexError::InvalidRecord);
+            return Err(IndexError::invalid_record());
         }
-        let next_used = used.checked_add(amount).ok_or(IndexError::InvalidRecord)?;
+        let next_used = used.checked_add(amount).ok_or_else(|| IndexError::invalid_record())?;
         let next_reserved = reserved
             .checked_add(amount)
-            .ok_or(IndexError::InvalidRecord)?;
-        if u64::try_from(next_used).map_err(|_| IndexError::InvalidRecord)? > limit {
-            return Err(IndexError::InvalidRecord);
+            .ok_or_else(|| IndexError::invalid_record())?;
+        if u64::try_from(next_used).map_err(|_| IndexError::invalid_record())? > limit {
+            return Err(IndexError::invalid_record());
         }
         tx.execute(
             "INSERT INTO append_ledger(scope,name,used,reserved) VALUES(?1,?2,?3,?4) ON CONFLICT(scope,name) DO UPDATE SET used=excluded.used,reserved=excluded.reserved",

@@ -35,7 +35,7 @@ describe("cloud API wrappers", () => {
       ["cloud_join_repository", { connectionId: "c", repositoryId: "r" }],
       ["cloud_save_mapping", { mappingId: "m", input: { localRoot: "/x" } }],
       ["cloud_delete_mapping", { mappingId: "m" }],
-      ["cloud_local_entries", { mappingId: "m" }],
+      ["cloud_local_entries", { mappingId: "m", path: "" }],
       ["cloud_preview", { mappingId: "m" }],
       ["cloud_sync", { mappingId: "m", previewId: "p" }],
       ["cloud_cancel", { mappingId: "m" }],
@@ -54,7 +54,16 @@ describe("cloud API wrappers", () => {
       ["cloud_protocols"],
       ["cloud_official_authorize", { provider: "google_drive", clientId: "client", redirectUri: "http://127.0.0.1/callback" }],
       ["cloud_official_cancel_authorization", { requestId: "request" }],
-      ["cloud_official_complete_authorization", { requestId: "request", callback: "callback", name: "Drive", clientSecret: null, rootId: "root" }],
+      ["cloud_official_complete_authorization", { requestId: "request", callback: "callback", name: "Drive", clientSecret: null, rootId: "root", direct: false }],
+    ]);
+  });
+
+  it('forwards official proxy choices and only whitelists editable basic fields', async () => {
+    await cloud.waitLoopbackAuthorization({ requestId: 'r', name: 'Drive', rootId: 'root', direct: true });
+    await cloud.updateOfficialConnection({ id: 'g', revision: 4, name: 'Renamed', direct: true, provider: 'onedrive', rootId: 'forged', refreshToken: 'forged' });
+    expect(invoke.mock.calls).toEqual([
+      ['cloud_official_wait_loopback', { requestId: 'r', name: 'Drive', clientSecret: null, rootId: 'root', direct: true }],
+      ['cloud_official_update_connection', { input: { id: 'g', revision: 4, name: 'Renamed', clientSecret: null, clearClientSecret: false, direct: true } }],
     ]);
   });
 
@@ -106,7 +115,7 @@ describe("cloud API wrappers", () => {
   it("does not invoke directly from the wrapper module", async () => {
     expect(invoke).toBeDefined();
     expect(Object.keys(cloud)).toEqual([
-      "protocols", "beginOfficialAuthorization", "beginLoopbackAuthorization", "waitLoopbackAuthorization", "cancelOfficialAuthorization", "completeOfficialAuthorization",
+      "protocols", "beginOfficialAuthorization", "beginLoopbackAuthorization", "waitLoopbackAuthorization", "cancelOfficialAuthorization", "completeOfficialAuthorization", "driveProxy", "updateOfficialConnection",
       "list", "probeBuckets", "connectionCredentials", "saveConnection", "testConnection", "deleteConnection",
       "createRepository", "joinRepository", "saveMapping", "appendDiscover", "createSyncDrive", "appendCreate", "appendJoin", "appendSaveMapping", "prepareMappingBind", "confirmMappingBind", "cancelMappingBind", "deleteMapping",
       "localEntries", "localStatus", "preview", "sync", "cancel", "recoveryRecords", "restore", "status",

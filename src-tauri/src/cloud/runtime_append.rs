@@ -283,6 +283,7 @@ impl CloudRuntime {
         let binding = mapping.append_binding.as_ref().ok_or_else(|| append_error(AppendError::TrustRejected))?;
         let cached = self.config.load_append_repository(&mapping.connection_id, &mapping.repository_id).map_err(config_error)?;
         if !binding.is_trusted() || trust(binding) != trust(&cached.binding) || binding.storage != cached.binding.storage || binding.selected_root.as_deref() != Some(mapping.logical_path.as_str()) { return Err(append_error(AppendError::TrustRejected)); }
+        let _metadata = self.metadata_guard(&mapping, &epoch).await;
         let mut index = self.open_append_index(&mapping, &epoch)?;
         let operation = index.begin_run("preview-metadata-v1", &hex::encode(rand::random::<[u8; 16]>())).map_err(append_error)?;
         let closure = append_discovery::discover_metadata(self.bound_append_store(&cached)?, &trust(binding), cached.password.as_bytes(), &mut index, &operation).await.map_err(append_error)?;
@@ -432,6 +433,16 @@ impl CloudRuntime {
         self.reselect_root_guard(&saved)?;
         Ok(saved)
     }
+    async fn metadata_guard(&self, mapping: &CloudMapping, epoch: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let key = Self::index_scope(mapping, epoch);
+        let lock = {
+            let mut locks = self.append_metadata.lock().await;
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            Arc::clone(locks.entry(key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))))
+        };
+        lock.lock_owned().await
+    }
+
     pub(crate) fn open_append_index(
         &self,
         mapping: &CloudMapping,
@@ -511,6 +522,23 @@ impl CloudRuntime {
         Ok(entries)
     }
 
+    pub async fn local_directory_listing(&self, mapping_id: &str, path: &str) -> Result<crate::cloud::runtime_types::LocalDirectoryListing, AppError> {
+        let entries = self.local_directory_entries(mapping_id).await?;
+        if !path.is_empty() && !entries.iter().any(|entry| entry.path == path && entry.is_dir) {
+            return Err(runtime_error("CLOUD_PATH_INVALID", "目录不存在 / Directory not found"));
+        }
+        let mapping = self.mapping(mapping_id)?;
+        let name = mapping.local_root.file_name().and_then(|name| name.to_str()).unwrap_or("同步盘 / Sync drive").to_owned();
+        let mut breadcrumbs = vec![crate::file_manager::types::FileBreadcrumbDto { id: String::new(), name }];
+        let mut current = String::new();
+        for name in path.split('/').filter(|name| !name.is_empty()) {
+            if !current.is_empty() { current.push('/'); }
+            current.push_str(name);
+            breadcrumbs.push(crate::file_manager::types::FileBreadcrumbDto { id: current.clone(), name: name.into() });
+        }
+        Ok(crate::cloud::runtime_types::LocalDirectoryListing { entries, breadcrumbs })
+    }
+
     pub async fn local_sync_entries(&self, mapping_id: &str) -> Result<Vec<LocalSyncEntry>, AppError> {
         self.admit()?;
         let _permit = self.network.read().await;
@@ -567,6 +595,7 @@ impl CloudRuntime {
         }
         let remote_revisions = if mapping.protocol == StorageProtocol::AppendV2 {
             let cached = self.append_cached(&mapping)?;
+            let _metadata = self.metadata_guard(&mapping, &epoch).await;
             let mut index = self.open_append_index(&mapping, &epoch)?;
             let operation = index.begin_run("preview-metadata-v1", &hex::encode(rand::random::<[u8; 16]>())).map_err(append_error)?;
             let closure = append_discovery::discover_metadata(self.bound_append_store(&cached)?, &trust(&cached.binding), cached.password.as_bytes(), &mut index, &operation).await.map_err(append_error)?;
@@ -628,6 +657,7 @@ impl CloudRuntime {
         &self, mapping: &CloudMapping, epoch: &str, selection: &[String],
     ) -> Result<(PreviewCounts, String), AppError> {
         let cached = self.append_cached(mapping)?;
+        let _metadata = self.metadata_guard(&mapping, &epoch).await;
         let mut index = self.open_append_index(mapping, epoch)?;
         // Separate metadata-only previews from older full-discovery attempts:
         // an exhausted legacy payload budget must not poison metadata browsing.

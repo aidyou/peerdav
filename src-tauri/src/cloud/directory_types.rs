@@ -51,6 +51,8 @@ pub(crate) struct S3UploadAdapter<'a> {
 }
 
 pub(crate) struct DirectoryBatch {
+    pub entry_states: std::collections::HashMap<String, (String, u64)>,
+    pub progress: Arc<std::sync::atomic::AtomicU64>,
     pub status: ObjectUploadDirectoryDto,
     pub session: Arc<ObjectSession>,
     pub root: Option<Arc<super::PhysicalRoot>>,

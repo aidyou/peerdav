@@ -28,8 +28,29 @@ async function openOfficial() {
   } catch (error) { fail(error); }
 }
 const officialBusy = ref(false);
+const officialAdvancedOpen = ref(false);
+const officialEdit = ref(null);
+let officialEditVersion = 0;
+async function editOfficial(item) {
+  const version = ++officialEditVersion;
+  try {
+    const direct = await cloud.driveProxy(item.id);
+    if (version !== officialEditVersion) return;
+    officialEdit.value = { id: item.id, revision: item.revision, name: item.name, protocolId: item.protocolId, rootId: item.rootId, clientSecret: '', clearClientSecret: false, direct };
+  } catch (error) { fail(error); }
+}
+function closeOfficialEdit() { officialEditVersion++; officialEdit.value = null; }
+async function saveOfficialEdit() {
+  if (!officialEdit.value || officialBusy.value) return;
+  officialBusy.value = true;
+  try {
+    await cloud.updateOfficialConnection({ ...officialEdit.value, clientSecret: officialEdit.value.clientSecret || null });
+    closeOfficialEdit(); notifyConnectionsChanged(); await refresh(); app.setNotice('cloud.saved');
+  } catch (error) { fail(error); }
+  finally { officialBusy.value = false; }
+}
 const authorization = ref(null);
-const official = ref({ provider: 'google_drive', name: '', clientId: '', clientSecret: '', redirectUri: 'http://127.0.0.1:53682/oauth/callback', rootId: 'root', callback: '' });
+const official = ref({ provider: 'google_drive', name: '', clientId: '', clientSecret: '', redirectUri: 'http://127.0.0.1:53682/oauth/callback', rootId: 'root', callback: '', direct: false });
 const loopbackWaiting = ref(false);
 let authorizationVersion = 0;
 function changeOfficialProvider() {
@@ -61,7 +82,7 @@ async function beginOfficial() {
 async function waitOfficial(request, version) {
   loopbackWaiting.value = true;
   try {
-    await cloud.waitLoopbackAuthorization({ requestId: request.requestId, name: official.value.name, clientSecret: official.value.clientSecret || null, rootId: official.value.rootId });
+    await cloud.waitLoopbackAuthorization({ requestId: request.requestId, name: official.value.name, clientSecret: official.value.clientSecret || null, rootId: official.value.rootId, direct: official.value.direct });
     if (version !== authorizationVersion) return;
     authorization.value = null; officialOpen.value = false;
     official.value.clientSecret = ''; official.value.callback = '';
@@ -82,7 +103,7 @@ async function finishOfficial() {
   } catch (error) { authorization.value = null; fail(error); }
   finally { officialBusy.value = false; }
 }
-onBeforeUnmount(() => { void cancelOfficial(); });
+onBeforeUnmount(() => { closeOfficialEdit(); void cancelOfficial(); });
 const provider = ref("");
 // Address-driven discovery: users pick a provider only to prefill the service
 // address, then "test" proves the address can list buckets before saving.
@@ -244,7 +265,7 @@ onMounted(refresh);
       <div v-if="data.officialConnections?.length" class="settings-rows">
         <div v-for="item in data.officialConnections" :key="item.id" class="settings-row">
           <div class="settings-row__text"><span class="settings-row__label">{{ item.name }}</span><span class="hint">{{ item.protocolId }}</span></div>
-          <div><el-button @click="writeRoute({ view: 'cloud', connectionId: String(item.id) })">{{ t('cloudBrowser.open') }}</el-button><el-button @click="deleteConnection(item)">{{ t('drive.remove') }}</el-button></div>
+          <div><el-button data-test="official-edit" @click="editOfficial(item)">{{ t('drive.connectionDetails') }}</el-button><el-button @click="writeRoute({ view: 'cloud', connectionId: String(item.id) })">{{ t('cloudBrowser.open') }}</el-button><el-button @click="deleteConnection(item)">{{ t('drive.remove') }}</el-button></div>
         </div>
       </div>
       <p class="settings-group__footnote">{{ t('drive.settingsHint') }}</p>
@@ -256,6 +277,11 @@ onMounted(refresh);
         <label>{{ t('drive.protocol') }}<el-select v-model="official.provider" :disabled="officialBusy || !!authorization" @change="changeOfficialProvider"><el-option v-for="item in officialDescriptors" :key="item.id" :value="item.id" :label="item.name" /></el-select></label>
         <label>{{ t('cloud.name') }}<el-input v-model="official.name" :disabled="officialBusy || loopbackWaiting" /></label>
         <label v-for="field in officialFields" :key="field.key">{{ locale === 'zh-CN' ? field.labelZh : field.labelEn }}<el-input v-model="official[field.key]" :type="field.secret ? 'password' : 'text'" :autocomplete="field.secret ? 'new-password' : 'off'" :disabled="officialBusy || loopbackWaiting || (!!authorization && ['clientId', 'redirectUri'].includes(field.key))" /></label>
+        <details class="connection-advanced" :open="officialAdvancedOpen" @toggle="officialAdvancedOpen = $event.target.open">
+          <summary>{{ t('drive.advanced') }}</summary>
+          <label>{{ t('network.title') }}<el-select v-model="official.direct" data-test="official-proxy" :disabled="officialBusy || !!authorization"><el-option :value="false" :label="t('network.client')" /><el-option :value="true" :label="t('cloud.proxyDirect')" /></el-select></label>
+          <p class="hint">{{ t('drive.officialProxyHint') }}</p>
+        </details>
         <p v-if="loopbackWaiting" class="hint" role="status">{{ t('drive.waitingAuthorization') }}</p>
         <template v-if="authorization">
           <a :href="authorization.authorizationUrl" target="_blank" rel="noopener noreferrer">{{ t('drive.openAuthorization') }}</a>
@@ -267,6 +293,22 @@ onMounted(refresh);
         <el-button v-if="!authorization" type="primary" :loading="officialBusy" :disabled="!official.clientId || !official.redirectUri || !official.name" @click="beginOfficial">{{ t('drive.authorize') }}</el-button>
         <el-button v-else-if="!loopbackWaiting" type="primary" :loading="officialBusy" :disabled="!official.callback" @click="finishOfficial">{{ t('drive.finishAuthorization') }}</el-button>
       </template>
+    </el-dialog>
+    <el-dialog :model-value="!!officialEdit" :title="t('drive.connectionDetails')" width="520px" :show-close="false" :close-on-click-modal="false" :close-on-press-escape="false" destroy-on-close>
+      <form v-if="officialEdit" class="stack official-editor" @submit.prevent="saveOfficialEdit">
+        <label>{{ t('drive.protocol') }}<el-input :model-value="officialEdit.protocolId" disabled /></label>
+        <label>{{ t('cloud.name') }}<el-input v-model="officialEdit.name" data-test="official-name" :disabled="officialBusy" /></label>
+        <label>{{ t('drive.rootId') }}<el-input :model-value="officialEdit.rootId" disabled /></label>
+        <p class="hint">{{ t('drive.officialEditHint') }}</p>
+        <label>{{ t('drive.clientSecret') }}<el-input v-model="officialEdit.clientSecret" data-test="official-secret" type="password" autocomplete="new-password" :placeholder="t('drive.keepSecretHint')" :disabled="officialBusy || officialEdit.clearClientSecret" /></label>
+        <label>{{ t('drive.clearClientSecret') }}<el-switch v-model="officialEdit.clearClientSecret" :disabled="officialBusy" /></label>
+        <details class="connection-advanced">
+          <summary>{{ t('drive.advanced') }}</summary>
+          <label>{{ t('network.title') }}<el-select v-model="officialEdit.direct" data-test="official-edit-proxy" :disabled="officialBusy"><el-option :value="false" :label="t('network.client')" /><el-option :value="true" :label="t('cloud.proxyDirect')" /></el-select></label>
+          <p class="hint">{{ t('drive.officialProxyHint') }}</p>
+        </details>
+      </form>
+      <template #footer><el-button :disabled="officialBusy" @click="closeOfficialEdit">{{ t('confirm.cancel') }}</el-button><el-button data-test="official-save" type="primary" :loading="officialBusy" :disabled="!officialEdit?.name.trim()" @click="saveOfficialEdit">{{ t('cloud.save') }}</el-button></template>
     </el-dialog>
     <el-dialog
       v-model="editorOpen"
@@ -305,7 +347,7 @@ onMounted(refresh);
           <div class="stack connection-advanced__fields">
             <label>{{ t("cloud.prefix") }}<el-input v-model="connection.prefix" /></label>
             <label>{{ t("cloud.sessionToken") }}<el-input v-model="connection.sessionToken" type="password" /></label>
-            <label>{{ t("cloud.proxy") }}<el-select v-model="connection.proxy.mode"><el-option value="client" :label="t('network.client')" /><el-option value="direct" :label="t('cloud.proxyDirect')" /></el-select></label>
+            <label>{{ t("network.title") }}<el-select v-model="connection.proxy.mode" :aria-label="t('network.title')"><el-option value="client" :label="t('network.client')" /><el-option value="direct" :label="t('cloud.proxyDirect')" /></el-select></label>
             <template v-if="connection.proxy.mode === 'custom'"><label>{{ t("cloud.proxyUrl") }}<el-input v-model="connection.proxy.url" /></label><label>{{ t("cloud.proxyUsername") }}<el-input v-model="connection.proxy.username" /></label><label>{{ t("cloud.proxyPassword") }}<el-input v-model="connection.proxy.password" type="password" /></label></template>
             <label class="connection-switch">{{ t("cloud.allowInsecureHttp") }}<el-switch v-model="connection.allowInsecureHttp" /></label>
             <label class="connection-switch">{{ t("cloud.pathStyle") }}<el-switch v-model="connection.pathStyle" /></label>

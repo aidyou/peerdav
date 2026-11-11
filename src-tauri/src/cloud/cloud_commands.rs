@@ -86,18 +86,35 @@ pub async fn cloud_official_begin_loopback(
 
 #[tauri::command]
 pub async fn cloud_official_wait_loopback(
-    request_id: String, name: String, client_secret: Option<String>, root_id: String,
+    request_id: String, name: String, client_secret: Option<String>, root_id: String, direct: Option<bool>,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<super::official_types::OfficialConnectionRedacted, AppError> {
-    cloud.0.wait_loopback_authorization(&request_id, name, client_secret, root_id).await
+    cloud.0.wait_loopback_authorization_with_proxy(&request_id, name, client_secret, root_id, direct.unwrap_or(false)).await
 }
 
 #[tauri::command]
 pub async fn cloud_official_complete_authorization(
-    request_id: String, callback: String, name: String, client_secret: Option<String>, root_id: String,
+    request_id: String, callback: String, name: String, client_secret: Option<String>, root_id: String, direct: Option<bool>,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<super::official_types::OfficialConnectionRedacted, AppError> {
-    cloud.0.complete_official_authorization(&request_id, &callback, name, client_secret, root_id).await
+    cloud.0.complete_official_authorization_with_proxy(&request_id, &callback, name, client_secret, root_id, direct.unwrap_or(false)).await
+}
+
+#[tauri::command]
+pub async fn cloud_official_update_connection(
+    input: super::official_types::UpdateOfficialConnectionInput,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<super::official_types::OfficialConnectionRedacted, AppError> {
+    cloud.0.admit()?;
+    let _network = cloud.0.network.write().await;
+    cloud.0.admit()?;
+    let revision = input.revision;
+    let result = cloud.0.config.update_official_connection(input).map_err(super::runtime::config_error)?;
+    if result.revision != revision {
+        cloud.0.official_refresh.lock().await.remove(&result.id);
+        cloud.0.objects.lock().await.sessions.remove(&result.id);
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -227,9 +244,24 @@ pub async fn cloud_cancel(
 #[tauri::command]
 pub async fn cloud_local_entries(
     mapping_id: String,
+    path: Option<String>,
     cloud: tauri::State<'_, SharedCloud>,
-) -> Result<Vec<LocalSyncEntry>, AppError> {
-    cloud.0.local_directory_entries(&mapping_id).await
+) -> Result<super::runtime_types::LocalDirectoryListing, AppError> {
+    cloud.0.local_directory_listing(&mapping_id, path.as_deref().unwrap_or("")).await
+}
+
+#[tauri::command]
+pub async fn cloud_local_preview(mapping_id: String, path: String, cloud: tauri::State<'_, SharedCloud>) -> Result<crate::PreviewPayload, AppError> {
+    cloud.0.local_file_preview(&mapping_id, &path).await
+}
+#[tauri::command]
+pub async fn cloud_local_open(app: tauri::AppHandle, mapping_id: String, path: String, cloud: tauri::State<'_, SharedCloud>) -> Result<(), AppError> {
+    cloud.0.local_file_open(&app, &mapping_id, &path).await
+}
+#[tauri::command]
+pub async fn cloud_local_mutate(mapping_id: String, path: String, destination: Option<String>, confirmed: bool, cloud: tauri::State<'_, SharedCloud>) -> Result<(), AppError> {
+    if !confirmed { return Err(AppError { code: "CLOUD_CONFIRMATION_REQUIRED".into(), message: "请确认本地文件操作 / Confirm local file operation".into(), detail: None, context: None }); }
+    cloud.0.local_file_mutate(&mapping_id, &path, destination.as_deref()).await
 }
 
 #[tauri::command]

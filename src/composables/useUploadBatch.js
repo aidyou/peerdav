@@ -81,7 +81,13 @@ export function useUploadBatch({ adapter, captureScope, scopeValid, canSelect, o
       const epoch = session.statusEpoch;
       session.statusRequest = adapter.status(uploadArgs(session));
       const summary = await session.statusRequest;
-      if (epoch === session.statusEpoch && !session.stopping) applyUploadSummary(session, summary);
+      if (epoch === session.statusEpoch && !session.stopping) {
+        applyUploadSummary(session, summary);
+        if (uploadPage.value && !uploadPageLoading.value) {
+          const page = await adapter.page({ ...uploadArgs(session), directoryToken: uploadPage.value.directoryToken, cursor: null, limit: 100 });
+          if (uploadSessionValid(session) && epoch === session.statusEpoch && !session.stopping) uploadPage.value = page;
+        }
+      }
     } catch (cause) {
       if (uploadSessionValid(session) && errorStrategy(cause) !== "ignore") {
         uploadBatchError.value = normalizeAppError(cause).message; reportUploadFailure(cause);

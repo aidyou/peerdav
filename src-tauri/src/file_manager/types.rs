@@ -64,6 +64,8 @@ pub(crate) struct OfficialUploadAdapter<'a> {
 }
 
 pub(crate) struct OfficialUploadJob {
+    pub entry_states: HashMap<String, (String, u64, u64)>,
+    pub progress: Arc<std::sync::atomic::AtomicU64>,
     pub decision: Arc<tokio::sync::Notify>,
     pub resolution: Option<(crate::cloud::directory_types::DirectoryConflictPolicy, bool)>,
     pub page: crate::local_upload_types::DirectoryPageDto,
@@ -204,6 +206,7 @@ pub struct FileCapabilities {
 #[serde(rename_all = "camelCase")]
 pub struct FileSessionDto {
     pub session_id: String,
+    pub supports_move: bool,
     pub root: String,
     pub capabilities: FileCapabilities,
 }
@@ -224,7 +227,7 @@ pub struct FileEntryDto {
     pub protected: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileBreadcrumbDto {
     pub id: String,

@@ -190,7 +190,13 @@ impl CloudRuntime {
                         Err(error) if error.code == "MIRROR_BUSY" => Ok(()),
                         Err(error) => Err(error),
                     },
-                    None => runtime.scheduled_sync(&id).await,
+                    None => match runtime.scheduled_sync(&id).await {
+                        Err(error) if error.code == "SYNC_ALREADY_RUNNING" => {
+                            log::debug!("scheduled sync skipped: mapping={id} already running");
+                            Ok(())
+                        }
+                        result => result,
+                    },
                 }
             })
         });
@@ -213,6 +219,10 @@ impl CloudRuntime {
     /// A mapping also requires a persisted materialized baseline for its root.
     pub(crate) async fn scheduled_sync(&self, mapping_id: &str) -> Result<(), AppError> {
         self.admit()?;
+        if self.manager.is_running(mapping_id) {
+            log::debug!("scheduled sync skipped: mapping={mapping_id} already running");
+            return Ok(());
+        }
         let mapping = self.mapping(mapping_id)?;
         self.validate_scheduled_root(&mapping)?;
         let root_epoch = match Self::root_epoch(&mapping.local_root) {

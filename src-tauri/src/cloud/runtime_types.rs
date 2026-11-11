@@ -65,6 +65,13 @@ pub struct CloudPreview {
     pub head_commit: Option<String>,
     pub root_epoch: String,
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalDirectoryListing {
+    pub entries: Vec<LocalSyncEntry>,
+    pub breadcrumbs: Vec<crate::file_manager::types::FileBreadcrumbDto>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalSyncEntry {

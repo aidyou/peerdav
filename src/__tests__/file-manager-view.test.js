@@ -16,6 +16,23 @@ function view(props = {}, slots = {}) {
 }
 
 describe("shared FileManagerView", () => {
+  it.each(['icons', 'list', 'columns', 'gallery'])('offers internal %s dragging only to folders with raw identities', async mode => {
+    const entries = entriesFor('path');
+    const onMove = vi.fn();
+    const wrapper = view({ entries, mode, moveEnabled: true, onMove, selection: [entries[1]], columns: [{ path: '', entries }] });
+    const selector = { icons: '.file-tile', list: 'tbody tr', columns: '.column-row', gallery: '.gallery-thumb' }[mode];
+    const rows = wrapper.findAll(selector);
+    const dataTransfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' };
+    await rows[1].trigger('dragstart', { dataTransfer });
+    await rows[2].trigger('drop', { dataTransfer });
+    expect(onMove).not.toHaveBeenCalled();
+    await rows[0].trigger('drop', { dataTransfer });
+    expect(toRaw(onMove.mock.calls[0][0][0])).toBe(entries[1]);
+    expect(toRaw(onMove.mock.calls[0][1])).toBe(entries[0]);
+    await rows[1].trigger('dragend');
+    await rows[0].trigger('drop', { dataTransfer });
+    expect(onMove.mock.calls).toHaveLength(1);
+  });
   for (const identityField of ["key", "path"]) {
     for (const mode of ["icons", "list", "columns", "gallery"]) {
       it(`${identityField} provider renders real ${mode} DOM with raw identities and events`, async () => {

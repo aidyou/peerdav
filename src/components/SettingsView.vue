@@ -152,6 +152,7 @@ const languageOptions = [
   { value: "en", label: "language.en" },
 ];
 
+const serviceLoading = ref(true);
 async function loadServiceSettings() {
   try {
     const settings = await app.invoke("service_settings");
@@ -162,10 +163,12 @@ async function loadServiceSettings() {
     serverDiscoveryPort.value = settings.discoveryPort;
     tcpEnabled.value = settings.tcp.enabled;
     tcpNetworks.value = settings.tcp.networks;
+    serviceLoading.value = false;
   } catch (error) { app.handleFailure(error); }
 }
 
 async function saveTcpSettings() {
+  if (serviceLoading.value) return;
   await run(async () => {
     await app.invoke("set_tcp_discovery", {
       ...adminArgs(), settings: { enabled: tcpEnabled.value, networks: tcpNetworks.value },
@@ -598,6 +601,7 @@ async function loadAdminData() {
 }
 
 async function startServer() {
+  if (serviceLoading.value) return;
   await run(async () => {
     app.serverStatus = await app.invoke("start_server", {
       ...adminArgs(),
@@ -825,15 +829,15 @@ async function chooseVaultKey() {
   });
 }
 
-// The settings panes are gated on the first load so the page paints a skeleton
-// immediately instead of showing empty controls while the backend answers.
-// Admin data (shares/clients) is excluded: those lists keep their own
-// per-list skeletons so a slow admin call does not block the whole page.
-const settingsLoading = ref(true);
-async function loadInitialSettings() {
-  try {
-    await Promise.all([loadServiceSettings(), loadLocalNetworks(), loadLanAddress(), loadAutostart(), loadTrayIconStyle(), loadCloud()]);
-  } finally { settingsLoading.value = false; }
+// Render local controls immediately; each backend-backed control owns its
+// loading state. Network discovery and cloud initialization must not gate navigation.
+function loadInitialSettings() {
+  void loadServiceSettings();
+  void loadLocalNetworks();
+  void loadLanAddress();
+  void loadAutostart();
+  void loadTrayIconStyle();
+  void loadCloud();
 }
 onMounted(() => {
   void loadInitialSettings();
@@ -920,8 +924,6 @@ async function loadInitialData() {
     </nav>
 
     <div class="settings-content">
-      <list-skeleton v-if="settingsLoading" class="settings-skeleton" :rows="8" />
-      <template v-else>
 
       <!-- 通用面板按语义分四组：外观、系统集成、锁屏、会话。每组是「组标题 + 行式列表」，
            行内标题在左、控件在右，一条设置项一行；服务、账户面板沿用同一套语法，
@@ -1118,7 +1120,7 @@ async function loadInitialData() {
             <div class="settings-row settings-row--actions">
               <el-button
                 type="primary"
-                :disabled="busy || app.serverStatus.running"
+                :disabled="busy || serviceLoading || app.serverStatus.running"
                 @click="startServer"
               >
                 {{ t("server.startService") }}
@@ -1154,7 +1156,7 @@ async function loadInitialData() {
               </el-select>
             </label>
             <div class="settings-row settings-row--actions">
-              <el-button plain :disabled="busy" @click="saveTcpSettings">{{ t("server.saveDiscovery") }}</el-button>
+              <el-button plain :disabled="busy || serviceLoading" @click="saveTcpSettings">{{ t("server.saveDiscovery") }}</el-button>
             </div>
           </div>
         </div>
@@ -1848,7 +1850,6 @@ async function loadInitialData() {
           <p class="settings-group__footnote">{{ t("vault.keyFileHint") }}</p>
         </div>
       </section>
-      </template>
     </div>
   </div>
 </template>
@@ -1975,8 +1976,6 @@ html[data-theme="dark"] .tray-icon-preview--mono {
   display: flex;
   flex-direction: column;
 }
-
-.settings-skeleton { flex: 1; padding: 18px 0; }
 
 @media (max-width: 680px) {
   .settings-view {

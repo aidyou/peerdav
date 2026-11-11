@@ -1,3 +1,5 @@
+pub(crate) const MAX_UPLOAD_ENTRY_STATES: usize = 4096;
+
 use serde::Serialize;
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -8,6 +10,7 @@ pub struct DirectoryEntryDto {
     pub size: u64,
     pub directory_token: Option<String>,
     pub phase: String,
+    pub transferred: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

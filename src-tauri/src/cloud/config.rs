@@ -64,7 +64,15 @@ impl CloudConfigStore {
     /// Official credentials are encrypted by the same Vault transaction as S3.
     pub fn save_official_connection(
         &self,
+        connection: super::official_types::OfficialConnection,
+    ) -> Result<super::official_types::OfficialConnectionRedacted, ConfigError> {
+        self.save_official_connection_with_proxy(connection, None)
+    }
+
+    pub fn save_official_connection_with_proxy(
+        &self,
         mut connection: super::official_types::OfficialConnection,
+        direct: Option<bool>,
     ) -> Result<super::official_types::OfficialConnectionRedacted, ConfigError> {
         let _guard = self.guard()?;
         let mut snapshot = self.load_locked()?;
@@ -83,8 +91,32 @@ impl CloudConfigStore {
                 .ok_or_else(|| ConfigError::Validation("connection revision exhausted".into()))?;
             *existing = connection.clone();
         }
+        if let Some(direct) = direct { snapshot.drive_proxies.insert(connection.id.clone(), direct); }
         self.save_locked(&snapshot)?;
         Ok(connection.redacted())
+    }
+
+    pub fn update_official_connection(&self, input: super::official_types::UpdateOfficialConnectionInput) -> Result<super::official_types::OfficialConnectionRedacted, ConfigError> {
+        let _guard = self.guard()?;
+        let mut snapshot = self.load_locked()?;
+        let connection = snapshot.official_connections.iter_mut().find(|entry| entry.id == input.id)
+            .ok_or_else(|| ConfigError::NotFound("official connection".into()))?;
+        if connection.revision != input.revision { return Err(ConfigError::Validation("official connection changed".into())); }
+        let old_secret = connection.client_secret.clone();
+        let old_direct = snapshot.drive_proxies.get(&input.id).copied().unwrap_or(false);
+        connection.name = input.name.trim().to_owned();
+        if input.clear_client_secret { connection.client_secret = None; }
+        else if let Some(secret) = input.client_secret.filter(|value| !value.is_empty()) { connection.client_secret = Some(secret); }
+        connection.validate()?;
+        // Display names do not change the admitted account, root or transport.
+        // Keep existing sync stores and access tokens valid for metadata-only edits.
+        if connection.client_secret != old_secret || input.direct != old_direct {
+            connection.revision = connection.revision.checked_add(1).ok_or(ConfigError::RevisionOverflow)?;
+        }
+        let redacted = connection.redacted();
+        snapshot.drive_proxies.insert(input.id, input.direct);
+        self.save_locked(&snapshot)?;
+        Ok(redacted)
     }
 
     /// Token rotation does not change the account/root generation of active sessions.

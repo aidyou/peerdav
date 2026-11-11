@@ -150,7 +150,10 @@ function mirrorStats(item) {
     failures: result.failures?.length || 0,
   });
 }
-function fail(error) { app.handleFailure(error); }
+function fail(error) {
+  if (error?.code === 'SYNC_ALREADY_RUNNING') { app.setNotice('cloud.syncAlreadyRunning'); return; }
+  app.handleFailure(error);
+}
 function resetSecrets() { password.value = ""; }
 function resetNewDrive() { resetBucket(); remoteFolderEdited.value = false; newDrive.value = { localRoot: "", logicalPath: "", password: "", confirmation: "" }; }
 function resetLink() { linkForm.value = { localRoot: "", selectedRoot: "", newRoot: "" }; linkRoots.value = []; joinedRepoId.value = ""; candidates.value = []; selectedCandidateKey.value = ""; resetSecrets(); }
@@ -459,6 +462,7 @@ function confirmPicker() {
 }
 function mappingRunning(item) { return ['scanning', 'uploading', 'publishing', 'applying'].includes(statuses.value.find((s) => s.mappingId === item.id)?.phase); }
 async function syncNow(item) {
+  if (mappingRunning(item)) { app.setNotice('cloud.syncAlreadyRunning'); return; }
   await run(async (scope) => {
     const result = await cloud.preview(String(item.id));
     if (scope !== generation || disposed) return;

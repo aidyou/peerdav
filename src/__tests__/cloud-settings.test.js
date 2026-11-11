@@ -9,6 +9,7 @@ const { cloud, confirmAction, openDialog, listen, app } = vi.hoisted(() => ({
     preview: vi.fn(), sync: vi.fn(), cancel: vi.fn(), recoveryRecords: vi.fn(), restore: vi.fn(),
     probeBuckets: vi.fn(),
     connectionCredentials: vi.fn(),
+    driveProxy: vi.fn(), updateOfficialConnection: vi.fn(),
     protocols: vi.fn(), beginOfficialAuthorization: vi.fn(), beginLoopbackAuthorization: vi.fn(), waitLoopbackAuthorization: vi.fn(), cancelOfficialAuthorization: vi.fn(), completeOfficialAuthorization: vi.fn(),
   },
   confirmAction: vi.fn(), openDialog: vi.fn(), listen: vi.fn(),
@@ -42,6 +43,32 @@ async function mountCloud(data = rows) {
 beforeEach(() => { setLocale("zh-CN"); Object.values(cloud).forEach((fn) => fn.mockReset()); confirmAction.mockReset(); confirmAction.mockResolvedValue(true); openDialog.mockReset(); app.handleFailure.mockReset(); app.setNotice.mockReset(); app.setError.mockReset(); progressHandler = undefined; cloud.connectionCredentials.mockResolvedValue({ accessKey: "", secretKey: "", sessionToken: null }); });
 
 describe("CloudSettings", () => {
+  it('edits official name, application secret and proxy without exposing identity edits', async () => {
+    cloud.driveProxy.mockResolvedValue(true);
+    const wrapper = await mountCloud({ ...rows, officialConnections: [{ id: 'g1', revision: 7, name: 'Google', protocolId: 'google_drive', rootId: 'root' }] });
+    await wrapper.find('[data-test=official-edit]').trigger('click'); await flushPromises();
+    expect(cloud.driveProxy).toHaveBeenCalledWith('g1');
+    const form = wrapper.find('.official-editor');
+    expect(form.findAll('input[disabled]').map(input => input.element.value)).toEqual(['google_drive', 'root']);
+    expect(form.find('[data-test=official-secret]').element.value).toBe('');
+    await form.find('[data-test=official-name]').setValue('Renamed');
+    await form.find('[data-test=official-secret]').setValue('replacement');
+    await wrapper.find('[data-test=official-save]').trigger('click'); await flushPromises();
+    expect(cloud.updateOfficialConnection).toHaveBeenCalledWith(expect.objectContaining({ id: 'g1', revision: 7, name: 'Renamed', clientSecret: 'replacement', direct: true }));
+    expect(wrapper.find('.official-editor').exists()).toBe(false);
+    wrapper.unmount();
+  });
+  it('retains the official editor on save failure and sends blank secrets as unchanged', async () => {
+    cloud.driveProxy.mockResolvedValue(false);
+    cloud.updateOfficialConnection.mockRejectedValue({ code: 'CLOUD_CONFIG', message: 'changed' });
+    const wrapper = await mountCloud({ ...rows, officialConnections: [{ id: 'g1', revision: 2, name: 'Drive', protocolId: 'google_drive', rootId: 'root' }] });
+    await wrapper.find('[data-test=official-edit]').trigger('click'); await flushPromises();
+    await wrapper.find('[data-test=official-save]').trigger('click'); await flushPromises();
+    expect(cloud.updateOfficialConnection).toHaveBeenCalledWith(expect.objectContaining({ clientSecret: null, clearClientSecret: false, direct: false }));
+    expect(wrapper.find('.official-editor').exists()).toBe(true);
+    expect(app.handleFailure).toHaveBeenCalledWith(expect.objectContaining({ message: 'changed' }));
+    wrapper.unmount();
+  });
   it("begins official authorization and cancels pending state on close", async () => {
     cloud.protocols.mockResolvedValue([{ id: 'google_drive', name: 'Google Drive', auth: 'oauth2', fields: [
       { key: 'clientId', labelZh: '应用客户端 ID' },
@@ -56,6 +83,8 @@ describe("CloudSettings", () => {
     await flushPromises();
     const form = wrapper.findAll('form').find(form => form.text().includes('应用客户端 ID'));
     expect(form).toBeDefined();
+    expect(form.find('details').text()).toContain('网络代理');
+    expect(form.find('[data-test=official-proxy]').exists()).toBe(true);
     const field = text => form.findAll('label').find(label => label.text() === text).find('input');
     await field('名称').setValue('Google');
     await field('应用客户端 ID').setValue('client');
@@ -63,6 +92,7 @@ describe("CloudSettings", () => {
     const begin = wrapper.findAll('button').find(button => button.text() === '生成授权链接');
     await begin.trigger('click'); await flushPromises();
     expect(cloud.beginLoopbackAuthorization).toHaveBeenCalledWith(expect.objectContaining({ provider: 'google_drive', clientId: 'client' }));
+    expect(cloud.waitLoopbackAuthorization).toHaveBeenCalledWith(expect.objectContaining({ direct: false }));
     expect(wrapper.find('a[target="_blank"]').attributes('rel')).toContain('noopener');
     wrapper.unmount(); await flushPromises();
     expect(cloud.cancelOfficialAuthorization).toHaveBeenCalledWith('request');
@@ -77,6 +107,9 @@ describe("CloudSettings", () => {
   it("opens a minimal add form with collapsed advanced settings and HTTP disabled", async () => {
     const wrapper = await mountCloud(); await wrapper.find('.connection-add').trigger('click');
     expect(wrapper.find('.connection-advanced').attributes('open')).toBeUndefined();
+    const proxy = wrapper.find('.connection-advanced').find('[aria-label="网络代理"]');
+    expect(proxy.exists()).toBe(true);
+    expect(wrapper.find('.connection-advanced').text()).toContain('网络代理');
     expect(wrapper.find('.connection-editor').findAll('label').filter((l) => !l.element.closest('details'))).toHaveLength(5);
     expect(wrapper.findAll('input[type="checkbox"]').every((i) => !i.element.checked)).toBe(true); wrapper.unmount();
   });

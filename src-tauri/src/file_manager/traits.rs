@@ -30,6 +30,10 @@ pub(crate) trait BrowserServiceFactory: Send + Sync {
 /// the admitted session and parent. Name-based lookup may not pick or merge an
 /// ambiguous sibling. Local download collision names do not change remote IDs.
 pub(crate) trait BrowserBackend: Send + Sync {
+    fn move_entry<'a>(&'a self, _peers: &'a PeerManager, _cloud: &'a CloudRuntime, _id: &'a str, _destination: &'a str) -> BoxFuture<'a, Result<(), AppError>> {
+        Box::pin(async { Err(super::service::unavailable()) })
+    }
+    fn supports_move(&self) -> bool { false }
     fn prepare<'a>(&'a self, peers: &'a PeerManager, cloud: &'a CloudRuntime) -> BoxFuture<'a, Result<(), AppError>>;
     fn upload_page<'a>(&'a self, peers: &'a std::sync::Arc<PeerManager>, cloud: &'a std::sync::Arc<CloudRuntime>, id: &'a str, directory_token: Option<String>, cursor: Option<String>, limit: Option<usize>) -> BoxFuture<'a, Result<crate::local_upload_types::DirectoryPageDto, AppError>>;
     fn upload_resolve<'a>(&'a self, peers: &'a std::sync::Arc<PeerManager>, cloud: &'a std::sync::Arc<CloudRuntime>, id: &'a str, conflict_id: &'a str, decision: crate::cloud::directory_types::DirectoryConflictPolicy, apply_to_remaining: bool) -> BoxFuture<'a, Result<(), AppError>>;

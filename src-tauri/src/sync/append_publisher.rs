@@ -268,7 +268,13 @@ impl AppendPublisher {
             bytes_written: 0,
         };
         index.freeze_publication_source(&op, |index, i| {
-            object_at(index, i).map_err(|_| super::index_types::IndexError::InvalidRecord)
+            object_at(index, i).map_err(|error| match error {
+                PublishError::Index(source) => source,
+                source => {
+                    log::error!("sync publication object validation failed: {source:?}");
+                    super::index_types::IndexError::invalid_record()
+                }
+            })
         })?;
         Ok(())
     }

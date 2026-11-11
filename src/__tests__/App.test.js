@@ -215,6 +215,20 @@ function findButton(wrapper, label) {
   return button;
 }
 
+// 浮动操作条只有图标，可访问名来自 aria-label，不能用可见文本查找。
+function barButton(wrapper, label) {
+  const button = wrapper
+    .findAll(".selection-actions button")
+    .find((item) => item.attributes("aria-label") === label);
+  if (!button) throw new Error(`selection-bar button not found: ${label}`);
+  return button;
+}
+
+async function clickBarButton(wrapper, label) {
+  await barButton(wrapper, label).trigger("click");
+  await flushPromises();
+}
+
 async function clickButton(wrapper, label) {
   await findButton(wrapper, label).trigger("click");
   await flushPromises();
@@ -1375,6 +1389,20 @@ describe("home workspace", () => {
     reloaded.unmount();
   });
 
+  it("renders settings without waiting for unrelated backend initialization", async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
+    const wrapper = await mountReady({ admin_session: async () => ({ username: 'admin', mustChangePassword: false }) });
+    invoke.mockImplementation((command) => {
+      if (['service_settings', 'cloud_list', 'local_networks', 'lan_address'].includes(command)) return new Promise(() => {});
+      return Promise.resolve(null);
+    });
+    await wrapper.find('button[aria-label="打开设置"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('#pane-general').exists()).toBe(true);
+    expect(wrapper.find('.settings-skeleton').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
   it("re-enters settings with the cached lists instead of flashing a skeleton", async () => {
     localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
     const wrapper = await mountReady({
@@ -2004,7 +2032,7 @@ describe("Finder-style peer browser", () => {
       file_list: async ({ id: path }) => {
         const listing = await (overrides.list_peer_dir || (async () => LISTING))({ peerId: 'peer-1', shareId: 'share-1', path });
         let parent = '';
-        const breadcrumbs = listing.path.split('/').filter(Boolean).map(name => { parent += `/${name}`; return { id: parent, name }; });
+        const breadcrumbs = [{ id: '/', name: SHARE.name }, ...listing.path.split('/').filter(Boolean).map(name => { parent += `/${name}`; return { id: parent, name }; })];
         return { ...listing, id: listing.path, breadcrumbs, entries: listing.entries.map(entry => ({ ...entry, id: entry.path })), complete: !listing.truncated, next: null, protected: false };
       },
       file_preview: async ({ id: path }) => (overrides.preview_peer_file ? overrides.preview_peer_file({ remotePath: path }) : ({ fileName: 'notes.txt', mime: 'text/plain', encoding: 'utf8', data: 'hello peer\n', size: 11 })),
@@ -2089,7 +2117,7 @@ describe("Finder-style peer browser", () => {
     });
     if (label === '删除') confirmAction.mockImplementationOnce(() => pending);
     await wrapper.findAll('.file-tile')[folder ? 0 : 1].trigger('click');
-    await wrapper.findAll('.selection-actions button').find((button) => button.text() === label).trigger('click');
+    await wrapper.findAll('.selection-actions button').find((button) => button.attributes('aria-label') === label).trigger('click');
     expect(wrapper.find('.selection-actions').exists()).toBe(false);
     expect(wrapper.findAll('.file-tile.is-selected')).toHaveLength(0);
     if (label === '下载') expect(invoke).toHaveBeenCalledWith('file_select_download', { sessionId: 'browser-session', selection: { mode: 'folder', id: '/sub' } });
@@ -2108,7 +2136,7 @@ describe("Finder-style peer browser", () => {
       file_discard_edit: async () => {},
     });
     await wrapper.find('.file-tile[data-path="/notes.txt"]').trigger('click');
-    await wrapper.findAll('.selection-actions button').find(button => button.text() === '外部编辑').trigger('click');
+    await wrapper.findAll('.selection-actions button').find(button => button.attributes('aria-label') === '外部编辑').trigger('click');
     await flushPromises();
     expect(wrapper.find('.edit-panel').text()).toContain('notes.txt');
     expect(wrapper.find('.edit-panel strong').text()).toBe('外部编辑：notes.txt');
@@ -2151,17 +2179,44 @@ describe("Finder-style peer browser", () => {
     expect(galleryCss).toMatch(/\.browser-main > \.file-view \{[^}]*flex: 1;[^}]*min-height: 0;[^}]*overflow: hidden;/);
     expect(galleryCss).toMatch(/\.gallery-stage \{[^}]*display: flex;[^}]*align-items: center;[^}]*justify-content: center;/);
     expect(galleryCss).not.toMatch(/\.gallery-stage \{[^}]*display: grid;/);
-    expect(galleryCss).toContain(".selection-bar {\n  flex: none;\n  box-sizing: border-box;\n  min-height: 54px;\n  display: flex;");
+    expect(galleryCss).toMatch(/\.selection-bar \{[^}]*position: absolute;[^}]*left: 50%;[^}]*bottom: 14px;[^}]*transform: translateX\(-50%\);[^}]*border-radius: 999px;[^}]*background: var\(--floating-bar-bg\);/);
     expect(galleryCss).toContain(".gallery-image {\n  max-width: 100%;\n  max-height: 100%;\n  width: auto;\n  height: auto;\n  object-fit: contain;\n  border-radius: 8px;\n  box-shadow: 0 8px 28px rgba(22, 32, 46, 0.16);\n}");
-    expect(galleryCss).toContain(".selection-bar--reserved");
-    expect(galleryCss).toContain(".selection-bar__hint");
     expect(galleryCss).toMatch(/\.selection-bar \{[^}]*min-height: 54px;/);
+    expect(galleryCss).toMatch(/\.browser-main--selection \{[^}]*padding-bottom: calc\(14px \+ var\(--floating-bar-height\)\);/);
     expect(galleryCss).toMatch(/\.gallery-strip \{\s*flex: none;/);
     expect(galleryCss).toContain(".gallery-video {\n  max-width: 100%;\n  max-height: 100%;\n  width: auto;\n  height: auto;\n  object-fit: contain;");
 
 
     expect(galleryCss).not.toMatch(/\.gallery-(image|video|text) \{[^}]*max-height: 380px/);
     wrapper.unmount();
+  });
+
+  it("floats the inverted icon-only action bar above reserved bottom space", async () => {
+    const { wrapper } = await openBrowser();
+    await wrapper.findAll(".file-tile")[1].trigger("click");
+    await flushPromises();
+    const bar = wrapper.find(".selection-bar");
+    expect(bar.exists()).toBe(true);
+    // 浮动条只呈现动作：没有摘要文本，每个动作都以 aria-label 命名。
+    expect(bar.text()).toBe("");
+    expect(bar.findAll("button").every((button) => button.attributes("aria-label"))).toBe(true);
+    // 选中时主区底部预留条体高度，列表最后一行不会被盖住。
+    expect(wrapper.find(".browser-main").classes()).toContain("browser-main--selection");
+    wrapper.unmount();
+
+    const appSource = readFileSync("src/App.vue", "utf8");
+    const light = appSource.match(/^:root \{([\s\S]*?)^\}/m)[1];
+    const dark = appSource.match(/:root\[data-theme="dark"\] \{([\s\S]*?)\n\}/)[1];
+    // 反色契约：亮色外观用暗底亮字，暗色外观用浅底深字。
+    expect(light).toContain("--floating-bar-bg: rgba(22, 32, 46, 0.92);");
+    expect(light).toContain("--floating-bar-fg: #f5f8fb;");
+    expect(dark).toContain("--floating-bar-bg: rgba(240, 244, 249, 0.94);");
+    expect(dark).toContain("--floating-bar-fg: #16202e;");
+    expect(light).toContain("--browser-body-bg: rgba(255, 255, 255, 0.1);");
+    expect(dark).toContain("--browser-body-bg: rgba(0, 0, 0, 0.1);");
+    for (const file of ["src/components/PeerBrowser.vue", "src/components/CloudBrowser.vue"]) {
+      expect(readFileSync(file, "utf8")).toMatch(/\.browser-body \{[^}]*background: var\(--browser-body-bg\);/);
+    }
   });
 
   it("keeps the gallery above the selection bar and centers preview media", async () => {
@@ -2382,11 +2437,11 @@ describe("Finder-style peer browser", () => {
     await flushPromises();
 
     expect(columnView.scrollLeft).toBe(720);
-    expect(wrapper.findAll('.selection-actions button').some((button) => button.text() === '打开')).toBe(false);
-    expect(wrapper.findAll('.selection-actions button').some((button) => button.text() === '下载')).toBe(true);
+    expect(wrapper.findAll('.selection-actions button').some((button) => button.attributes('aria-label') === '打开')).toBe(false);
+    expect(wrapper.findAll('.selection-actions button').some((button) => button.attributes('aria-label') === '下载')).toBe(true);
     await wrapper.find('button[aria-label="列表"]').trigger('click');
     await flushPromises();
-    expect(wrapper.findAll('.selection-actions button').some((button) => button.text() === '打开')).toBe(true);
+    expect(wrapper.findAll('.selection-actions button').some((button) => button.attributes('aria-label') === '打开')).toBe(true);
 
     wrapper.unmount();
   });
@@ -2602,7 +2657,7 @@ describe("Finder-style peer browser", () => {
   it("shows a single-file native queue without invented byte progress and releases on close", async () => {
     const release = vi.fn(async () => {}); const reveal = vi.fn(async () => {});
     const { wrapper } = await openBrowser({ transfer_release_download: release, transfer_reveal_download: reveal });
-    await wrapper.findAll('.file-tile')[1].trigger('click'); await clickButton(wrapper, '下载'); await flushPromises();
+    await wrapper.findAll('.file-tile')[1].trigger('click'); await clickBarButton(wrapper, '下载'); await flushPromises();
     expect(invoke).toHaveBeenCalledWith('file_select_download', { sessionId: 'browser-session', selection: { mode: 'single', id: '/notes.txt' } });
     expect(wrapper.find('[data-test=download-dialog]').text()).toContain('notes.txt');
     expect(wrapper.find('[data-test=download-dialog] [role=progressbar]').exists()).toBe(false);
@@ -2625,7 +2680,7 @@ describe("Finder-style peer browser", () => {
 
     await wrapper.findAll(".file-tile")[1].trigger("click");
     await flushPromises();
-    await clickButton(wrapper, "下载");
+    await clickBarButton(wrapper, "下载");
     await flushPromises();
 
     expect(invoke).toHaveBeenCalledWith('file_select_download', { sessionId: 'browser-session', selection: { mode: 'single', id: '/notes.txt' } });
@@ -2850,7 +2905,7 @@ describe("Finder-style peer browser", () => {
 
     const labels = wrapper
       .findAll(".selection-actions button")
-      .map((button) => button.text());
+      .map((button) => button.attributes("aria-label"));
     expect(labels).toContain("下载");
     expect(labels).not.toContain("预览");
     expect(labels).not.toContain("编辑");
@@ -2869,7 +2924,7 @@ describe("Finder-style peer browser", () => {
     await wrapper.findAll(".file-tile")[0].trigger("click");
     await flushPromises();
 
-    await clickButton(wrapper, "删除");
+    await clickBarButton(wrapper, "删除");
 
     expect(confirmAction).toHaveBeenCalledWith(
       "删除文件夹“sub”及其中的所有内容？此操作无法撤销。",
@@ -2894,7 +2949,7 @@ describe("Finder-style peer browser", () => {
     });
     await wrapper.findAll('.file-tile')[0].trigger('click');
     await flushPromises();
-    await clickButton(wrapper, '删除');
+    await clickBarButton(wrapper, '删除');
     expect(confirmAction).toHaveBeenCalledTimes(1);
     wrapper.unmount();
     settle(true);
@@ -2927,7 +2982,7 @@ describe("Finder-style peer browser", () => {
     await wrapper.findAll(".file-tile")[0].trigger("click");
     await flushPromises();
 
-    await clickButton(wrapper, "删除");
+    await clickBarButton(wrapper, "删除");
 
     expect(confirmAction).toHaveBeenCalledTimes(1);
     expect(remove).not.toHaveBeenCalled();
@@ -2947,9 +3002,9 @@ describe("Finder-style peer browser", () => {
     await wrapper.findAll(".file-tile")[0].trigger("click");
     await flushPromises();
 
-    expect(findButton(wrapper, "打开").exists()).toBe(true);
+    expect(barButton(wrapper, "打开").exists()).toBe(true);
     expect(
-      wrapper.findAll(".selection-actions button").some((button) => button.text() === "删除"),
+      wrapper.findAll(".selection-actions button").some((button) => button.attributes("aria-label") === "删除"),
     ).toBe(false);
 
     wrapper.unmount();
@@ -2997,9 +3052,8 @@ describe("Finder-style peer browser", () => {
     await tiles[3].trigger("click", { ctrlKey: true });
     await flushPromises();
     const bar = wrapper.find(".selection-bar");
-    expect(bar.classes()).toContain("selection-bar--multi");
-    expect(bar.text()).toContain("已选 2 项");
-    expect(bar.text()).toContain("2 个文件 · 0 个目录");
+    // 操作条只显示动作按钮，选中规模由列表自身的选中态证明。
+    expect(bar.text()).toBe("");
     expect(bar.find(".selection-tree").exists()).toBe(false);
     expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(2);
 
@@ -3007,7 +3061,7 @@ describe("Finder-style peer browser", () => {
     await tiles[0].trigger("click");
     await flushPromises();
     expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(1);
-    expect(wrapper.find(".selection-bar").text()).toContain("sub");
+    expect(wrapper.find(".file-tile.is-selected").attributes("data-path")).toBe("/sub");
 
     // Shift+click selects the inclusive range from the anchor.
     await tiles[1].trigger("click");
@@ -3015,7 +3069,6 @@ describe("Finder-style peer browser", () => {
     await tiles[3].trigger("click", { shiftKey: true });
     await flushPromises();
     expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(3);
-    expect(wrapper.find(".selection-bar").text()).toContain("已选 3 项");
 
     // macOS 习惯用 Cmd（metaKey）做跳跃多选，与 Ctrl 等价。
     await tiles[0].trigger("click");
@@ -3023,16 +3076,14 @@ describe("Finder-style peer browser", () => {
     await tiles[2].trigger("click", { metaKey: true });
     await flushPromises();
     expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(2);
-    expect(wrapper.find(".selection-bar").text()).toContain("已选 2 项");
 
     // Alt 与 Ctrl/Cmd 等价，也作为附加选择键。
     await tiles[3].trigger("click", { altKey: true });
     await flushPromises();
     expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(3);
-    expect(wrapper.find(".selection-bar").text()).toContain("已选 3 项");
 
     // 清除选择回到空态（画廊外不显示底栏）。
-    await wrapper.find(".selection-clear").trigger("click");
+    await wrapper.find('[data-test="clear-selection"]').trigger("click");
     await flushPromises();
     expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(0);
     expect(wrapper.find(".selection-bar").exists()).toBe(false);
@@ -3238,7 +3289,7 @@ describe("Finder-style peer browser", () => {
     await flushPromises();
     await tiles[1].trigger("click", { ctrlKey: true });
     await flushPromises();
-    await clickButton(wrapper, "下载");
+    await clickBarButton(wrapper, "下载");
     await flushPromises();
 
     const reveal = wrapper.findAll("button").find((button) => button.text() === "打开所在目录");
@@ -3288,9 +3339,9 @@ describe("Finder-style peer browser", () => {
     await flushPromises();
     await tiles[2].trigger("click", { ctrlKey: true });
     await flushPromises();
-    expect(wrapper.find(".selection-bar").text()).toContain("已选 3 项");
+    expect(wrapper.findAll(".file-tile.is-selected")).toHaveLength(3);
 
-    await clickButton(wrapper, "下载");
+    await clickBarButton(wrapper, "下载");
     await flushPromises();
 
     expect(invoke).toHaveBeenCalledWith('file_select_download', {
@@ -3320,7 +3371,7 @@ describe("Finder-style peer browser", () => {
       transfer_start_download: async () => queueSummary('running', { totalFiles: 10001, completedFiles: 5000, currentRelativePath: 'sub/deep/a.txt' }),
       transfer_page_download: async () => ({ items: [{ remotePath: '/sub/inner.txt', relativePath: 'sub/inner.txt', phase: 'completed' }], nextOffset: 100 }),
     });
-    await wrapper.findAll('.file-tile')[0].trigger('click'); await clickButton(wrapper, '下载'); await flushPromises();
+    await wrapper.findAll('.file-tile')[0].trigger('click'); await clickBarButton(wrapper, '下载'); await flushPromises();
     expect(invoke).toHaveBeenCalledWith('file_select_download', { sessionId: 'browser-session', selection: { mode: 'folder', id: '/sub' } });
     expect(invoke).toHaveBeenCalledWith('transfer_page_download', { queueId: 'peer-download', offset: 0, limit: 100 });
     expect(wrapper.find('[data-test=download-dialog]').text()).toContain('5000/10001');
@@ -3340,7 +3391,7 @@ describe("Finder-style peer browser", () => {
       transfer_start_download: downloadTo,
     });
     await wrapper.findAll('.file-tile')[0].trigger('click');
-    await clickButton(wrapper, '下载'); await flushPromises();
+    await clickBarButton(wrapper, '下载'); await flushPromises();
     expect(downloadTo).toHaveBeenCalledTimes(1);
     if (code === 'TRANSFER_CANCELED') {
       expect(wrapper.find('[data-test=download-dialog] [role=alert]').exists()).toBe(false);
@@ -3359,7 +3410,7 @@ describe("Finder-style peer browser", () => {
     const resolve = vi.fn(async () => {}); const cancel = vi.fn(async () => {});
     let state = queueSummary('conflict', { conflict: { conflictId: 'one', relativePath: 'sub/a.txt' } });
     const { wrapper } = await openBrowser({ transfer_start_download: async () => state, transfer_status_download: async () => state, transfer_resolve_download: resolve, transfer_cancel_download: cancel });
-    await wrapper.findAll('.file-tile')[0].trigger('click'); await clickButton(wrapper, '下载'); await flushPromises();
+    await wrapper.findAll('.file-tile')[0].trigger('click'); await clickBarButton(wrapper, '下载'); await flushPromises();
     expect(new DOMWrapper(document.querySelector('[data-test=download-apply-remaining]')).element.checked).toBe(false);
     state = queueSummary('conflict', { skippedFiles: 1, conflict: { conflictId: 'two', relativePath: 'sub/b.txt' } });
     await new DOMWrapper(document.querySelector('[data-test=download-skip]')).trigger('click'); await flushPromises();

@@ -34,6 +34,10 @@ impl CloudRuntime {
     }
 
     pub async fn wait_loopback_authorization(&self, request_id: &str, name: String, client_secret: Option<String>, root_id: String) -> Result<super::official_types::OfficialConnectionRedacted, AppError> {
+        self.wait_loopback_authorization_with_proxy(request_id, name, client_secret, root_id, false).await
+    }
+
+    pub async fn wait_loopback_authorization_with_proxy(&self, request_id: &str, name: String, client_secret: Option<String>, root_id: String, direct: bool) -> Result<super::official_types::OfficialConnectionRedacted, AppError> {
         self.admit()?;
         let pending = self.official_callbacks.lock().await.remove(request_id).ok_or_else(|| oauth_error(OAuthError::InvalidState))?;
         let cancel = pending.cancel.clone();
@@ -49,7 +53,7 @@ impl CloudRuntime {
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(oauth_error(OAuthError::InvalidState)),
-            result = self.complete_official_authorization(request_id, callback.as_str(), name, client_secret, root_id) => result,
+            result = self.complete_official_authorization_with_proxy(request_id, callback.as_str(), name, client_secret, root_id, direct) => result,
         };
         self.official_callback_cancels.lock().await.remove(request_id);
         self.official_authorizations.cancel(request_id).map_err(oauth_error)?;
@@ -65,6 +69,12 @@ impl CloudRuntime {
     pub async fn complete_official_authorization(
         &self, request_id: &str, callback: &str, name: String, client_secret: Option<String>, root_id: String,
     ) -> Result<super::official_types::OfficialConnectionRedacted, AppError> {
+        self.complete_official_authorization_with_proxy(request_id, callback, name, client_secret, root_id, false).await
+    }
+
+    pub async fn complete_official_authorization_with_proxy(
+        &self, request_id: &str, callback: &str, name: String, client_secret: Option<String>, root_id: String, direct: bool,
+    ) -> Result<super::official_types::OfficialConnectionRedacted, AppError> {
         self.admit()?;
         let _network = self.network.read().await;
         let _refresh = self.official_refresh.lock().await;
@@ -76,13 +86,15 @@ impl CloudRuntime {
         let exchange = self.official_authorizations.complete(request_id, callback).map_err(oauth_error)?;
         let provider = exchange.provider();
         let client_id = exchange.client_id().map_err(oauth_error)?.to_owned();
-        let tokens = exchange.exchange_using(client_secret.clone().map(Zeroizing::new), provider.token_endpoint(), self.official_http_client(None)?).await.map_err(oauth_error)?;
+        let proxy = if direct { super::types::ProxyMode::Direct } else { self.official_proxy(None)? };
+        let client = super::proxy::ConnectionTransport::new(&proxy).map_err(|source| AppError::from(crate::DomainError::from(source)))?.client().clone();
+        let tokens = exchange.exchange_using(client_secret.clone().map(Zeroizing::new), provider.token_endpoint(), client).await.map_err(oauth_error)?;
         self.admit()?;
         let refresh = tokens.refresh_token.ok_or_else(|| oauth_error(OAuthError::InvalidResponse))?;
-        self.config.save_official_connection(super::official_types::OfficialConnection {
+        self.config.save_official_connection_with_proxy(super::official_types::OfficialConnection {
             id: String::new(), name, provider, config_version: 1, revision: 0, client_id,
             client_secret, refresh_token: refresh.to_string(), root_id,
-        }).map_err(super::runtime::config_error)
+        }, Some(direct)).map_err(super::runtime::config_error)
     }
 
     pub(crate) async fn official_api(&self, connection_id: &str) -> Result<(super::official_types::OfficialConnection, OfficialApi), AppError> {

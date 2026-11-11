@@ -69,6 +69,12 @@ async fn google_sync_roundtrip(mode: crate::sync::append_types::AppendMode, choi
         }
     });
     let store = runtime.google_store(&connection.id).expect("store").expect("Google");
+    let renamed = runtime.config.update_official_connection(crate::cloud::official_types::UpdateOfficialConnectionInput {
+        id: connection.id.clone(), revision: connection.revision, name: "GoogleDrive".into(),
+        client_secret: None, clear_client_secret: false, direct: false,
+    }).expect("rename connection");
+    assert_eq!(renamed.name, "GoogleDrive");
+    // An already admitted store must remain usable after a display-only edit.
     let key = "_peerdav_encrypt/objects/immutable";
     store.put(key, crate::cloud::bytes_stream(bytes::Bytes::from_static(b"payload")), PutCondition::Any).await.expect("put");
     assert_eq!(store.stat(key).await.expect("stat").size, 7);
@@ -98,6 +104,9 @@ async fn google_sync_roundtrip(mode: crate::sync::append_types::AppendMode, choi
             }
         }
     }).await.expect("initial sync completes");
+    let (first, second) = tokio::join!(runtime.local_sync_entries(&mapping.id), runtime.local_sync_entries(&mapping.id));
+    first.expect("first concurrent metadata listing");
+    second.expect("second concurrent metadata listing");
     std::fs::write(local_directory.path().join("hello.txt"), "Google sync payload").expect("local file");
     let plan = runtime.preview(&mapping.id).await.expect("preview upload");
     runtime.manual_sync(&mapping.id, &plan.preview_id).await.expect("start upload sync");
@@ -208,6 +217,10 @@ async fn google_sync_roundtrip(mode: crate::sync::append_types::AppendMode, choi
     assert_eq!(created.name, "same-created-name");
     let nested = sessions.create_directory(&peers, &runtime, &opened.session_id, &created.id, "nested").await.expect("created ID immediately usable without parent refresh");
     assert_eq!(nested.parent_id, created.id);
+    let navigation = sessions.list(&peers, &runtime, &opened.session_id, &nested.id, None).await.expect("complete native breadcrumbs");
+    assert_eq!(navigation.breadcrumbs.iter().map(|crumb| crumb.id.as_str()).collect::<Vec<_>>(), vec!["", created.id.as_str(), nested.id.as_str()]);
+    assert_eq!(navigation.breadcrumbs[0].name, "GoogleDrive");
+    assert_eq!(navigation.breadcrumbs[1].name, "same-created-name");
     let source = tempfile::tempdir().expect("upload source");
     let source_file = source.path().join("existing.txt");
     std::fs::write(&source_file, "original").expect("source");
@@ -235,6 +248,9 @@ async fn google_sync_roundtrip(mode: crate::sync::append_types::AppendMode, choi
                 let overwrite = choice == crate::cloud::directory_types::DirectoryConflictPolicy::Overwrite;
                 assert_eq!(status.skipped_files, u64::from(!overwrite));
                 assert_eq!(status.completed_files, u64::from(overwrite));
+                let page = session.backend.upload_page(&peers, &runtime, &selected.batch_id, None, None, Some(1)).await.expect("terminal item page");
+                assert_eq!(page.entries[0].phase, if overwrite { "completed" } else { "skipped" });
+                assert_eq!(page.entries[0].transferred, Some(if overwrite { 11 } else { 0 }));
                 break;
             }
             assert_ne!(status.phase, "failed", "{:?}", status.error);
@@ -303,7 +319,12 @@ async fn google_sync_roundtrip(mode: crate::sync::append_types::AppendMode, choi
         loop {
             let status = session.backend.upload_action(&peers, &runtime, &folder.batch_id, crate::file_manager::types::UploadAction::Status).await.expect("folder status");
             let crate::file_manager::types::FileUploadDto::Cloud(status) = status else { panic!("folder status") };
-            if status.phase == "completed" { assert_eq!(status.completed_files, 1); break; }
+            if status.phase == "completed" {
+                assert_eq!(status.completed_files, 1);
+                let page = session.backend.upload_page(&peers, &runtime, &folder.batch_id, None, None, None).await.expect("folder entries");
+                assert!(page.entries.iter().all(|entry| entry.phase == "completed"));
+                break;
+            }
             assert_ne!(status.phase, "failed", "{:?}", status.error);
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }

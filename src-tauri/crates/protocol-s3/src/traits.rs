@@ -15,6 +15,12 @@ pub trait ObjectStore: Send + Sync {
     fn scope(&self) -> Option<ObjectStoreScope> {
         None
     }
+    fn copy_move_stream<'a>(&'a self, key: &'a str, body: ObjectStream) -> BoxFuture<'a, Result<ObjectMetadata, CloudError>> {
+        self.put(key, body, PutCondition::CreateOnly)
+    }
+    fn verify_move_capabilities(&self) -> BoxFuture<'_, Result<StorageCapabilities, CloudError>> {
+        Box::pin(async { Ok(self.capabilities()) })
+    }
     fn capabilities(&self) -> StorageCapabilities;
     /// Pull-based listing preserves provider pagination and does not collect the
     /// full repository in memory. Every page error must reach the caller.

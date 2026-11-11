@@ -91,6 +91,18 @@ impl OfficialApi {
         Ok(result.get("eTag").and_then(Value::as_str).unwrap_or_default().into())
     }
 
+    pub(crate) async fn move_item(&self, id: &str, from: &str, destination: &str) -> Result<(), OfficialApiError> {
+        let url = self.item_url(id)?;
+        self.item_url(destination)?;
+        let request = match self.provider {
+            OfficialProvider::GoogleDrive => self.client.patch(url).query(&[("addParents", destination), ("removeParents", from), ("supportsAllDrives", "true")]).json(&serde_json::json!({})),
+            OfficialProvider::OneDrive => self.client.patch(url).json(&serde_json::json!({"parentReference": {"id": destination}, "@microsoft.graph.conflictBehavior": "fail"})),
+            _ => return Err(OfficialApiError::InvalidInput),
+        };
+        self.mutation_response(request.bearer_auth(self.access_token.as_str())).await?;
+        Ok(())
+    }
+
     pub(crate) async fn delete_item(&self, id: &str, revision: &str) -> Result<(), OfficialApiError> {
         let url = self.item_url(id)?;
         // Google trash is recoverable and includes folder descendants. Graph DELETE
@@ -111,7 +123,7 @@ impl OfficialApi {
         Ok(())
     }
 
-    fn upload_request(&self, parent: &str, name: &str, file: std::fs::File, size: u64) -> Result<reqwest::RequestBuilder, OfficialApiError> {
+    fn upload_request(&self, parent: &str, name: &str, file: std::fs::File, size: u64, progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>) -> Result<reqwest::RequestBuilder, OfficialApiError> {
         if parent.is_empty() || parent.contains(['/', '\\', '\0']) || name.trim().is_empty() || name.contains(['/', '\\', '\0']) || matches!(name, "." | "..") { return Err(OfficialApiError::InvalidInput); }
         if self.provider != OfficialProvider::GoogleDrive { return Err(OfficialApiError::InvalidInput); }
         let metadata = serde_json::to_vec(&serde_json::json!({"name":name,"parents":[parent]})).map_err(|_| OfficialApiError::InvalidInput)?;
@@ -121,17 +133,30 @@ impl OfficialApi {
         let tail = format!("\r\n--{boundary}--\r\n");
         let length = (header.len() as u64).checked_add(size).and_then(|n| n.checked_add(tail.len() as u64)).ok_or(OfficialApiError::InvalidInput)?;
         let stream = futures_util::stream::once(async move { Ok::<_, std::io::Error>(bytes::Bytes::from(header)) })
-            .chain(tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file)))
+            .chain(tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file)).inspect(move |chunk| {
+                if let (Some(counter), Ok(bytes)) = (&progress, chunk) { counter.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed); }
+            }))
             .chain(futures_util::stream::once(async move { Ok::<_, std::io::Error>(bytes::Bytes::from(tail)) }));
         Ok(self.client.post("https://www.googleapis.com/upload/drive/v3/files").query(&[("uploadType", "multipart"), ("supportsAllDrives", "true")]).bearer_auth(self.access_token.as_str()).header(reqwest::header::CONTENT_TYPE, format!("multipart/related; boundary={boundary}")).header(reqwest::header::CONTENT_LENGTH, length).body(reqwest::Body::wrap_stream(stream)))
     }
 
+    #[cfg(test)]
     pub(crate) async fn upload_new(&self, parent: &str, name: &str, file: std::fs::File, size: u64) -> Result<(), OfficialApiError> {
-        self.mutation_response(self.upload_request(parent, name, file, size)?).await?;
+        self.mutation_response(self.upload_request(parent, name, file, size, None)?).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn upload_new_progress(&self, parent: &str, name: &str, file: std::fs::File, size: u64, progress: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Result<(), OfficialApiError> {
+        self.mutation_response(self.upload_request(parent, name, file, size, Some(progress))?).await?;
         Ok(())
     }
 
     pub(crate) async fn replace_file_stream(&self, id: &str, file: std::fs::File, size: u64, expected: Option<&str>) -> Result<(), OfficialApiError> {
+        self.replace_file_stream_progress(id, file, size, expected, None).await
+    }
+
+    pub(crate) async fn replace_file_stream_progress(&self, id: &str, file: std::fs::File, size: u64, expected: Option<&str>, progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>) -> Result<(), OfficialApiError> {
+        use futures_util::StreamExt;
         if self.provider != OfficialProvider::GoogleDrive { return Err(OfficialApiError::InvalidInput); }
         if let Some(expected) = expected {
             if self.metadata(id).await?.get("version").and_then(Value::as_str) != Some(expected) { return Err(OfficialApiError::Http { status: 412, message: "File changed; confirm again".into() }); }
@@ -140,13 +165,15 @@ impl OfficialApi {
         url.set_path(&url.path().replacen("/drive/v3/", "/upload/drive/v3/", 1));
         let request = self.client.patch(url).query(&[("uploadType", "media"), ("supportsAllDrives", "true")])
             .bearer_auth(self.access_token.as_str()).header(reqwest::header::CONTENT_TYPE, "application/octet-stream").header(reqwest::header::CONTENT_LENGTH, size)
-            .body(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file))));
+            .body(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file)).inspect(move |chunk| {
+                if let (Some(counter), Ok(bytes)) = (&progress, chunk) { counter.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed); }
+            })));
         self.mutation_response(request).await?;
         Ok(())
     }
 
     pub(crate) async fn upload_object(&self, parent: &str, name: &str, file: std::fs::File, size: u64) -> Result<String, OfficialApiError> {
-        let value = self.mutation_response(self.upload_request(parent, name, file, size)?).await?;
+        let value = self.mutation_response(self.upload_request(parent, name, file, size, None)?).await?;
         value.get("id").and_then(Value::as_str).map(str::to_owned).ok_or(OfficialApiError::InvalidResponse)
     }
 
@@ -517,7 +544,9 @@ mod tests {
         let mut file = tempfile::tempfile().expect("file");
         use std::io::{Write, Seek};
         file.write_all(b"payload").expect("write"); file.rewind().expect("rewind");
-        let request = api.upload_request("root", "quote\".txt", file, 7).expect("upload").build().expect("request");
+        let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let request = api.upload_request("root", "quote\".txt", file, 7, Some(progress.clone())).expect("upload").build().expect("request");
+        assert_eq!(progress.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(request.url().path(), "/upload/drive/v3/files");
         assert!(request.headers()[reqwest::header::CONTENT_TYPE].to_str().expect("type").starts_with("multipart/related;"));
         let expected = request.headers()[reqwest::header::CONTENT_LENGTH].to_str().expect("length").parse::<usize>().expect("size");
@@ -538,6 +567,7 @@ mod tests {
         let mut request = request;
         *request.url_mut() = url::Url::parse(&format!("http://{address}/upload")).expect("url");
         api.client.execute(request).await.expect("send");
+        assert_eq!(progress.load(std::sync::atomic::Ordering::Relaxed), 7, "count file bytes, not multipart metadata or framing");
         let bytes = task.await.expect("task");
         let body = String::from_utf8_lossy(&bytes);
         assert!(body.contains("\"parents\":[\"root\"]"));

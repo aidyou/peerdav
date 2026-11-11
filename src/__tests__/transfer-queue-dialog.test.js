@@ -117,6 +117,24 @@ describe('mounted transfer dialogs', () => {
     expect(document.querySelector('.upload-queue').textContent).not.toContain('Not tracked');
   });
 
+  it('shows streamed bytes, proportional row fill and confirmed terminal entry states', async () => {
+    setLocale('en');
+    const w = render(UploadBatchDialog, { open: true, running: true, summary: { phase: 'running', currentRelativePath: 'a.txt' }, page: { entries: [
+      { name: 'a.txt', relativePath: 'a.txt', kind: 'file', size: 2048, transferred: 512, phase: 'active' },
+      { name: 'done.txt', relativePath: 'done.txt', kind: 'file', size: 10, transferred: 10, phase: 'completed' },
+      { name: 'skip.txt', relativePath: 'skip.txt', kind: 'file', size: 10, phase: 'skipped' },
+    ] } });
+    await nextTick();
+    const rows = w.findAll('.upload-queue li');
+    expect(rows[0].text()).toContain('512 B/2.0 KB');
+    expect(rows[0].element.style.getPropertyValue('--upload-progress')).toBe('25%');
+    expect(rows[1].find('.queue-cell--status').text()).toBe('Uploaded');
+    expect(rows[2].find('.queue-cell--status').text()).toBe('Skipped');
+    await w.setProps({ running: false, summary: { phase: 'completed' }, page: { entries: [{ name: 'a.txt', relativePath: 'a.txt', kind: 'file', size: 2048, transferred: 2048, phase: 'completed' }] } });
+    expect(w.find('.queue-cell--status').text()).toBe('Uploaded');
+    expect(w.find('.is-active').exists()).toBe(false);
+  });
+
   it('marks the upload folder row with a spinner, success check or error cross', async () => {
     setLocale('en');
     const base = { batchId: 'b', completedFiles: 0, completedBytes: 0, totalFiles: 0, skippedFiles: 0 };

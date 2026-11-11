@@ -1,4 +1,5 @@
 <script setup>
+import { onBeforeUnmount } from 'vue';
 import { t } from "../lib/i18n";
 import FileGlyph from "./FileGlyph.vue";
 import BrowserSkeleton from "./BrowserSkeleton.vue";
@@ -6,6 +7,7 @@ import BrowserSkeleton from "./BrowserSkeleton.vue";
 // Entries and columns are provider-owned objects. Identity is read verbatim:
 // never decode, normalize, trim or reconstruct an object key or LAN path here.
 const props = defineProps({
+  moveEnabled: Boolean,
   entries: { type: Array, default: () => [] },
   mode: { type: String, default: "icons" },
   selection: { type: Array, default: () => [] },
@@ -26,10 +28,35 @@ const props = defineProps({
   formatModified: { type: Function, default: () => "" },
   entryStatus: { type: Function, default: () => "" },
 });
-const emit = defineEmits(["select", "activate", "column-select", "preview", "column-element", "column-wheel", "status-action"]);
+const emit = defineEmits(["move", "select", "activate", "column-select", "preview", "column-element", "column-wheel", "status-action"]);
+let dragged = null;
+function startDrag(entry, event) {
+  if (!props.moveEnabled || entry.remoteOnly || entry.protected) { event.preventDefault(); return; }
+  dragged = props.selection.some(item => identity(item) === identity(entry)) ? props.selection.slice() : [entry];
+  event.dataTransfer?.setData('application/x-peerdav-internal', 'move');
+  if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+}
+function allowDrop(entry, event) {
+  if (props.moveEnabled && dragged && entry.isDir && !entry.remoteOnly && !entry.protected && !dragged.some(item => identity(item) === identity(entry))) {
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move';
+  }
+}
+function drop(entry, event) {
+  if (!props.moveEnabled || !dragged || !entry.isDir || entry.remoteOnly || entry.protected || dragged.some(item => identity(item) === identity(entry))) return;
+  event.preventDefault();
+  const sources = dragged; dragged = null;
+  emit('move', sources, entry);
+}
+onBeforeUnmount(() => { dragged = null; });
 const identity = (entry) => entry[props.identityField];
 const selected = (entry) => props.selection.some((item) => identity(item) === identity(entry));
 const attributes = (entry) => ({
+  draggable: props.moveEnabled && !entry.remoteOnly && !entry.protected,
+  onDragstart: event => startDrag(entry, event),
+  onDragover: event => allowDrop(entry, event),
+  onDrop: event => drop(entry, event),
+  onDragend: () => { dragged = null; },
   [props.identityField === "key" ? "data-key" : "data-path"]: identity(entry),
   ...(entry.key !== undefined && entry.key === identity(entry) ? { 'data-key': entry.key } : {}),
 });

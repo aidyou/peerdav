@@ -24,6 +24,17 @@ function setup(overrides = {}) {
 }
 
 describe("shared upload batch session", () => {
+  it('refreshes entry progress and terminal states without clearing the current page', async () => {
+    const { batch, adapter } = setup({ page: vi.fn(async () => ({ directoryToken: 'root', entries: [{ relativePath: 'a', phase: 'selected' }] })) });
+    await batch.selectUpload('files');
+    adapter.page.mockResolvedValueOnce({ directoryToken: 'root', entries: [{ relativePath: 'a', phase: 'active', transferred: 12 }] });
+    await batch.pollUpload();
+    expect(batch.uploadPage.value.entries[0]).toMatchObject({ phase: 'active', transferred: 12 });
+    adapter.status.mockResolvedValueOnce(summary('completed', { completedFiles: 1 }));
+    adapter.page.mockResolvedValueOnce({ directoryToken: 'root', entries: [{ relativePath: 'a', phase: 'completed', transferred: 30 }] });
+    await batch.pollUpload();
+    expect(batch.uploadPage.value.entries[0]).toMatchObject({ phase: 'completed', transferred: 30 });
+  });
   it('asks again unchecked for a second conflict and resets a new queue to Ask', async () => {
     const first = { conflictId: 'first', relativePath: 'a.txt' };
     const second = { conflictId: 'second', relativePath: 'b.txt' };

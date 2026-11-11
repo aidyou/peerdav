@@ -379,6 +379,9 @@ mod tests {
         let open = sessions.open(&peers, &f.runtime, FileLocation::S3 { connection_id: "connection".into(), bucket: "bucket".into() }).await?;
         let page = sessions.list(&peers, &f.runtime, &open.session_id, "", None).await?;
         assert!(page.complete);
+        assert_eq!(page.breadcrumbs.len(), 1);
+        assert_eq!(page.breadcrumbs[0].id, "");
+        assert_eq!(page.breadcrumbs[0].name, "bucket");
         assert!(page.entries.iter().any(|entry| entry.id == "docs/" && entry.is_dir));
         assert!(page.entries.iter().all(|entry| entry.parent_id.is_empty()));
         let dto = serde_json::to_value(&page).map_err(|_| TestError::from("identity DTO serialization failed"))?;
@@ -670,6 +673,8 @@ mod tests {
             let done = directory_settled(&f, &selected.batch_id).await?;
             assert_eq!(done.phase, "completed");
             assert_eq!(done.skipped_files, count);
+            let page = f.runtime.object_page_upload_directory("connection", &selected.batch_id, None, None, Some(100)).await?;
+            assert!(page.entries.iter().all(|entry| entry.phase == "skipped" && entry.transferred == Some(0)));
             assert_eq!(f.store.mutations.load(Ordering::SeqCst), 0);
             f.runtime
                 .object_release_upload_directory("connection", &selected.batch_id)
@@ -2845,7 +2850,16 @@ impl CloudRuntime {
                 })
             })
             .collect::<Result<Vec<_>, AppError>>()?;
+        let mut breadcrumbs = vec![crate::file_manager::types::FileBreadcrumbDto { id: String::new(), name: session.bucket.clone() }];
+        breadcrumbs.extend(crate::file_manager::service::path_breadcrumbs(&page.prefix));
+        let config = self.config.snapshot().map_err(super::runtime::config_error)?;
+        if let Some((mapping, root)) = config.mirror_mappings.iter().filter(|mapping| mapping.connection_id == connection_id && mapping.bucket.as_deref().unwrap_or(&session.bucket) == session.bucket).map(|mapping| (mapping, crate::mirror::cloud_key(&mapping.cloud_prefix, ""))).filter(|(_, root)| page.prefix.starts_with(root)).max_by_key(|(_, root)| root.len()) {
+            let name = mapping.local_root.file_name().and_then(|name| name.to_str()).unwrap_or("同步盘 / Sync drive").to_owned();
+            breadcrumbs.retain(|crumb| crumb.id.len() > root.len());
+            breadcrumbs.insert(0, crate::file_manager::types::FileBreadcrumbDto { id: root, name });
+        }
         Ok(ObjectPageDto {
+            breadcrumbs,
             prefix: page.prefix,
             objects,
             next: page.next,

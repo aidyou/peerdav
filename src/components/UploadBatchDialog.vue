@@ -25,8 +25,11 @@ const uploadedBytes = computed(() => props.summary?.completedBytes || 0);
 // 有统计内容时才作为 aria-live 区域，避免空区域被读屏登记为状态源。
 const hasStats = computed(() => total.value > 0 || uploadedBytes.value > 0 || (props.summary?.skippedFiles ?? 0) > 0);
 
-// 列表是远端目录预览而非逐文件队列，只有正在处理的条目才有状态可言。
-const isActive = (item) => item.relativePath === props.summary?.currentRelativePath && props.running;
+// 后端逐项状态为准；旧适配器仅能明确标识当前活动项。
+const isActive = (item) => props.running && !['completed', 'skipped', 'failed', 'cancelled'].includes(item.phase) && (item.phase === 'active' || item.relativePath === props.summary?.currentRelativePath);
+const entryPhase = item => isActive(item) ? 'active' : item.phase;
+const entryProgress = item => Number.isFinite(item.transferred) ? Math.min(100, Math.max(0, item.size ? item.transferred / item.size * 100 : 0)) : 0;
+const entryStatus = item => isActive(item) && Number.isFinite(item.transferred) ? `${formatBytes(item.transferred)}/${formatBytes(item.size)}` : t(`cloudBrowser.uploadEntry.${entryPhase(item)}`);
 // 上传目标目录固定为选择时的目录，预览页只展示它的直接子项。
 const remotePath = computed(() => props.page?.relativePath || props.summary?.rootName || "");
 // 目录行右侧状态图标：进行中旋转、完成打勾、失败红叉；取消不额外标注。
@@ -105,15 +108,15 @@ const entrySize = (item) => {
             <span role="columnheader">{{ t('peer.queueColStatus') }}</span>
           </div>
           <ul class="transfer-queue upload-queue" role="rowgroup">
-            <li v-for="item in page?.entries || []" role="row" :key="item.relativePath" :data-status="isActive(item) ? 'active' : 'unscanned'"
-              :class="{ 'is-active': isActive(item) }">
+            <li v-for="item in page?.entries || []" role="row" :key="item.relativePath" :data-status="entryPhase(item) || 'unscanned'"
+              :class="{ 'is-active': isActive(item) }" :style="isActive(item) ? { '--upload-progress': `${entryProgress(item)}%` } : undefined">
               <div class="queue-cell queue-cell--path" role="cell" :title="item.relativePath">
                 <FileGlyph :entry="{ isDir: item.kind === 'directory', name: item.name }" />
                 <span class="queue-path">{{ item.name }}</span>
               </div>
               <div class="queue-cell queue-cell--size" role="cell">{{ entrySize(item) }}</div>
               <div class="queue-cell queue-cell--status" role="cell">
-                <el-tag v-if="isActive(item)" :type="statusTagTone('uploading')" effect="plain" round size="small">{{ t('cloudBrowser.uploadActive') }}</el-tag>
+                <el-tag v-if="['active', 'completed', 'skipped', 'failed', 'cancelled', 'selected'].includes(entryPhase(item))" :type="statusTagTone(entryPhase(item) === 'active' ? 'uploading' : entryPhase(item))" effect="plain" round size="small">{{ entryStatus(item) }}</el-tag>
                 <span v-else class="queue-empty">—</span>
               </div>
             </li>
@@ -177,9 +180,9 @@ const entrySize = (item) => {
 /* 在固定大小的 HTML 盒子上旋转，避免依赖不同 WebView 的 SVG transform-box 实现。 */
 .upload-dir__spinner { display: inline-flex; width: 16px; height: 16px; flex: none; transform-origin: center; animation: upload-directory-spin 0.9s linear infinite; }
 @keyframes upload-directory-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-/* 旋转只是“进行中”的辅助表达，用户要求减少动效时改为静态图标。 */
+/* 减少动效时降低旋转频率，仍保留上传中的必要活动反馈。 */
 @media (prefers-reduced-motion: reduce) {
-  .upload-dir__spinner { animation: none; }
+  .upload-dir__spinner { animation-duration: 2.4s; }
 }
 .upload-dir__notice { font-size: 11.5px; color: var(--app-text-muted); }
 
@@ -191,7 +194,7 @@ const entrySize = (item) => {
 .transfer-queue { list-style: none; max-height: min(360px, 45vh); overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; margin: 0; padding: 0; border: 1px solid var(--app-border); border-radius: 10px; }
 .transfer-queue li { padding: 9px 11px; }
 .transfer-queue li + li { border-top: 1px solid var(--app-border); }
-.transfer-queue li.is-active { background: color-mix(in oklab, var(--el-color-primary) 20%, transparent); }
+.transfer-queue li.is-active { background: linear-gradient(to right, color-mix(in oklab, var(--el-color-primary) 20%, transparent) var(--upload-progress, 0%), transparent var(--upload-progress, 0%)); }
 
 .queue-cell { min-width: 0; }
 .queue-cell--path { display: flex; align-items: center; gap: 9px; }

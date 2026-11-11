@@ -62,6 +62,8 @@ pub(crate) enum PeerBrowser {
     },
 }
 pub(crate) struct PeerUploadBatch {
+    pub entry_states: std::collections::HashMap<String, (String, u64)>,
+    pub progress: Arc<std::sync::atomic::AtomicU64>,
     pub status: PeerUploadSummary,
     pub roots: Option<Vec<SelectedRoot>>,
     pub browser: Arc<tokio::sync::Mutex<PeerBrowser>>,

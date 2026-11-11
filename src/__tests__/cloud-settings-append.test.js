@@ -454,6 +454,16 @@ describe("append settings through unified invoke", () => {
     expect(nativeInvoke).toHaveBeenCalledWith('cloud_sync', { mappingId: 'a1', previewId: 'fresh' });
     w.unmount();
   });
+  it('shows a notice instead of an error for a duplicate manual sync', async () => {
+    rows.mappings = [{ id: 'a1', connectionId: 'c1', repositoryId: 'append-repo', localRoot: '/local' }];
+    const w = await mountSettings();
+    nativeInvoke.mockRejectedValueOnce({ code: 'SYNC_ALREADY_RUNNING', message: 'Already running' });
+    await w.find('.mapping-sync').trigger('click'); await flushPromises();
+    expect(app.setNotice).toHaveBeenCalledWith('cloud.syncAlreadyRunning');
+    expect(app.handleFailure).not.toHaveBeenCalled();
+    expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_sync')).toBe(false);
+    w.unmount();
+  });
   it('does not sync an empty plan and clears loading after a preview error', async () => {
     rows.mappings = [{ id: 'a1', connectionId: 'c1', repositoryId: 'append-repo', localRoot: '/local' }];
     const w = await mountSettings();

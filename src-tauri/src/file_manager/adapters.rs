@@ -312,6 +312,13 @@ impl BrowserBackend for PeerBrowserBackend {
 }
 
 impl BrowserBackend for CloudBrowserBackend {
+    fn supports_move(&self) -> bool { true }
+    fn move_entry<'a>(&'a self, peers: &'a PeerManager, cloud: &'a CloudRuntime, id: &'a str, destination: &'a str) -> BoxFuture<'a, Result<(), AppError>> {
+        Box::pin(async move {
+            self.admit(peers, cloud).await?;
+            cloud.object_move(&self.connection_id, self.revision, &self.identity, id, destination).await
+        })
+    }
     fn prepare<'a>(&'a self, peers: &'a PeerManager, cloud: &'a CloudRuntime) -> BoxFuture<'a, Result<(), AppError>> {
         Box::pin(async move {
             self.admit(peers, cloud).await?;

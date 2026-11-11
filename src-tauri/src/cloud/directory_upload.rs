@@ -5,7 +5,7 @@ use super::{
 #[cfg(test)]
 use crate::local_upload::open_directory_checked;
 use crate::{AppError, DomainError};
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{FutureExt, StreamExt, TryStreamExt};
 use std::{
     path::Path,
     sync::{
@@ -59,7 +59,7 @@ impl CloudRuntime {
         let mut state = self.objects.lock().await;
         state.prune();
         if state.upload_directories.len() >= 4 || state.local_handle_count().saturating_add(files.len()) > MAX_LOCAL_HANDLES { return Err(invalid()); }
-        state.upload_directories.insert(status.batch_id.clone(), DirectoryBatch { status: status.clone(), session, root: None, files: Some(files), browser: Arc::new(tokio::sync::Mutex::new(browser)), cancel: Arc::new(AtomicBool::new(false)), cancel_signal: Arc::new(tokio::sync::Notify::new()), decision: Arc::new(tokio::sync::Notify::new()), resolution: None, handle: None, stopping: Arc::new(tokio::sync::Mutex::new(())), created: std::time::Instant::now(), lifecycle });
+        state.upload_directories.insert(status.batch_id.clone(), DirectoryBatch { entry_states: Default::default(), progress: Default::default(), status: status.clone(), session, root: None, files: Some(files), browser: Arc::new(tokio::sync::Mutex::new(browser)), cancel: Arc::new(AtomicBool::new(false)), cancel_signal: Arc::new(tokio::sync::Notify::new()), decision: Arc::new(tokio::sync::Notify::new()), resolution: None, handle: None, stopping: Arc::new(tokio::sync::Mutex::new(())), created: std::time::Instant::now(), lifecycle });
         Ok(status)
     }
     pub(crate) async fn object_select_upload_directory(
@@ -141,6 +141,7 @@ impl CloudRuntime {
         state.upload_directories.insert(
             status.batch_id.clone(),
             DirectoryBatch {
+                entry_states: Default::default(), progress: Default::default(),
                 status: status.clone(),
                 session,
                 root: Some(root),
@@ -306,6 +307,7 @@ impl CloudRuntime {
                 let mut state = self.objects.lock().await;
                 let batch = state.upload_directories.get_mut(id).ok_or_else(invalid)?;
                 batch.status.current_relative_path = Some(file.relative.clone());
+                batch.progress.store(0, std::sync::atomic::Ordering::Relaxed);
                 // 目录批次流式扫描，只有发现一个文件才能确定总量；选中文件批次已在选择时计数。
                 if walked {
                     batch.status.total_files += 1;
@@ -370,6 +372,7 @@ impl CloudRuntime {
                     let mut state = self.objects.lock().await;
                     let batch = state.upload_directories.get_mut(id).ok_or_else(invalid)?;
                     batch.status.skipped_files += 1;
+                    crate::local_upload::record_upload_entry(&mut batch.entry_states, file.relative.clone(), "skipped".into(), 0);
                     batch.status.current_relative_path = None;
                     batch.status.conflict = None;
                     batch.status.phase = "running".into();
@@ -406,6 +409,7 @@ impl CloudRuntime {
                 batch.status.conflict = None;
                 batch.status.phase = "running".into();
             }
+            let progress = self.objects.lock().await.upload_directories.get(id).ok_or_else(invalid)?.progress.clone();
             let stream = futures_util::stream::try_unfold(
                 tokio::fs::File::from_std(file.file),
                 |mut file| async move {
@@ -426,6 +430,7 @@ impl CloudRuntime {
                     Ok(Some((bytes::Bytes::from(buffer), file)))
                 },
             )
+            .inspect_ok(move |bytes| { progress.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed); })
             .boxed();
             let result = session
                 .service
@@ -463,6 +468,7 @@ impl CloudRuntime {
             let batch = state.upload_directories.get_mut(id).ok_or_else(invalid)?;
             batch.status.completed_files += 1;
             batch.status.completed_bytes += file.size;
+            crate::local_upload::record_upload_entry(&mut batch.entry_states, file.relative.clone(), "completed".into(), file.size);
             batch.status.current_relative_path = None;
             batch.status.conflict = None;
             batch.status.phase = "running".into();
@@ -478,6 +484,7 @@ impl CloudRuntime {
                 Err(_) => "failed",
             }
             .into();
+            if let Some(path) = batch.status.current_relative_path.clone() { crate::local_upload::record_upload_entry(&mut batch.entry_states, path, batch.status.phase.clone(), batch.progress.load(std::sync::atomic::Ordering::Relaxed)); }
             batch.status.error = result.err();
             batch.status.conflict = None;
             batch.status.current_relative_path = None;
@@ -611,7 +618,7 @@ impl CloudRuntime {
                 batch.status.phase == "completed",
             )
         };
-        tokio::task::spawn_blocking(move || {
+        let mut page = tokio::task::spawn_blocking(move || {
             browser
                 .blocking_lock()
                 .page(directory_token, cursor, limit, active, completed)
@@ -621,7 +628,14 @@ impl CloudRuntime {
             app(DomainError::Internal {
                 detail: e.to_string(),
             })
-        })?
+        })??;
+        let state = self.objects.lock().await;
+        let batch = state.upload_directories.get(id).ok_or_else(invalid)?;
+        for entry in &mut page.entries {
+            if let Some((phase, bytes)) = batch.entry_states.get(&entry.relative_path) { entry.phase = phase.clone(); entry.transferred = Some(*bytes); }
+            else if batch.status.current_relative_path.as_deref() == Some(entry.relative_path.as_str()) { entry.transferred = Some(batch.progress.load(std::sync::atomic::Ordering::Relaxed).min(entry.size)); }
+        }
+        Ok(page)
     }
     pub async fn object_release_upload_directory(
         &self,

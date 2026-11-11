@@ -298,6 +298,32 @@ impl BrowserBackend for OfficialBrowserBackend {
     fn upload_resolve<'a>(&'a self, peers: &'a Arc<PeerManager>, cloud: &'a Arc<CloudRuntime>, id: &'a str, conflict_id: &'a str, decision: crate::cloud::directory_types::DirectoryConflictPolicy, apply_to_remaining: bool) -> BoxFuture<'a, Result<(), AppError>> {
         Box::pin(async move { self.admit(peers, cloud).await?; crate::traits::UploadQueueAdapter::resolve(&OfficialUploadAdapter { backend: self, cloud }, id, conflict_id, decision, apply_to_remaining).await })
     }
+    fn supports_move(&self) -> bool { self.provider != crate::cloud::oauth_types::OfficialProvider::BaiduNetdisk }
+    fn move_entry<'a>(&'a self, peers: &'a PeerManager, cloud: &'a CloudRuntime, id: &'a str, destination: &'a str) -> BoxFuture<'a, Result<(), AppError>> {
+        Box::pin(async move {
+            self.admit_write(peers, cloud, id).await?;
+            self.admit_write(peers, cloud, destination).await?;
+            if id.is_empty() || id == destination { return Err(super::service::invalid()); }
+            let from = self.parents.lock().await.get(id).cloned().ok_or_else(super::service::invalid)?;
+            let target = if destination.is_empty() { self.root_id.clone() } else { self.directories.lock().await.get(destination).cloned().ok_or_else(super::service::invalid)? };
+            if from == destination { return Err(super::service::invalid()); }
+            {
+                let parents = self.parents.lock().await;
+                let mut current = destination;
+                let mut visited = std::collections::HashSet::new();
+                while !current.is_empty() {
+                    if current == id || !visited.insert(current) || visited.len() > crate::download_types::MAX_DOWNLOAD_DEPTH { return Err(super::service::invalid()); }
+                    current = parents.get(current).ok_or_else(super::service::invalid)?;
+                }
+            }
+            let from_id = if from.is_empty() { self.root_id.clone() } else { self.directories.lock().await.get(&from).cloned().ok_or_else(super::service::invalid)? };
+            let _network = cloud.network.read().await;
+            let (_, api) = cloud.official_api(&self.connection_id).await?;
+            api.move_item(id, &from_id, &target).await.map_err(crate::cloud::official_runtime::api_error)?;
+            self.parents.lock().await.insert(id.into(), destination.into());
+            Ok(())
+        })
+    }
     fn create_dir<'a>(&'a self, peers: &'a PeerManager, cloud: &'a CloudRuntime, path: &'a str, name: &'a str) -> BoxFuture<'a, Result<FileEntryDto, AppError>> {
         Box::pin(async move {
             self.admit_write(peers, cloud, path).await?;
@@ -498,10 +524,11 @@ impl BrowserBackend for OfficialBrowserBackend {
                 let name = visible.split('/').next().ok_or_else(super::service::invalid)?.to_owned();
                 let directory = visible.contains('/');
                 let relative_path = if status.root_name.is_empty() { name.clone() } else { format!("{}/{name}", status.root_name) };
-                listed.entry(name.clone()).or_insert(crate::local_upload_types::DirectoryEntryDto { name, relative_path, kind: if directory { "directory" } else { "file" }.into(), size: if directory { 0 } else { file.size }, directory_token: None, phase: "selected".into() });
+                listed.entry(name.clone()).or_insert(crate::local_upload_types::DirectoryEntryDto { name, relative_path, kind: if directory { "directory" } else { "file" }.into(), size: if directory { 0 } else { file.size }, directory_token: None, phase: "selected".into(), transferred: Some(0) });
             }
             let page = crate::local_upload_types::DirectoryPageDto { directory_token: id.clone(), parent_token: None, relative_path: status.root_name.clone(), entries: listed.into_values().collect(), next_cursor: None };
-            jobs.insert(id, OfficialUploadJob { decision: Default::default(), resolution: None, page, parent, files, status: status.clone(), cancel: cloud.vault.transfer_cancellation().map_err(AppError::from)?.child_token(), handle: None });
+            let entry_states = files.iter().map(|file| (file.relative.clone(), ("selected".into(), 0, file.size))).collect();
+            jobs.insert(id, OfficialUploadJob { entry_states, progress: Default::default(), decision: Default::default(), resolution: None, page, parent, files, status: status.clone(), cancel: cloud.vault.transfer_cancellation().map_err(AppError::from)?.child_token(), handle: None });
             Ok(FileUploadDto::Cloud(status))
         })
     }

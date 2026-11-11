@@ -11,6 +11,7 @@ pub struct ObjectEntryDto {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectPageDto {
+    pub breadcrumbs: Vec<crate::file_manager::types::FileBreadcrumbDto>,
     pub prefix: String,
     pub objects: Vec<ObjectEntryDto>,
     pub next: Option<String>,

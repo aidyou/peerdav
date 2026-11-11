@@ -6,6 +6,13 @@ use crate::local_upload_types::*;
 use crate::{AppError, DomainError};
 use cap_fs_ext::DirExt;
 
+pub(crate) fn record_upload_entry(states: &mut std::collections::HashMap<String, (String, u64)>, path: String, phase: String, bytes: u64) {
+    if states.len() >= MAX_UPLOAD_ENTRY_STATES && !states.contains_key(&path) {
+        if let Some(previous) = states.keys().next().cloned() { states.remove(&previous); }
+    }
+    states.insert(path, (phase, bytes));
+}
+
 /// One lifecycle dispatcher for every upload transport. Cancellation is joined by
 /// the adapter before the final status is returned; unknown actions never succeed.
 pub(crate) async fn queue_action<A: crate::traits::UploadQueueAdapter>(adapter: &A, id: &str, action: crate::file_manager::types::UploadAction) -> Result<A::Status, AppError> {
@@ -54,7 +61,7 @@ pub(crate) fn open_selected_files(paths: Vec<std::path::PathBuf>) -> Result<(Vec
         if !meta.is_file() || meta.file_type().is_symlink() { return Err(invalid()); }
         let file = open_file_checked(&dir, &name, &meta)?;
         let size = file.metadata().map_err(io)?.len();
-        entries.push(DirectoryEntryDto { name: name.clone(), relative_path: name.clone(), kind: "file".into(), size, directory_token: None, phase: "unscanned".into() });
+        entries.push(DirectoryEntryDto { name: name.clone(), relative_path: name.clone(), kind: "file".into(), size, directory_token: None, phase: "unscanned".into(), transferred: None });
         files.push(DirectoryFile { relative: name, file, size });
     }
     Ok((files, crate::peer_upload_types::PeerBrowser::Files { entries, token: token()?, cursor: None }))
@@ -453,6 +460,7 @@ impl DirectoryBrowser {
                 size: meta.len(),
                 directory_token,
                 phase: phase.into(),
+                transferred: None,
             });
         }
         self.cursor = if exhausted { None } else { Some(token()?) };
@@ -470,6 +478,16 @@ impl DirectoryBrowser {
 mod queue_conflict_tests {
     use super::*;
     use crate::cloud::directory_types::DirectoryConflictPolicy as Policy;
+
+    #[test]
+    fn upload_entry_state_cache_is_bounded_and_updates_existing_entries() {
+        let mut states = std::collections::HashMap::new();
+        for index in 0..MAX_UPLOAD_ENTRY_STATES + 1 { record_upload_entry(&mut states, format!("{index}"), "completed".into(), 7); }
+        assert_eq!(states.len(), MAX_UPLOAD_ENTRY_STATES);
+        record_upload_entry(&mut states, MAX_UPLOAD_ENTRY_STATES.to_string(), "skipped".into(), 0);
+        assert_eq!(states.len(), MAX_UPLOAD_ENTRY_STATES);
+        assert_eq!(states.get(&MAX_UPLOAD_ENTRY_STATES.to_string()), Some(&("skipped".into(), 0)));
+    }
 
     #[tokio::test]
     async fn resolution_matrix_caches_only_current_queue_remaining_decisions() {

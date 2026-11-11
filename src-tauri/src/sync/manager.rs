@@ -67,6 +67,11 @@ impl SyncManager {
     pub fn is_open(&self) -> bool {
         self.state().gate
     }
+    pub fn is_running(&self, id: &str) -> bool {
+        let mut state = self.state();
+        Self::reap(&mut state, id);
+        state.runs.contains_key(id) || state.stopping.contains(id)
+    }
     pub fn status(&self, id: &str) -> SyncStatus {
         self.statuses()
             .get(id)

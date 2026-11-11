@@ -46,11 +46,12 @@ function findInDocument(wrapper, selector) {
 async function browser(mode = "list") { if (mode !== null) localStorage.setItem("peerdav.cloudView", mode); const wrapper = mount(CloudBrowser, { attachTo: document.body, props: { connectionId: "c1" }, global: { stubs: { "el-button": button, "el-input": input, "el-select": select, "el-option": option, "el-dialog": dialog, "el-progress": progress, "el-tag": { template: "<span><slot /></span>" } } } }); wrappers.push(wrapper); await flushPromises(); return wrapper; }
 async function click(wrapper, selector) { await findInDocument(wrapper, selector).trigger("click"); await flushPromises(); }
 async function prepare() { await flushPromises(); }
-function textButton(wrapper, label) { return wrapper.findAll("button").find((item) => item.text() === label); }
+function textButton(wrapper, label) { return wrapper.findAll("button").find((item) => item.text() === label || item.attributes("aria-label") === label); }
 beforeEach(() => {
   vi.useFakeTimers(); nativeInvoke.mockReset(); confirmAction.mockReset(); confirmAction.mockResolvedValue(true); setLocale("en");
   localStorage.removeItem("peerdav.cloudView");
   localStorage.removeItem("peerdav.cloudViewScope");
+  for (const key of Object.keys(localStorage)) { if (key.startsWith('peerdav.fileLocation:')) localStorage.removeItem(key); }
   handlers = { cloud_list: () => ({ connections: [{ id: "c1", name: "Main", bucket: "main", buckets: ["main", "photos"], prefix: "configured/" }, { id: "c2", name: "Other", bucket: "main", buckets: ["main"] }] }), cloud_object_select_bucket: () => ({}), cloud_object_list: () => page([file]), cloud_object_status: () => [], cloud_object_discover: () => ({ complete: true }), cloud_object_prepare: () => ({ physicalId: "physical", discovered: true }), cloud_object_select_local: () => ({ token: "opaque", fileName: "a.txt", localPath: "/must-not-leak" }), cloud_object_upload: () => transfer(), cloud_object_download: () => transfer("running", { direction: "download" }), cloud_object_cancel: () => transfer("cancelling"), reveal_local_directory: () => ({}), cloud_object_recovery_acknowledge: () => transfer("acknowledged"), cloud_object_delete_plan: () => deletePlan(), cloud_object_delete_execute: () => ({ deleted: [file.key], failed: [] }) };
   Object.assign(app, { invoke: nativeInvoke, clearMessages: vi.fn() });
   Object.assign(handlers, {
@@ -99,12 +100,22 @@ beforeEach(() => {
       connections: result.connections?.map(connection => ({ browserCapabilities: { selectRoot: true, syncDrives: true }, ...connection })),
       officialConnections: result.officialConnections?.map(connection => ({ browserCapabilities: { selectRoot: false, syncDrives: connection.protocolId === 'google_drive' }, ...connection })),
     };
+    if (command === 'cloud_local_entries' && Array.isArray(result)) {
+      const path = args.path || '';
+      if (path && !result.some(entry => entry.path === path && entry.isDir)) throw error('CLOUD_PATH_INVALID', 'Directory not found');
+      let current = '';
+      return { entries: result, breadcrumbs: [{ id: '', name: 'Drive' }, ...path.split('/').filter(Boolean).map(name => { current = current ? `${current}/${name}` : name; return { id: current, name }; })] };
+    }
     if (command !== 'file_list') return result;
     // Legacy object fixtures are adapted here, not in the production browser.
     const { path, ...page } = result;
     let parent = '';
     const crumbs = page.breadcrumbs ?? (page.id ?? path ?? '').split('/').filter(Boolean).map(name => { parent += `${name}/`; return { id: parent, name }; });
-    return { ...page, id: page.id ?? path, breadcrumbs: crumbs.map(({ path, ...crumb }) => ({ ...crumb, id: crumb.id ?? path })), entries: page.entries.map(({ path, ...entry }) => ({ ...entry, id: entry.id ?? path })) };
+    const catalog = await handlers.cloud_list();
+    const connection = catalog.officialConnections?.find(item => item.id === 'c1');
+    const rootName = connection?.name || 'main';
+    const fullCrumbs = [{ id: '', name: rootName }, ...crumbs.filter(crumb => (crumb.id ?? crumb.path) !== '').map(crumb => ({ ...crumb, name: crumb.name === '_peerdav_encrypt' ? t('cloudBrowser.encryptedDrive') : crumb.name === '_peerdav_mirror' ? t('cloudBrowser.mirrorDrive') : crumb.name }))];
+    return { ...page, id: page.id ?? path, breadcrumbs: fullCrumbs.map(({ path, ...crumb }) => ({ ...crumb, id: crumb.id ?? path })), entries: page.entries.map(({ path, ...entry }) => ({ ...entry, id: entry.id ?? path })) };
   });
 });
 afterEach(() => { wrappers.splice(0).forEach((wrapper) => { if (wrapper.exists()) wrapper.unmount(); }); document.body.innerHTML = ''; vi.useRealTimers(); });
@@ -338,6 +349,19 @@ describe("official cloud sessions", () => {
     } finally { prompt.mockRestore(); }
   });
 
+  it.each([false, true])('confirms remote drag moves before invoking file_move (%s)', async confirmed => {
+    confirmAction.mockResolvedValue(confirmed);
+    handlers.file_open_session = () => ({ sessionId: 'official', root: '', supportsMove: true, capabilities: { preview: true } });
+    handlers.file_move = () => null;
+    const wrapper = await browser('list');
+    const manager = wrapper.findComponent({ name: 'FileManagerView' });
+    expect(manager.props('moveEnabled')).toBe(true);
+    manager.vm.$emit('move', [{ id: 'source', name: 'a.txt', isDir: false }], { id: 'target', name: 'Folder', isDir: true });
+    await flushPromises();
+    expect(nativeInvoke.mock.calls.some(([name]) => name === 'file_move')).toBe(confirmed);
+    if (confirmed) expect(nativeInvoke).toHaveBeenCalledWith('file_move', { sessionId: 'official', id: 'source', destination: 'target' });
+  });
+
   it('offers preview, system editing and last-position deletion using session capabilities', async () => {
     handlers.cloud_list = () => ({ connections: [], officialConnections: [{ id: 'c1', name: 'Google', protocolId: 'google_drive', rootId: 'root' }] });
     handlers.file_open_session = () => ({ sessionId: 'official', root: '', capabilities: { preview: true, onlinePreview: true, externalEdit: true, delete: true, download: true } });
@@ -399,8 +423,9 @@ describe("official cloud sessions", () => {
     expect(wrapper.find('[data-key="~61/~62"]').text()).toContain('notes.txt');
     wrapper.unmount();
     wrapper = await browser();
-    expect(wrapper.find('[data-key="~61/"]').exists()).toBe(true);
-    expect(wrapper.find('[data-key="~63/"]').exists()).toBe(true);
+    expect(wrapper.find('[data-key="~61/~62"]').exists()).toBe(true);
+    expect(wrapper.find('.breadcrumbs').text()).toContain('Official');
+    expect(wrapper.find('.breadcrumbs').text()).toContain('Documents');
     expect(document.body.textContent).not.toContain('FILE_CAPABILITY_UNAVAILABLE');
     expect(document.body.textContent).not.toContain('CLOUD_DISCOVERY_INCOMPLETE');
     expect(nativeInvoke.mock.calls.some(([name]) => name === 'cloud_object_prepare' || name === 'cloud_object_select_bucket')).toBe(false);
@@ -549,6 +574,65 @@ describe("local sync-drive contents", () => {
   const catalog = () => ({ connections: [{ id: 'c1', name: 'Main', bucket: 'main', buckets: ['main', 'photos'] }], mappings: [{ id: 'm1', connectionId: 'c1', repositoryId: 'r1', localRoot: '/local/Documents' }, { id: 'm2', connectionId: 'c1', repositoryId: 'r2', localRoot: '/local/Pictures' }] });
   const contents = () => [{ path: 'docs', name: 'docs', isDir: true, size: 0, synced: false }, { path: 'docs/new.txt', name: 'new.txt', isDir: false, size: 4, synced: false }, { path: 'done.txt', name: 'done.txt', isDir: false, size: 2, synced: true }];
   beforeEach(() => { handlers.cloud_list = catalog; handlers.cloud_local_entries = contents; handlers.cloud_local_status = contents; handlers.cloud_status = () => []; handlers.cloud_preview = () => ({ previewId: 'plan', summary: { uploads: 1, downloads: 0, deletes: 0, conflicts: 0 } }); handlers.cloud_sync = () => ({ runId: 1 }); });
+  it('supports additive local selection and disables file-only actions for multiple entries', async () => {
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    await wrapper.find('[data-path="done.txt"]').trigger('click');
+    await wrapper.find('[data-path="docs"]').trigger('click', { ctrlKey: true });
+    expect(wrapper.findAll('[aria-selected="true"]')).toHaveLength(2);
+    expect(wrapper.find('[data-test="local-bar-preview"]').attributes('disabled')).toBeDefined();
+    expect(wrapper.find('[data-test="local-bar-open"]').attributes('disabled')).toBeDefined();
+    expect(wrapper.find('[data-test="local-bar-delete"]').attributes('disabled')).toBeUndefined();
+  });
+  it('does not delete after the user changes drives while confirmation is open', async () => {
+    const pending = deferred(); confirmAction.mockReturnValue(pending.promise);
+    handlers.cloud_local_mutate = () => null;
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    await wrapper.find('[data-path="done.txt"]').trigger('click');
+    await click(wrapper, '[data-test="local-bar-delete"]');
+    await wrapper.findAll('.drive-link')[1].trigger('click'); await flushPromises();
+    pending.resolve(true); await flushPromises();
+    expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_local_mutate')).toBe(false);
+  });
+  it.each([false, true])('confirms local drag moves before any mutation (confirmed=%s)', async confirmed => {
+    confirmAction.mockResolvedValue(confirmed);
+    handlers.cloud_local_mutate = () => null;
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    const manager = wrapper.findComponent({ name: 'FileManagerView' });
+    manager.vm.$emit('move', [{ path: 'done.txt', name: 'done.txt', isDir: false }], { path: 'docs', name: 'docs', isDir: true });
+    await flushPromises();
+    expect(confirmAction).toHaveBeenCalled();
+    expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_local_mutate')).toBe(confirmed);
+    if (confirmed) expect(nativeInvoke).toHaveBeenCalledWith('cloud_preview', { mappingId: 'm1', selection: ['done.txt', 'docs/done.txt'] });
+  });
+  it('keeps local actions in three titlebar groups and previews without transfers', async () => {
+    handlers.cloud_local_preview = () => ({ fileName: 'done.txt', mime: 'text/plain', encoding: 'utf8', data: 'local text', size: 10 });
+    handlers.cloud_local_open = () => null;
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    const toolbar = wrapper.find('.local-titlebar-actions');
+    expect(toolbar.findAll('[role="group"]')).toHaveLength(3);
+    expect(toolbar.findAll('.titlebar-divider')).toHaveLength(3);
+    expect(toolbar.findAll('.view-switch__button')).toHaveLength(12);
+    await wrapper.find('[data-path="done.txt"]').trigger('click'); await flushPromises();
+    expect(wrapper.find('.local-selection-bar').findAll('.bar-action')).toHaveLength(5);
+    await click(wrapper, '[data-test="local-bar-preview"]');
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_preview', { mappingId: 'm1', path: 'done.txt' });
+    expect(wrapper.text()).toContain('local text');
+    await click(wrapper, '[data-test="local-open"]');
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_open', { mappingId: 'm1', path: 'done.txt' });
+    expect(nativeInvoke.mock.calls.some(([command]) => ['file_select_download', 'file_select_upload', 'cloud_object_preview'].includes(command))).toBe(false);
+  });
+  it('deletes locally before requesting a selection-scoped sync', async () => {
+    handlers.cloud_local_mutate = () => null;
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    await wrapper.find('[data-path="done.txt"]').trigger('click'); await flushPromises();
+    await click(wrapper, '[data-test="local-delete"]');
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_mutate', { mappingId: 'm1', path: 'done.txt', destination: null, confirmed: true });
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_preview', { mappingId: 'm1', selection: ['done.txt'] });
+    const commands = nativeInvoke.mock.calls.map(([command]) => command);
+    expect(commands.indexOf('cloud_local_mutate')).toBeLessThan(commands.indexOf('cloud_preview'));
+    expect(commands).toContain('cloud_sync');
+    expect(commands).not.toContain('file_delete_execute');
+  });
   it('shows running status in the drive list before opening it and clears it after completion', async () => {
     handlers.cloud_list = () => ({ ...catalog(), statuses: [{ mappingId: 'm1', phase: 'uploading', runId: 1 }] });
     handlers.cloud_status = () => [{ mappingId: 'm1', phase: 'completed', runId: 1 }];
@@ -609,7 +693,7 @@ describe("local sync-drive contents", () => {
   it.each(['icons', 'list', 'columns', 'gallery'])('reuses the shared %s view with real local paths and sync markers', async (mode) => {
     const wrapper = await browser(mode); await click(wrapper, '.drive-link');
     expect(wrapper.findAll('.drive-link').map(link => link.text())).toEqual(['Documents', 'Pictures']);
-    expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_entries', { mappingId: 'm1' });
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_entries', { mappingId: 'm1', path: '' });
     const manager = wrapper.findComponent({ name: 'FileManagerView' });
     expect(manager.props('entries').map(entry => entry.path)).toEqual(['docs', 'done.txt']);
     expect(wrapper.findAll('.entry-status')).toHaveLength(1);
@@ -617,7 +701,8 @@ describe("local sync-drive contents", () => {
     expect(nativeInvoke).toHaveBeenCalledWith('cloud_preview', { mappingId: 'm1', selection: ['docs'] });
     expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_sync')).toBe(false);
     expect(wrapper.find('.local-plan').text()).toContain('1');
-    expect(wrapper.text()).toContain(t('drive.syncWholeHint'));
+    expect(wrapper.text()).not.toContain(t('drive.syncWholeHint'));
+    expect(wrapper.find(`[aria-label="${t('drive.help')}"]`).exists()).toBe(true);
     await textButton(wrapper, t('drive.applyPlan')).trigger('click'); await flushPromises();
     expect(nativeInvoke).toHaveBeenCalledWith('cloud_sync', { mappingId: 'm1', previewId: 'plan' });
     handlers.cloud_status = () => [{ mappingId: 'm1', phase: 'completed', runId: 1 }];
@@ -642,7 +727,7 @@ describe("local sync-drive contents", () => {
     expect(wrapper.findComponent({ name: 'FileManagerView' }).props('selection').map(entry => entry.path)).toEqual(['docs/new.txt']);
     expect(wrapper.find('.local-plan').exists()).toBe(true);
     await wrapper.findAll('.drive-link')[1].trigger('click'); await flushPromises();
-    expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_entries', { mappingId: 'm2' });
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_entries', { mappingId: 'm2', path: '' });
   });
   it('navigates local folders and changes modes without requesting S3 listings', async () => {
     const wrapper = await browser('list'); await click(wrapper, '.drive-link');
@@ -673,6 +758,16 @@ describe("local sync-drive contents", () => {
     expect(textButton(wrapper, t('drive.syncNow')).attributes('disabled')).toBeDefined();
     await click(wrapper, '.entry-status');
     expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_preview')).toBe(false);
+  });
+  it.each(['list', 'icons', 'columns', 'gallery'])('keeps the local directory after refresh and WebView reload in %s mode', async mode => {
+    let wrapper = await browser(mode); await click(wrapper, '.drive-link');
+    await wrapper.find('[data-path="docs"]').trigger('dblclick'); await flushPromises();
+    await textButton(wrapper, t('cloudBrowser.refresh')).trigger('click'); await flushPromises();
+    expect(wrapper.find('.breadcrumbs').text()).toContain('docs');
+    wrapper.unmount();
+    wrapper = await browser(mode);
+    expect(wrapper.find('.breadcrumbs').text()).toContain('docs');
+    expect(wrapper.findAll('.breadcrumb')).toHaveLength(2);
   });
   it('returns to the local root if refresh removes the open directory', async () => {
     const wrapper = await browser('list'); await click(wrapper, '.drive-link');
@@ -798,6 +893,7 @@ describe("streaming directory upload", () => {
   });
   it.each(['connection', 'bucket', 'unmount'])('releases late picker and start responses on %s changes', async (change) => {
     for (const stage of ['select', 'start']) {
+      localStorage.removeItem('peerdav.cloudViewScope');
       const pending = deferred(); handlers[`cloud_object_${stage}_upload_directory`] = () => pending.promise;
       const wrapper = await browser(); await click(wrapper, '[data-test=upload-directory]');
       if (change === 'connection') await wrapper.setProps({ connectionId: 'c2' });
@@ -926,8 +1022,7 @@ describe("CloudBrowser", () => {
     const wrapper = await browser();
     const rows = wrapper.findAll('tbody tr');
     await rows[2].trigger('click'); await rows[0].trigger('click', { ctrlKey: true });
-    expect(wrapper.find('.selection-actions [data-test=download]').classes()).toContain('el-button--primary');
-    expect(wrapper.find('.selection-actions [data-test=download]').classes()).toContain('is-plain');
+    expect(wrapper.find('.selection-actions [data-test=download]').classes()).toContain('bar-action');
     await click(wrapper, '.selection-actions [data-test=download]');
     expect(nativeInvoke.mock.calls.find(([name]) => name === 'file_select_download')[1].selection).toEqual({ mode: 'files', ids: ['a.txt', 'c.txt'] });
     await click(wrapper, '[data-test=refresh]');
@@ -946,13 +1041,13 @@ describe("CloudBrowser", () => {
     expect(wrapper.find('.column-empty').exists()).toBe(false);
     await click(wrapper, '[data-key="b/"]');
     second.resolve(page([{ key: 'b/new.txt', size: 2 }])); await flushPromises();
-    expect(wrapper.find('.selection-summary').text()).toContain('b');
+    expect(wrapper.findAll('.column')[1].text()).toContain('new.txt');
     first.resolve(page([{ key: 'a/obsolete.txt' }])); await flushPromises();
     expect(wrapper.find('.column-view').text()).toContain('new.txt');
     expect(wrapper.find('.column-view').text()).not.toContain('obsolete.txt');
     expect(nativeInvoke.mock.calls.filter(([name, args]) => name === 'file_list' && args.id === '')).toHaveLength(1);
     await click(wrapper, '[data-key="b/new.txt"]');
-    expect(wrapper.find('.selection-summary').text()).toContain('new.txt');
+    expect(wrapper.find('.column-view .is-selected').attributes('data-key')).toBe('b/new.txt');
   });
   it.each(['icons', 'columns', 'gallery'])("uses a %s skeleton for the first pending listing and removes it on failure", async (mode) => {
     const listing = deferred();
@@ -992,11 +1087,11 @@ describe("CloudBrowser", () => {
     expect(nativeInvoke.mock.calls.filter(([name, args]) => name === 'file_list' && args.id === 'docs/')).toHaveLength(1);
     expect(wrapper.findAll('.column')).toHaveLength(2);
     listing.resolve(page([{ key: 'docs/file.txt' }])); await flushPromises();
-    expect(wrapper.find('.selection-summary').text()).toContain('docs');
-    expect(textButton(wrapper, t('peer.open'))).toBeUndefined();
+    expect(wrapper.find('.column-view .is-selected').attributes('data-key')).toBe('docs/');
+    expect(wrapper.find('.selection-actions [data-test=open]').exists()).toBe(false);
     expect(wrapper.find('.selection-actions [data-test=download]').classes()).not.toContain('el-button--primary');
     await click(wrapper, '[aria-label="List"]');
-    expect(textButton(wrapper, t('peer.open'))).toBeDefined();
+    expect(wrapper.find('.selection-actions [data-test=open]').exists()).toBe(true);
   });
   it("shows ancestor rebuilding as loading, recovers failed ancestors and invalidates a connection switch", async () => {
     handlers.cloud_object_list = ({ prefix }) => prefix ? page([{ key: 'docs/file.txt' }]) : page([{ key: 'docs/file.txt' }]);
@@ -1544,10 +1639,10 @@ describe("CloudBrowser", () => {
     const rows = wrapper.findAll('[data-test=file-row]');
     await rows[0].trigger('click');
     await rows[1].trigger('click', { ctrlKey: true });
-    expect(wrapper.find('.selection-summary').text()).toContain(t('peer.selectedCount', { count: 2 }));
+    expect(wrapper.findAll('[data-test=file-row].is-selected')).toHaveLength(2);
     // The range starts at the last clicked row, so b..c replaces the add-on.
     await rows[2].trigger('click', { shiftKey: true });
-    expect(wrapper.find('.selection-summary').text()).toContain(t('peer.selectedCount', { count: 2 }));
+    expect(wrapper.findAll('[data-test=file-row].is-selected').map(row => row.attributes('data-key'))).toEqual(['b.txt', 'c.txt']);
     await textButton(wrapper, t('cloudBrowser.download')).trigger('click');
     await flushPromises();
     expect(nativeInvoke).toHaveBeenCalledWith('file_select_download', {
@@ -1674,11 +1769,11 @@ describe("CloudBrowser", () => {
     const wrapper = await browser();
     const view = wrapper.find(".file-view");
     await view.trigger("keydown", { key: "ArrowDown" });
-    expect(wrapper.find(".selection-summary").text()).toContain("docs");
+    expect(wrapper.find(".is-selected").attributes("data-key")).toBe("docs/");
     await view.trigger("keydown", { key: "ArrowDown" });
-    expect(wrapper.find(".selection-summary").text()).toContain("b.txt");
+    expect(wrapper.find(".is-selected").attributes("data-key")).toBe("b.txt");
     await view.trigger("keydown", { key: "ArrowDown" });
-    expect(wrapper.find(".selection-summary").text()).toContain("docs");
+    expect(wrapper.find(".is-selected").attributes("data-key")).toBe("docs/");
     await wrapper.find("[data-test=folder-row]").trigger("dblclick");
     await flushPromises();
     expect(wrapper.find(".breadcrumb.is-current").text()).toBe("docs");
@@ -1696,6 +1791,11 @@ describe("CloudBrowser", () => {
     expect(wrapper.find(".breadcrumb.is-current").text()).toBe("docs");
     expect(wrapper.findAll(".column")).toHaveLength(2);
   });
+  it('keeps network proxy configuration out of the browser sidebar', async () => {
+    const wrapper = await browser();
+    expect(wrapper.find('.browser-sidebar').text()).not.toContain(t('network.title'));
+    expect(wrapper.findComponent({ name: 'NetworkProxySettings' }).exists()).toBe(false);
+  });
   it("hides the selection bar in gallery view without a selection and after clearing a multi selection", async () => {
     handlers.cloud_object_list = () => page([file, { key: "b.txt", size: 2 }]);
     handlers.cloud_object_preview = () => ({ fileName: "a.txt", mime: "text/plain", encoding: "utf8", data: "x", size: 1 });
@@ -1705,7 +1805,7 @@ describe("CloudBrowser", () => {
     const thumbs = wrapper.findAll(".gallery-thumb");
     await thumbs[0].trigger("click");
     await thumbs[1].trigger("click", { ctrlKey: true });
-    expect(wrapper.find(".selection-bar--multi").exists()).toBe(true);
+    expect(wrapper.findAll(".gallery-thumb.is-selected")).toHaveLength(2);
     await textButton(wrapper, t("peer.clearSelection")).trigger("click");
     expect(wrapper.find(".selection-bar").exists()).toBe(false);
   });

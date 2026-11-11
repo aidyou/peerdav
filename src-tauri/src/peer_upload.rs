@@ -136,6 +136,7 @@ impl PeerManager {
                         size,
                         directory_token: None,
                         phase: "unscanned".into(),
+                        transferred: None,
                     });
                     roots.push(SelectedRoot::File(DirectoryFile {
                         relative: name,
@@ -194,6 +195,7 @@ impl PeerManager {
         batches.insert(
             status.batch_id.clone(),
             PeerUploadBatch {
+                entry_states: Default::default(), progress: Default::default(),
                 status: status.clone(),
                 roots: Some(roots),
                 browser: Arc::new(Mutex::new(browser)),
@@ -358,6 +360,7 @@ impl PeerManager {
             let b = map.get_mut(id).ok_or_else(invalid)?;
             b.status.completed_files += 1;
             b.status.completed_bytes += file.size;
+        crate::local_upload::record_upload_entry(&mut b.entry_states, file.relative.clone(), "completed".into(), file.size);
             return Ok(());
         }
         let relative = Path::new(&file.relative);
@@ -376,10 +379,9 @@ impl PeerManager {
         let encoded = encode_share_path(&status.share_name, &directory).map_err(AppError::from)?;
         {
             let mut map = self.upload_batches.lock().await;
-            map.get_mut(id)
-                .ok_or_else(invalid)?
-                .status
-                .current_relative_path = Some(file.relative.clone());
+            let batch = map.get_mut(id).ok_or_else(invalid)?;
+            batch.progress.store(0, std::sync::atomic::Ordering::Relaxed);
+            batch.status.current_relative_path = Some(file.relative.clone());
         }
         let destination = tokio::select! { biased; _ = cancel.changed() => return Err(canceled()), r = resolve_remote_destination(&client, &encoded, &directory, name, ConflictPolicy::Fail) => r };
         let mut condition = peerdav_protocol_peerdav::peerdav_file_core::Condition::CreateOnly;
@@ -434,6 +436,7 @@ impl PeerManager {
                     let mut map = self.upload_batches.lock().await;
                     let b = map.get_mut(id).ok_or_else(invalid)?;
                     b.status.skipped_files += 1;
+                    crate::local_upload::record_upload_entry(&mut b.entry_states, file.relative.clone(), "skipped".into(), 0);
                     b.status.phase = "running".into();
                     b.status.conflict = None;
                     b.status.current_relative_path = None;
@@ -457,13 +460,19 @@ impl PeerManager {
             b.status.conflict = None;
         }
         tokio::select! { biased; _ = cancel.changed() => return Err(canceled()), r = ensure_remote_directories(&client, &status.share_name, &directory) => r.map_err(AppError::from)? }
+        let progress = {
+            let mut map = self.upload_batches.lock().await;
+            let b = map.get_mut(id).ok_or_else(invalid)?;
+            b.progress.store(0, std::sync::atomic::Ordering::Relaxed);
+            b.progress.clone()
+        };
         crate::transfer::upload_opened(
             &client,
             &remote,
             file.file,
             relative,
             file.size,
-            None,
+            Some(Arc::new(move |phase, bytes, _, _| { if matches!(phase, crate::UploadPhase::Uploading | crate::UploadPhase::Committing | crate::UploadPhase::Completed) { progress.store(bytes, std::sync::atomic::Ordering::Relaxed); } })),
             Some((id.to_owned(), cancel.clone())),
             condition,
         )
@@ -473,6 +482,7 @@ impl PeerManager {
         let b = map.get_mut(id).ok_or_else(invalid)?;
         b.status.completed_files += 1;
         b.status.completed_bytes += file.size;
+        crate::local_upload::record_upload_entry(&mut b.entry_states, file.relative.clone(), "completed".into(), file.size);
         b.status.current_relative_path = None;
         Ok(())
     }
@@ -480,7 +490,10 @@ impl PeerManager {
         let mut map = self.upload_batches.lock().await;
         if let Some(b) = map.get_mut(id) {
             b.status.conflict = None;
-            b.status.current_relative_path = None;
+            if let Some(path) = b.status.current_relative_path.take() {
+                let phase = if *b.cancel.borrow() || result.as_ref().err().is_some_and(|error| error.code == "TRANSFER_CANCELED") { "cancelled" } else if result.is_err() { "failed" } else { "completed" };
+                crate::local_upload::record_upload_entry(&mut b.entry_states, path, phase.into(), b.progress.load(std::sync::atomic::Ordering::Relaxed));
+            }
             match result {
                 Ok(()) => {
                     b.status.phase = if *b.cancel.borrow() {
@@ -695,11 +708,18 @@ async fn page_upload_batch(
             b.status.phase == "completed",
         )
     };
-    tokio::task::spawn_blocking(move || {
+    let mut page = tokio::task::spawn_blocking(move || {
         browser.blocking_lock().page(directory_token, cursor, limit, active, completed)
     })
     .await
-    .map_err(task_error)?
+    .map_err(task_error)??;
+    let mut map = peers.upload_batches.lock().await;
+    let b = bound(&mut map, batch_id, peer_id)?;
+    for entry in &mut page.entries {
+        if let Some((phase, bytes)) = b.entry_states.get(&entry.relative_path) { entry.phase = phase.clone(); entry.transferred = Some(*bytes); }
+        else if b.status.current_relative_path.as_deref() == Some(entry.relative_path.as_str()) { entry.transferred = Some(b.progress.load(std::sync::atomic::Ordering::Relaxed).min(entry.size)); }
+    }
+    Ok(page)
 }
 #[tauri::command]
 pub async fn peer_resolve_upload_batch(

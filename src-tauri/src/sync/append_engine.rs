@@ -65,7 +65,7 @@ fn reserve_block_read(
 ) -> Result<(), AppendError> {
     let mut index = shared
         .lock()
-        .map_err(|_| AppendError::Index(super::index_types::IndexError::InvalidRecord))?;
+        .map_err(|_| AppendError::Index(super::index_types::IndexError::invalid_record()))?;
     let mut budget = index.discovery_budget(operation)?;
     if budget.requests >= MAX_DISCOVERY_REQUESTS {
         return Err(AppendError::ResourceLimit("block requests"));
@@ -1136,7 +1136,7 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
     epoch.source_scan = materialized.verified_scan;
     apply_index
         .lock()
-        .map_err(|_| super::index_types::IndexError::InvalidRecord)?
+        .map_err(|_| super::index_types::IndexError::invalid_record())?
         .acknowledge_epoch(&epoch)?;
     Ok(AppendEngineReport {
         frontier: epoch.frontier,

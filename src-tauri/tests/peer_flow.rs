@@ -680,6 +680,9 @@ async fn unified_peer_file_session_rechecks_authorization_and_lock() {
     let page = sessions.list(&harness.peers, &cloud, &session.session_id, "/", None).await.expect("unified list");
     assert!(page.complete);
     assert_eq!(page.entries.len(), 3);
+    assert_eq!(page.breadcrumbs.len(), 1);
+    assert_eq!(page.breadcrumbs[0].id, "/");
+    assert!(!page.breadcrumbs[0].name.is_empty());
     assert!(session.capabilities.create_dir);
     let edit = sessions.prepare_edit(&harness.peers, &cloud, &session.session_id, "/notes.txt").await.expect("unified Peer editor reads through trait");
     assert_eq!(edit.id, "/notes.txt");

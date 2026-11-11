@@ -77,6 +77,11 @@ pub async fn file_release_upload(sessions: State<'_, SharedFileSessions>, peers:
 }
 
 #[tauri::command]
+pub async fn file_move(sessions: State<'_, SharedFileSessions>, peers: State<'_, SharedPeers>, cloud: State<'_, SharedCloud>, session_id: String, id: String, destination: String) -> Result<(), AppError> {
+    sessions.move_entry(&peers, &cloud.0, &session_id, &id, &destination).await
+}
+
+#[tauri::command]
 pub async fn file_create_directory(sessions: State<'_, SharedFileSessions>, peers: State<'_, SharedPeers>, cloud: State<'_, SharedCloud>, session_id: String, id: String, name: String) -> Result<FileEntryDto, AppError> {
     sessions.create_directory(&peers, &cloud.0, &session_id, &id, &name).await
 }

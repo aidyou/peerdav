@@ -65,6 +65,25 @@ impl ObjectStore for CoreS3ReadBridge {
     fn scope(&self) -> Option<ObjectStoreScope> {
         ObjectStore::scope(self.0.store.as_ref())
     }
+    fn copy_move_stream<'a>(&'a self, key: &'a str, body: ObjectStream) -> BoxFuture<'a, Result<ObjectMetadata, CloudError>> {
+        // Explicit move copies retain the provider's bounded create-only path.
+        // The move planner checks MAX_PUT_BYTES before any user-object mutation.
+        self.0.store.put(key, body, PutCondition::CreateOnly)
+    }
+    fn verify_move_capabilities(&self) -> BoxFuture<'_, Result<StorageCapabilities, CloudError>> {
+        Box::pin(async {
+            let key = format!("probes/{}/move-create", rand::random::<u128>());
+            let first = self.0.store.put(&key, futures_util::stream::once(async { Ok(bytes::Bytes::from_static(b"move probe")) }).boxed(), PutCondition::CreateOnly).await?;
+            let duplicate = self.0.store.put(&key, futures_util::stream::once(async { Ok(bytes::Bytes::from_static(b"must not replace")) }).boxed(), PutCondition::CreateOnly).await;
+            if !matches!(duplicate, Err(CloudError::Precondition)) {
+                return Err(CloudError::Unsupported);
+            }
+            if let Err(error) = self.0.store.delete_if_match(&key, first.etag.as_deref().ok_or(CloudError::Unsupported)?).await {
+                return Err(error);
+            }
+            Ok(StorageCapabilities { create_only: true, conditional_replace: false, range_read: true, conditional_writes_verified: true })
+        })
+    }
     fn capabilities(&self) -> StorageCapabilities {
         let snapshot = FileBackend::capabilities(&self.0);
         let supports = |condition| snapshot.writes.iter().any(|support| matches!(

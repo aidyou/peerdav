@@ -22,6 +22,19 @@ pub enum IndexError {
     UnsupportedSchema,
 }
 
+impl IndexError {
+    /// Record the rejecting guard without logging indexed paths or payloads.
+    #[track_caller]
+    pub(crate) fn invalid_record() -> Self {
+        let location = std::panic::Location::caller();
+        log::error!(
+            "sync index validation rejected: guard={}:{}:{}",
+            location.file(), location.line(), location.column(),
+        );
+        Self::InvalidRecord
+    }
+}
+
 /// Unknown is not an empty directory: no deletion may be inferred from it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]

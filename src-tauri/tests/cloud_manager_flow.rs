@@ -74,7 +74,10 @@ async fn duplicate_start_is_rejected_while_worker_waits() {
         m.start("a", w),
         Ok(StartResult::AlreadyRunning(_))
     ));
+    assert!(m.is_running("a"));
+    assert!(!m.is_running("b"));
     m.stop_mapping("a").await.unwrap();
+    assert!(!m.is_running("a"));
 }
 #[tokio::test]
 async fn stop_one_mapping_keeps_other_active() {

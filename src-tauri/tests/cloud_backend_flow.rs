@@ -1429,6 +1429,10 @@ async fn sync_drive_storage_stays_bound_after_connection_changes() {
     runtime.manual_sync(&mapping.id, &scoped.preview_id).await.expect("selected sync");
     wait_completed(&runtime, &mapping.id).await;
     let status = runtime.local_sync_entries(&mapping.id).await.expect("selected status");
+    let navigation = runtime.local_directory_listing(&mapping.id, "docs").await.expect("backend navigation");
+    assert_eq!(navigation.breadcrumbs.iter().map(|crumb| crumb.id.as_str()).collect::<Vec<_>>(), vec!["", "docs"]);
+    assert_eq!(navigation.breadcrumbs[1].name, "docs");
+    assert!(runtime.local_directory_listing(&mapping.id, "../outside").await.is_err());
     assert!(status.iter().any(|entry| entry.path == "picked.txt" && entry.synced));
     assert!(status.iter().any(|entry| entry.path == "unpicked.txt" && !entry.synced));
     std::fs::remove_file(local.path().join("unpicked.txt")).expect("remove unpicked");

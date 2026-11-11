@@ -1672,6 +1672,16 @@ body:has(.window-frame) .el-overlay-dialog {
   --accent: var(--accent-blue);
   --accent-rgb: 54, 114, 233;
   --selection-bg: linear-gradient(rgba(var(--accent-rgb), 0.14), rgba(var(--accent-rgb), 0.14)) var(--app-surface);
+  /* 文件管理器浮动操作条：背景与正文反相，两种外观共用同一组语义名。 */
+  --floating-bar-bg: rgba(22, 32, 46, 0.92);
+  --floating-bar-fg: #f5f8fb;
+  --floating-bar-muted: rgba(245, 248, 251, 0.72);
+  --floating-bar-border: rgba(255, 255, 255, 0.16);
+  --floating-bar-hover: rgba(255, 255, 255, 0.12);
+  --floating-bar-shadow: 0 12px 32px rgba(22, 32, 46, 0.22);
+  --floating-bar-danger: #ff9d95;
+  --floating-bar-height: 68px;
+  --browser-body-bg: rgba(255, 255, 255, 0.1);
   --selection-border: rgba(var(--accent-rgb), 0.5);
   --accent-on: #ffffff;
 
@@ -1853,6 +1863,15 @@ body:has(.window-frame) .el-overlay-dialog {
   --app-surface-2: #232a33;
   --app-surface-3: #20262e;
   --app-bg-solid: #14181f;
+  /* 暗色外观下浮动操作条反相：浅色底、深色字。 */
+  --floating-bar-bg: rgba(240, 244, 249, 0.94);
+  --floating-bar-fg: #16202e;
+  --floating-bar-muted: rgba(22, 32, 46, 0.66);
+  --floating-bar-border: rgba(0, 0, 0, 0.22);
+  --floating-bar-hover: rgba(22, 32, 46, 0.10);
+  --floating-bar-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  --floating-bar-danger: #b3261e;
+  --browser-body-bg: rgba(0, 0, 0, 0.1);
   --app-border: #30363d;
   --app-frame-border: rgba(0, 0, 0, 0.5);
   --titlebar-bg: rgba(28, 33, 40, 0.6);

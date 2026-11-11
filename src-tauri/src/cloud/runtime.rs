@@ -370,6 +370,8 @@ pub struct CloudRuntime {
     gate: AtomicBool,
     cancel: Arc<AtomicBool>,
     pub(crate) network: Arc<RwLock<()>>,
+    /// Metadata previews share durable run slots; serialize their budget snapshots.
+    pub(super) append_metadata: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub(crate) objects: tokio::sync::Mutex<super::object_runtime_types::ObjectState>,
     pub(crate) object_events: Arc<dyn SyncEvents>,
     pub(crate) object_lifecycle: tokio::sync::Mutex<()>,
@@ -404,6 +406,7 @@ impl CloudRuntime {
             gate: AtomicBool::new(false),
             cancel: Arc::new(AtomicBool::new(false)),
             network: Arc::new(RwLock::new(())),
+            append_metadata: tokio::sync::Mutex::new(HashMap::new()),
             pending_mappings: tokio::sync::Mutex::new(HashMap::new()),
             tickets: Mutex::new(HashMap::new()),
             schedules: super::runtime_schedule::CloudSchedules::new(),
@@ -541,6 +544,7 @@ impl CloudRuntime {
             else { Arc::new(S3Store::new(self.append_config(connection_id, bucket)?).map_err(cloud_error)?) };
         let page = store.list_page(&full_prefix, next).await.map_err(cloud_error)?;
         Ok(super::object_runtime_types::ObjectPageDto {
+            breadcrumbs: crate::file_manager::service::path_breadcrumbs(&full_prefix),
             prefix: full_prefix, complete: page.next_token.is_none(), next: page.next_token,
             prefix_protected: false,
             objects: page.objects.into_iter().map(|item| super::object_runtime_types::ObjectEntryDto {
@@ -890,11 +894,19 @@ impl CloudRuntime {
             .map(|v| hex::encode(Sha256::digest(v)))
             .map_err(|e| runtime_error("CLOUD_SCAN_FAILED", &e.to_string()))
     }
+    pub(super) fn admit_sync_idle(&self, mapping_id: &str) -> Result<(), AppError> {
+        if self.manager.is_running(mapping_id) {
+            return Err(runtime_error("SYNC_ALREADY_RUNNING", "此同步盘正在同步，已忽略重复请求 / This drive is syncing; duplicate request ignored"));
+        }
+        Ok(())
+    }
+
     pub async fn preview(&self, id: &str) -> Result<CloudPreview, AppError> {
         self.preview_selection(id, &[]).await
     }
 
     pub async fn preview_selection(&self, id: &str, selection: &[String]) -> Result<CloudPreview, AppError> {
+        self.admit_sync_idle(id)?;
         if selection.len() > 1000 { return Err(runtime_error("CLOUD_CONFIG_INVALID", "选中条目过多 / Too many selected entries")); }
         for path in selection { crate::sync::namespace::components(path).map_err(|error| runtime_error("CLOUD_CONFIG_INVALID", &error.to_string()))?; }
         self.admit()?;
@@ -1054,6 +1066,7 @@ impl CloudRuntime {
         automatic: bool,
     ) -> Result<CloudSyncResult, AppError> {
         self.admit()?;
+        self.admit_sync_idle(mapping_id)?;
         if !self.safe_apply {
             return Err(runtime_error(
                 "SYNC_SAFE_APPLY_UNSUPPORTED",

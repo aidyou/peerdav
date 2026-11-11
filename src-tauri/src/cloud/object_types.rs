@@ -36,6 +36,23 @@ pub(crate) struct StorageIdentityRegistry {
     pub bindings: Vec<StorageIdentityBinding>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct MoveObject {
+    pub source: String,
+    pub destination: String,
+    pub revision: String,
+    pub size: u64,
+    pub digest: Option<String>,
+    pub attempted: bool,
+    pub completed: bool,
+    pub requests: u32,
+}
+#[derive(Serialize, Deserialize)]
+pub(crate) struct MoveTask {
+    pub entries: Vec<MoveObject>,
+    pub complete: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum ObjectGuardError {
     #[error("storage identity has not been confirmed locally")]

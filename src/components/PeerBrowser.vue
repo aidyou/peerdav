@@ -43,12 +43,65 @@ const VIEW_STORAGE_KEY = props.adapter ? 'peerdav.cloudView' : 'peerdav.peerView
 const VIEW_MODES = ["icons", "list", "columns", "gallery"];
 let fileSession = null;
 const fileCapabilities = ref(null);
+const supportsMove = ref(false);
+const moveOpen = ref(false);
+const moveDestination = ref('');
+const moveFolders = ref([]);
+const moveCrumbs = ref([]);
+const moveLoading = ref(false);
+async function listMoveFolders(id = '') {
+  moveLoading.value = true;
+  const generation = sessionGeneration;
+  try {
+    const session = await getFileSession();
+    let next = null;
+    const folders = [];
+    const seen = new Set();
+    let crumbs = [];
+    do {
+      const page = await fileInvoke('file_list', { sessionId: session.sessionId, id, next });
+      if (browserDisposed || generation !== sessionGeneration) return;
+      folders.push(...page.entries.filter(entry => entry.isDir && !entry.protected && !selectedEntries.value.some(source => source.id === entry.id)));
+      crumbs = page.breadcrumbs || [];
+      next = page.next;
+      if (next && (seen.has(next) || seen.size >= 1000)) throw { code: 'FILE_LIST_LIMIT', message: t('cloudBrowser.invalidPlan') };
+      if (next) seen.add(next);
+    } while (next);
+    moveFolders.value = folders; moveCrumbs.value = crumbs; moveDestination.value = id;
+  } catch (error) { app.handleFailure(error); }
+  finally { moveLoading.value = false; }
+}
+async function dropMove(sources, target) {
+  if (!supportsMove.value || busy.value || !target.isDir) return;
+  const generation = sessionGeneration;
+  if (!await confirmAction(t('drive.moveConfirm', { count: sources.length, name: target.name }), t('drive.move'), { confirmText: t('drive.move') }) || browserDisposed || generation !== sessionGeneration) return;
+  setSelection(sources); moveDestination.value = target.id;
+  await moveSelected();
+}
+async function showMove() { moveOpen.value = true; await listMoveFolders(); }
+async function moveSelected() {
+  if (moveLoading.value || !supportsMove.value) return;
+  const selected = selectedEntries.value.slice();
+  const generation = sessionGeneration;
+  moveLoading.value = true;
+  try {
+    const session = await getFileSession();
+    for (const entry of selected) {
+      if (browserDisposed || generation !== sessionGeneration) return;
+      await fileInvoke('file_move', { sessionId: session.sessionId, id: entry.id, destination: moveDestination.value });
+    }
+    if (browserDisposed || generation !== sessionGeneration) return;
+    moveOpen.value = false; setSelection([]); await refreshListing();
+  } catch (error) { app.handleFailure(error); }
+  finally { moveLoading.value = false; }
+}
 let sessionOpening = null;
 let sessionGeneration = 0;
 async function closeFileSession() {
   sessionGeneration++;
   const previous = fileSession;
   fileSession = null; fileCapabilities.value = null; sessionOpening = null;
+  supportsMove.value = false; moveOpen.value = false;
   filesPrepared.value = false;
   await cancelUploadSession();
   if (previous) await fileInvoke('file_close_session', { sessionId: previous.sessionId }).catch(app.handleFailure);
@@ -65,6 +118,7 @@ async function getFileSession() {
       }
       fileSession = session;
       fileCapabilities.value = session.capabilities || null;
+      supportsMove.value = session.supportsMove === true;
       return session;
     }).finally(() => { if (generation === sessionGeneration) sessionOpening = null; });
   }
@@ -193,21 +247,7 @@ const peerHost = computed(() => {
   }
 });
 
-const breadcrumbs = computed(() => {
-  const crumbs = [
-    {
-      name: activeShare.value?.name || t("peer.root"),
-      id: rootPath.value,
-    },
-  ];
-  const trail = peerListing.value?.breadcrumbs ?? navigationBreadcrumbs.value;
-  if (Array.isArray(trail)) {
-    return [...crumbs, ...trail
-      .filter(crumb => crumb.id !== rootPath.value)
-      .map(crumb => ({ ...crumb, name: crumb.name === '_peerdav_encrypt' ? t('cloudBrowser.encryptedDrive') : crumb.name === '_peerdav_mirror' ? t('cloudBrowser.mirrorDrive') : crumb.name }))];
-  }
-  return crumbs;
-});
+const breadcrumbs = computed(() => peerListing.value?.breadcrumbs ?? navigationBreadcrumbs.value ?? []);
 
 const breadcrumbsEl = ref(null);
 
@@ -416,9 +456,16 @@ async function deleteCurrentFolder() {
 }
 let navigationToken = 0;
 
+function navigationStorageKey() { return `peerdav.fileLocation:${props.peer.id}:${activeShareId.value}`; }
+function savedNavigation() {
+  try { const value = JSON.parse(globalThis.localStorage?.getItem(navigationStorageKey()) || 'null'); return Array.isArray(value) && value.length <= 128 && value.every(id => typeof id === 'string') ? value : []; } catch { return []; }
+}
 function applyListing(listing) {
   peerListing.value = listing;
   peerPath.value = listing.id;
+  if (props.adapter) {
+    try { globalThis.localStorage?.setItem(navigationStorageKey(), JSON.stringify([...(listing.breadcrumbs || []).map(crumb => crumb.id), listing.id].filter((id, index, ids) => ids.indexOf(id) === index))); } catch { /* 存储受限不影响导航。 */ }
+  }
   clearSelection();
   clearPreview();
   if (viewMode.value === "columns") {
@@ -475,7 +522,7 @@ async function loadPath(path) {
   const knownTrail = breadcrumbs.value;
   const ancestor = knownTrail.findIndex(crumb => crumb.id === path);
   const entry = peerListing.value?.entries.find(entry => entry.id === path && entry.isDir);
-  navigationBreadcrumbs.value = ancestor >= 0 ? knownTrail.slice(1, ancestor + 1) : entry ? [...knownTrail.slice(1), { id: entry.id, name: entry.name }] : [];
+  navigationBreadcrumbs.value = ancestor >= 0 ? knownTrail.slice(0, ancestor + 1) : entry ? [...knownTrail, { id: entry.id, name: entry.name }] : [];
   peerPath.value = path;
   peerListing.value = null;
   loadFailed.value = false;
@@ -510,7 +557,15 @@ async function loadPeer() {
       activeShareId.value = peerShares.value[0].id;
       await getFileSession();
       void prepareFiles();
+      const saved = props.adapter ? savedNavigation() : [];
       await loadPath(rootPath.value);
+      let restoreToken = navigationToken;
+      for (const id of saved.filter(id => id !== rootPath.value)) {
+        if (browserDisposed || restoreToken !== navigationToken) break;
+        if (!peerListing.value?.entries.some(entry => entry.id === id && entry.isDir)) break;
+        await loadPath(id);
+        restoreToken += 1;
+      }
     }
   });
 }
@@ -560,34 +615,6 @@ function clearSelection() {
   selectionAnchor.value = null;
   setSelection([]);
 }
-
-const selectionFileCount = computed(
-  () => selectedEntries.value.filter((entry) => !entry.isDir).length,
-);
-const selectionDirCount = computed(
-  () => selectedEntries.value.length - selectionFileCount.value,
-);
-const selectionTitle = computed(() =>
-  selectedEntries.value.length > 1
-    ? t("peer.selectedCount", { count: selectedEntries.value.length })
-    : selectedEntry.value?.name ?? "",
-);
-const selectionSubtitle = computed(() => {
-  if (selectedEntries.value.length > 1) {
-    return t("peer.selectedSummary", {
-      files: selectionFileCount.value,
-      dirs: selectionDirCount.value,
-    });
-  }
-  if (!selectedEntry.value) return "";
-  return entryKind(selectedEntry.value) +
-    (selectedEntry.value.isDir ? "" : ` · ${formatSize(selectedEntry.value)}`);
-});
-const selectionGlyph = computed(() =>
-  selectedEntries.value.length > 1
-    ? { isDir: true, name: "", contentType: null }
-    : selectedEntry.value,
-);
 
 // 修饰键判定不能只依赖 click 事件：部分 WebKit 环境（Tauri 在 Linux 用的 WebKitGTK）
 // 在 mousedown 被 preventDefault 后不会把 Ctrl/Cmd/Alt/Shift 带进 click，
@@ -680,6 +707,7 @@ function onFileViewMousedown(event) {
   if (event.target?.closest?.("a, input, textarea, select, [contenteditable], pre, video, audio")) {
     return;
   }
+  if (event.target?.closest?.('[draggable="true"]')) return;
   event.preventDefault();
   fileViewEl.value?.focus();
   marqueeStart = { clientX: event.clientX, clientY: event.clientY };
@@ -1177,7 +1205,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
         </p>
       </aside>
 
-      <main class="browser-main">
+      <main class="browser-main" :class="{ 'browser-main--selection': selectedEntries.length }">
         <OperationErrorDialog v-if="preparationError" :error="preparationError" retryable recheck :busy="preparingFiles" @retry="prepareFiles" @close="preparationError = null" />
         <OperationErrorDialog :error="operationError" retryable @retry="viewMode === 'columns' ? rebuildColumnStack() : refreshListing()" @close="operationError = null" />
         <div class="pathbar">
@@ -1353,7 +1381,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
           @mousedown="onFileViewMousedown"
         >
           <div v-if="marquee" class="marquee" :style="marqueeStyle"></div>
-          <FileManagerView identity-field="id" column-identity-field="id" :entries="peerListing.entries" :mode="viewMode" :selection="selectedEntries"
+          <FileManagerView :move-enabled="!!adapter && supportsMove && !busy && !moveLoading" @move="dropMove" identity-field="id" column-identity-field="id" :entries="peerListing.entries" :mode="viewMode" :selection="selectedEntries"
             :columns="visibleColumns" :column-loading="loadingColumn !== -1" :append-loading-column="loadingColumn !== -1"
             :empty-label="adapter ? t('cloudBrowser.empty') : ''"
             :partial="!!peerListing.truncated" :time-column="timeColumn" :time-label="t(timeColumn === 'created' ? 'cloudBrowser.created' : 'peer.modified')" :entry-kind="entryKind" :format-size="formatSize" :format-modified="formatModified"
@@ -1420,75 +1448,93 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
           <div v-else class="file-empty"><p role="alert">{{ listingError?.message || t('peer.loadFailed') }}</p><el-button data-test="retry-load" @click="loadPath(peerPath)">{{ t('peer.refresh') }}</el-button></div>
         </div>
 
-        <div
-          v-if="selectedEntries.length"
-          class="selection-bar"
-          :class="{
-            'selection-bar--reserved': !selectedEntries.length,
-            'selection-bar--multi': selectedEntries.length > 1,
-          }"
-        >
-          <div v-if="selectedEntries.length" class="selection-summary">
-            <FileGlyph :entry="selectionGlyph" />
-            <div>
-              <strong>{{ selectionTitle }}</strong>
-              <span>{{ selectionSubtitle }}</span>
-            </div>
-            <el-button
-              v-if="selectedEntries.length > 1"
-              class="selection-clear"
-              link
-              type="primary"
-              :disabled="busy"
-              @click="clearSelection"
-            >
-              {{ t("peer.clearSelection") }}
-            </el-button>
-          </div>
-          <p v-else class="selection-bar__hint">{{ t("peer.selectionHint") }}</p>
-          <div v-if="selectedEntries.length" class="selection-actions">
+        <div v-if="selectedEntries.length" class="selection-bar">
+          <div class="selection-actions">
+            <el-tooltip v-if="adapter && supportsMove" :content="t('drive.move')" placement="top" :show-after="200" :enterable="false"><button type="button" class="bar-action" data-test="move" :aria-label="t('drive.move')" :disabled="busy || selectedEntries.some(entry => entry.protected)" @click="showMove"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v11H3ZM12 14h6m-3-3 3 3-3 3"/></svg></button></el-tooltip>
             <template v-if="selectedEntries.length === 1 && selectedEntry.isDir">
-              <el-button
-                v-if="viewMode !== 'columns'"
-                type="primary"
-                :disabled="busy"
-                @click="runSelectionAction(([entry]) => browse(entry.id))"
-              >
-                {{ t("peer.open") }}
-              </el-button>
-              <el-button data-test="download" plain :disabled="busy || fileCapabilities?.download === false || fileCapabilities?.downloadDirectory === false" @click="runSelectionAction(([entry]) => downloadDirectory(entry))">
-                {{ t("peer.download") }}
-              </el-button>
+              <el-tooltip v-if="viewMode !== 'columns'" :content="t('peer.open')" placement="top" :show-after="200" :hide-after="0" :enterable="false">
+                <button
+                  type="button"
+                  class="bar-action"
+                  data-test="open"
+                  :aria-label="t('peer.open')"
+                  :disabled="busy"
+                  @click="runSelectionAction(([entry]) => browse(entry.id))"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5c0-.8.7-1.5 1.5-1.5h4l1.8 2H19c.8 0 1.5.7 1.5 1.5v8c0 .8-.7 1.5-1.5 1.5H5c-.8 0-1.5-.7-1.5-1.5z" /></svg>
+                </button>
+              </el-tooltip>
+              <el-tooltip :content="t('peer.download')" placement="top" :show-after="200" :hide-after="0" :enterable="false">
+                <button type="button" class="bar-action" data-test="download" :aria-label="t('peer.download')" :disabled="busy || fileCapabilities?.download === false || fileCapabilities?.downloadDirectory === false" @click="runSelectionAction(([entry]) => downloadDirectory(entry))">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10" /><path d="m8 10 4 4 4-4" /><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
+                </button>
+              </el-tooltip>
             </template>
             <template v-else-if="selectedEntries.length === 1">
-              <el-button v-if="canPreview(selectedEntry) && fileCapabilities?.preview !== false" data-test="preview" plain :disabled="busy" @click="runSelectionAction(([entry]) => previewEntry(entry))">{{ t('peer.preview') }}</el-button>
-              <el-button v-if="fileCapabilities?.onlinePreview && selectedEntry.onlinePreview" data-test="online-preview" plain :disabled="busy" @click="runSelectionAction(([entry]) => onlinePreviewEntry(entry))">{{ t('peer.onlinePreview') }}</el-button>
-              <el-button data-test="download" plain :disabled="busy || fileCapabilities?.download === false" @click="runSelectionAction(([entry]) => downloadEntry(entry))">
-                {{ t("peer.download") }}
-              </el-button>
-              <el-button
+              <el-tooltip v-if="canPreview(selectedEntry) && fileCapabilities?.preview !== false" :content="t('peer.preview')" placement="top" :show-after="200" :hide-after="0" :enterable="false">
+                <button type="button" class="bar-action" data-test="preview" :aria-label="t('peer.preview')" :disabled="busy" @click="runSelectionAction(([entry]) => previewEntry(entry))">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z" /><circle cx="12" cy="12" r="2.8" /></svg>
+                </button>
+              </el-tooltip>
+              <el-tooltip v-if="fileCapabilities?.onlinePreview && selectedEntry.onlinePreview" :content="t('peer.onlinePreview')" placement="top" :show-after="200" :hide-after="0" :enterable="false">
+                <button type="button" class="bar-action" data-test="online-preview" :aria-label="t('peer.onlinePreview')" :disabled="busy" @click="runSelectionAction(([entry]) => onlinePreviewEntry(entry))">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" /><path d="M4 12h16" /><path d="M12 4c2.4 2.3 2.4 13.7 0 16M12 4c-2.4 2.3-2.4 13.7 0 16" /></svg>
+                </button>
+              </el-tooltip>
+              <el-tooltip :content="t('peer.download')" placement="top" :show-after="200" :hide-after="0" :enterable="false">
+                <button type="button" class="bar-action" data-test="download" :aria-label="t('peer.download')" :disabled="busy || fileCapabilities?.download === false" @click="runSelectionAction(([entry]) => downloadEntry(entry))">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10" /><path d="m8 10 4 4 4-4" /><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
+                </button>
+              </el-tooltip>
+              <el-tooltip
                 v-if="!selectedEntry.protected && !peerListing?.protected && (fileCapabilities?.externalEdit ?? !adapter) && (isReadableText(selectedEntry) || /\.(docx?|xlsx?|pptx?|odt|ods|odp|rtf|pages|numbers|key)$/i.test(selectedEntry.name))"
-                data-test="edit"
-                plain
-                :disabled="busy"
-                @click="runSelectionAction(([entry]) => editEntry(entry))"
+                :content="t('peer.edit')"
+                placement="top"
+                :show-after="200"
+                :hide-after="0"
+                :enterable="false"
               >
-                {{ t("peer.edit") }}
-              </el-button>
+                <button
+                  type="button"
+                  class="bar-action"
+                  data-test="edit"
+                  :aria-label="t('peer.edit')"
+                  :disabled="busy"
+                  @click="runSelectionAction(([entry]) => editEntry(entry))"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19.3 8.7a2.2 2.2 0 0 0-3.1-3.1L5 16.9V20Z" /><path d="m14.5 7.5 2 2" /></svg>
+                </button>
+              </el-tooltip>
             </template>
-            <el-button v-else data-test="download" type="primary" plain :disabled="busy || fileCapabilities?.download === false || (selectedEntries.some(entry => entry.isDir) && fileCapabilities?.downloadDirectory === false)" @click="runSelectionAction(downloadSelected)">
-              {{ t("peer.download") }}
-            </el-button>
-            <el-button
+            <el-tooltip v-else :content="t('peer.download')" placement="top" :show-after="200" :hide-after="0" :enterable="false">
+              <button type="button" class="bar-action" data-test="download" :aria-label="t('peer.download')" :disabled="busy || fileCapabilities?.download === false || (selectedEntries.some(entry => entry.isDir) && fileCapabilities?.downloadDirectory === false)" @click="runSelectionAction(downloadSelected)">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10" /><path d="m8 10 4 4 4-4" /><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
+              </button>
+            </el-tooltip>
+            <el-tooltip
               v-if="canDeleteEntries && selectedEntries.every(entry => !entry.protected && entry.id !== rootPath) && !peerListing?.protected"
-              data-test="delete-file"
-              type="danger"
-              plain
-              :disabled="busy"
-              @click="runSelectionAction(entries => entries.length === 1 ? deleteEntry(entries[0]) : deleteSelected(entries))"
+              :content="t('common.delete')"
+              placement="top"
+              :show-after="200"
+              :hide-after="0"
+              :enterable="false"
             >
-              {{ t("common.delete") }}
-            </el-button>
+              <button
+                type="button"
+                class="bar-action bar-action--danger"
+                data-test="delete-file"
+                :aria-label="t('common.delete')"
+                :disabled="busy"
+                @click="runSelectionAction(entries => entries.length === 1 ? deleteEntry(entries[0]) : deleteSelected(entries))"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16" /><path d="M9 7V5h6v2" /><path d="M6 7l1 12h10l1-12" /></svg>
+              </button>
+            </el-tooltip>
+            <el-tooltip v-if="selectedEntries.length > 1" :content="t('peer.clearSelection')" placement="top" :show-after="200" :hide-after="0" :enterable="false">
+              <button type="button" class="bar-action" data-test="clear-selection" :aria-label="t('peer.clearSelection')" :disabled="busy" @click="clearSelection">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+              </button>
+            </el-tooltip>
           </div>
         </div>
 
@@ -1523,6 +1569,11 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
       v-model:apply-remaining="uploadApplyRemaining" :resolving="uploadResolving" :overwrite-allowed="uploadOverwriteAllowed"
       @close="closeUpload" @cancel="cancelUpload" @resolve="resolveUploadConflict" />
 
+    <el-dialog v-model="moveOpen" :title="t('drive.move')" width="480px">
+      <nav :aria-label="t('drive.moveDestination')"><button v-for="crumb in moveCrumbs" :key="crumb.id" type="button" class="breadcrumb" :disabled="moveLoading" @click="listMoveFolders(crumb.id)">{{ crumb.name }}</button></nav>
+      <div v-loading="moveLoading"><button v-for="folder in moveFolders" :key="folder.id" type="button" class="share-link" @click="listMoveFolders(folder.id)"><FileGlyph :entry="folder"/><span>{{ folder.name }}</span></button></div>
+      <template #footer><el-button @click="moveOpen = false">{{ t('common.cancel') }}</el-button><el-button type="primary" :disabled="moveLoading" @click="moveSelected">{{ t('drive.move') }}</el-button></template>
+    </el-dialog>
     <FilePreviewDialog
       :open="previewOpen"
       :target="previewTarget"
@@ -1717,7 +1768,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   display: grid;
   grid-template-columns: 180px minmax(0, 1fr);
   overflow: hidden;
-  background: var(--app-surface);
+  background: var(--browser-body-bg);
 }
 
 .browser-sidebar {
@@ -1783,6 +1834,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 }
 
 .browser-main {
+  position: relative;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -1790,6 +1842,15 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+/* 浮动操作条会盖住列表末尾，选中时把主区底部垫高到条体高度以上。 */
+.browser-main--selection {
+  padding-bottom: calc(14px + var(--floating-bar-height));
+}
+
+.peer-browser--embedded .browser-main.browser-main--selection {
+  padding-bottom: calc(10px + var(--floating-bar-height));
 }
 
 .pathbar {
@@ -1964,71 +2025,65 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
   overflow: hidden;
 }
 
+/* 阿里盘式浮动操作条：底部居中、反色胶囊，明暗外观下背景与正文互换。 */
 .selection-bar {
-  flex: none;
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  z-index: 7;
   box-sizing: border-box;
   min-height: 54px;
+  max-width: calc(100% - 48px);
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 10px;
-  border: 1px solid var(--app-border);
-  border-radius: 10px;
-  background: var(--app-surface-2);
+  justify-content: center;
+  gap: 16px;
+  padding: 8px 14px;
+  border: 1px solid var(--floating-bar-border);
+  border-radius: 999px;
+  background: var(--floating-bar-bg);
+  color: var(--floating-bar-fg);
+  box-shadow: var(--floating-bar-shadow);
+  backdrop-filter: blur(12px);
 }
 
-.selection-bar--reserved {
-  border-style: dashed;
-  background: transparent;
-}
-
-.selection-bar--multi {
+.bar-action {
+  display: inline-flex;
   align-items: center;
-}
-
-.selection-clear {
+  justify-content: center;
   flex: none;
-  margin-left: auto;
+  width: 36px;
+  height: 36px;
   padding: 0;
-  height: auto;
-  min-height: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
 }
 
-.selection-bar__hint {
-  margin: 0;
-  font-size: 12px;
-  color: var(--app-text-muted);
+.bar-action:hover:not(:disabled) {
+  background: var(--floating-bar-hover);
 }
 
-.selection-summary {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
+.bar-action:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
-.selection-summary div {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
+.bar-action svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
-.selection-summary strong,
-.selection-summary span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.selection-summary strong {
-  font-size: 12.5px;
-  color: var(--app-text);
-}
-
-.selection-summary span {
-  font-size: 11px;
-  color: var(--app-text-muted);
+.bar-action--danger {
+  color: var(--floating-bar-danger);
 }
 
 .selection-actions {
@@ -2084,7 +2139,6 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
     flex: none;
   }
 
-  .selection-bar,
   .edit-panel {
     align-items: stretch;
     flex-direction: column;

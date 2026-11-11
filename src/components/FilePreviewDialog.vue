@@ -19,6 +19,7 @@ const props = defineProps({
   target: { type: Object, default: null },
   preview: { type: Object, default: null },
   limit: { type: Object, default: null },
+  downloadAllowed: { type: Boolean, default: true },
   busy: { type: Boolean, default: false },
 });
 const emit = defineEmits(["close", "download"]);
@@ -160,7 +161,7 @@ watch(
         <FileGlyph v-if="target" :entry="target" size="xl" />
         <strong>{{ t("peer.previewUnavailable") }}</strong>
         <p>{{ limitText }}</p>
-        <el-button type="primary" :disabled="busy" @click="emit('download')">
+        <el-button v-if="downloadAllowed" type="primary" :disabled="busy" @click="emit('download')">
           {{ t("peer.download") }}
         </el-button>
       </div>
