@@ -1101,6 +1101,9 @@ mod cfgtest {
         assert_eq!(replaced.key, key);
         assert_eq!(replaced.size, 11);
         assert!(replaced.etag.is_some());
+        assert!(matches!(bridge.replace_edit(key, body(b"stale edit"), "stale").await, Err(CloudError::Precondition)));
+        let edited = bridge.replace_edit(key, body(b"edited"), replaced.etag.as_deref().expect("revision")).await.expect("edit CAS");
+        assert_eq!(edited.size, 6);
     }
 
     #[tokio::test]

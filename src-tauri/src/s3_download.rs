@@ -73,7 +73,16 @@ impl TransferQueueAdapter for S3DownloadAdapter {
                     let page = self.session.service.browse_with_budget(&prefix, next.as_deref(), &mut ledger).await.map_err(app)?;
                     for object in page.objects {
                         let tail = object.key.strip_prefix(&prefix).ok_or_else(crate::local_upload::invalid)?;
-                        if tail.is_empty() || object.key.ends_with('/') { continue; }
+                        if object.key.ends_with('/') {
+                            let relative = if tail.is_empty() { name.to_owned() } else { format!("{name}/{}", tail.trim_end_matches('/')) };
+                            if !targets.contains(&relative) && result.len() >= MAX_DOWNLOAD_ITEMS { return Err(crate::local_upload::invalid()); }
+                            if targets.insert(relative.clone()) {
+                                let mut item = crate::download::item(object.key, relative, 0)?;
+                                item.is_dir = true; result.push(item);
+                            }
+                            continue;
+                        }
+                        if tail.is_empty() { continue; }
                         if tail.split('/').count() > MAX_DOWNLOAD_DEPTH || result.len() >= MAX_DOWNLOAD_ITEMS {
                             return Err(crate::local_upload::invalid());
                         }

@@ -341,6 +341,7 @@ mod tests {
                 Ok(CloudConnection {
                     id: "connection".into(),
                     name: "offline".into(),
+                    protocol_id: super::super::config_types::CloudProtocolId::S3,
                     revision: rev.load(Ordering::SeqCst),
                     schedule: ScheduleConfig::default(),
                     config: S3Config {
@@ -368,6 +369,134 @@ mod tests {
             events,
         })
     }
+    #[tokio::test]
+    async fn unified_file_sessions_bind_scope_expire_close_and_lock() -> Result<(), TestError> {
+        use crate::file_manager::types::*;
+        let f = fixture().await?;
+        f.runtime.resume()?;
+        let peers = crate::PeerManager::new(Arc::clone(&f.runtime.vault), f._dir.path().join("peer-temp"))?;
+        let sessions = FileSessions::default();
+        let open = sessions.open(&peers, &f.runtime, FileLocation::S3 { connection_id: "connection".into(), bucket: "bucket".into() }).await?;
+        let page = sessions.list(&peers, &f.runtime, &open.session_id, "", None).await?;
+        assert!(page.complete);
+        assert!(page.entries.iter().any(|entry| entry.id == "docs/" && entry.is_dir));
+        assert!(page.entries.iter().all(|entry| entry.parent_id.is_empty()));
+        let dto = serde_json::to_value(&page).map_err(|_| TestError::from("identity DTO serialization failed"))?;
+        assert!(dto.get("path").is_none());
+        assert!(dto["entries"].as_array().ok_or("missing entries")?.iter().all(|entry| entry.get("id").is_some() && entry.get("path").is_none()));
+        let session = sessions.admitted(&peers, &f.runtime, &open.session_id).await?;
+        session.backend.prepare(&peers, &f.runtime).await?;
+        let prepared_reads = f.store.reads.load(Ordering::SeqCst);
+        session.backend.prepare(&peers, &f.runtime).await?;
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), prepared_reads, "session preparation reuses completed discovery");
+        let peers = Arc::new(peers);
+        let (_, download) = session.backend.download(&peers, &f.runtime).await?;
+        download.validate().await?;
+        drop(download);
+        drop(session);
+        let reads = f.store.reads.load(Ordering::SeqCst);
+        assert!(sessions.list(&peers, &f.runtime, "forged", "", None).await.is_err());
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), reads);
+        sessions.close(&open.session_id).await;
+        assert!(sessions.list(&peers, &f.runtime, &open.session_id, "", None).await.is_err());
+        let stale = sessions.open(&peers, &f.runtime, FileLocation::S3 { connection_id: "connection".into(), bucket: "bucket".into() }).await?;
+        assert!(sessions.delete_plan(&peers, &f.runtime, &stale.session_id, "").await.is_err());
+        assert!(sessions.delete_execute(&peers, &f.runtime, &stale.session_id, "forged", true).await.is_err());
+        f.revision.store(2, Ordering::SeqCst);
+        assert!(sessions.list(&peers, &f.runtime, &stale.session_id, "", None).await.is_err());
+        assert!(sessions.preview(&peers, &f.runtime, &stale.session_id, "docs/a").await.is_err());
+        let expired = sessions.open(&peers, &f.runtime, FileLocation::S3 { connection_id: "connection".into(), bucket: "bucket".into() }).await?;
+        {
+            let mut entries = sessions.sessions.lock().await;
+            let entry = entries.get_mut(&expired.session_id).ok_or("missing session")?;
+            Arc::get_mut(entry).ok_or("shared session")?.created = std::time::Instant::now() - std::time::Duration::from_secs(FILE_SESSION_TTL_SECS);
+        }
+        assert!(sessions.list(&peers, &f.runtime, &expired.session_id, "", None).await.is_err());
+        let locked = sessions.open(&peers, &f.runtime, FileLocation::S3 { connection_id: "connection".into(), bucket: "bucket".into() }).await?;
+        f.runtime.vault.lock()?;
+        assert!(sessions.list(&peers, &f.runtime, &locked.session_id, "", None).await.is_err());
+        assert!(sessions.preview(&peers, &f.runtime, &locked.session_id, "docs/a").await.is_err());
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), reads);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn unified_preview_closed_during_io_never_returns_old_payload() -> Result<(), TestError> {
+        use crate::file_manager::types::*;
+        let f = fixture().await?;
+        f.runtime.resume()?;
+        let peers = crate::PeerManager::new(Arc::clone(&f.runtime.vault), f._dir.path().join("peer-temp"))?;
+        let sessions = FileSessions::default();
+        let opened = sessions.open(&peers, &f.runtime, FileLocation::S3 { connection_id: "connection".into(), bucket: "bucket".into() }).await?;
+        f.store.behavior.store(7, Ordering::SeqCst);
+        let preview = sessions.preview(&peers, &f.runtime, &opened.session_id, "preview/small.md");
+        let close = async {
+            f.store.stat_started.notified().await;
+            sessions.close(&opened.session_id).await;
+            f.store.stat_release.notify_one();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async { tokio::join!(preview, close) }).await?;
+        assert_eq!(result.err().ok_or("closed session returned payload")?.code, "FILE_SESSION_INVALID");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_session_binding_rejects_bucket_and_revision_changes_before_io() -> Result<(), TestError> {
+        let f = fixture().await?;
+        f.runtime.resume()?;
+        let (revision, identity) = f.runtime.object_selection_scope("connection").await?;
+        f.runtime.object_list_bound("connection", "", None, Some((revision, &identity))).await?;
+        *f.store.bucket.lock().map_err(|_| "bucket lock")? = "alternate".into();
+        f.runtime.object_select_bucket("connection", "alternate").await?;
+        let reads = f.store.reads.load(Ordering::SeqCst);
+        assert!(f.runtime.object_list_bound("connection", "", None, Some((revision, &identity))).await.is_err());
+        assert!(f.runtime.object_preview_bound("connection", "docs/a", Some((revision, &identity))).await.is_err());
+        assert!(f.runtime.object_delete_plan_bound("connection", "docs/", Some((revision, &identity))).await.is_err());
+        assert!(f.runtime.object_delete_execute_bound("connection", "forged", true, Some((revision, &identity))).await.is_err());
+        assert!(f.runtime.object_select_upload_files_bound("connection", revision, String::new(), Vec::new(), Some(&identity)).await.is_err());
+        assert!(f.runtime.object_select_upload_directory_bound("connection", revision, String::new(), f._dir.path(), Some(&identity)).await.is_err());
+        assert_eq!(f.store.mutations.load(Ordering::SeqCst), 0);
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), reads);
+        *f.store.bucket.lock().map_err(|_| "bucket lock")? = "bucket".into();
+        f.runtime.object_select_bucket("connection", "bucket").await?;
+        f.revision.store(2, Ordering::SeqCst);
+        assert!(f.runtime.object_list_bound("connection", "", None, Some((revision, &identity))).await.is_err());
+        assert!(f.runtime.object_preview_bound("connection", "docs/a", Some((revision, &identity))).await.is_err());
+        assert_eq!(f.store.reads.load(Ordering::SeqCst), reads);
+        Ok(())
+    }
+    #[tokio::test]
+    async fn shared_download_s3_empty_directory_markers_preserve_directories() -> Result<(), TestError> {
+        use crate::{download_types::*, traits::TransferQueueAdapter};
+        let f = fixture().await?; f.runtime.resume()?;
+        f.store.extra_objects.lock().await.extend(["empty/".into(), "empty/nested/".into()]);
+        let session = f.runtime.object_session("connection").await?;
+        let adapter = Arc::new(crate::download_types::S3DownloadAdapter { runtime: Arc::clone(&f.runtime), connection: "connection".into(), session });
+        let plan = adapter.plan(DownloadSelection::Folder { path: "empty".into() }).await?;
+        assert_eq!(plan.len(), 2);
+        assert!(plan.iter().all(|item| item.is_dir));
+        assert_eq!(plan.iter().map(|item| item.relative_path.as_str()).collect::<Vec<_>>(), ["empty", "empty/nested"]);
+        let dir = tempfile::tempdir()?;
+        let queues = Arc::new(DownloadQueues::default());
+        let q = queues.select(DownloadBackend::S3 { connection_id: "connection".into() }, DownloadSelection::Folder { path: "empty".into() }, super::super::PhysicalRoot::open(dir.path()).map_err(app)?, adapter).await?;
+        queues.start(&q.queue_id).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let s = queues.status(&q.queue_id).await?;
+                if s.phase == "completed" { break; }
+                if s.phase == "failed" { return Err(s.error.ok_or_else(state_error)?); }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            Ok::<_, AppError>(())
+        }).await??;
+        assert!(dir.path().join("empty/nested").is_dir());
+        queues.release(&q.queue_id).await?;
+        f.store.extra_objects.lock().await.push(format!("empty/{}/", vec!["nested"; MAX_DOWNLOAD_DEPTH + 1].join("/")));
+        let session = f.runtime.object_session("connection").await?;
+        let adapter = crate::download_types::S3DownloadAdapter { runtime: Arc::clone(&f.runtime), connection: "connection".into(), session };
+        assert!(adapter.plan(DownloadSelection::Folder { path: "empty".into() }).await.is_err());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn shared_download_s3_adapter_skip_overwrite_reset_and_prefix_plan() -> Result<(), TestError> {
         use crate::{download_types::*, traits::TransferQueueAdapter};
@@ -400,6 +529,35 @@ mod tests {
         f.revision.store(2, Ordering::SeqCst); assert!(adapter.validate().await.is_err());
         Ok(())
     }
+    #[tokio::test]
+    async fn unified_upload_selection_binds_bucket_and_releases_handles() -> Result<(), TestError> {
+        use crate::file_manager::types::*;
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let peers = Arc::new(crate::PeerManager::new(Arc::clone(&f.runtime.vault), f._dir.path().join("peer-temp"))?);
+        let sessions = FileSessions::default();
+        let opened = sessions.open(&peers, &f.runtime, FileLocation::S3 { connection_id: "connection".into(), bucket: "bucket".into() }).await?;
+        let session = sessions.admitted(&peers, &f.runtime, &opened.session_id).await?;
+        let source = f._dir.path().join("selected.txt");
+        std::fs::write(&source, b"selected")?;
+        let selected = session.backend.select_upload(&peers, &f.runtime, "docs/".into(), vec![source.clone()], crate::file_manager::types::UploadMode::Single, Default::default()).await?;
+        let FileUploadDto::Cloud(summary) = selected else { return Err("unexpected backend".into()); };
+        assert_eq!(summary.bucket, "bucket");
+        assert_eq!(summary.prefix, "docs/");
+        assert_eq!(summary.phase, "selected");
+        let page = session.backend.upload_page(&peers, &f.runtime, &summary.batch_id, None, None, Some(1)).await?;
+        assert_eq!(page.entries.len(), 1);
+        let status = session.backend.upload_action(&peers, &f.runtime, &summary.batch_id, UploadAction::Status).await?;
+        assert!(matches!(status, FileUploadDto::Cloud(ref value) if value.phase == "selected"));
+        session.backend.upload_action(&peers, &f.runtime, &summary.batch_id, UploadAction::Cancel).await?;
+        session.backend.release_upload(&peers, &f.runtime, &summary.batch_id).await?;
+        assert!(f.runtime.object_status_upload_directory("connection", &summary.batch_id).await.is_err());
+        *f.store.bucket.lock().map_err(|_| "bucket lock")? = "alternate".into();
+        f.runtime.object_select_bucket("connection", "alternate").await?;
+        assert!(session.backend.select_upload(&peers, &f.runtime, "docs/".into(), vec![source], crate::file_manager::types::UploadMode::Single, Default::default()).await.is_err());
+        Ok(())
+    }
+
     async fn authorize(f: &Fixture) -> Result<(), AppError> {
         f.runtime.resume()?;
         f.runtime
@@ -1651,6 +1809,45 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn unified_delete_plan_is_bound_expiring_and_single_use() -> Result<(), TestError> {
+        use crate::file_manager::types::*;
+        let f = fixture().await?;
+        authorize(&f).await?;
+        let peers = crate::PeerManager::new(Arc::clone(&f.runtime.vault), f._dir.path().join("peer-temp"))?;
+        let sessions = FileSessions::default();
+        let first = sessions.open(&peers, &f.runtime, FileLocation::S3 { connection_id: "connection".into(), bucket: "bucket".into() }).await?;
+        let second = sessions.open(&peers, &f.runtime, FileLocation::S3 { connection_id: "connection".into(), bucket: "bucket".into() }).await?;
+        let plan = sessions.delete_plan(&peers, &f.runtime, &first.session_id, "docs/").await?;
+        assert_eq!(plan.object_count, 2);
+        let wire = serde_json::to_value(&plan).map_err(|_| "serialize unified delete plan")?;
+        assert_eq!(wire["targetId"], "docs/");
+        assert_eq!(wire["confirmation"], "snapshot");
+        assert_eq!(wire["entries"][0]["id"], "docs/a");
+        assert!(wire["entries"][0].get("key").is_none());
+        assert!(sessions.delete_execute(&peers, &f.runtime, &second.session_id, &plan.plan_id, true).await.is_err());
+        assert!(sessions.delete_execute(&peers, &f.runtime, &first.session_id, &plan.plan_id, false).await.is_err());
+        assert_eq!(f.store.mutations.load(Ordering::SeqCst), 0);
+        f.store.extra_objects.lock().await.push("docs/new-after-plan".into());
+        let result = sessions.delete_execute(&peers, &f.runtime, &first.session_id, &plan.plan_id, true).await?;
+        assert_eq!(result.deleted, vec!["docs/a", "docs/nested/b"]);
+        assert!(result.failed.is_empty());
+        assert!(sessions.delete_execute(&peers, &f.runtime, &first.session_id, &plan.plan_id, true).await.is_err());
+        let expired = sessions.delete_plan(&peers, &f.runtime, &first.session_id, "docs/").await?;
+        {
+            let mut plans = sessions.delete_plans.lock().await;
+            plans.get_mut(&expired.plan_id).ok_or("missing plan")?.created = std::time::Instant::now() - std::time::Duration::from_secs(300);
+        }
+        assert!(sessions.delete_execute(&peers, &f.runtime, &first.session_id, &expired.plan_id, true).await.is_err());
+        let stale = sessions.delete_plan(&peers, &f.runtime, &first.session_id, "docs/").await?;
+        f.revision.store(2, Ordering::SeqCst);
+        assert!(sessions.delete_execute(&peers, &f.runtime, &first.session_id, &stale.plan_id, true).await.is_err());
+        assert_eq!(f.store.mutations.load(Ordering::SeqCst), 2);
+        sessions.close(&first.session_id).await;
+        assert!(!sessions.delete_plans.lock().await.contains_key(&stale.plan_id));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn delete_folder_trailing_slash_snapshot_lifecycle() -> Result<(), TestError> {
         let f = fixture().await?;
         authorize(&f).await?;
@@ -2365,15 +2562,7 @@ impl CloudRuntime {
         self.object_admit()?;
         let mut state = self.objects.lock().await;
         state.prune();
-        let load = || {
-            self.config
-                .snapshot()
-                .map_err(config_error)?
-                .connections
-                .into_iter()
-                .find(|c| c.id == connection_id)
-                .ok_or_else(|| app(CloudError::NotFound))
-        };
+        let load = || self.connection(connection_id);
         #[cfg(not(test))]
         let connection = load()?;
         #[cfg(test)]
@@ -2514,7 +2703,7 @@ impl CloudRuntime {
             &input.secret_key,
             input.session_token.as_deref(),
             input.allow_insecure_http,
-            &input.proxy,
+            &self.resolved_proxy(&input.proxy)?,
         )
         .await
         .map_err(app)
@@ -2545,9 +2734,20 @@ impl CloudRuntime {
         connection_id: &str,
         key: &str,
     ) -> Result<crate::types::PreviewPayload, AppError> {
+        self.object_preview_bound(connection_id, key, None).await
+    }
+    pub(crate) async fn object_preview_bound(
+        &self,
+        connection_id: &str,
+        key: &str,
+        binding: Option<(u64, &ProtectedIdentity)>,
+    ) -> Result<crate::types::PreviewPayload, AppError> {
         self.object_admit()?;
         let _permit = self.network.read().await;
         let session = self.object_session(connection_id).await?;
+        if binding.is_some_and(|(revision, identity)| revision != session.revision || *identity != session.identity) {
+            return Err(state_error());
+        }
         let limit = crate::types::MAX_PREVIEW_BYTES;
         let metadata = session.store.stat(key).await.map_err(app)?;
         if metadata.size > limit {
@@ -2581,9 +2781,21 @@ impl CloudRuntime {
         prefix: &str,
         next: Option<&str>,
     ) -> Result<ObjectPageDto, AppError> {
+        self.object_list_bound(connection_id, prefix, next, None).await
+    }
+    pub(crate) async fn object_list_bound(
+        &self,
+        connection_id: &str,
+        prefix: &str,
+        next: Option<&str>,
+        binding: Option<(u64, &ProtectedIdentity)>,
+    ) -> Result<ObjectPageDto, AppError> {
         self.object_admit()?;
         let _permit = self.network.read().await;
         let session = self.object_session(connection_id).await?;
+        if binding.is_some_and(|(revision, identity)| revision != session.revision || *identity != session.identity) {
+            return Err(state_error());
+        }
         let mut operations = session.browse.lock().await;
         // No token is an explicit user browse/refresh, not an automatic retry.
         if next.is_none() {
@@ -2731,9 +2943,18 @@ impl CloudRuntime {
         connection_id: &str,
         prefix: &str,
     ) -> Result<ObjectDeletePlanDto, AppError> {
+        self.object_delete_plan_bound(connection_id, prefix, None).await
+    }
+    pub(crate) async fn object_delete_plan_bound(
+        &self,
+        connection_id: &str,
+        prefix: &str,
+        binding: Option<(u64, &ProtectedIdentity)>,
+    ) -> Result<ObjectDeletePlanDto, AppError> {
         self.object_admit()?;
         let _permit = self.network.read().await;
         let session = self.object_session(connection_id).await?;
+        if binding.is_some_and(|(revision, identity)| revision != session.revision || *identity != session.identity) { return Err(state_error()); }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| {
@@ -2788,9 +3009,19 @@ impl CloudRuntime {
         plan_id: &str,
         confirmed: bool,
     ) -> Result<ObjectDeleteResultDto, AppError> {
+        self.object_delete_execute_bound(connection_id, plan_id, confirmed, None).await
+    }
+    pub(crate) async fn object_delete_execute_bound(
+        &self,
+        connection_id: &str,
+        plan_id: &str,
+        confirmed: bool,
+        binding: Option<(u64, &ProtectedIdentity)>,
+    ) -> Result<ObjectDeleteResultDto, AppError> {
         self.object_admit()?;
         let _permit = self.network.read().await;
         let session = self.object_session(connection_id).await?;
+        if binding.is_some_and(|(revision, identity)| revision != session.revision || *identity != session.identity) { return Err(state_error()); }
         if !confirmed {
             return Err(app(ObjectServiceError::ConfirmationRequired));
         }

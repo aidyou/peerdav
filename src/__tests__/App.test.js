@@ -1568,7 +1568,7 @@ describe("settings information architecture", () => {
       wrapper
         .findAll("#pane-general .group-title")
         .map((node) => node.text()),
-    ).toEqual(["外观", "系统集成", "锁屏", "忽略规则", "软件更新", "会话"]);
+    ).toEqual(["网络代理", "外观", "系统集成", "锁屏", "忽略规则", "软件更新", "会话"]);
     const ignoreGroup = wrapper.find('[data-testid="ignore-settings"]');
     expect(ignoreGroup.find('[role="switch"]').attributes("aria-checked")).toBe("true");
     await ignoreGroup.find('[role="switch"]').trigger("click");
@@ -1997,6 +1997,17 @@ describe("Finder-style peer browser", () => {
       }),
       list_peers: async () => [PEER],
       list_peer_shares: async () => [SHARE],
+      file_open_session: async () => ({ sessionId: 'browser-session', root: '/' }),
+      file_close_session: async () => {},
+      file_delete_plan: async () => ({ planId: 'peer-plan' }),
+      file_delete_execute: async () => ({ deleted: [], failed: [] }),
+      file_list: async ({ id: path }) => {
+        const listing = await (overrides.list_peer_dir || (async () => LISTING))({ peerId: 'peer-1', shareId: 'share-1', path });
+        let parent = '';
+        const breadcrumbs = listing.path.split('/').filter(Boolean).map(name => { parent += `/${name}`; return { id: parent, name }; });
+        return { ...listing, id: listing.path, breadcrumbs, entries: listing.entries.map(entry => ({ ...entry, id: entry.path })), complete: !listing.truncated, next: null, protected: false };
+      },
+      file_preview: async ({ id: path }) => (overrides.preview_peer_file ? overrides.preview_peer_file({ remotePath: path }) : ({ fileName: 'notes.txt', mime: 'text/plain', encoding: 'utf8', data: 'hello peer\n', size: 11 })),
       list_peer_dir: async () => LISTING,
       preview_peer_file: async () => ({
         fileName: "notes.txt",
@@ -2005,12 +2016,27 @@ describe("Finder-style peer browser", () => {
         data: "hello peer\n",
         size: 11,
       }),
+      file_select_download: async args => overrides.transfer_select_download ? overrides.transfer_select_download(args) : queueSummary('selected'),
       transfer_select_download: async () => queueSummary('selected'),
       transfer_start_download: async () => queueSummary('completed', { completedFiles: 1 }),
       transfer_status_download: async () => queueSummary('completed', { completedFiles: 1 }),
       transfer_page_download: async () => ({ items: [{ remotePath: '/notes.txt', relativePath: 'notes.txt', phase: 'completed' }], nextOffset: null }),
       transfer_resolve_download: async () => {}, transfer_cancel_download: async () => {},
       transfer_release_download: async () => {}, transfer_reveal_download: async () => {},
+      file_select_upload: async args => overrides.peer_select_upload_batch ? overrides.peer_select_upload_batch(args) : batchSummary('selected'),
+      file_upload_action: async ({ action, batchId }) => {
+        const args = { peerId: 'peer-1', batchId };
+        if (action === 'cancel') {
+          await (overrides.peer_cancel_upload_batch || (async () => {}))(args);
+          return (overrides.peer_status_upload_batch || (async () => batchSummary('cancelled')))(args);
+        }
+        return action === 'start'
+          ? (overrides.peer_start_upload_batch || (async () => batchSummary('running')))(args)
+          : (overrides.peer_status_upload_batch || (async () => batchSummary('running')))(args);
+      },
+      file_upload_page: args => (overrides.peer_page_upload_batch || (async () => batchPage()))(args),
+      file_upload_resolve: args => (overrides.peer_resolve_upload_batch || (async () => {}))(args),
+      file_release_upload: args => (overrides.peer_release_upload_batch || (async () => {}))(args),
       peer_select_upload_batch: async () => batchSummary("selected"),
       peer_start_upload_batch: async () => batchSummary("running"),
       peer_status_upload_batch: async () => batchSummary("running"),
@@ -2040,12 +2066,12 @@ describe("Finder-style peer browser", () => {
     await wrapper.find(`${entrySelector}[data-path="${mode === 'single' ? '/notes.txt' : '/sub'}"]`).trigger('click');
     if (mode === 'files') await wrapper.find(`${entrySelector}[data-path="/notes.txt"]`).trigger('click', { ctrlKey: true });
     await flushPromises();
-    await wrapper.find('.selection-actions button').trigger('click');
+    await wrapper.find('.selection-actions [data-test="download"]').trigger('click');
     expect(wrapper.find('.selection-bar').exists()).toBe(false);
     expect(wrapper.findAll(`${entrySelector}.is-selected`)).toHaveLength(0);
-    expect(invoke).toHaveBeenCalledWith('transfer_select_download', {
-      backend: { backend: 'peer', peerId: 'peer-1', shareId: 'share-1' },
-      selection: mode === 'single' ? { mode, path: '/notes.txt' } : { mode, paths: ['/sub', '/notes.txt'] },
+    expect(invoke).toHaveBeenCalledWith('file_select_download', {
+      sessionId: 'browser-session',
+      selection: mode === 'single' ? { mode, id: '/notes.txt' } : { mode, ids: ['/sub', '/notes.txt'] },
     });
     settle(null); await flushPromises();
     expect(wrapper.find('.selection-bar').exists()).toBe(false);
@@ -2059,19 +2085,41 @@ describe("Finder-style peer browser", () => {
     const { wrapper } = await openBrowser({
       list_peer_shares: async () => [{ ...SHARE, permissions: { ...SHARE.permissions, canDelete: true } }],
       transfer_select_download: () => pending,
-      prepare_peer_external_edit: () => pending,
+      file_prepare_edit: () => pending,
     });
     if (label === '删除') confirmAction.mockImplementationOnce(() => pending);
     await wrapper.findAll('.file-tile')[folder ? 0 : 1].trigger('click');
     await wrapper.findAll('.selection-actions button').find((button) => button.text() === label).trigger('click');
     expect(wrapper.find('.selection-actions').exists()).toBe(false);
     expect(wrapper.findAll('.file-tile.is-selected')).toHaveLength(0);
-    if (label === '下载') expect(invoke).toHaveBeenCalledWith('transfer_select_download', { backend: { backend: 'peer', peerId: 'peer-1', shareId: 'share-1' }, selection: { mode: 'folder', path: '/sub' } });
-    if (label === '外部编辑') expect(invoke).toHaveBeenCalledWith('prepare_peer_external_edit', { peerId: 'peer-1', shareId: 'share-1', remotePath: '/notes.txt' });
-    if (label === '打开') expect(invoke).toHaveBeenCalledWith('list_peer_dir', { peerId: 'peer-1', shareId: 'share-1', path: '/sub' });
+    if (label === '下载') expect(invoke).toHaveBeenCalledWith('file_select_download', { sessionId: 'browser-session', selection: { mode: 'folder', id: '/sub' } });
+    if (label === '外部编辑') expect(invoke).toHaveBeenCalledWith('file_prepare_edit', { sessionId: 'browser-session', id: '/notes.txt' });
+    if (label === '打开') expect(invoke).toHaveBeenCalledWith('file_list', { sessionId: 'browser-session', id: '/sub', next: null });
     settle(label === '删除' ? false : null); await flushPromises();
     if (label === '删除') expect(invoke.mock.calls.some(([name]) => name === 'delete_peer_entry')).toBe(false);
     expect(wrapper.find('.selection-actions').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it('uses the same ID-based editor lifecycle as cloud adapters', async () => {
+    const { wrapper } = await openBrowser({
+      file_prepare_edit: async () => ({ editId: 'shared-edit', id: '/notes.txt', name: 'notes.txt', localPath: '/private/editor/notes.txt' }),
+      file_commit_edit: async () => true,
+      file_discard_edit: async () => {},
+    });
+    await wrapper.find('.file-tile[data-path="/notes.txt"]').trigger('click');
+    await wrapper.findAll('.selection-actions button').find(button => button.text() === '外部编辑').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('.edit-panel').text()).toContain('notes.txt');
+    expect(wrapper.find('.edit-panel strong').text()).toBe('外部编辑：notes.txt');
+    await wrapper.findAll('.edit-panel button').find(button => button.text() === '上传修改').trigger('click');
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith('file_commit_edit', { editId: 'shared-edit' });
+    await wrapper.findAll('.edit-panel button').find(button => button.text() === '放弃').trigger('click');
+    await flushPromises();
+    expect(invoke).toHaveBeenCalledWith('file_discard_edit', { editId: 'shared-edit' });
+    expect(wrapper.find('.edit-panel').exists()).toBe(false);
+    expect(invoke.mock.calls.some(([name]) => ['prepare_peer_external_edit', 'commit_peer_external_edit', 'discard_peer_external_edit'].includes(name))).toBe(false);
     wrapper.unmount();
   });
 
@@ -2142,8 +2190,7 @@ describe("Finder-style peer browser", () => {
     expect(wrapper.find(".selection-bar").exists()).toBe(false);
     const main = wrapper.find(".browser-main");
     const gallery = wrapper.find(".gallery-view");
-    const thumbs = wrapper.findAll(".gallery-thumb");
-    await thumbs[0].trigger("click");
+    await wrapper.find('.gallery-thumb[data-path="/photo.png"]').trigger("click");
     await flushPromises();
     expect(main.element.contains(gallery.element)).toBe(true);
     expect(wrapper.find(".selection-bar").exists()).toBe(true);
@@ -2556,7 +2603,7 @@ describe("Finder-style peer browser", () => {
     const release = vi.fn(async () => {}); const reveal = vi.fn(async () => {});
     const { wrapper } = await openBrowser({ transfer_release_download: release, transfer_reveal_download: reveal });
     await wrapper.findAll('.file-tile')[1].trigger('click'); await clickButton(wrapper, '下载'); await flushPromises();
-    expect(invoke).toHaveBeenCalledWith('transfer_select_download', { backend: { backend: 'peer', peerId: 'peer-1', shareId: 'share-1' }, selection: { mode: 'single', path: '/notes.txt' } });
+    expect(invoke).toHaveBeenCalledWith('file_select_download', { sessionId: 'browser-session', selection: { mode: 'single', id: '/notes.txt' } });
     expect(wrapper.find('[data-test=download-dialog]').text()).toContain('notes.txt');
     expect(wrapper.find('[data-test=download-dialog] [role=progressbar]').exists()).toBe(false);
     await wrapper.find('[data-test=reveal-download]').trigger('click'); await flushPromises();
@@ -2570,7 +2617,7 @@ describe("Finder-style peer browser", () => {
     const resolveConflict = vi.fn(async () => {});
     const { wrapper, downloadTo } = await openBrowser({
       peer_start_upload_batch: async () => batchSummary("conflict", {
-        conflict: { conflictId: "conflict-a", relativePath: "docs/a.txt", key: "/docs/a.txt", etag: null },
+        conflict: { conflictId: "conflict-a", overwriteAllowed: true, relativePath: "docs/a.txt", key: "/docs/a.txt", etag: null },
       }),
       peer_resolve_upload_batch: resolveConflict,
       peer_status_upload_batch: async () => batchSummary("completed", { completedFiles: 1, completedBytes: 5, totalFiles: 1 }),
@@ -2581,7 +2628,7 @@ describe("Finder-style peer browser", () => {
     await clickButton(wrapper, "下载");
     await flushPromises();
 
-    expect(invoke).toHaveBeenCalledWith('transfer_select_download', { backend: { backend: 'peer', peerId: 'peer-1', shareId: 'share-1' }, selection: { mode: 'single', path: '/notes.txt' } });
+    expect(invoke).toHaveBeenCalledWith('file_select_download', { sessionId: 'browser-session', selection: { mode: 'single', id: '/notes.txt' } });
     expect(downloadTo).not.toHaveBeenCalled();
     expect(wrapper.text()).not.toContain('/tmp/peerdav-save.txt');
 
@@ -2594,7 +2641,7 @@ describe("Finder-style peer browser", () => {
     await new DOMWrapper(document.querySelector('[data-test="upload-apply-remaining"]')).setValue(true);
     await new DOMWrapper(document.querySelector('[data-test="upload-overwrite"]')).trigger("click");
     await flushPromises();
-    expect(resolveConflict).toHaveBeenCalledWith({ peerId: "peer-1", batchId: "peer-batch",
+    expect(resolveConflict).toHaveBeenCalledWith({ sessionId: 'browser-session', batchId: "peer-batch",
       conflictId: "conflict-a", decision: "overwrite", applyToRemaining: true });
     expect(wrapper.find('[data-test="upload-dialog"] .dialog-footer').text()).toContain("1/1");
     expect(wrapper.find('[data-test="upload-dialog"] .dialog-footer').text()).toContain("5 B");
@@ -2814,7 +2861,7 @@ describe("Finder-style peer browser", () => {
   it("deletes a selected folder only after confirmation", async () => {
     const remove = vi.fn(async () => {});
     const { wrapper } = await openBrowser({
-      delete_peer_entry: remove,
+      file_delete_execute: async args => { await remove(args); return { deleted: ['/sub'], failed: [] }; },
       list_peer_shares: async () => [
         { ...SHARE, permissions: { ...SHARE.permissions, canDelete: true } },
       ],
@@ -2830,12 +2877,41 @@ describe("Finder-style peer browser", () => {
       { danger: true, confirmText: "删除" },
     );
     expect(remove).toHaveBeenCalledWith({
-      peerId: "peer-1",
-      shareId: "share-1",
-      remotePath: "/sub",
+      sessionId: 'browser-session', planId: 'peer-plan', confirmed: true,
     });
     expect(document.body.textContent).toContain("已删除“sub”。");
 
+    wrapper.unmount();
+  });
+
+  it('does not execute a peer deletion confirmed after unmount', async () => {
+    let settle;
+    confirmAction.mockImplementationOnce(() => new Promise(resolve => { settle = resolve; }));
+    const remove = vi.fn(async () => ({ deleted: ['/sub'], failed: [] }));
+    const { wrapper } = await openBrowser({
+      file_delete_execute: remove,
+      list_peer_shares: async () => [{ ...SHARE, permissions: { ...SHARE.permissions, canDelete: true } }],
+    });
+    await wrapper.findAll('.file-tile')[0].trigger('click');
+    await flushPromises();
+    await clickButton(wrapper, '删除');
+    expect(confirmAction).toHaveBeenCalledTimes(1);
+    wrapper.unmount();
+    settle(true);
+    await flushPromises();
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it('hides operations denied by backend capabilities even when share permissions allow them', async () => {
+    const { wrapper } = await openBrowser({
+      file_open_session: async () => ({ sessionId: 'restricted', root: '/', capabilities: { upload: false, delete: false, externalEdit: false } }),
+      list_peer_shares: async () => [{ ...SHARE, permissions: { canWrite: true, canDelete: true } }],
+    });
+    await wrapper.find('.file-tile[data-path="/notes.txt"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('[data-test=delete-file]').exists()).toBe(false);
+    expect(wrapper.find('[data-test=upload]').attributes('disabled')).toBeDefined();
+    expect(wrapper.findAll('.preview-actions button').some(button => button.text() === '编辑')).toBe(false);
     wrapper.unmount();
   });
 
@@ -2843,7 +2919,7 @@ describe("Finder-style peer browser", () => {
     const remove = vi.fn(async () => {});
     confirmAction.mockResolvedValueOnce(false);
     const { wrapper } = await openBrowser({
-      delete_peer_entry: remove,
+      file_delete_execute: async args => { await remove(args); return { deleted: ['/sub'], failed: [] }; },
       list_peer_shares: async () => [
         { ...SHARE, permissions: { ...SHARE.permissions, canDelete: true } },
       ],
@@ -3217,8 +3293,8 @@ describe("Finder-style peer browser", () => {
     await clickButton(wrapper, "下载");
     await flushPromises();
 
-    expect(invoke).toHaveBeenCalledWith('transfer_select_download', {
-      backend: { backend: 'peer', peerId: 'peer-1', shareId: 'share-1' }, selection: { mode: 'files', paths: ['/sub', '/a.txt', '/b.txt'] },
+    expect(invoke).toHaveBeenCalledWith('file_select_download', {
+      sessionId: 'browser-session', selection: { mode: 'files', ids: ['/sub', '/a.txt', '/b.txt'] },
     });
     expect(prepare).not.toHaveBeenCalled();
     expect(downloadFile).not.toHaveBeenCalled();
@@ -3245,7 +3321,7 @@ describe("Finder-style peer browser", () => {
       transfer_page_download: async () => ({ items: [{ remotePath: '/sub/inner.txt', relativePath: 'sub/inner.txt', phase: 'completed' }], nextOffset: 100 }),
     });
     await wrapper.findAll('.file-tile')[0].trigger('click'); await clickButton(wrapper, '下载'); await flushPromises();
-    expect(invoke).toHaveBeenCalledWith('transfer_select_download', { backend: { backend: 'peer', peerId: 'peer-1', shareId: 'share-1' }, selection: { mode: 'folder', path: '/sub' } });
+    expect(invoke).toHaveBeenCalledWith('file_select_download', { sessionId: 'browser-session', selection: { mode: 'folder', id: '/sub' } });
     expect(invoke).toHaveBeenCalledWith('transfer_page_download', { queueId: 'peer-download', offset: 0, limit: 100 });
     expect(wrapper.find('[data-test=download-dialog]').text()).toContain('5000/10001');
     expect(wrapper.find('[data-test=download-dialog]').text()).toContain('sub/deep/a.txt');
@@ -3344,9 +3420,9 @@ describe("Finder-style peer browser", () => {
     const { wrapper } = await openBrowser({ peer_select_upload_batch: selectBatch, peer_page_upload_batch: pageBatch });
     await wrapper.find('button[aria-label="上传文件夹"]').trigger("click");
     await flushPromises();
-    expect(selectBatch).toHaveBeenCalledWith({ peerId: "peer-1", shareName: "Docs", remoteDir: "/", mode: "folder",
+    expect(selectBatch).toHaveBeenCalledWith({ sessionId: 'browser-session', id: '/', mode: "folder",
       options: { respectGitignore: generalSettings.respectGitignore, patterns: generalSettings.ignorePatterns } });
-    expect(invoke).toHaveBeenCalledWith("peer_start_upload_batch", { peerId: "peer-1", batchId: "peer-batch", conflictPolicy: "ask" });
+    expect(invoke).toHaveBeenCalledWith("file_upload_action", { sessionId: 'browser-session', batchId: "peer-batch", action: 'start' });
     expect(wrapper.findAll('[data-test="upload-dialog"] li')).toHaveLength(1);
     expect(wrapper.find('[data-test="upload-dialog"]').text()).toContain("sub");
     expect(wrapper.find('[data-test="upload-enter"]').exists()).toBe(false);
@@ -3369,7 +3445,7 @@ describe("Finder-style peer browser", () => {
     selected(batchSummary("selected"));
     await flushPromises();
     expect(start).not.toHaveBeenCalled();
-    expect(release).toHaveBeenCalledWith({ peerId: "peer-1", batchId: "peer-batch" });
+    expect(release).toHaveBeenCalledWith({ sessionId: 'browser-session', batchId: "peer-batch" });
   });
 
   it("disables peer batch selection without write permission", async () => {
@@ -3394,11 +3470,12 @@ describe("Finder-style peer browser", () => {
     expect(document.querySelector(".shortcuts-panel")).toBeNull();
     expect(trigger.attributes("aria-expanded")).toBe("false");
 
-    // 图标位置：紧随"上传文件夹"之后，只在文件管理器打开时出现。
+    // 快捷键位于刷新之后，只在文件管理器打开时出现。
     const labels = wrapper
       .findAll("#titlebar-file-actions .view-switch__button")
       .map((button) => button.attributes("aria-label"));
-    expect(labels.indexOf("上传文件夹") + 1).toBe(labels.indexOf("快捷键说明"));
+    expect(labels.indexOf("上传文件夹") + 1).toBe(labels.indexOf("刷新"));
+    expect(labels.indexOf("刷新") + 1).toBe(labels.indexOf("快捷键说明"));
 
     await trigger.trigger("click");
     await flushPromises();
@@ -3442,9 +3519,9 @@ describe("Finder-style peer browser", () => {
     const slot = wrapper.find("#titlebar-file-actions");
     expect(slot.exists()).toBe(true);
     expect(slot.findAll(".view-switch")).toHaveLength(2);
-    // 第 8 个是快捷键说明入口，紧随上传文件夹之后。
+    // 浏览方式不变；操作区依次为上传、刷新、快捷键，各组之间分隔。
     expect(slot.findAll(".view-switch__button")).toHaveLength(8);
-    expect(slot.findAll(".titlebar-divider")).toHaveLength(1);
+    expect(slot.findAll(".titlebar-divider")).toHaveLength(3);
     expect(slot.find(".pathbar-actions").classes()).not.toContain(
       "titlebar-pill",
     );

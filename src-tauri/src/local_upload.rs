@@ -6,6 +6,17 @@ use crate::local_upload_types::*;
 use crate::{AppError, DomainError};
 use cap_fs_ext::DirExt;
 
+/// One lifecycle dispatcher for every upload transport. Cancellation is joined by
+/// the adapter before the final status is returned; unknown actions never succeed.
+pub(crate) async fn queue_action<A: crate::traits::UploadQueueAdapter>(adapter: &A, id: &str, action: crate::file_manager::types::UploadAction) -> Result<A::Status, AppError> {
+    use crate::file_manager::types::UploadAction;
+    match action {
+        UploadAction::Start => start_queue(adapter, id, Default::default()).await,
+        UploadAction::Status => adapter.status(id).await,
+        UploadAction::Cancel => { adapter.cancel(id).await?; adapter.status(id).await },
+    }
+}
+
 pub(crate) async fn start_queue<A: crate::traits::UploadQueueAdapter>(adapter: &A, id: &str, policy: crate::cloud::directory_types::DirectoryConflictPolicy) -> Result<A::Status, AppError> {
     crate::types::QueueConflictPolicy::from_upload(policy)?;
     adapter.start(id, policy).await

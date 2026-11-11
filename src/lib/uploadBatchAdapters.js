@@ -1,6 +1,22 @@
 import { cloudObjects } from "./cloud";
 import { peerUploadBatch } from "./peer";
 
+import { invoke, errorStrategy } from './invoke';
+
+// Every browser transport exposes the same admitted-session queue lifecycle.
+export const fileUploadAdapter = {
+  identity: scope => ({ sessionId: scope.sessionId }),
+  start: ({ sessionId, batchId }) => invoke('file_upload_action', { sessionId, batchId, action: 'start' }),
+  status: ({ sessionId, batchId }) => invoke('file_upload_action', { sessionId, batchId, action: 'status' }),
+  cancel: ({ sessionId, batchId }) => invoke('file_upload_action', { sessionId, batchId, action: 'cancel' }),
+  release: ({ sessionId, batchId }) => invoke('file_release_upload', { sessionId, batchId }),
+  page: ({ sessionId, batchId, directoryToken, cursor, limit }) => invoke('file_upload_page', { sessionId, batchId, directoryToken, cursor, limit }),
+  resolve: ({ sessionId, batchId, conflictId, decision, applyToRemaining }) => invoke('file_upload_resolve', { sessionId, batchId, conflictId, decision, applyToRemaining }),
+  overwriteAllowed: conflict => conflict?.overwriteAllowed === true,
+  isCursorReset: error => errorStrategy(error) === 'refresh',
+  isCancellation: error => errorStrategy(error) === 'ignore',
+};
+
 export const cloudUploadAdapter = {
   identity: ({ connectionId }) => ({ connectionId }),
   select: ({ connectionId, prefix }, mode) => cloudObjects.selectUploadDirectory({ connectionId, prefix, mode }),

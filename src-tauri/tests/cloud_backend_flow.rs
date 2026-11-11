@@ -649,6 +649,71 @@ fn runtime_for(dir: &tempfile::TempDir) -> Arc<CloudRuntime> {
 }
 
 #[tokio::test]
+async fn loopback_authorization_cancel_and_lock_release_listener() {
+    use peerdav_lib::cloud::oauth_types::OfficialProvider;
+    let data = tempfile::tempdir().expect("data");
+    let runtime = runtime_for(&data);
+    runtime.resume().expect("resume");
+    let start = runtime.begin_loopback_authorization(OfficialProvider::GoogleDrive, "client".into(), "http://127.0.0.1:0/oauth/callback".into()).await.expect("begin");
+    let url = url::Url::parse(&start.authorization_url).expect("url");
+    let redirect = url.query_pairs().find(|(key, _)| key == "redirect_uri").expect("redirect").1.into_owned();
+    let address = url::Url::parse(&redirect).expect("callback");
+    let port = address.port().expect("port");
+    let waiter = runtime.clone();
+    let id = start.request_id.clone();
+    let task = tokio::spawn(async move { waiter.wait_loopback_authorization(&id, "Google".into(), None, "root".into()).await });
+    tokio::task::yield_now().await;
+    runtime.cancel_official_authorization(&start.request_id).await.expect("cancel");
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(2), task).await.expect("bounded cancel").expect("join").is_err());
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await.expect("listener released");
+    drop(listener);
+    let start = runtime.begin_loopback_authorization(OfficialProvider::OneDrive, "client".into(), "http://127.0.0.1:0/oauth/callback".into()).await.expect("begin second");
+    let waiter = runtime.clone();
+    let task = tokio::spawn(async move { waiter.wait_loopback_authorization(&start.request_id, "Microsoft".into(), None, "root".into()).await });
+    tokio::task::yield_now().await;
+    runtime.stop_and_clear().await.expect("shutdown");
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(2), task).await.expect("bounded shutdown").expect("join").is_err());
+    assert!(runtime.snapshot().expect("snapshot").official_connections.is_empty());
+}
+
+#[tokio::test]
+async fn official_sessions_reject_forged_roots_writes_and_stale_generations() {
+    use peerdav_lib::cloud::{oauth_types::OfficialProvider, official_types::OfficialConnection};
+    use peerdav_lib::file_manager::types::{FileLocation, FileSessions};
+    let data = tempfile::tempdir().expect("data");
+    let vault = Arc::new(Vault::open(&data.path().join("vault.pd")).expect("vault"));
+    vault.initialize(data.path().to_str().expect("path"), "admin", "password 123").expect("init");
+    let config = peerdav_lib::cloud::config::CloudConfigStore::new(vault.clone());
+    let drive = config.save_official_connection(OfficialConnection {
+        id: String::new(), name: "Google".into(), provider: OfficialProvider::GoogleDrive,
+        config_version: 1, revision: 0, client_id: "client".into(), client_secret: None,
+        refresh_token: "offline-invalid-token".into(), root_id: "root".into(),
+    }).expect("save");
+    let peers = peerdav_lib::PeerManager::new(vault.clone(), data.path().join("peer-temp")).expect("peers");
+    let runtime = CloudRuntime::new(vault, Arc::new(NoopSyncEvents), data.path().to_owned());
+    let sessions = FileSessions::default();
+    assert!(sessions.open(&peers, &runtime, FileLocation::Cloud { connection_id: drive.id.clone(), root_id: None }).await.is_err());
+    runtime.resume().expect("resume");
+    assert!(sessions.open(&peers, &runtime, FileLocation::Cloud { connection_id: drive.id.clone(), root_id: Some("forged".into()) }).await.is_err());
+    let opened = sessions.open(&peers, &runtime, FileLocation::Cloud { connection_id: drive.id.clone(), root_id: None }).await.expect("open by ID");
+    assert!(opened.capabilities.list);
+    assert!(opened.capabilities.upload && opened.capabilities.create_dir);
+    assert!(opened.capabilities.delete && opened.capabilities.external_edit && opened.capabilities.online_preview);
+    assert!(opened.capabilities.download && opened.capabilities.preview && opened.capabilities.download_directory);
+    for path in ["", "/", "///", "../"] {
+        assert!(sessions.delete_plan(&peers, &runtime, &opened.session_id, path).await.is_err());
+    }
+    assert!(sessions.list(&peers, &runtime, &opened.session_id, "unlisted-folder", None).await.is_err());
+    assert!(sessions.delete_plan(&peers, &runtime, &opened.session_id, "file").await.is_err());
+    assert!(sessions.preview(&peers, &runtime, &opened.session_id, "file").await.is_err());
+    let mut changed = config.snapshot().expect("snapshot").official_connections[0].clone();
+    changed.root_id = "changed".into();
+    config.save_official_connection(changed).expect("change root");
+    assert!(sessions.list(&peers, &runtime, &opened.session_id, "", None).await.is_err());
+    runtime.stop_and_clear().await.expect("stop");
+}
+
+#[tokio::test]
 async fn file_browser_backend_cloud_contract() {
     use peerdav_lib::file_manager::{cloud_list, cloud_preview};
 
@@ -673,6 +738,16 @@ async fn file_browser_backend_cloud_contract() {
         .lock()
         .expect("objects")
         .insert("runtime/docs/notes.txt".into(), b"adapter text\n".to_vec());
+    let peer_vault = Arc::new(Vault::open(&data.path().join("browser-peer.pd")).expect("peer vault"));
+    peer_vault.initialize(data.path().to_str().expect("path"), "admin", "password 123").expect("peer init");
+    let peers = peerdav_lib::PeerManager::new(peer_vault, data.path().join("peer-temp")).expect("peers");
+    let sessions = peerdav_lib::file_manager::types::FileSessions::default();
+    let session = sessions.open(&peers, &runtime, peerdav_lib::file_manager::types::FileLocation::Cloud {
+        connection_id: connection.id.clone(), root_id: None,
+    }).await.expect("resolve stored protocol by ID");
+    let unified = sessions.list(&peers, &runtime, &session.session_id, "docs/", None).await.expect("unified list");
+    assert!(unified.entries.iter().any(|entry| entry.name == "notes.txt"));
+    sessions.close(&session.session_id).await;
     let browse = |prefix, cursor| cloud_list(&runtime, &connection.id, prefix, cursor);
     let preview = |key| cloud_preview(&runtime, &connection.id, key);
     let page = browse("docs/", None)
@@ -744,6 +819,42 @@ async fn file_browser_backend_cloud_contract() {
             .all(|(method, _)| *method == Method::GET || *method == Method::HEAD)
     );
     runtime.stop_and_clear().await.expect("stop runtime");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_cloud_editor_uploads_changes_and_rejects_remote_conflicts() {
+    use peerdav_lib::file_manager::types::{FileLocation, FileSessions};
+    let fixture = Fixture::start(false).await;
+    let data = tempfile::tempdir().expect("data");
+    let vault = Arc::new(Vault::open(&data.path().join("vault.pd")).expect("vault"));
+    vault.initialize(data.path().to_str().expect("path"), "admin", "password 123").expect("initialize");
+    let config = peerdav_lib::cloud::config::CloudConfigStore::new(vault.clone());
+    let guard = peerdav_lib::cloud::ObjectGuard::open(data.path().join("cloud-object-guard.sqlite"), config.get_or_create_index_key().expect("key").as_ref()).expect("guard");
+    guard.register_storage_identity(&peerdav_lib::cloud::ProtectedIdentity {
+        endpoint: fixture.endpoint.clone(), bucket: "fixture".into(), prefix: "runtime/".into(), alias: String::new(),
+    }, peerdav_lib::cloud::StorageIdentityAssociation::New).expect("identity");
+    drop(guard);
+    let peers = peerdav_lib::PeerManager::new(vault.clone(), data.path().join("peer-temp")).expect("peers");
+    let runtime = CloudRuntime::new(vault, Arc::new(NoopSyncEvents), data.path().to_owned());
+    runtime.resume().expect("resume");
+    let connection = runtime.save_connection(runtime_connection(&fixture)).expect("connection");
+    fixture.state.objects.lock().expect("objects").insert("runtime/notes.txt".into(), b"original".to_vec());
+    runtime.object_discover(&connection.id, "").await.expect("discover");
+    let sessions = FileSessions::default();
+    let session = sessions.open(&peers, &runtime, FileLocation::Cloud { connection_id: connection.id.clone(), root_id: None }).await.expect("session");
+    let edit = sessions.prepare_edit(&peers, &runtime, &session.session_id, "notes.txt").await.expect("prepare");
+    assert!(std::path::Path::new(&edit.local_path).starts_with(data.path().join("editor")));
+    assert!(!sessions.commit_edit(&peers, &runtime, &edit.edit_id).await.expect("unchanged"));
+    tokio::fs::write(&edit.local_path, b"saved edit").await.expect("save");
+    assert!(sessions.commit_edit(&peers, &runtime, &edit.edit_id).await.expect("upload"));
+    assert_eq!(fixture.state.objects.lock().expect("objects").get("runtime/notes.txt").expect("uploaded"), b"saved edit");
+    fixture.state.objects.lock().expect("objects").insert("runtime/notes.txt".into(), b"remote concurrent change".to_vec());
+    tokio::fs::write(&edit.local_path, b"another local save").await.expect("save");
+    assert!(sessions.commit_edit(&peers, &runtime, &edit.edit_id).await.is_err());
+    assert_eq!(tokio::fs::read(&edit.local_path).await.expect("preserved"), b"another local save");
+    sessions.discard_edit(&edit.edit_id).await.expect("discard");
+    assert!(!std::path::Path::new(&edit.local_path).exists());
+    runtime.stop_and_clear().await.expect("stop");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1164,6 +1275,10 @@ async fn sync_drive_create_join_sync_both_modes_without_cas_probe_or_control_hea
         assert!(!blocks.is_empty());
         for (key, _) in &blocks { fixture.state.objects.lock().unwrap().remove(key); }
         fixture.state.requests.lock().unwrap().clear();
+        let cloud_only = reader.local_sync_entries(&reader_mapping.id).await.expect("remote-only metadata listing");
+        assert!(cloud_only.iter().any(|entry| entry.path == "file.txt" && entry.remote_only && !entry.synced));
+        assert!(!destination.path().join("file.txt").exists());
+        assert!(fixture.state.requests.lock().unwrap().iter().all(|(_, path)| !path.contains("/blocks/")));
         let preview = reader.preview(&reader_mapping.id).await.unwrap();
         assert_eq!(preview.counts.downloads, 1);
         assert!(fixture.state.requests.lock().unwrap().iter().all(|(_, path)| !path.contains("/blocks/")));
@@ -1187,6 +1302,8 @@ async fn sync_drive_create_join_sync_both_modes_without_cas_probe_or_control_hea
             .await
             .unwrap();
         wait_completed(&runtime, &mapping.id).await;
+        let remote_changed = reader.local_sync_entries(&reader_mapping.id).await.expect("updated remote status");
+        assert!(remote_changed.iter().any(|entry| entry.path == "file.txt" && !entry.synced && !entry.remote_only));
         let preview = reader.preview(&reader_mapping.id).await.unwrap();
         reader
             .manual_sync(&reader_mapping.id, &preview.preview_id)
@@ -1284,14 +1401,37 @@ async fn sync_drive_storage_stays_bound_after_connection_changes() {
     std::fs::create_dir(local.path().join("docs")).expect("folder");
     let payload = b"private payload must never be stored as plaintext";
     std::fs::write(local.path().join("docs/private.txt"), payload).expect("file");
-    let mapping = runtime.save_append_mapping(SaveAppendMappingInput {
+    let mapping_input = || SaveAppendMappingInput {
         mapping_id: None, selected_root: "root".into(), mapping: AddMappingInput {
             connection_id: connection.id.clone(), repository_id: created.binding.repo_id.clone(),
             local_root: local.path().to_owned(), logical_path: "root".into(),
             schedule: ScheduleConfig { enabled: true, interval: 60 },
         },
-    }).await.expect("mapping");
-    assert!(runtime.validate_scheduled_root(&mapping).is_err(), "automatic sync cannot bypass first confirmation");
+    };
+    let prepared = runtime.prepare_append_mapping(mapping_input()).await.expect("prepare without binding");
+    assert_eq!(prepared.logical_path, "root");
+    let inspection = runtime.inspect_mapping_preparation(prepared).await.expect("inspect empty remote");
+    assert!(inspection.remote_empty);
+    assert!(!inspection.local_empty);
+    assert!(runtime.snapshot().expect("snapshot").mappings.is_empty());
+    let direct = runtime.prepare_mapping_bind(mapping_input()).await.expect("empty remote binds directly");
+    assert!(direct.plan_id.is_none());
+    assert!(direct.run_id.is_some());
+    let mapping = direct.mapping.expect("direct binding");
+    let restore_error = runtime.restore(&mapping.id, "missing", std::path::PathBuf::from("restored.txt")).await.expect_err("writes blocked while first sync runs");
+    assert_eq!(restore_error.code, "CLOUD_SYNC_BUSY");
+    wait_completed(&runtime, &mapping.id).await;
+    runtime.validate_scheduled_root(&mapping).expect("direct initial sync authorizes subsequent scheduling");
+    std::fs::write(local.path().join("picked.txt"), b"picked").expect("picked file");
+    std::fs::write(local.path().join("unpicked.txt"), b"unpicked").expect("unpicked file");
+    let scoped = runtime.preview_selection(&mapping.id, &["picked.txt".into()]).await.expect("selected preview");
+    assert_eq!(scoped.summary.uploads, 1);
+    runtime.manual_sync(&mapping.id, &scoped.preview_id).await.expect("selected sync");
+    wait_completed(&runtime, &mapping.id).await;
+    let status = runtime.local_sync_entries(&mapping.id).await.expect("selected status");
+    assert!(status.iter().any(|entry| entry.path == "picked.txt" && entry.synced));
+    assert!(status.iter().any(|entry| entry.path == "unpicked.txt" && !entry.synced));
+    std::fs::remove_file(local.path().join("unpicked.txt")).expect("remove unpicked");
     let mut updated = runtime_connection(&fixture);
     updated.id = Some(connection.id.clone());
     updated.bucket = "other".into();
@@ -1312,8 +1452,61 @@ async fn sync_drive_storage_stays_bound_after_connection_changes() {
     std::fs::remove_file(local.path().join("docs/private.txt")).expect("delete child");
     let entries = runtime.local_sync_entries(&mapping.id).await.expect("pending delete");
     assert!(entries.iter().any(|entry| entry.path == "docs" && !entry.synced));
-    runtime.stop_and_clear().await.expect("stop");
+    assert!(entries.iter().any(|entry| entry.path == "docs/private.txt" && entry.remote_only && !entry.synced));
+    runtime.delete_mapping(&mapping.id).await.expect("remove prior binding");
+    let empty_local = tempfile::tempdir().expect("empty local root");
+    let mut pending_input = mapping_input();
+    pending_input.mapping.local_root = empty_local.path().to_owned();
+    let pending = runtime.prepare_append_mapping(pending_input).await.expect("prepare existing cloud drive");
+    let inspection = runtime.inspect_mapping_preparation(pending).await.expect("inspect empty local");
+    assert!(inspection.local_empty);
+    assert!(!inspection.remote_empty);
+    assert!(runtime.snapshot().expect("snapshot").mappings.is_empty());
+    std::fs::write(empty_local.path().join("local-only.txt"), b"local").expect("local file");
+    let both = runtime.inspect_mapping_preparation(inspection.mapping.clone()).await.expect("inspect both populated");
+    assert!(!both.local_empty && !both.remote_empty);
+    let mut input = mapping_input();
+    input.mapping.local_root = empty_local.path().to_owned();
+    let pending = runtime.prepare_mapping_bind(input).await.expect("both populated require plan");
+    assert!(pending.mapping.is_none());
+    let plan_id = pending.plan_id.expect("pending plan");
+    assert!(pending.entries.iter().any(|entry| entry.action == "upload"));
+    assert!(pending.entries.iter().any(|entry| entry.action == "download"));
+    assert_eq!(runtime.confirm_mapping_bind(&plan_id, false).await.expect_err("confirmation required").code, "CLOUD_CONFIRMATION_REQUIRED");
+    assert!(runtime.snapshot().expect("snapshot").mappings.is_empty());
+    std::fs::write(empty_local.path().join("later.txt"), b"later").expect("change plan");
+    assert_eq!(runtime.confirm_mapping_bind(&plan_id, true).await.expect_err("stale plan").code, "CLOUD_PREVIEW_STALE");
+    runtime.cancel_mapping_bind(&plan_id).await.expect("cancel");
+    assert!(runtime.validate_mapping_bind(&plan_id).await.is_err());
+    let mut confirmed_input = mapping_input();
+    confirmed_input.mapping.local_root = empty_local.path().to_owned();
+    let confirmed_plan = runtime.prepare_mapping_bind(confirmed_input).await.expect("fresh populated plan");
+    let confirmed = runtime.confirm_mapping_bind(&confirmed_plan.plan_id.expect("confirmation plan"), true).await.expect("confirm populated binding");
+    let merged = confirmed.mapping.expect("confirmed mapping");
+    wait_completed(&runtime, &merged.id).await;
+    assert_eq!(std::fs::read(empty_local.path().join("docs/private.txt")).expect("merged remote file"), payload);
+    assert_eq!(std::fs::read(empty_local.path().join("local-only.txt")).expect("retained local file"), b"local");
+    runtime.delete_mapping(&merged.id).await.expect("remove confirmed binding");
+    std::fs::remove_file(empty_local.path().join("picked.txt")).expect("clear picked file");
+    std::fs::remove_file(empty_local.path().join("docs/private.txt")).expect("clear downloaded file");
+    std::fs::remove_dir(empty_local.path().join("docs")).expect("clear downloaded directory");
+    std::fs::remove_file(empty_local.path().join("local-only.txt")).expect("clear local");
+    std::fs::remove_file(empty_local.path().join("later.txt")).expect("clear later");
+    let mut empty_input = mapping_input();
+    empty_input.mapping.local_root = empty_local.path().to_owned();
+    let direct_download = runtime.prepare_mapping_bind(empty_input).await.expect("empty local binds without confirmation");
+    assert!(direct_download.plan_id.is_none());
+    let downloaded = direct_download.mapping.expect("download mapping");
+    wait_completed(&runtime, &downloaded.id).await;
+    assert_eq!(std::fs::read(empty_local.path().join("docs/private.txt")).expect("downloaded contents"), payload);
+    runtime.delete_mapping(&downloaded.id).await.expect("remove download mapping");
+    fixture.state.objects.lock().expect("objects").remove(&created.binding.anchor_key);
+    let remaining = runtime.inspect_mapping_preparation(inspection.mapping.clone()).await.expect("cached authenticated metadata remains usable");
+    assert!(!remaining.remote_empty, "missing remote anchor must never turn cached nonempty data into empty");
     fixture.shutdown().await;
+    assert!(runtime.inspect_mapping_preparation(inspection.mapping).await.is_err(), "network failure cannot establish an empty endpoint");
+    assert!(runtime.snapshot().expect("snapshot").mappings.is_empty());
+    runtime.stop_and_clear().await.expect("stop");
 }
 
 async fn wait_completed(runtime: &CloudRuntime, mapping_id: &str) {

@@ -30,6 +30,11 @@ fn token() -> Result<String, AppError> {
 
 impl crate::traits::UploadQueueAdapter for S3UploadAdapter<'_> {
     type Status = ObjectUploadDirectoryDto;
+    fn status<'a>(&'a self, id: &'a str) -> futures_util::future::BoxFuture<'a, Result<Self::Status, AppError>> { Box::pin(self.runtime.object_status_upload_directory(self.connection, id)) }
+    fn page<'a>(&'a self, id: &'a str, directory_token: Option<String>, cursor: Option<String>, limit: Option<usize>) -> futures_util::future::BoxFuture<'a, Result<DirectoryPageDto, AppError>> { Box::pin(self.runtime.object_page_upload_directory(self.connection, id, directory_token, cursor, limit)) }
+    fn resolve<'a>(&'a self, id: &'a str, conflict_id: &'a str, decision: DirectoryConflictPolicy, apply_to_remaining: bool) -> futures_util::future::BoxFuture<'a, Result<(), AppError>> { Box::pin(self.runtime.object_resolve_upload_directory_conflict(self.connection, id, conflict_id, decision, apply_to_remaining)) }
+    fn cancel<'a>(&'a self, id: &'a str) -> futures_util::future::BoxFuture<'a, Result<(), AppError>> { Box::pin(self.runtime.object_cancel_upload_directory(self.connection, id)) }
+    fn release<'a>(&'a self, id: &'a str) -> futures_util::future::BoxFuture<'a, Result<(), AppError>> { Box::pin(self.runtime.object_release_upload_directory(self.connection, id)) }
     fn start<'a>(&'a self, id: &'a str, policy: DirectoryConflictPolicy) -> futures_util::future::BoxFuture<'a, Result<Self::Status, AppError>> {
         Box::pin(self.runtime.object_start_upload_directory_inner(self.connection, id, policy))
     }
@@ -37,13 +42,16 @@ impl crate::traits::UploadQueueAdapter for S3UploadAdapter<'_> {
 
 impl CloudRuntime {
     pub(crate) async fn object_select_upload_files(&self, connection_id: &str, revision: u64, prefix: String, paths: Vec<std::path::PathBuf>) -> Result<ObjectUploadDirectoryDto, AppError> {
+        self.object_select_upload_files_bound(connection_id, revision, prefix, paths, None).await
+    }
+    pub(crate) async fn object_select_upload_files_bound(&self, connection_id: &str, revision: u64, prefix: String, paths: Vec<std::path::PathBuf>, identity: Option<&super::ProtectedIdentity>) -> Result<ObjectUploadDirectoryDto, AppError> {
         self.object_admit()?;
         super::object_service::valid_prefix(&prefix).map_err(app)?;
         if prefix.len() > MAX_UPLOAD_DIRECTORY_PATH_BYTES { return Err(invalid()); }
         let _lifecycle = self.object_lifecycle.lock().await;
         let _permit = self.network.read().await;
         let session = self.object_session(connection_id).await?;
-        if session.revision != revision { return Err(invalid()); }
+        if session.revision != revision || identity.is_some_and(|identity| *identity != session.identity) { return Err(invalid()); }
         let lifecycle = self.vault.transfer_cancellation().map_err(AppError::from)?;
         let (files, browser) = tokio::task::spawn_blocking(move || crate::local_upload::open_selected_files(paths)).await.map_err(|e| app(DomainError::Internal { detail: e.to_string() }))??;
         let queue_id = token()?;
@@ -61,6 +69,11 @@ impl CloudRuntime {
         prefix: String,
         path: &Path,
     ) -> Result<ObjectUploadDirectoryDto, AppError> {
+        self.object_select_upload_directory_bound(connection_id, revision, prefix, path, None).await
+    }
+    pub(crate) async fn object_select_upload_directory_bound(
+        &self, connection_id: &str, revision: u64, prefix: String, path: &Path, identity: Option<&super::ProtectedIdentity>,
+    ) -> Result<ObjectUploadDirectoryDto, AppError> {
         self.object_admit()?;
         super::object_service::valid_prefix(&prefix).map_err(app)?;
         if prefix.len() > MAX_UPLOAD_DIRECTORY_PATH_BYTES {
@@ -69,7 +82,7 @@ impl CloudRuntime {
         let _lifecycle = self.object_lifecycle.lock().await;
         let _permit = self.network.read().await;
         let session = self.object_session(connection_id).await?;
-        if session.revision != revision {
+        if session.revision != revision || identity.is_some_and(|identity| *identity != session.identity) {
             return Err(invalid());
         }
         let root_name = path
@@ -319,6 +332,7 @@ impl CloudRuntime {
                         let batch = state.upload_directories.get_mut(id).ok_or_else(invalid)?;
                         batch.status.phase = "conflict".into();
                         batch.status.conflict = Some(DirectoryConflictDto {
+                            overwrite_allowed: meta.etag.as_ref().is_some_and(|etag| !etag.is_empty()),
                             conflict_id: token()?,
                             relative_path: file.relative.clone(),
                             key: key.clone(),
@@ -500,6 +514,7 @@ impl CloudRuntime {
                 .as_ref()
                 .is_none_or(|conflict| conflict.conflict_id != conflict_id)
             || batch.resolution.is_some()
+            || (policy == DirectoryConflictPolicy::Overwrite && batch.status.conflict.as_ref().is_none_or(|conflict| !conflict.overwrite_allowed))
             || batch.cancel.load(Ordering::Acquire)
         {
             return Err(invalid());

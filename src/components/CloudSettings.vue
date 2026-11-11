@@ -1,10 +1,10 @@
 <script setup>
-import { computed, h, onMounted, ref } from "vue";
+import { computed, h, onBeforeUnmount, onMounted, ref } from "vue";
 import { cloud, blankConnection } from "../lib/cloud";
 import { connectionEditor, parseS3Url } from "../lib/s3Url";
 import { confirmAction } from "../lib/confirm";
 import { useAppContext } from "../lib/appContext";
-import { t } from "../lib/i18n";
+import { t, locale } from "../lib/i18n";
 import { writeRoute } from "../lib/navigation";
 
 const app = useAppContext();
@@ -16,6 +16,73 @@ const url = ref("");
 const loading = ref(false);
 const probing = ref(false);
 const buckets = ref([]);
+const officialOpen = ref(false);
+const protocolDescriptors = ref([]);
+const officialDescriptors = computed(() => protocolDescriptors.value.filter(item => item.auth === 'oauth2'));
+const officialFields = computed(() => officialDescriptors.value.find(item => item.id === official.value.provider)?.fields || []);
+async function openOfficial() {
+  try {
+    protocolDescriptors.value = await cloud.protocols();
+    if (!officialDescriptors.value.some(item => item.id === official.value.provider)) official.value.provider = officialDescriptors.value[0]?.id || '';
+    if (official.value.provider) officialOpen.value = true;
+  } catch (error) { fail(error); }
+}
+const officialBusy = ref(false);
+const authorization = ref(null);
+const official = ref({ provider: 'google_drive', name: '', clientId: '', clientSecret: '', redirectUri: 'http://127.0.0.1:53682/oauth/callback', rootId: 'root', callback: '' });
+const loopbackWaiting = ref(false);
+let authorizationVersion = 0;
+function changeOfficialProvider() {
+  official.value.rootId = official.value.provider === 'baidu_netdisk' ? '/' : 'root';
+}
+async function cancelOfficial() {
+  authorizationVersion++;
+  loopbackWaiting.value = false;
+  const request = authorization.value;
+  authorization.value = null;
+  official.value.clientSecret = ''; official.value.callback = '';
+  officialOpen.value = false;
+  if (request) { try { await cloud.cancelOfficialAuthorization(request.requestId); } catch (error) { fail(error); } }
+}
+async function beginOfficial() {
+  const version = ++authorizationVersion;
+  officialBusy.value = true;
+  try {
+    if (authorization.value) await cloud.cancelOfficialAuthorization(authorization.value.requestId);
+    authorization.value = null;
+    const loopback = official.value.provider !== 'baidu_netdisk';
+    const result = await (loopback ? cloud.beginLoopbackAuthorization : cloud.beginOfficialAuthorization)(official.value);
+    if (version !== authorizationVersion) { await cloud.cancelOfficialAuthorization(result.requestId); return; }
+    authorization.value = result;
+    if (loopback) void waitOfficial(result, version);
+  } catch (error) { fail(error); }
+  finally { officialBusy.value = false; }
+}
+async function waitOfficial(request, version) {
+  loopbackWaiting.value = true;
+  try {
+    await cloud.waitLoopbackAuthorization({ requestId: request.requestId, name: official.value.name, clientSecret: official.value.clientSecret || null, rootId: official.value.rootId });
+    if (version !== authorizationVersion) return;
+    authorization.value = null; officialOpen.value = false;
+    official.value.clientSecret = ''; official.value.callback = '';
+    notifyConnectionsChanged(); await refresh();
+  } catch (error) {
+    if (version === authorizationVersion) { authorization.value = null; fail(error); }
+  } finally { if (version === authorizationVersion) loopbackWaiting.value = false; }
+}
+async function finishOfficial() {
+  if (loopbackWaiting.value || !authorization.value) return;
+  officialBusy.value = true;
+  try {
+    await cloud.completeOfficialAuthorization({ ...official.value, requestId: authorization.value.requestId });
+    authorization.value = null;
+    official.value.clientSecret = ''; official.value.callback = '';
+    officialOpen.value = false;
+    notifyConnectionsChanged(); await refresh();
+  } catch (error) { authorization.value = null; fail(error); }
+  finally { officialBusy.value = false; }
+}
+onBeforeUnmount(() => { void cancelOfficial(); });
 const provider = ref("");
 // Address-driven discovery: users pick a provider only to prefill the service
 // address, then "test" proves the address can list buckets before saving.
@@ -173,9 +240,34 @@ onMounted(refresh);
       </div>
       <div v-else class="cloud-empty"><p class="hint">{{ t('drive.connectionsEmpty') }}</p></div>
 
+      <el-button class="official-add" @click="openOfficial">{{ t('drive.officialAdd') }}</el-button>
+      <div v-if="data.officialConnections?.length" class="settings-rows">
+        <div v-for="item in data.officialConnections" :key="item.id" class="settings-row">
+          <div class="settings-row__text"><span class="settings-row__label">{{ item.name }}</span><span class="hint">{{ item.protocolId }}</span></div>
+          <div><el-button @click="writeRoute({ view: 'cloud', connectionId: String(item.id) })">{{ t('cloudBrowser.open') }}</el-button><el-button @click="deleteConnection(item)">{{ t('drive.remove') }}</el-button></div>
+        </div>
+      </div>
       <p class="settings-group__footnote">{{ t('drive.settingsHint') }}</p>
     </div>
 
+    <el-dialog v-model="officialOpen" :title="t('drive.officialAdd')" width="520px" :close-on-click-modal="false" :close-on-press-escape="false" :show-close="false" destroy-on-close>
+      <form class="stack" @submit.prevent="authorization ? finishOfficial() : beginOfficial()">
+        <p class="hint">{{ t('drive.officialHint') }}</p>
+        <label>{{ t('drive.protocol') }}<el-select v-model="official.provider" :disabled="officialBusy || !!authorization" @change="changeOfficialProvider"><el-option v-for="item in officialDescriptors" :key="item.id" :value="item.id" :label="item.name" /></el-select></label>
+        <label>{{ t('cloud.name') }}<el-input v-model="official.name" :disabled="officialBusy || loopbackWaiting" /></label>
+        <label v-for="field in officialFields" :key="field.key">{{ locale === 'zh-CN' ? field.labelZh : field.labelEn }}<el-input v-model="official[field.key]" :type="field.secret ? 'password' : 'text'" :autocomplete="field.secret ? 'new-password' : 'off'" :disabled="officialBusy || loopbackWaiting || (!!authorization && ['clientId', 'redirectUri'].includes(field.key))" /></label>
+        <p v-if="loopbackWaiting" class="hint" role="status">{{ t('drive.waitingAuthorization') }}</p>
+        <template v-if="authorization">
+          <a :href="authorization.authorizationUrl" target="_blank" rel="noopener noreferrer">{{ t('drive.openAuthorization') }}</a>
+          <label v-if="!loopbackWaiting">{{ t('drive.callback') }}<el-input v-model="official.callback" type="password" autocomplete="off" :disabled="officialBusy" /></label>
+        </template>
+      </form>
+      <template #footer>
+        <el-button :disabled="officialBusy" @click="cancelOfficial">{{ t('confirm.cancel') }}</el-button>
+        <el-button v-if="!authorization" type="primary" :loading="officialBusy" :disabled="!official.clientId || !official.redirectUri || !official.name" @click="beginOfficial">{{ t('drive.authorize') }}</el-button>
+        <el-button v-else-if="!loopbackWaiting" type="primary" :loading="officialBusy" :disabled="!official.callback" @click="finishOfficial">{{ t('drive.finishAuthorization') }}</el-button>
+      </template>
+    </el-dialog>
     <el-dialog
       v-model="editorOpen"
       :title="editorTitle"
@@ -213,7 +305,7 @@ onMounted(refresh);
           <div class="stack connection-advanced__fields">
             <label>{{ t("cloud.prefix") }}<el-input v-model="connection.prefix" /></label>
             <label>{{ t("cloud.sessionToken") }}<el-input v-model="connection.sessionToken" type="password" /></label>
-            <label>{{ t("cloud.proxy") }}<el-select v-model="connection.proxy.mode"><el-option value="direct" :label="t('cloud.proxyDirect')" /><el-option value="environment" :label="t('cloud.proxyEnvironment')" /><el-option value="custom" :label="t('cloud.proxyCustom')" /></el-select></label>
+            <label>{{ t("cloud.proxy") }}<el-select v-model="connection.proxy.mode"><el-option value="client" :label="t('network.client')" /><el-option value="direct" :label="t('cloud.proxyDirect')" /></el-select></label>
             <template v-if="connection.proxy.mode === 'custom'"><label>{{ t("cloud.proxyUrl") }}<el-input v-model="connection.proxy.url" /></label><label>{{ t("cloud.proxyUsername") }}<el-input v-model="connection.proxy.username" /></label><label>{{ t("cloud.proxyPassword") }}<el-input v-model="connection.proxy.password" type="password" /></label></template>
             <label class="connection-switch">{{ t("cloud.allowInsecureHttp") }}<el-switch v-model="connection.allowInsecureHttp" /></label>
             <label class="connection-switch">{{ t("cloud.pathStyle") }}<el-switch v-model="connection.pathStyle" /></label>

@@ -20,6 +20,24 @@ mod run_budget_tests {
     use super::*;
 
     #[test]
+    fn engine_binary_chunks_reopen_at_legal_block_limit_and_read_legacy() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("index");
+        let mut index = AppendIndex::open(&path, Zeroizing::new([7; 32]), "binary-test".into())?;
+        let object = PreparedObject::new("block/key".into(), vec![255; super::super::append_types::MAX_BLOCK_SIZE + 1024]);
+        index.cache_engine_object("run", 0, &object)?;
+        let old = PreparedObject::new("old/key".into(), vec![1, 2, 3]);
+        let tx = Transaction::new_unchecked(&index.connection, TransactionBehavior::Immediate)?;
+        index.write_raw_tx(&tx, "engine-object", "legacy:0", &serde_json::to_vec(&old)?)?;
+        tx.commit()?;
+        drop(index);
+        let index = AppendIndex::open(&path, Zeroizing::new([7; 32]), "binary-test".into())?;
+        assert_eq!(index.engine_object("run", 0)?, object);
+        assert_eq!(index.engine_object("legacy", 0)?, old);
+        Ok(())
+    }
+
+    #[test]
     fn metadata_preview_slot_does_not_reuse_exhausted_payload_budget()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
@@ -1049,12 +1067,15 @@ impl AppendIndex {
         object: &PreparedObject,
     ) -> Result<(), IndexError> {
         let tx = Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        self.write_raw_tx(
-            &tx,
-            "engine-object",
-            &format!("{run}:{ordinal}"),
-            &serde_json::to_vec(object)?,
-        )?;
+        // Store wire bytes as bounded binary chunks, not JSON integer arrays.
+        // A legal 8 MiB block can expand past MAX_RECORD in the old encoding.
+        let name = format!("{run}:{ordinal}");
+        let chunks = object.bytes().len().div_ceil(MAX_CHUNK);
+        for (part, bytes) in object.bytes().chunks(MAX_CHUNK).enumerate() {
+            self.write_raw_tx(&tx, "engine-object-part", &format!("{name}:{part}"), bytes)?;
+        }
+        self.write_raw_tx(&tx, "engine-object-v2", &name,
+            &serde_json::to_vec(&(object.key(), object.bytes().len(), chunks))?)?;
         tx.commit()?;
         Ok(())
     }
@@ -1064,8 +1085,21 @@ impl AppendIndex {
         run: &str,
         ordinal: usize,
     ) -> Result<PreparedObject, IndexError> {
-        self.engine_record("object", &format!("{run}:{ordinal}"))?
-            .ok_or(IndexError::InvalidRecord)
+        let name = format!("{run}:{ordinal}");
+        if let Some(record) = self.read_raw("engine-object-v2", &name)? {
+            let (key, len, chunks): (String, usize, usize) = serde_json::from_slice(&record)?;
+            if len > 2 * (super::append_types::MAX_METADATA_SIZE + 16) + 4096 || chunks != len.div_ceil(MAX_CHUNK) { return Err(IndexError::InvalidRecord); }
+            let mut bytes = Vec::with_capacity(len);
+            for part in 0..chunks {
+                let data = self.read_raw("engine-object-part", &format!("{name}:{part}"))?.ok_or(IndexError::InvalidRecord)?;
+                if data.len() > MAX_CHUNK || bytes.len().saturating_add(data.len()) > len { return Err(IndexError::InvalidRecord); }
+                bytes.extend_from_slice(&data);
+            }
+            if bytes.len() != len { return Err(IndexError::InvalidRecord); }
+            return Ok(PreparedObject::new(key, bytes));
+        }
+        // Frozen/retry operations created by older versions remain readable.
+        self.engine_record("object", &name)?.ok_or(IndexError::InvalidRecord)
     }
 
     pub fn reserve(&mut self, name: &str, amount: u64, limit: u64) -> Result<(), IndexError> {

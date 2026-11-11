@@ -93,6 +93,62 @@ fn mirror_and_repository_mappings_cannot_share_local_trees() {
 }
 
 #[test]
+fn official_connections_are_encrypted_redacted_and_revision_checked() {
+    use peerdav_lib::cloud::{official_types::OfficialConnection, oauth_types::OfficialProvider};
+    let (dir, store) = store();
+    let saved = store.save_official_connection(OfficialConnection {
+        id: String::new(), name: "Google Drive".into(), provider: OfficialProvider::GoogleDrive,
+        config_version: 1, revision: 0, client_id: "client".into(),
+        client_secret: Some("OFFICIAL_PRIVATE_CLIENT_SECRET".into()),
+        refresh_token: "OFFICIAL_PRIVATE_REFRESH_TOKEN".into(), root_id: "root".into(),
+    }).expect("save official connection");
+    assert_eq!(saved.revision, 1);
+    assert!(saved.browser_capabilities.sync_drives);
+    assert!(!saved.browser_capabilities.select_root);
+    let public = serde_json::to_string(&saved).expect("redacted");
+    assert!(!public.contains("OFFICIAL_PRIVATE"));
+    let connection = store.snapshot().expect("snapshot").official_connections[0].clone();
+    assert!(!format!("{connection:?}").contains("OFFICIAL_PRIVATE"));
+    let mut update = connection.clone();
+    update.name = "Renamed".into();
+    store.rotate_official_token(&saved.id, 1, "OFFICIAL_PRIVATE_ROTATED").expect("token rotation");
+    let rotated = store.snapshot().expect("rotated snapshot").official_connections[0].clone();
+    assert_eq!(rotated.revision, 1, "token refresh must not invalidate browsing sessions");
+    assert_eq!(rotated.refresh_token, "OFFICIAL_PRIVATE_ROTATED");
+    update.refresh_token = rotated.refresh_token;
+    assert_eq!(store.save_official_connection(update).expect("update").revision, 2);
+    assert!(store.rotate_official_token(&saved.id, 1, "stale-token").is_err());
+    assert!(store.save_official_connection(connection.clone()).is_err(), "stale updates must not replace refreshed tokens");
+    let mut invalid = connection;
+    invalid.id.clear();
+    invalid.config_version = 2;
+    assert!(store.save_official_connection(invalid).is_err());
+    let bytes = fs::read(dir.path().join("vault.pd")).expect("database");
+    assert!(!bytes.windows(b"OFFICIAL_PRIVATE".len()).any(|part| part == b"OFFICIAL_PRIVATE"));
+}
+
+#[test]
+fn legacy_connections_gain_explicit_protocol_without_changing_identity() {
+    use peerdav_lib::cloud::config_types::CloudConnection;
+    let (_dir, store) = store();
+    let connection = store.save_connection(input()).expect("save connection");
+    let mut legacy = serde_json::to_value(&store.snapshot().expect("snapshot").connections[0])
+        .expect("encode connection");
+    legacy.as_object_mut().expect("object").remove("protocolId");
+    let restored: CloudConnection = serde_json::from_value(legacy.clone()).expect("legacy S3");
+    let encoded = serde_json::to_value(&restored).expect("encode migrated connection");
+    assert_eq!(encoded["protocolId"], "s3");
+    assert_eq!(encoded["id"], connection.id);
+    assert_eq!(encoded["revision"], connection.revision);
+    let public = serde_json::to_value(restored.redacted()).expect("public connection");
+    assert_eq!(public["protocolId"], "s3");
+    assert_eq!(public["browserCapabilities"], serde_json::json!({ "selectRoot": true, "syncDrives": true }));
+    assert!(public.get("secretKey").is_none());
+    legacy["protocolId"] = "unsupported_protocol".into();
+    assert!(serde_json::from_value::<CloudConnection>(legacy).is_err());
+}
+
+#[test]
 fn legacy_schema_defaults_to_cas_and_rejects_unknown_protocol_or_fields() {
     let legacy = legacy_mapping();
     let mapping: CloudMapping = serde_json::from_value(legacy.clone()).expect("legacy mapping");

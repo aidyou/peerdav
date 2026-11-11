@@ -14,6 +14,7 @@ use std::sync::{
 /// does not invent a capability epoch.
 pub struct CoreS3Backend {
     pub(crate) store: Arc<S3Store>,
+    pub(crate) generation: u64,
     scope: BackendScope,
     capabilities: Capabilities,
 }
@@ -61,6 +62,7 @@ impl CoreS3Backend {
             }
         }
         Ok(Self {
+            generation,
             store,
             scope,
             capabilities: Capabilities {

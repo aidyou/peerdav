@@ -30,6 +30,8 @@ pub struct LocalEpoch {
     pub revision_count: usize,
     pub binding_count: usize,
     #[serde(default)]
+    pub selection: Vec<String>,
+    #[serde(default)]
     pub publication: Option<String>,
 }
 

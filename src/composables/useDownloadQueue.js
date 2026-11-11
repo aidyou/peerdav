@@ -3,7 +3,7 @@ import { invoke, errorStrategy } from "../lib/invoke";
 import { t } from "../lib/i18n";
 
 // Native queue IDs are capabilities; neither roots nor recursive plans enter the UI.
-export function useDownloadQueue({ captureScope, scopeValid, backend, onFailure, onSelected = () => {} }) {
+export function useDownloadQueue({ captureScope, scopeValid, backend, select = (scope, selection) => invoke("transfer_select_download", { backend: backend(scope), selection }), onFailure, onSelected = () => {} }) {
   const downloadDialogOpen = ref(false);
   const downloadState = ref(null);
   const downloadPage = ref({ items: [], nextOffset: null });
@@ -18,7 +18,7 @@ export function useDownloadQueue({ captureScope, scopeValid, backend, onFailure,
   const args = (s) => ({ queueId: s.queueId });
   const downloadRunning = computed(() => downloadSelecting.value || downloadCanceling.value || ["selected", "running", "conflict", "cancelling", "canceling"].includes(downloadState.value?.phase));
   const downloadSummary = computed(() => t("peer.downloadSummary", { finished: (downloadState.value?.completedFiles || 0) + (downloadState.value?.skippedFiles || 0), total: downloadState.value?.totalFiles || 0 }));
-  const downloadQueue = computed(() => downloadPage.value.items.map((item) => ({ ...item, status: ({ completed: "done", running: "downloading", failed: "error", skipped: "skipped" })[item.phase] || item.phase })));
+  const downloadQueue = computed(() => downloadPage.value.items.map((item) => ({ ...item, transferId: item.id, status: ({ completed: "done", running: "downloading", failed: "error", skipped: "skipped" })[item.phase] || item.phase })));
   function apply(s, state) {
     if (!valid(s)) return;
     if (state.conflict?.conflictId === s.resolvedConflictId) state = { ...state, conflict: null };
@@ -70,7 +70,7 @@ export function useDownloadQueue({ captureScope, scopeValid, backend, onFailure,
     session = s; downloadSelecting.value = true; downloadApplyRemaining.value = false;
     downloadState.value = null; downloadPage.value = { items: [], nextOffset: null };
     try {
-      const state = await invoke("transfer_select_download", { backend: backend(s.scope), selection });
+      const state = await select(s.scope, selection);
       if (!state) return;
       s.queueId = state.queueId;
       if (!valid(s)) { await release(s); return; }

@@ -2122,6 +2122,15 @@ impl PeerManager {
         }
     }
 
+    pub(crate) async fn create_directory(&self, peer_id: &str, share_id: &str, path: &str) -> Result<(), DomainError> {
+        let backend = self.read_backend(peer_id, share_id)?;
+        let display = normalize_display_path(path)?;
+        backend.create_dir(read_context(0, NonZeroUsize::MIN), wire::peerdav_file_core::CreateDirRequest {
+            entry: backend.scope().entry(display), condition: wire::peerdav_file_core::Condition::CreateOnly,
+        }).await.map_err(protocol_error)?;
+        Ok(())
+    }
+
     pub async fn delete_entry(
         &self,
         peer_id: &str,
@@ -2409,6 +2418,45 @@ impl PeerManager {
             bytes.extend_from_slice(&chunk);
         }
         preview_payload(file_name, bytes)
+    }
+
+    /// Reads a bounded, revision-checked snapshot for the shared editor.
+    pub(crate) async fn read_editor_content(&self, peer_id: &str, share_id: &str, id: &str) -> Result<crate::file_manager::types::EditContent, DomainError> {
+        let (_, client) = self.peer_client(peer_id)?;
+        let (display, remote, name) = remote_file_target(share_id, id)?;
+        let before = remote_meta(&client, &remote, &display).await?;
+        let limit = crate::file_manager::types::MAX_EDIT_BYTES as u64;
+        if before.size > limit { return Err(DomainError::TransferTooLarge { size: before.size, limit }); }
+        let revision = before.etag.ok_or_else(|| DomainError::PeerProtocol { detail: "Peer editor requires a remote revision".into() })?;
+        let mut response = wire::get(&client, &remote, None).await.map_err(protocol_error)?;
+        ensure_status(response.status(), "read editor content", &display)?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| map_transport("read editor content", &error))? {
+            let size = (bytes.len() as u64).saturating_add(chunk.len() as u64);
+            if size > limit { return Err(DomainError::TransferTooLarge { size, limit }); }
+            bytes.extend_from_slice(&chunk);
+        }
+        let after = remote_meta(&client, &remote, &display).await?;
+        if after.etag.as_deref() != Some(revision.as_str()) || bytes.len() as u64 != before.size { return Err(DomainError::TransferConflict { path: display }); }
+        Ok(crate::file_manager::types::EditContent { name, bytes, revision })
+    }
+
+    pub(crate) async fn write_editor_content(&self, peer_id: &str, share_id: &str, id: &str, revision: &str, bytes: Vec<u8>) -> Result<String, DomainError> {
+        let limit = crate::file_manager::types::MAX_EDIT_BYTES as u64;
+        if bytes.len() as u64 > limit { return Err(DomainError::TransferTooLarge { size: bytes.len() as u64, limit }); }
+        let (_, client) = self.peer_client(peer_id)?;
+        let (display, remote, _) = remote_file_target(share_id, id)?;
+        let meta = remote_meta(&client, &remote, &display).await?;
+        if meta.etag.as_deref() != Some(revision) { return Err(DomainError::TransferConflict { path: display }); }
+        let condition = if revision.starts_with('"') || revision.starts_with("W/\"") { revision.to_owned() } else { format!("\"{revision}\"") };
+        let response = client.start_request(reqwest::Method::PUT, &remote).await
+            .map_err(|error| map_dav_error("write editor content", error, &display))?
+            .header(reqwest::header::IF_MATCH, condition).timeout(TRANSFER_TIMEOUT).body(bytes).send().await
+            .map_err(|error| map_transport("write editor content", &error))?;
+        if response.status() == StatusCode::PRECONDITION_FAILED { return Err(DomainError::TransferConflict { path: display }); }
+        ensure_status(response.status(), "write editor content", &display)?;
+        response.headers().get(reqwest::header::ETAG).and_then(|value| value.to_str().ok()).map(|value| value.trim_matches('"').to_owned())
+            .ok_or_else(|| DomainError::PeerProtocol { detail: "Peer editor write did not return a revision; refresh before retrying".into() })
     }
 
     /// Downloads to a controlled temporary directory and records a baseline.

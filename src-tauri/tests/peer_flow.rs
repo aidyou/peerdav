@@ -670,6 +670,71 @@ async fn file_browser_backend_peer_contract() {
 }
 
 #[tokio::test]
+async fn unified_peer_file_session_rechecks_authorization_and_lock() {
+    use peerdav_lib::{file_manager::types::{FileSessions, FileLocation}, cloud::runtime::CloudRuntime, sync::traits::NoopSyncEvents};
+    let harness = Harness::new(vec![loopback_rule()], false).await;
+    let (info, _) = harness.connect().await;
+    let cloud = CloudRuntime::new(Arc::clone(&harness.vault), Arc::new(NoopSyncEvents), harness.directory.path().to_owned());
+    let sessions = FileSessions::default();
+    let session = sessions.open(&harness.peers, &cloud, FileLocation::Peerdav { peer_id: info.id.clone(), share_id: harness.share_id.clone() }).await.expect("open unified peer session");
+    let page = sessions.list(&harness.peers, &cloud, &session.session_id, "/", None).await.expect("unified list");
+    assert!(page.complete);
+    assert_eq!(page.entries.len(), 3);
+    assert!(session.capabilities.create_dir);
+    let edit = sessions.prepare_edit(&harness.peers, &cloud, &session.session_id, "/notes.txt").await.expect("unified Peer editor reads through trait");
+    assert_eq!(edit.id, "/notes.txt");
+    assert_eq!(edit.name, "notes.txt");
+    assert_eq!(std::fs::read(&edit.local_path).expect("edit snapshot"), b"hello peer\n");
+    assert!(!sessions.commit_edit(&harness.peers, &cloud, &edit.edit_id).await.expect("unchanged edit"));
+    std::fs::write(&edit.local_path, "shared editor writeback").expect("local edit");
+    assert!(sessions.commit_edit(&harness.peers, &cloud, &edit.edit_id).await.expect("unified writeback"));
+    assert_eq!(std::fs::read(harness.share_root.join("notes.txt")).expect("written remote"), b"shared editor writeback");
+    std::fs::write(&edit.local_path, "second shared writeback").expect("second local edit");
+    assert!(sessions.commit_edit(&harness.peers, &cloud, &edit.edit_id).await.expect("repeat write uses returned revision"));
+    std::fs::write(harness.share_root.join("notes.txt"), "independent remote change").expect("remote edit");
+    std::fs::write(&edit.local_path, "must not overwrite remote").expect("conflicting local edit");
+    assert!(sessions.commit_edit(&harness.peers, &cloud, &edit.edit_id).await.is_err());
+    assert_eq!(std::fs::read(harness.share_root.join("notes.txt")).expect("preserved remote"), b"independent remote change");
+    sessions.discard_edit(&edit.edit_id).await.expect("release unified edit");
+    for name in ["", "..", "a/b", "a\\b"] { assert!(sessions.create_directory(&harness.peers, &cloud, &session.session_id, "/", name).await.is_err()); }
+    let created = sessions.create_directory(&harness.peers, &cloud, &session.session_id, "/", "empty-folder").await.expect("create empty directory");
+    assert_eq!(created.id, "/empty-folder");
+    assert_eq!(created.parent_id, "/");
+    assert_eq!(created.name, "empty-folder");
+    assert!(created.is_dir);
+    assert!(harness.share_root.join("empty-folder").is_dir());
+    assert!(sessions.list(&harness.peers, &cloud, &session.session_id, "/../outside", None).await.is_err());
+    assert!(sessions.preview(&harness.peers, &cloud, &session.session_id, "/notes.txt").await.is_ok());
+    for id in ["/", "///", "/../outside", "/sub/..", "/sub\\.."] {
+        assert!(sessions.delete_plan(&harness.peers, &cloud, &session.session_id, id).await.is_err(), "protocol adapter rejects root aliases or unsafe path IDs: {id}");
+    }
+    let plan = sessions.delete_plan(&harness.peers, &cloud, &session.session_id, "/notes.txt").await.expect("delete plan");
+    assert!(sessions.delete_execute(&harness.peers, &cloud, &session.session_id, &plan.plan_id, false).await.is_err());
+    let second = sessions.open(&harness.peers, &cloud, FileLocation::Peerdav { peer_id: info.id.clone(), share_id: harness.share_id.clone() }).await.expect("second session");
+    assert!(sessions.delete_execute(&harness.peers, &cloud, &second.session_id, &plan.plan_id, true).await.is_err());
+    assert!(harness.share_root.join("notes.txt").exists());
+    let revoked_edit = sessions.prepare_edit(&harness.peers, &cloud, &session.session_id, "/notes.txt").await.expect("edit before revocation");
+    std::fs::write(&revoked_edit.local_path, "revoked write must not apply").expect("pending edit");
+    let authorization = harness.controller.list_authorizations().into_iter().next().expect("authorization");
+    harness.controller.revoke_authorization(&authorization.id).expect("remote revoke");
+    assert!(sessions.commit_edit(&harness.peers, &cloud, &revoked_edit.edit_id).await.is_err());
+    assert_eq!(std::fs::read(harness.share_root.join("notes.txt")).expect("revoked edit preserved remote"), b"independent remote change");
+    sessions.discard_edit(&revoked_edit.edit_id).await.expect("release revoked edit");
+    assert!(sessions.list(&harness.peers, &cloud, &session.session_id, "/", None).await.is_err());
+    assert!(sessions.preview(&harness.peers, &cloud, &session.session_id, "/notes.txt").await.is_err());
+    assert!(sessions.delete_execute(&harness.peers, &cloud, &session.session_id, &plan.plan_id, true).await.is_err());
+    assert!(harness.share_root.join("notes.txt").exists());
+    harness.peers.forget_local(&info.id).await.expect("remove authorization binding");
+    assert!(sessions.list(&harness.peers, &cloud, &session.session_id, "/", None).await.is_err());
+    assert!(sessions.preview(&harness.peers, &cloud, &session.session_id, "/notes.txt").await.is_err());
+    assert!(sessions.delete_execute(&harness.peers, &cloud, &session.session_id, &plan.plan_id, true).await.is_err());
+    assert!(harness.share_root.join("notes.txt").exists());
+    harness.vault.lock().expect("lock");
+    assert!(sessions.list(&harness.peers, &cloud, &session.session_id, "/", None).await.is_err());
+    harness.controller.stop().await;
+}
+
+#[tokio::test]
 async fn browse_transfer_preview_and_external_edit_roundtrip() {
     let harness = Harness::new(vec![loopback_rule()], false).await;
     let (info, _code) = harness.connect().await;

@@ -216,6 +216,7 @@ mod budget_tests {
                     tips: vec![],
                 },
                 &cancel,
+                &[],
             )
             .await;
             assert!(
@@ -337,6 +338,21 @@ fn matches_projection(scan: &ScanReport, projection: &Projection) -> bool {
             == directories
 }
 
+fn selected_path(path: &str, selection: &[String]) -> bool {
+    selection.is_empty() || selection.iter().any(|selected| path == selected || path.strip_prefix(selected).is_some_and(|suffix| suffix.starts_with('/')))
+}
+
+fn selected_projection(full: &Projection, selection: &[String]) -> Projection {
+    Projection { entries: full.entries.iter().filter(|entry| selected_path(&entry.logical_path.join("/"), selection) || selected_path(&entry.projection_path.join("/"), selection)).cloned().collect() }
+}
+
+fn selected_scan(full: &ScanReport, selection: &[String]) -> ScanReport {
+    let mut scan = full.clone();
+    scan.files.retain(|file| selected_path(&file.path, selection));
+    scan.directories.retain(|path| selected_path(path, selection) || selection.iter().any(|selected| selected.starts_with(&format!("{path}/"))));
+    scan
+}
+
 fn projection(revisions: &RevisionMap, mapping: &str) -> Result<Projection, AppendEngineError> {
     Ok(super::namespace::project_scoped(
         &merge::project(revisions)?,
@@ -405,6 +421,7 @@ async fn prepare_local<S: ObjectStore + ?Sized>(
     bindings: &mut Bindings,
     remote: &mut TaggedFrontier,
     cancel: &Arc<AtomicBool>,
+    selection: &[String],
 ) -> Result<String, AppendEngineError> {
     use super::{merge_types::*, namespace};
     use sha2::{Digest, Sha256};
@@ -670,7 +687,7 @@ async fn prepare_local<S: ObjectStore + ?Sized>(
             wire,
         ),
     )?;
-    if scan_complete(request.root, cancel.clone())? != *scan {
+    if selected_scan(&scan_complete(request.root, cancel.clone())?, selection) != *scan {
         return Err(super::scan_types::ScanError::RootChanged.into());
     }
     super::append_publisher::AppendPublisher::prepare_cached(
@@ -710,7 +727,7 @@ pub async fn pull<S: ObjectStore + ?Sized>(
     cancel: Arc<AtomicBool>,
 ) -> Result<AppendEngineReport, AppendEngineError> {
     pull_or_run(
-        store, binding, password, index, request, cancel, false, false,
+        store, binding, password, index, request, cancel, false, false, &[],
     )
     .await
 }
@@ -737,9 +754,18 @@ pub async fn run_with_deletion_policy<S: ObjectStore + ?Sized>(
     automatic: bool,
 ) -> Result<AppendEngineReport, AppendEngineError> {
     pull_or_run(
-        store, binding, password, index, request, cancel, true, automatic,
+        store, binding, password, index, request, cancel, true, automatic, &[],
     )
     .await
+}
+
+pub async fn run_selected<S: ObjectStore + ?Sized>(
+    store: Arc<S>, binding: &TrustBinding, password: &[u8], index: &mut AppendIndex,
+    request: &AppendPullRequest<'_>, cancel: Arc<AtomicBool>, selection: &[String],
+) -> Result<AppendEngineReport, AppendEngineError> {
+    if selection.is_empty() || selection.len() > 1000 { return Err(AppendError::Input("selection").into()); }
+    for path in selection { super::namespace::components(path)?; }
+    pull_or_run(store, binding, password, index, request, cancel, true, false, selection).await
 }
 
 async fn pull_or_run<S: ObjectStore + ?Sized>(
@@ -751,6 +777,7 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
     mut cancel: Arc<AtomicBool>,
     publish: bool,
     automatic: bool,
+    selection: &[String],
 ) -> Result<AppendEngineReport, AppendEngineError> {
     if cancel.load(Ordering::SeqCst) && index.pending_epoch()?.is_none() {
         return Err(AppendEngineError::Cancelled);
@@ -787,6 +814,11 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
     };
     let base_projection = projection(&base, request.mapping)?;
     let pending = index.pending_epoch()?;
+    let resumed_selection = if selection.is_empty() { pending.as_ref().map(|epoch| epoch.selection.clone()) } else { None };
+    let selection = resumed_selection.as_deref().unwrap_or(selection);
+    if pending.as_ref().is_some_and(|epoch| epoch.selection != selection) {
+        return Err(AppendEngineError::RecoveryPaused);
+    }
     if automatic && pending.is_some() {
         return Err(AppendEngineError::RecoveryPaused);
     }
@@ -933,7 +965,9 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
             )?;
         }
         let mut publication = None;
-        if publish && !matches_projection(&current_scan, &base_projection) {
+        let publish_scan = selected_scan(&current_scan, selection);
+        let publish_base = selected_projection(&base_projection, selection);
+        if publish && !matches_projection(&publish_scan, &publish_base) {
             let repository = append_discovery::open_budgeted(
                 store.clone(),
                 binding,
@@ -948,13 +982,14 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
                     &repository,
                     index,
                     request,
-                    &current_scan,
+                    &publish_scan,
                     &base,
-                    &base_projection,
+                    &publish_base,
                     &mut revisions,
                     &mut bindings,
                     &mut frontier,
                     &cancel,
+                    selection,
                 )
                 .await?,
             );
@@ -976,7 +1011,29 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
                 .checked_add(1)
                 .ok_or(AppendError::ResourceLimit("local epoch"))
         })?;
+        if !selection.is_empty() {
+            let full = projection(&revisions, request.mapping)?;
+            let chosen = full.entries.iter().chain(base_projection.entries.iter()).filter(|entry| selected_path(&entry.logical_path.join("/"), selection) || selected_path(&entry.projection_path.join("/"), selection)).map(|entry| entry.entity.clone()).collect::<BTreeSet<_>>();
+            let ancestor_paths = selection.iter().flat_map(|path| {
+                let parts = path.split('/').collect::<Vec<_>>();
+                (1..parts.len()).map(move |n| parts[..n].join("/"))
+            }).collect::<BTreeSet<_>>();
+            let ancestors = full.entries.iter().filter(|entry| ancestor_paths.contains(&entry.logical_path.join("/"))).map(|entry| entry.entity.clone()).collect::<BTreeSet<_>>();
+            let prefix = super::namespace::components(request.mapping)?;
+            let anchors = (1..=prefix.len()).map(|n| super::namespace::entity(&prefix[..n])).collect::<BTreeSet<_>>();
+            let mut retained = chosen.union(&ancestors).cloned().chain(anchors).chain(base.values().map(|revision| revision.entity.clone())).collect::<BTreeSet<_>>();
+            loop {
+                let parents = revisions.values().filter(|revision| retained.contains(&revision.entity)).filter_map(|revision| match &revision.value { RevisionValue::Live { parent_dir, .. } if parent_dir.0 != "root" => Some(parent_dir.clone()), _ => None }).collect::<Vec<_>>();
+                let before = retained.len();
+                retained.extend(parents);
+                if retained.len() == before { break; }
+            }
+            let known_entities = base.values().map(|revision| revision.entity.clone()).collect::<BTreeSet<_>>();
+            revisions.retain(|id, revision| base.contains_key(id) || retained.contains(&revision.entity) && !known_entities.contains(&revision.entity) || chosen.contains(&revision.entity) || ancestors.contains(&revision.entity));
+            merge::validate(&revisions)?;
+        }
         let epoch = LocalEpoch {
+            selection: selection.to_vec(),
             id: request.run_id.to_owned(),
             sequence,
             frontier,
@@ -1004,6 +1061,19 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
     let repository =
         append_discovery::open_budgeted(store.clone(), binding, password, index, &epoch.id).await?;
     let target = projection(&index.epoch_revisions(&epoch)?, request.mapping)?;
+    let mut apply_target = selected_projection(&target, selection);
+    let apply_base = selected_projection(&base_projection, selection);
+    if !selection.is_empty() {
+        // Unselected local paths participate only in strict verification, never
+        // in remote history or publication. Existing bytes must remain intact.
+        use super::merge_types::{EntityId, RevisionId, ProjectionEntry, FileNode};
+        for file in current_scan.files.iter().filter(|file| !selected_path(&file.path, selection)) {
+            apply_target.entries.push(ProjectionEntry { entity: EntityId(format!("local:{}", file.path)), version: RevisionId("local-only".into()), logical_path: file.path.split('/').map(str::to_owned).collect(), projection_path: file.path.split('/').map(str::to_owned).collect(), value: RevisionValue::Live { parent_dir: EntityId("root".into()), name: file.path.clone(), node: Node::File(FileNode { blocks: vec![], length: file.size, digest: file.whole_file_hash.clone() }) }, conflict: false });
+        }
+        for path in current_scan.directories.iter().filter(|path| !path.is_empty() && !selected_path(path, selection)) {
+            apply_target.entries.push(ProjectionEntry { entity: EntityId(format!("local:{path}")), version: RevisionId("local-only".into()), logical_path: path.split('/').map(str::to_owned).collect(), projection_path: path.split('/').map(str::to_owned).collect(), value: RevisionValue::Live { parent_dir: EntityId("root".into()), name: path.clone(), node: Node::Dir }, conflict: false });
+        }
+    }
     let records = index.engine_apply_records(&epoch.id)?;
     if !records.is_empty() {
         let summary = super::recovery::recover_append_records(
@@ -1041,8 +1111,8 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
         run_id: &epoch.id,
         source_scan: &epoch.source_scan,
         current_scan: &current_scan,
-        base_projection: &base_projection,
-        target: &target,
+        base_projection: &apply_base,
+        target: &apply_target,
         local_chunks: &LocalChunks::new(),
         final_verify: FinalVerifyMode::Strict,
     };

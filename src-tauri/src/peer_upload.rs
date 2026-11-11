@@ -29,13 +29,18 @@ fn bound<'a>(
 }
 impl crate::traits::UploadQueueAdapter for PeerUploadAdapter<'_> {
     type Status = PeerUploadSummary;
+    fn status<'a>(&'a self, id: &'a str) -> futures_util::future::BoxFuture<'a, Result<Self::Status, AppError>> { Box::pin(async move { Ok(bound(&mut *self.manager.upload_batches.lock().await, id, self.peer)?.status.clone()) }) }
+    fn page<'a>(&'a self, id: &'a str, directory_token: Option<String>, cursor: Option<String>, limit: Option<usize>) -> futures_util::future::BoxFuture<'a, Result<DirectoryPageDto, AppError>> { Box::pin(page_upload_batch(self.manager, self.peer, id, directory_token, cursor, limit)) }
+    fn resolve<'a>(&'a self, id: &'a str, conflict_id: &'a str, decision: DirectoryConflictPolicy, apply_to_remaining: bool) -> futures_util::future::BoxFuture<'a, Result<(), AppError>> { Box::pin(async move { resolve_batch_conflict(bound(&mut *self.manager.upload_batches.lock().await, id, self.peer)?, conflict_id, decision, apply_to_remaining) }) }
+    fn cancel<'a>(&'a self, id: &'a str) -> futures_util::future::BoxFuture<'a, Result<(), AppError>> { Box::pin(self.manager.cancel_upload_batch(self.peer, id)) }
+    fn release<'a>(&'a self, id: &'a str) -> futures_util::future::BoxFuture<'a, Result<(), AppError>> { Box::pin(self.manager.release_upload_batch(self.peer, id)) }
     fn start<'a>(&'a self, id: &'a str, policy: DirectoryConflictPolicy) -> futures_util::future::BoxFuture<'a, Result<Self::Status, AppError>> {
         Box::pin(self.manager.start_upload_batch_inner(self.peer, id, policy))
     }
 }
 
 impl PeerManager {
-    pub(super) fn upload_scope(&self, peer: &str) -> Result<String, AppError> {
+    pub(crate) fn upload_scope(&self, peer: &str) -> Result<String, AppError> {
         let (record, _) = self.peer_client(peer).map_err(AppError::from)?;
         let code = Zeroizing::new(
             self.vault
@@ -542,7 +547,7 @@ impl PeerManager {
         }
         Ok(())
     }
-    async fn release_upload_batch(&self, peer: &str, id: &str) -> Result<(), AppError> {
+    pub(crate) async fn release_upload_batch(&self, peer: &str, id: &str) -> Result<(), AppError> {
         self.cancel_upload_batch(peer, id).await?;
         self.upload_batches.lock().await.remove(id);
         Ok(())
@@ -659,17 +664,24 @@ pub async fn peer_status_upload_batch(
     peer_id: String,
     batch_id: String,
 ) -> Result<PeerUploadSummary, AppError> {
-    Ok(
-        bound(&mut *peers.upload_batches.lock().await, &batch_id, &peer_id)?
-            .status
-            .clone(),
-    )
+    crate::traits::UploadQueueAdapter::status(&PeerUploadAdapter { manager: peers.inner(), peer: &peer_id }, &batch_id).await
 }
 #[tauri::command]
 pub async fn peer_page_upload_batch(
     peers: State<'_, SharedPeers>,
     peer_id: String,
     batch_id: String,
+    directory_token: Option<String>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+) -> Result<DirectoryPageDto, AppError> {
+    crate::traits::UploadQueueAdapter::page(&PeerUploadAdapter { manager: peers.inner(), peer: &peer_id }, &batch_id, directory_token, cursor, limit).await
+}
+
+async fn page_upload_batch(
+    peers: &PeerManager,
+    peer_id: &str,
+    batch_id: &str,
     directory_token: Option<String>,
     cursor: Option<String>,
     limit: Option<usize>,
@@ -684,46 +696,7 @@ pub async fn peer_page_upload_batch(
         )
     };
     tokio::task::spawn_blocking(move || {
-        let mut browser = browser.blocking_lock();
-        match &mut *browser {
-            PeerBrowser::Directory(b) => b.page(directory_token, cursor, limit, active, completed),
-            PeerBrowser::Files {
-                entries,
-                token: root_token,
-                cursor: saved,
-            } => {
-                if directory_token.as_ref().is_some_and(|t| t != root_token) {
-                    return Err(invalid());
-                }
-                let start = match cursor {
-                    None => 0,
-                    Some(c) => saved
-                        .as_ref()
-                        .filter(|(s, _)| *s == c)
-                        .map(|(_, i)| *i)
-                        .ok_or_else(invalid)?,
-                };
-                let end = (start + limit.unwrap_or(100).clamp(1, 128)).min(entries.len());
-                let mut page = entries[start..end].to_vec();
-                for e in &mut page {
-                    if active.as_deref() == Some(&e.relative_path) && !completed {
-                        e.phase = "active".into();
-                    }
-                }
-                *saved = if end < entries.len() {
-                    Some((token()?, end))
-                } else {
-                    None
-                };
-                Ok(DirectoryPageDto {
-                    directory_token: root_token.clone(),
-                    parent_token: None,
-                    relative_path: String::new(),
-                    entries: page,
-                    next_cursor: saved.as_ref().map(|(s, _)| s.clone()),
-                })
-            }
-        }
+        browser.blocking_lock().page(directory_token, cursor, limit, active, completed)
     })
     .await
     .map_err(task_error)?
@@ -737,13 +710,7 @@ pub async fn peer_resolve_upload_batch(
     decision: DirectoryConflictPolicy,
     apply_to_remaining: bool,
 ) -> Result<(), AppError> {
-    let mut map = peers.upload_batches.lock().await;
-    resolve_batch_conflict(
-        bound(&mut map, &batch_id, &peer_id)?,
-        &conflict_id,
-        decision,
-        apply_to_remaining,
-    )
+    crate::traits::UploadQueueAdapter::resolve(&PeerUploadAdapter { manager: peers.inner(), peer: &peer_id }, &batch_id, &conflict_id, decision, apply_to_remaining).await
 }
 fn resolve_batch_conflict(
     b: &mut PeerUploadBatch,
@@ -777,7 +744,7 @@ pub async fn peer_cancel_upload_batch(
     peer_id: String,
     batch_id: String,
 ) -> Result<(), AppError> {
-    peers.cancel_upload_batch(&peer_id, &batch_id).await
+    crate::traits::UploadQueueAdapter::cancel(&PeerUploadAdapter { manager: peers.inner(), peer: &peer_id }, &batch_id).await
 }
 #[tauri::command]
 pub async fn peer_release_upload_batch(
@@ -785,7 +752,7 @@ pub async fn peer_release_upload_batch(
     peer_id: String,
     batch_id: String,
 ) -> Result<(), AppError> {
-    peers.release_upload_batch(&peer_id, &batch_id).await
+    crate::traits::UploadQueueAdapter::release(&PeerUploadAdapter { manager: peers.inner(), peer: &peer_id }, &batch_id).await
 }
 
 #[cfg(test)]

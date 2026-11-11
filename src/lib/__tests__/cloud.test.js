@@ -45,6 +45,19 @@ describe("cloud API wrappers", () => {
     ]);
   });
 
+  it("passes official authorization fields without forwarding caller tokens or endpoints", async () => {
+    await cloud.protocols();
+    await cloud.beginOfficialAuthorization({ provider: "google_drive", clientId: "client", redirectUri: "http://127.0.0.1/callback", endpoint: "https://evil.invalid" });
+    await cloud.cancelOfficialAuthorization("request");
+    await cloud.completeOfficialAuthorization({ requestId: "request", callback: "callback", name: "Drive", rootId: "root", accessToken: "forged" });
+    expect(invoke.mock.calls).toEqual([
+      ["cloud_protocols"],
+      ["cloud_official_authorize", { provider: "google_drive", clientId: "client", redirectUri: "http://127.0.0.1/callback" }],
+      ["cloud_official_cancel_authorization", { requestId: "request" }],
+      ["cloud_official_complete_authorization", { requestId: "request", callback: "callback", name: "Drive", clientSecret: null, rootId: "root" }],
+    ]);
+  });
+
   it("passes only the explicitly confirmed mirror plan and defaults to no approval", async () => {
     await cloud.mirrorSync("m");
     await cloud.mirrorSync("m", true, "snapshot-1");
@@ -93,9 +106,10 @@ describe("cloud API wrappers", () => {
   it("does not invoke directly from the wrapper module", async () => {
     expect(invoke).toBeDefined();
     expect(Object.keys(cloud)).toEqual([
+      "protocols", "beginOfficialAuthorization", "beginLoopbackAuthorization", "waitLoopbackAuthorization", "cancelOfficialAuthorization", "completeOfficialAuthorization",
       "list", "probeBuckets", "connectionCredentials", "saveConnection", "testConnection", "deleteConnection",
-      "createRepository", "joinRepository", "saveMapping", "appendDiscover", "createSyncDrive", "appendCreate", "appendJoin", "appendSaveMapping", "deleteMapping",
-      "localEntries", "preview", "sync", "cancel", "recoveryRecords", "restore", "status",
+      "createRepository", "joinRepository", "saveMapping", "appendDiscover", "createSyncDrive", "appendCreate", "appendJoin", "appendSaveMapping", "prepareMappingBind", "confirmMappingBind", "cancelMappingBind", "deleteMapping",
+      "localEntries", "localStatus", "preview", "sync", "cancel", "recoveryRecords", "restore", "status",
       "mirrorFolders", "mirrorSaveMapping", "mirrorDeleteMapping", "mirrorSync", "mirrorCancel",
     ]);
   });
@@ -104,7 +118,7 @@ describe("cloud API wrappers", () => {
     const first = blankConnection();
     const second = blankConnection();
     first.proxy.password = "secret";
-    expect(second.proxy).toMatchObject({ mode: "direct" });
+    expect(second.proxy).toMatchObject({ mode: "client" });
   });
 
   it("creates independent mapping defaults with schedule settings", () => {

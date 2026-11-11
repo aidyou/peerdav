@@ -35,6 +35,7 @@ pub mod append;
 
 #[derive(Clone)]
 struct Ticket {
+    selection: Vec<String>,
     id: String,
     mapping: String,
     mapping_hash: String,
@@ -358,6 +359,9 @@ impl Drop for MirrorRunGuard<'_> {
 }
 
 pub struct CloudRuntime {
+    #[cfg(test)]
+    pub(crate) official_fixture: std::sync::Mutex<Option<String>>,
+    pub(crate) weak_self: std::sync::Weak<CloudRuntime>,
     pub(crate) vault: Arc<Vault>,
     pub(crate) config: CloudConfigStore,
     pub(crate) manager: Arc<SyncManager>,
@@ -369,6 +373,11 @@ pub struct CloudRuntime {
     pub(crate) objects: tokio::sync::Mutex<super::object_runtime_types::ObjectState>,
     pub(crate) object_events: Arc<dyn SyncEvents>,
     pub(crate) object_lifecycle: tokio::sync::Mutex<()>,
+    pub(crate) official_authorizations: super::oauth_types::OAuthAuthorizations,
+    pub(crate) official_callbacks: tokio::sync::Mutex<HashMap<String, super::oauth_types::LoopbackAuthorization>>,
+    pub(crate) official_callback_cancels: tokio::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
+    pub(crate) official_refresh: tokio::sync::Mutex<HashMap<String, super::oauth_types::CachedAccessToken>>,
+    pub(super) pending_mappings: tokio::sync::Mutex<HashMap<String, PendingMapping>>,
     tickets: Mutex<HashMap<String, Ticket>>,
     pub(crate) schedules: super::runtime_schedule::CloudSchedules,
     /// 每个镜像映射的运行中取消令牌；同步结束后移除，用于实现「同一映射不重入」与取消。
@@ -376,11 +385,18 @@ pub struct CloudRuntime {
 }
 impl CloudRuntime {
     pub fn new(vault: Arc<Vault>, events: Arc<dyn SyncEvents>, data_dir: PathBuf) -> Arc<Self> {
-        Arc::new(Self {
+        Arc::new_cyclic(|weak_self| Self {
+            #[cfg(test)]
+            official_fixture: std::sync::Mutex::new(None),
+            weak_self: weak_self.clone(),
             config: CloudConfigStore::new(Arc::clone(&vault)),
             manager: SyncManager::new(Arc::clone(&events)),
             object_events: events,
             object_lifecycle: tokio::sync::Mutex::new(()),
+            official_authorizations: super::oauth_types::OAuthAuthorizations::default(),
+            official_callbacks: tokio::sync::Mutex::new(HashMap::new()),
+            official_callback_cancels: tokio::sync::Mutex::new(HashMap::new()),
+            official_refresh: tokio::sync::Mutex::new(HashMap::new()),
             objects: tokio::sync::Mutex::new(super::object_runtime_types::ObjectState::new()),
             vault,
             safe_apply: probe_apply_capability(&data_dir),
@@ -388,6 +404,7 @@ impl CloudRuntime {
             gate: AtomicBool::new(false),
             cancel: Arc::new(AtomicBool::new(false)),
             network: Arc::new(RwLock::new(())),
+            pending_mappings: tokio::sync::Mutex::new(HashMap::new()),
             tickets: Mutex::new(HashMap::new()),
             schedules: super::runtime_schedule::CloudSchedules::new(),
             mirror_runs: Mutex::new(HashMap::new()),
@@ -396,6 +413,8 @@ impl CloudRuntime {
     pub async fn stop_and_clear(&self) -> Result<(), AppError> {
         self.gate.store(false, Ordering::Release);
         self.cancel.store(true, Ordering::Release);
+        for (_, cancel) in self.official_callback_cancels.lock().await.drain() { cancel.cancel(); }
+        self.official_callbacks.lock().await.clear();
         self.cancel_mirror_runs();
         let _objects = self.object_lifecycle.lock().await;
         for result in [
@@ -411,6 +430,9 @@ impl CloudRuntime {
             }
         }
         let _p = self.network.write().await;
+        self.pending_mappings.lock().await.clear();
+        self.official_authorizations.clear().map_err(super::official_runtime::oauth_error)?;
+        self.official_refresh.lock().await.clear();
         match self.tickets.lock() {
             Ok(mut tickets) => tickets.clear(),
             Err(poisoned) => {
@@ -485,6 +507,7 @@ impl CloudRuntime {
     pub fn snapshot(&self) -> Result<CloudRuntimeSnapshot, AppError> {
         let s = self.config.snapshot().map_err(config_error)?;
         Ok(CloudRuntimeSnapshot {
+            official_connections: s.official_connections.iter().map(super::official_types::OfficialConnection::redacted).collect(),
             connections: s
                 .connections
                 .iter()
@@ -513,7 +536,9 @@ impl CloudRuntime {
         self.object_admit()?;
         let relative = crate::mirror::normalize_cloud_prefix(prefix).map_err(AppError::from)?;
         let full_prefix = crate::mirror::cloud_key(&relative, "");
-        let store = S3Store::new(self.append_config(connection_id, bucket)?).map_err(cloud_error)?;
+        self.append_storage(connection_id, bucket)?;
+        let store: Arc<dyn ObjectStore> = if let Some(store) = self.google_store(connection_id)? { store }
+            else { Arc::new(S3Store::new(self.append_config(connection_id, bucket)?).map_err(cloud_error)?) };
         let page = store.list_page(&full_prefix, next).await.map_err(cloud_error)?;
         Ok(super::object_runtime_types::ObjectPageDto {
             prefix: full_prefix, complete: page.next_token.is_none(), next: page.next_token,
@@ -614,22 +639,21 @@ impl CloudRuntime {
         force_mass_delete: bool,
         confirmed_plan: Option<String>,
     ) -> Result<crate::mirror::MirrorSyncResult, AppError> {
-        let mut connection = self.connection(&mapping.connection_id)?;
-        if let Some(bucket) = &mapping.bucket {
-            if bucket != &connection.config.bucket && !connection.config.buckets.contains(bucket) {
-                return Err(runtime_error("CLOUD_CONFIG_INVALID", "请选择已配置的存储桶 / Select a configured bucket"));
+        let (store, endpoint, bucket): (Arc<dyn ObjectStore>, String, String) = if let Some(store) = self.google_store(&mapping.connection_id)? {
+            let entry = self.config.snapshot().map_err(config_error)?.official_connections.into_iter().find(|entry| entry.id == mapping.connection_id).ok_or_else(|| config_error(ConfigError::NotFound("connection".into())))?;
+            if mapping.bucket.as_ref().is_some_and(|bucket| bucket != &entry.root_id) { return Err(runtime_error("CLOUD_CONFIG_INVALID", "网盘根范围不匹配 / Drive root scope mismatch")); }
+            (store, "https://www.googleapis.com/drive/v3".into(), entry.root_id)
+        } else {
+            let mut connection = self.connection(&mapping.connection_id)?;
+            if let Some(bucket) = &mapping.bucket {
+                if bucket != &connection.config.bucket && !connection.config.buckets.contains(bucket) { return Err(runtime_error("CLOUD_CONFIG_INVALID", "请选择已配置的存储桶 / Select a configured bucket")); }
+                connection.config.bucket = bucket.clone();
             }
-            connection.config.bucket = bucket.clone();
-        }
-        let context = crate::mirror::MirrorRunContext {
-            endpoint: connection.config.endpoint.clone(),
-            bucket: connection.config.bucket.clone(),
-            force_mass_delete,
-            confirmed_plan,
+            let endpoint = connection.config.endpoint.clone(); let bucket = connection.config.bucket.clone();
+            (Arc::new(S3Store::new(connection.config).map_err(cloud_error)?), endpoint, bucket)
         };
-        let store = S3Store::new(connection.config).map_err(cloud_error)?;
-        let store: Arc<dyn ObjectStore> = Arc::new(store);
-        let _ = self.object_events.progress(SyncStatus {
+        let context = crate::mirror::MirrorRunContext { endpoint, bucket, force_mass_delete, confirmed_plan };
+        self.manager.report_status(SyncStatus {
             mapping_id: mapping.id.clone(),
             run_id: None,
             phase: SyncPhase::Scanning,
@@ -647,7 +671,7 @@ impl CloudRuntime {
             Err(crate::mirror::MirrorError::Canceled) => SyncPhase::Cancelled,
             Err(_) => SyncPhase::Failed,
         };
-        let _ = self.object_events.progress(SyncStatus {
+        self.manager.report_status(SyncStatus {
             mapping_id: mapping.id.clone(),
             run_id: None,
             phase,
@@ -783,14 +807,21 @@ impl CloudRuntime {
         .map_err(cloud_error)?;
         Ok(true)
     }
-    fn connection(&self, id: &str) -> Result<CloudConnection, AppError> {
-        self.config
+    pub(crate) fn connection_revision(&self, id: &str) -> Result<u64, AppError> {
+        if let Some(entry) = self.config.snapshot().map_err(config_error)?.official_connections.iter().find(|entry| entry.id == id) { return Ok(entry.revision); }
+        Ok(self.connection(id)?.revision)
+    }
+
+    pub(crate) fn connection(&self, id: &str) -> Result<CloudConnection, AppError> {
+        let mut connection = self.config
             .snapshot()
             .map_err(config_error)?
             .connections
             .into_iter()
             .find(|c| c.id == id)
-            .ok_or_else(|| config_error(ConfigError::NotFound("connection".into())))
+            .ok_or_else(|| config_error(ConfigError::NotFound("connection".into())))?;
+        connection.config.proxy = self.resolved_proxy(&connection.config.proxy)?;
+        Ok(connection)
     }
     async fn repo(&self, m: &CloudMapping) -> Result<(Arc<Repository>, u64), AppError> {
         let c = self.connection(&m.connection_id)?;
@@ -860,6 +891,12 @@ impl CloudRuntime {
             .map_err(|e| runtime_error("CLOUD_SCAN_FAILED", &e.to_string()))
     }
     pub async fn preview(&self, id: &str) -> Result<CloudPreview, AppError> {
+        self.preview_selection(id, &[]).await
+    }
+
+    pub async fn preview_selection(&self, id: &str, selection: &[String]) -> Result<CloudPreview, AppError> {
+        if selection.len() > 1000 { return Err(runtime_error("CLOUD_CONFIG_INVALID", "选中条目过多 / Too many selected entries")); }
+        for path in selection { crate::sync::namespace::components(path).map_err(|error| runtime_error("CLOUD_CONFIG_INVALID", &error.to_string()))?; }
         self.admit()?;
         let _p = self.network.read().await;
         self.admit()?;
@@ -886,12 +923,13 @@ impl CloudRuntime {
         .await
         .map_err(|_| runtime_error("CLOUD_SCAN_FAILED", "扫描任务异常退出 / Scan task failed"))?
         .map_err(|e| runtime_error("CLOUD_SCAN_FAILED", &e.to_string()))?;
+        if !selection.is_empty() && m.protocol != StorageProtocol::AppendV2 { return Err(runtime_error("CLOUD_CONFIG_INVALID", "此旧版同步盘不支持选中同步 / Selected sync is unavailable for this legacy drive")); }
         let digest = Self::digest(&report)?;
         let (total, rev, head_commit) = if m.protocol == StorageProtocol::AppendV2 {
-            let (counts, signature) = self.append_preview_state(&m, &epoch).await?;
+            let (counts, signature) = self.append_preview_selection(&m, &epoch, selection).await?;
             (
                 counts,
-                self.connection(&m.connection_id)?.revision,
+                self.connection_revision(&m.connection_id)?,
                 Some(signature),
             )
         } else {
@@ -955,6 +993,7 @@ impl CloudRuntime {
 
         let id = hex::encode(rand::random::<[u8; 16]>());
         let ticket = Ticket {
+            selection: selection.to_vec(),
             id: id.clone(),
             mapping: m.id.clone(),
             mapping_hash: Self::mapping_digest(&m)?,
@@ -1067,10 +1106,11 @@ impl CloudRuntime {
             ));
         }
         let m = self.mapping(mapping_id)?;
+        if !ticket.selection.is_empty() { self.validate_scheduled_root(&m)?; }
         self.authorize_root_for_manual(&m, &ticket.root, true)?;
         if m.protocol == StorageProtocol::AppendV2 {
             let (_, signature) = self.append_preview_state(&m, &ticket.epoch).await?;
-            if self.connection(&m.connection_id)?.revision != ticket.revision
+            if self.connection_revision(&m.connection_id)? != ticket.revision
                 || Some(signature) != ticket.head
             {
                 return Err(runtime_error(
@@ -1078,7 +1118,7 @@ impl CloudRuntime {
                     "远端或配置已变化 / Remote or configuration changed",
                 ));
             }
-            return self.start_append_worker(m, &ticket.epoch, automatic).await;
+            return self.start_append_worker(m, &ticket.epoch, automatic, ticket.selection).await;
         }
         let (repo, rev) = self.repo(&m).await?;
         if rev != ticket.revision || repo.head().await.map_err(repo_error)?.commit != ticket.head {
@@ -1150,6 +1190,13 @@ impl CloudRuntime {
             hex::encode(digest.finalize())
         )
     }
+    pub(crate) fn ensure_mapping_writable(&self, id: &str) -> Result<(), AppError> {
+        if matches!(self.manager.status(id).phase, SyncPhase::Scanning | SyncPhase::Uploading | SyncPhase::Publishing | SyncPhase::Applying) {
+            return Err(runtime_error("CLOUD_SYNC_BUSY", "同步中，暂不可写入 / Sync is running; writes are temporarily disabled"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn mapping(&self, id: &str) -> Result<CloudMapping, AppError> {
         self.config
             .snapshot()
@@ -1284,7 +1331,7 @@ fn runtime_error(code: &str, msg: &str) -> AppError {
         context: None,
     }
 }
-fn config_error(e: ConfigError) -> AppError {
+pub(crate) fn config_error(e: ConfigError) -> AppError {
     let code = match &e {
         ConfigError::NotFound(_) => "CLOUD_CONFIG_NOT_FOUND",
         _ => "CLOUD_CONFIG_INVALID",

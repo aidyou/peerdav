@@ -37,6 +37,7 @@ pub struct ObjectUploadDirectoryDto {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectoryConflictDto {
+    pub overwrite_allowed: bool,
     pub conflict_id: String,
     pub relative_path: String,
     pub key: String,

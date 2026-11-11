@@ -18,6 +18,7 @@ pub(crate) fn item(
         return Err(invalid());
     }
     Ok(DownloadItem {
+        is_dir: false,
         remote_path,
         relative_path,
         size,
@@ -144,6 +145,14 @@ impl DownloadQueues {
                     let q = map.get_mut(id).ok_or_else(invalid)?;
                     q.status.current_relative_path = Some(item.relative_path.clone());
                     progress.store(0, Ordering::Relaxed);
+                }
+                if item.is_dir {
+                    root.ensure_download_directory(&item.relative_path).map_err(app)?;
+                    let mut map = self.queues.lock().await;
+                    let q = map.get_mut(id).ok_or_else(invalid)?;
+                    q.status.completed_files += 1;
+                    q.items[index].phase = "completed".into();
+                    continue;
                 }
                 let exists = root
                     .relative_target_exists(&item.relative_path)
@@ -347,6 +356,25 @@ mod tests {
     use super::*;
     use futures_util::future::BoxFuture;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[test]
+    fn download_selection_accepts_only_opaque_id_contract() {
+        for mode in ["single", "folder"] {
+            let selection: DownloadSelection = serde_json::from_value(serde_json::json!({ "mode": mode, "id": "opaque:not/a/display/name" })).expect("opaque ID");
+            match selection {
+                DownloadSelection::Single { path } | DownloadSelection::Folder { path } => assert_eq!(path, "opaque:not/a/display/name"),
+                DownloadSelection::Files { .. } => panic!("single target"),
+            }
+            assert!(serde_json::from_value::<DownloadSelection>(serde_json::json!({ "mode": mode, "path": "legacy" })).is_err());
+        }
+        let selection: DownloadSelection = serde_json::from_value(serde_json::json!({ "mode": "files", "ids": ["id-a", "id-b"] })).expect("batch IDs");
+        assert!(matches!(selection, DownloadSelection::Files { paths } if paths == ["id-a", "id-b"]));
+        assert!(serde_json::from_value::<DownloadSelection>(serde_json::json!({ "mode": "files", "paths": ["legacy"] })).is_err());
+        let dto = serde_json::to_value(item("opaque-id".into(), "local.txt".into(), 1).expect("item")).expect("queue identity DTO");
+        assert_eq!(dto["id"], "opaque-id");
+        assert_eq!(dto["relativePath"], "local.txt");
+        assert!(dto.get("remotePath").is_none());
+    }
+
     struct Adapter {
         calls: Arc<AtomicUsize>,
     }
@@ -358,8 +386,13 @@ mod tests {
         fn validate(&self) -> BoxFuture<'_, Result<(), AppError>> {
             Box::pin(async { Ok(()) })
         }
-        fn plan(&self, _: DownloadSelection) -> BoxFuture<'_, Result<Vec<DownloadItem>, AppError>> {
-            Box::pin(async {
+        fn plan(&self, selection: DownloadSelection) -> BoxFuture<'_, Result<Vec<DownloadItem>, AppError>> {
+            Box::pin(async move {
+                if matches!(selection, DownloadSelection::Folder { .. }) {
+                    let mut directory = item(String::new(), "empty/nested".into(), 0)?;
+                    directory.is_dir = true;
+                    return Ok(vec![directory]);
+                }
                 Ok(vec![
                     item("a".into(), "a".into(), 0)?,
                     item("b".into(), "b".into(), 0)?,
@@ -396,6 +429,18 @@ mod tests {
         .await
         .unwrap()
     }
+    #[tokio::test]
+    async fn empty_directories_are_installed_without_file_payload_requests() {
+        let dir = tempfile::tempdir().expect("dir");
+        let queues = Arc::new(DownloadQueues::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let q = queues.select(DownloadBackend::Official { connection_id: "test".into() }, DownloadSelection::Folder { path: "folder/".into() }, crate::cloud::PhysicalRoot::open(dir.path()).expect("root"), Arc::new(Adapter { calls: calls.clone() })).await.expect("queue");
+        queues.start(&q.queue_id).await.expect("start");
+        wait(&queues, &q.queue_id, "completed").await;
+        assert!(dir.path().join("empty/nested").is_dir());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn queue_decisions_reset_skip_without_payload_overwrite_and_fixed_reveal() {
         let dir = tempfile::tempdir().unwrap();

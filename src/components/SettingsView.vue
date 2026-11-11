@@ -17,6 +17,7 @@ import { locale, setLocale, localizeMessage, t } from "../lib/i18n";
 import { theme, setTheme, SUPPORTED_THEMES } from "../lib/theme";
 import { accent, setAccent, SUPPORTED_ACCENTS } from "../lib/accent";
 import { generalSettings, saveGeneralSettings, shortcutFromEvent } from "../lib/general";
+import NetworkProxySettings from './NetworkProxySettings.vue';
 import { accessRowState, findAccessRequest, findSavedPeer } from "../lib/access";
 import { statusTagTone } from "../lib/tagTone";
 import { validatePassword } from "../lib/password";
@@ -927,6 +928,7 @@ async function loadInitialData() {
            成组的数据录入也走行式列表，提交动作收在列表尾行。
            面板级动作（立即锁屏、退出登录）挂在组标题右侧的小胶囊上，不占一行。 -->
       <section v-if="app.settingsTab === 'general'" id="pane-general" class="settings-pane" role="region" aria-labelledby="tab-general">
+        <NetworkProxySettings />
         <div class="settings-group">
           <h3 class="group-title">{{ t("settings.groupAppearance") }}</h3>
           <div class="settings-rows">

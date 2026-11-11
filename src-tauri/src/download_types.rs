@@ -25,6 +25,10 @@ pub enum DownloadBackend {
         #[serde(rename = "shareId")]
         share_id: String,
     },
+    Official {
+        #[serde(rename = "connectionId")]
+        connection_id: String,
+    },
     S3 {
         #[serde(rename = "connectionId")]
         connection_id: String,
@@ -33,13 +37,16 @@ pub enum DownloadBackend {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
 pub enum DownloadSelection {
-    Single { path: String },
-    Files { paths: Vec<String> },
-    Folder { path: String },
+    Single { #[serde(rename = "id")] path: String },
+    Files { #[serde(rename = "ids")] paths: Vec<String> },
+    Folder { #[serde(rename = "id")] path: String },
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadItem {
+    pub is_dir: bool,
+    /// Remote identity; only the protocol adapter may interpret its contents.
+    #[serde(rename = "id")]
     pub remote_path: String,
     pub relative_path: String,
     /// 文件字节大小，供下载队列展示“大小”列与行内进度分母。
@@ -94,6 +101,19 @@ pub(crate) struct PeerDownloadAdapter {
     pub share: String,
     pub scope: String,
 }
+pub(crate) struct OfficialDownloadAdapter {
+    pub parents: HashMap<String, String>,
+    pub content_types: Mutex<HashMap<String, String>>,
+    #[cfg(test)]
+    pub pages: Option<HashMap<(String, Option<String>), crate::cloud::official_api_types::OfficialPage>>,
+    pub runtime: Arc<crate::cloud::runtime::CloudRuntime>,
+    pub connection: String,
+    pub revision: u64,
+    pub names: HashMap<String, String>,
+    pub directories: HashMap<String, String>,
+    pub files: Mutex<HashMap<String, (String, u64)>>,
+}
+
 pub(crate) struct S3DownloadAdapter {
     pub runtime: Arc<crate::cloud::runtime::CloudRuntime>,
     pub connection: String,

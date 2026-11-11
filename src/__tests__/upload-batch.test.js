@@ -57,9 +57,9 @@ describe("shared upload batch session", () => {
     const picker = deferred();
     const { batch, adapter } = setup({ select: () => picker.promise });
     const pending = batch.selectUpload();
-    await batch.cancelUploadSession();
+    const stopping = batch.cancelUploadSession();
     picker.resolve(summary("selected"));
-    await pending;
+    await Promise.all([pending, stopping]);
     expect(adapter.start).not.toHaveBeenCalled();
     expect(adapter.release).toHaveBeenCalledTimes(1);
     expect(batch.uploadDialogOpen.value).toBe(false);
@@ -69,13 +69,33 @@ describe("shared upload batch session", () => {
     const { batch, adapter } = setup({ page: () => page.promise });
     const pending = batch.selectUpload();
     await Promise.resolve();
-    await batch.cancelUploadSession();
+    const stopping = batch.cancelUploadSession();
     page.resolve({ entries: [{ name: "stale" }] });
-    await pending;
+    await Promise.all([pending, stopping]);
     await batch.cancelUploadSession();
     expect(batch.uploadPage.value).toBeNull();
     expect(adapter.start).not.toHaveBeenCalled();
     expect(adapter.release).toHaveBeenCalledTimes(1);
+  });
+  it('joins late start cleanup before resolving teardown', async () => {
+    const start = deferred();
+    const released = deferred();
+    const { batch, adapter } = setup({ start: vi.fn(() => start.promise), release: vi.fn(() => released.promise) });
+    const pending = batch.selectUpload();
+    for (let index = 0; index < 8 && !adapter.start.mock.calls.length; index++) await Promise.resolve();
+    expect(adapter.start).toHaveBeenCalledTimes(1);
+    let stopped = false;
+    const stopping = batch.cancelUploadSession().then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    start.resolve(summary());
+    for (let index = 0; index < 8 && !adapter.release.mock.calls.length; index++) await Promise.resolve();
+    expect(adapter.release).toHaveBeenCalledTimes(1);
+    expect(stopped).toBe(false);
+    released.resolve();
+    await Promise.all([pending, stopping]);
+    expect(stopped).toBe(true);
+    expect(adapter.cancel).toHaveBeenCalledTimes(2);
   });
   it("replaces pages rather than appending upload history", async () => {
     const { batch, adapter } = setup();

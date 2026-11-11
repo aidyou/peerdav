@@ -554,6 +554,29 @@ async fn plan_rejects_out_of_prefix_control_head_and_sibling() {
 }
 
 #[tokio::test]
+async fn empty_directory_creation_uses_guarded_marker_and_rejects_root() {
+    let (store, calls) = FakeStore::new(vec![page(&[], None)]);
+    let svc = service(store, "");
+    svc.discover("").await.expect("discover protection");
+    svc.create_directory("folder/").await.expect("create marker");
+    assert_eq!(calls.lock().expect("calls").put, 1);
+    assert!(svc.create_directory("").await.is_err());
+    assert!(svc.create_directory("../").await.is_err());
+    assert_eq!(calls.lock().expect("calls").put, 1);
+}
+
+#[tokio::test]
+async fn empty_directory_marker_can_be_planned_and_deleted_without_root_access() {
+    let (store, calls) = FakeStore::new(vec![page(&["empty/"], None)]);
+    let svc = service(store, "");
+    svc.discover("").await.expect("discover");
+    let plan = svc.delete_plan("empty/", 4_000_000_000).await.expect("marker delete plan");
+    assert_eq!(svc.execute_delete(&plan, true).await.expect("delete marker").len(), 1);
+    assert_eq!(calls.lock().expect("calls").deletes, ["empty/"]);
+    assert!(svc.delete_plan("/", 4_000_000_000).await.is_err());
+}
+
+#[tokio::test]
 async fn empty_root_browse_and_confirmed_delete_work_for_ordinary_objects() {
     let (store, calls) = FakeStore::new(vec![page(&["folder/a", "folder/b"], None)]);
     let svc = service(store, "");

@@ -11,6 +11,7 @@ pub mod download_types;
 mod download;
 mod download_commands;
 mod s3_download;
+mod official_download;
 mod error;
 pub mod file_manager;
 mod fs;
@@ -145,6 +146,7 @@ pub fn run() {
             if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                 window::restore(&window, &vault)?;
             }
+            app.manage(Arc::new(file_manager::types::FileSessions::default()));
             app.manage(Arc::new(download_types::DownloadQueues::default()));
             app.manage(cloud::runtime_types::SharedCloud(cloud));
             app.manage(Arc::clone(&vault) as SharedVault);
@@ -222,6 +224,24 @@ pub fn run() {
             }
             let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool> =
                 Box::new(tauri::generate_handler![
+                    file_manager::commands::file_upload_resolve,
+                    file_manager::commands::file_upload_page,
+                    file_manager::commands::file_upload_action,
+                    file_manager::commands::file_release_upload,
+                    file_manager::commands::file_create_directory,
+                    file_manager::commands::file_open_session,
+                    file_manager::commands::file_prepare_session,
+                    file_manager::commands::file_list,
+                    file_manager::commands::file_preview,
+                    file_manager::commands::file_prepare_edit,
+                    file_manager::commands::file_commit_edit,
+                    file_manager::commands::file_discard_edit,
+                    file_manager::commands::file_online_preview,
+                    file_manager::commands::file_delete_plan,
+                    file_manager::commands::file_delete_execute,
+                    file_manager::commands::file_select_upload,
+                    file_manager::commands::file_select_download,
+                    file_manager::commands::file_close_session,
                     download_commands::transfer_select_download,
                     download_commands::transfer_start_download,
                     download_commands::transfer_status_download,
@@ -307,6 +327,16 @@ pub fn run() {
                     commands::commit_peer_external_edit,
                     commands::discard_peer_external_edit,
                     cloud::cloud_commands::cloud_list,
+                    cloud::cloud_commands::cloud_protocols,
+                    cloud::cloud_commands::client_proxy_settings,
+                    cloud::cloud_commands::save_client_proxy_settings,
+                    cloud::cloud_commands::drive_proxy_settings,
+                    cloud::cloud_commands::save_drive_proxy_settings,
+                    cloud::cloud_commands::cloud_official_authorize,
+                    cloud::cloud_commands::cloud_official_begin_loopback,
+                    cloud::cloud_commands::cloud_official_wait_loopback,
+                    cloud::cloud_commands::cloud_official_cancel_authorization,
+                    cloud::cloud_commands::cloud_official_complete_authorization,
                     cloud::cloud_commands::cloud_test_connection,
                     cloud::cloud_commands::cloud_probe_buckets,
                     cloud::cloud_commands::cloud_connection_credentials,
@@ -318,6 +348,9 @@ pub fn run() {
                     cloud::cloud_commands::cloud_create_sync_drive,
                     cloud::cloud_commands::cloud_append_create,
                     cloud::cloud_commands::cloud_append_join,
+                    cloud::cloud_commands::cloud_prepare_mapping_bind,
+                    cloud::cloud_commands::cloud_confirm_mapping_bind,
+                    cloud::cloud_commands::cloud_cancel_mapping_bind,
                     cloud::cloud_commands::cloud_append_save_mapping,
                     cloud::cloud_commands::cloud_create_repository,
                     cloud::cloud_commands::cloud_join_repository,

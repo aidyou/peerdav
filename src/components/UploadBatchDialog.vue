@@ -82,9 +82,11 @@ const entrySize = (item) => {
           <span class="upload-dir__label">{{ t('cloudBrowser.uploadRemoteDir') }}</span>
           <span class="mono upload-dir__value" :title="remotePath">{{ remotePath }}</span>
           <span v-if="phaseIcon" class="upload-dir__state" :class="`is-${phaseIcon}`">
-            <svg v-if="phaseIcon === 'active'" class="upload-dir__spinner" viewBox="0 0 16 16" aria-hidden="true">
-              <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="24 14" />
-            </svg>
+            <span v-if="phaseIcon === 'active'" class="upload-dir__spinner" aria-hidden="true">
+              <svg viewBox="0 0 16 16">
+                <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="24 14" />
+              </svg>
+            </span>
             <svg v-else-if="phaseIcon === 'done'" viewBox="0 0 16 16" aria-hidden="true">
               <path d="M3.5 8.5l3 3 5.5-6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
             </svg>
@@ -172,10 +174,9 @@ const entrySize = (item) => {
 .upload-dir__state.is-active { color: var(--el-color-primary); }
 .upload-dir__state.is-done { color: var(--el-color-success); }
 .upload-dir__state.is-error { color: var(--el-color-danger); }
-/* transform-box/transform-origin 必须显式声明：WebKitGTK（Tauri Linux 内核）对 SVG 元素的
-   CSS transform 默认原点在视口左上角，不写就会“在转但看不出”，甚至表现为不旋转。 */
-.upload-dir__spinner { transform-box: view-box; transform-origin: 50% 50%; animation: queue-spin 0.9s linear infinite; }
-@keyframes queue-spin { to { transform: rotate(360deg); } }
+/* 在固定大小的 HTML 盒子上旋转，避免依赖不同 WebView 的 SVG transform-box 实现。 */
+.upload-dir__spinner { display: inline-flex; width: 16px; height: 16px; flex: none; transform-origin: center; animation: upload-directory-spin 0.9s linear infinite; }
+@keyframes upload-directory-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 /* 旋转只是“进行中”的辅助表达，用户要求减少动效时改为静态图标。 */
 @media (prefers-reduced-motion: reduce) {
   .upload-dir__spinner { animation: none; }

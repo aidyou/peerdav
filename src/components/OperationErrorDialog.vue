@@ -9,12 +9,17 @@ const emit = defineEmits(["close", "retry"]);
       <p class="cloud-error__message">{{ error.message }}</p><span class="error-code">{{ error.code }}</span>
       <details v-if="error.detail" :key="error"><summary>{{ t('transferQueue.details') }}</summary><p>{{ error.detail }}</p></details>
     </div>
-    <template #footer><el-button @click="emit('close')">{{ t('common.close') }}</el-button>
-      <el-button v-if="retryable" :data-test="recheck ? 'recheck' : 'retry-load'" type="primary" :disabled="busy" @click="emit('retry')">{{ t(recheck ? 'cloudBrowser.recheck' : 'cloudBrowser.retry') }}</el-button>
+    <template #footer>
+      <div class="operation-error__actions">
+        <el-button @click="emit('close')">{{ t('common.close') }}</el-button>
+        <el-button v-if="retryable" :data-test="recheck ? 'recheck' : 'retry-load'" type="primary" :disabled="busy" @click="emit('retry')">{{ t(recheck ? 'cloudBrowser.recheck' : 'cloudBrowser.retry') }}</el-button>
+      </div>
     </template>
   </el-dialog>
 </template>
 <style scoped>
+.operation-error__actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 12px; }
+.operation-error__actions :deep(.el-button + .el-button) { margin-left: 0; }
 .operation-error { display: flex; flex-direction: column; gap: 10px; overflow-wrap: anywhere; }
 p { margin: 0; white-space: pre-wrap; }
 .error-code, details { font-size: 12px; color: var(--app-text-muted); }

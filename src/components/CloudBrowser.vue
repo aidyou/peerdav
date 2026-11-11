@@ -22,8 +22,12 @@ import {
 } from "../lib/textPreview";
 import { errorStrategy, normalizeAppError } from "../lib/invoke";
 import CloudSyncDrives from "./CloudSyncDrives.vue";
+import SharedFileBrowser from "./FileBrowser.vue";
+import { cloudBrowserAdapter } from '../lib/fileBrowserAdapter';
+import NetworkProxySettings from './NetworkProxySettings.vue';
 import { t } from "../lib/i18n";
 
+const proxyOpen = ref(false);
 const props = defineProps({ connectionId: { type: String, required: true } });
 const app = useAppContext();
 
@@ -189,6 +193,7 @@ function formatModified(seconds) {
 }
 
 let catalogVersion = 0;
+const driveStatuses = ref([]);
 const drives = computed(() => catalogDrives.value.map((item, index) => ({ ...item, label: item.localRoot?.split(/[\\/]+/).filter(Boolean).pop() || item.logicalPath || t("drive.number", { number: index + 1 }) })));
 const localDrive = computed(() => drives.value.find(item => item.id === activeDriveId.value));
 const localFiles = ref([]);
@@ -251,7 +256,11 @@ async function compareLocalStatus(id, version, request) {
     const entries = await cloud.localStatus(id);
     if (!currentLocal(version) || request !== localRequest) return;
     const states = new Map(entries.map(entry => [entry.path, entry]));
-    localFiles.value = localFiles.value.map(entry => ({ ...entry, synced: states.get(entry.path)?.synced === true }));
+    const localPaths = new Set(localFiles.value.map(entry => entry.path));
+    localFiles.value = [
+      ...localFiles.value.map(entry => ({ ...entry, synced: states.get(entry.path)?.synced === true, remoteOnly: false })),
+      ...entries.filter(entry => entry.remoteOnly === true && !localPaths.has(entry.path)),
+    ];
     localStatusKnown.value = true;
   } catch (cause) {
     if (currentLocal(version) && request === localRequest) app.handleFailure(cause);
@@ -275,18 +284,19 @@ async function openLocal(drive) {
   if (!drive.mappingId) { openManagement(drive.id); return; }
   closePreview(); clearSelection(); resetLocalScope();
   activeDriveId.value = drive.id; view.value = "local";
-  localFiles.value = []; localPath.value = ""; localSelection.value = []; localPreview.value = null; localPhase.value = "";
+  localFiles.value = []; localPath.value = ""; localSelection.value = []; localPreview.value = null; localPhase.value = drivePhase(drive);
   void loadLocal();
 }
 function selectLocal(entry) { localSelection.value = [entry]; }
 function activateLocal(entry) { selectLocal(entry); if (entry.isDir) localPath.value = entry.path; }
-async function previewLocalSync() {
+async function previewLocalSync(entry) {
+  const selection = entry?.path ? [entry.path] : [];
   const id = localDrive.value?.mappingId;
   if (!id || localBusy.value || localRunning.value) return;
   const version = localVersion;
   localBusy.value = true; localError.value = null; localPreview.value = null;
   if (['failed', 'cancelled'].includes(localPhase.value)) localPhase.value = '';
-  try { const result = await cloud.preview(id); if (currentLocal(version)) localPreview.value = { ...result, mappingId: id, checkedAt: new Date().toISOString() }; }
+  try { const result = await cloud.preview(id, selection); if (currentLocal(version)) localPreview.value = { ...result, selection, mappingId: id, checkedAt: new Date().toISOString() }; }
   catch (cause) { if (currentLocal(version)) { localError.value = normalizeAppError(cause); app.handleFailure(cause); } }
   finally { if (currentLocal(version)) localBusy.value = false; }
 }
@@ -302,13 +312,18 @@ async function applyLocalSync() {
   catch (cause) { if (currentLocal(version)) { localError.value = normalizeAppError(cause); app.handleFailure(cause); } }
   finally { if (currentLocal(version)) localBusy.value = false; }
 }
+function drivePhase(drive) { return driveStatuses.value.find(status => status.mappingId === drive.mappingId)?.phase || ''; }
+function driveSyncing(drive) { return ['scanning', 'uploading', 'publishing', 'applying'].includes(drivePhase(drive)); }
 async function pollLocalSync() {
-  if (view.value !== "local" || !localDrive.value?.mappingId || localPolling) return;
-  const id = localDrive.value.mappingId;
+  if (localPolling || !catalogDrives.value.some(drive => drive.mappingId)) return;
+  const connection = props.connectionId;
+  const id = localDrive.value?.mappingId;
   const version = localVersion;
   localPolling = true;
   try {
     const statuses = await cloud.status();
+    if (disposed || connection !== props.connectionId) return;
+    driveStatuses.value = statuses;
     if (!currentLocal(version) || localDrive.value?.mappingId !== id) return;
     const status = statuses.find(item => item.mappingId === id);
     if (status?.phase && (status.phase !== localPhase.value || status.runId !== localRunId.value)) {
@@ -342,7 +357,7 @@ async function selectBucket(bucket) {
   activeDriveId.value = "";
   view.value = "files";
   requestId++;
-  try { await cloudObjects.selectBucket(connectionId, bucket); }
+  try { if (connectionBrowserCapabilities.value.selectRoot === true) await cloudObjects.selectBucket(connectionId, bucket); }
   catch (cause) {
     if (disposed || connectionId !== props.connectionId || version !== bucketSelectionVersion) return false;
     activeBucket.value = previousBucket;
@@ -356,8 +371,10 @@ async function selectBucket(bucket) {
   clearSelection();
   columnVersion++; columnAncestors.value = [];
   clearPreview();
-  void prepare();
-  void load();
+  if (root.value) {
+    void prepare();
+    void load();
+  }
   return true;
 }
 async function refreshCatalog() {
@@ -366,9 +383,11 @@ async function refreshCatalog() {
   try {
     const catalog = await cloud.list();
     if (disposed || version !== catalogVersion || connectionId !== props.connectionId) return;
-    connections.value = catalog.connections;
-    const connection = (catalog.connections || []).find((item) => String(item.id) === connectionId);
-    const list = connection?.buckets?.length ? connection.buckets : (connection?.bucket ? [connection.bucket] : []);
+    connections.value = [...(catalog.connections || []), ...(catalog.officialConnections || [])];
+    driveStatuses.value = catalog.statuses || [];
+    const connection = connections.value.find((item) => String(item.id) === connectionId);
+    const list = connection?.buckets?.length ? connection.buckets : connection?.bucket ? [connection.bucket] : connection?.rootId ? [connection.rootId] : [];
+    if (connection?.browserCapabilities?.selectRoot === false && view.value !== 'management') { view.value = 'files'; activeDriveId.value = ''; }
     buckets.value = list;
     if (!activeBucket.value && list.length) activeBucket.value = list[0];
     catalogDrives.value = [
@@ -392,6 +411,9 @@ async function refreshCatalog() {
 const connections = ref([]);
 const prefix = ref("");
 const root = ref("");
+const ordinaryBrowser = ref(null);
+const connectionBrowserCapabilities = computed(() => connections.value.find(item => String(item.id) === props.connectionId)?.browserCapabilities || {});
+const ordinaryAdapter = computed(() => cloudBrowserAdapter(props.connectionId, activeBucket.value, '', app));
 const objects = ref([]);
 const next = ref(null);
 const complete = ref(false);
@@ -943,12 +965,12 @@ const {
 });
 function download(item) {
   if (!item || item.isDir) return;
-  return selectDownload({ mode: "single", path: item.key });
+  return selectDownload({ mode: "single", id: item.key });
 }
 function downloadSelection(entries) {
   if (!entries.length) return;
-  if (entries.length === 1) return selectDownload({ mode: entries[0].isDir ? "folder" : "single", path: entries[0].key });
-  return selectDownload({ mode: "files", paths: entries.map((entry) => entry.key) });
+  if (entries.length === 1) return selectDownload({ mode: entries[0].isDir ? "folder" : "single", id: entries[0].key });
+  return selectDownload({ mode: "files", ids: entries.map((entry) => entry.key) });
 }
 function validDeletePlan(plan, target) {
   return plan != null && Number.isSafeInteger(plan.objectCount) && plan.objectCount >= 0 && Array.isArray(plan.entries)
@@ -1055,7 +1077,10 @@ async function poll() {
         }
       }
       transfers.value = scoped.filter((item) => !["completed", "cancelled", "acknowledged"].includes(item.phase));
-      if (refreshAfterUpload) refresh();
+      if (refreshAfterUpload) {
+        if (!root.value && ordinaryBrowser.value) void ordinaryBrowser.value.refresh();
+        else refresh();
+      }
     }
   } catch (cause) {
     if (version === statusVersion) fail(cause, scope);
@@ -1115,9 +1140,11 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="cloud-browser" :aria-label="t('cloudBrowser.title')">
+    <el-dialog v-model="proxyOpen" :title="t('network.title')" width="480px" destroy-on-close><NetworkProxySettings v-if="proxyOpen" :key="connectionId" :connection-id="connectionId" /></el-dialog>
     <div class="browser-body">
       <aside class="browser-sidebar">
         <div class="sidebar-identity"><strong>{{ connectionName }}</strong><span class="mono">{{ connectionHost }}</span></div>
+        <button type="button" class="share-link" @click="proxyOpen = true">{{ t('network.title') }}</button>
         <p class="sidebar-label">{{ t('cloudBrowser.buckets') }}</p>
         <button v-for="bucket in buckets" :key="bucket" type="button" class="share-link bucket-link" :class="{ 'is-active': view === 'files' && activeBucket === bucket }" @click="selectBucket(bucket)">
           <FileGlyph :entry="{ isDir: true, name: bucket }" /><span>{{ bucket }}</span>
@@ -1128,13 +1155,13 @@ onBeforeUnmount(() => {
           <button type="button" class="sidebar-section-manage" :class="{ 'is-active': view === 'management' && !activeDriveId }" @click="openManagement()">{{ t('drive.manageActions') }}</button>
         </div>
         <button v-for="(drive, index) in drives" :key="index" type="button" class="share-link drive-link" :class="{ 'is-active': activeDriveId === drive.id }" @click="openLocal(drive)">
-          <FileGlyph :entry="{ isDir: true, name: drive.label, driveKind: drive.driveKind || 'encrypted-drive' }" /><span>{{ drive.label }}</span>
+          <FileGlyph :entry="{ isDir: true, name: drive.label, driveKind: drive.driveKind || 'encrypted-drive' }" /><span>{{ drive.label }}</span><span v-if="driveSyncing(drive)" class="drive-sync-status" role="status">{{ t('drive.syncing') }}</span><span v-else-if="['failed', 'pendingRecovery'].includes(drivePhase(drive))" role="status">{{ t('cloud.phaseFailed') }}</span>
         </button>
         <p v-if="!drives.length" class="sidebar-empty">{{ t('cloudBrowser.noSyncDrives') }}</p>
       </aside>
       <main class="browser-main">
         <div v-if="view === 'management'" class="management-view">
-          <div class="management-content"><CloudSyncDrives :key="connectionId" :connection-id="connectionId" :bucket="activeBucket" :focus-id="localDrive?.repositoryId || activeDriveId" @changed="refreshCatalog" /></div>
+          <div class="management-content"><p v-if="connectionBrowserCapabilities.syncDrives !== true" role="status">{{ t('drive.syncProtocolUnavailable') }}</p><CloudSyncDrives v-else :key="connectionId" :connection-id="connectionId" :bucket="activeBucket" :focus-id="localDrive?.repositoryId || activeDriveId" @changed="refreshCatalog" /></div>
         </div>
         <template v-else-if="view === 'local'">
           <div class="pathbar">
@@ -1158,12 +1185,13 @@ onBeforeUnmount(() => {
           </div>
           <div class="file-view local-file-view">
             <FileManagerView :entries="localEntries" :mode="viewMode" :selection="localSelection" :columns="localColumns" :loading="localLoading" :error="localError"
-              :entry-kind="entryKind" :format-size="formatSize" :entry-status="entry => !localStatusKnown || entry.synced ? '' : t('drive.pendingSync')"
+              :entry-kind="entryKind" :format-size="formatSize" :entry-status="entry => !localStatusKnown || entry.synced ? '' : t(entry.remoteOnly ? 'drive.cloudOnly' : 'drive.pendingSync')"
               @select="selectLocal" @activate="activateLocal" @column-select="activateLocal" @preview="activateLocal" @status-action="previewLocalSync">
               <template #gallery-preview><div v-if="localSelection[0]" class="gallery-placeholder"><FileGlyph :entry="localSelection[0]" size="xl" /><strong>{{ localSelection[0].name }}</strong><span>{{ formatSize(localSelection[0]) }}</span></div><p v-else>{{ t('peer.selectPreview') }}</p></template>
             </FileManagerView>
           </div>
         </template>
+        <SharedFileBrowser ref="ordinaryBrowser" v-else-if="!root && activeBucket" :key="`${connectionId}:${activeBucket}`" :peer="{ id: connectionId, label: connectionName, url: connectionHost }" :adapter="ordinaryAdapter" hide-sidebar />
         <template v-else>
           <div class="pathbar">
             <div ref="breadcrumbsEl" class="breadcrumbs" aria-label="Breadcrumb" @wheel="scrollBreadcrumbs">
@@ -1188,11 +1216,6 @@ onBeforeUnmount(() => {
               </div>
               <span class="titlebar-divider" aria-hidden="true"></span>
               <div class="view-switch" role="group" :aria-label="t('cloudBrowser.fileActions')">
-                <el-tooltip :content="t('cloudBrowser.refresh')" placement="bottom" :show-after="200" :hide-after="0" :enterable="false">
-                  <button type="button" class="view-switch__button" data-test="refresh" :aria-label="t('cloudBrowser.refresh')" :disabled="busy || loading" @click="refresh">
-                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7" /><path d="M20 5v6h-6" /></svg>
-                  </button>
-                </el-tooltip>
                 <el-tooltip :content="t('cloudBrowser.upload')" placement="bottom" :show-after="200" :hide-after="0" :enterable="false">
                   <button type="button" class="view-switch__button" data-test="upload" :aria-label="t('cloudBrowser.upload')" :disabled="!canMutate" @click="upload">
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4" /><path d="m8 8 4-4 4 4" /><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" /></svg>
@@ -1203,12 +1226,19 @@ onBeforeUnmount(() => {
                     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5c0-.8.7-1.5 1.5-1.5h4l1.8 2H19c.8 0 1.5.7 1.5 1.5v8c0 .8-.7 1.5-1.5 1.5H5c-.8 0-1.5-.7-1.5-1.5z" /><path d="M12 17v-5M9.5 14.5 12 12l2.5 2.5" /></svg>
                   </button>
                 </el-tooltip>
+                <span class="titlebar-divider" aria-hidden="true"></span>
                 <el-tooltip v-if="!insideEncryptedDrive" :content="prefix ? t('cloudBrowser.deletePrefix') : t('cloudBrowser.deletePrefixRootHint')" placement="bottom" :show-after="200" :hide-after="0" :enterable="false">
                   <button type="button" class="view-switch__button" data-test="delete-prefix" :aria-label="t('cloudBrowser.deletePrefix')" :disabled="deleting || !canMutate || hasProtectedObjects" :aria-busy="deleting ? 'true' : undefined" @click="remove(prefix)">
                     <svg v-if="deleting" class="action-spinner" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="34 20" /></svg>
                     <svg v-else viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16" /><path d="M9 7V5h6v2" /><path d="M6 7l1 12h10l1-12" /></svg>
                   </button>
                 </el-tooltip>
+                <el-tooltip :content="t('cloudBrowser.refresh')" placement="bottom" :show-after="200" :hide-after="0" :enterable="false">
+                  <button type="button" class="view-switch__button" data-test="refresh" :aria-label="t('cloudBrowser.refresh')" :disabled="busy || loading" @click="refresh">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7" /><path d="M20 5v6h-6" /></svg>
+                  </button>
+                </el-tooltip>
+                <span class="titlebar-divider" aria-hidden="true"></span>
                 <button ref="shortcutsTriggerEl" type="button" class="view-switch__button shortcuts-trigger" :aria-label="t('peer.shortcuts')" :aria-expanded="shortcutsOpen ? 'true' : 'false'" @click="toggleShortcutsPanel">
                   <svg viewBox="0 0 24 24" aria-hidden="true">
                     <rect x="2.5" y="6.5" width="19" height="11" rx="2" />
@@ -1289,6 +1319,8 @@ onBeforeUnmount(() => {
           </div>
           <ul v-if="transfers.length" class="cloud-tree cloud-transfers" :aria-label="t('cloudBrowser.transfers')"><li v-for="item in transfers" :key="item.transferId"><span>{{ item.key == null ? t('cloudBrowser.unknownTarget') : JSON.stringify(item.key) }}<span v-if="item.sizeHint != null"> · {{ t('cloudBrowser.bytes', { size: item.sizeHint }) }}</span> · {{ t(`cloudBrowser.${item.direction}`) }} · {{ t(`cloudBrowser.phase.${item.phase}`) }}<strong v-if="item.recoveryRequired || item.phase === 'unknown'"> · {{ t('cloudBrowser.recovery') }}</strong><span v-if="item.error"> · {{ item.error.message }}</span></span><p v-if="item.phase === 'acknowledged'">{{ t('cloudBrowser.acknowledgedNotice') }}</p><el-button v-if="item.phase === 'unknown'" :disabled="busy" @click="acknowledge(item)">{{ t('cloudBrowser.acknowledge') }}</el-button><el-button v-if="item.phase === 'running'" :disabled="busy" @click="cancel(item)">{{ t('cloudBrowser.cancel') }}</el-button></li></ul>
         </template>
+        <OperationErrorDialog v-if="view === 'files' && !root" :error="visibleError" :retryable="!!retryOperation" @close="closeOperationError" @retry="retryFailedOperation" />
+        <ul v-if="view === 'files' && !root && transfers.length" class="cloud-tree cloud-transfers" :aria-label="t('cloudBrowser.transfers')"><li v-for="item in transfers" :key="item.transferId"><span>{{ item.key == null ? t('cloudBrowser.unknownTarget') : JSON.stringify(item.key) }} · {{ t(`cloudBrowser.phase.${item.phase}`) }}<span v-if="item.phase === 'acknowledged'"> · {{ t('cloudBrowser.acknowledgedNotice') }}</span><strong v-if="item.recoveryRequired || item.phase === 'unknown'"> · {{ t('cloudBrowser.recovery') }}</strong><span v-if="item.error"> · {{ item.error.message }}</span></span><el-button v-if="item.phase === 'unknown'" :disabled="busy" @click="acknowledge(item)">{{ t('cloudBrowser.acknowledge') }}</el-button><el-button v-if="item.phase === 'running'" :disabled="busy" @click="cancel(item)">{{ t('cloudBrowser.cancel') }}</el-button></li></ul>
       </main>
     </div>
     <FilePreviewDialog

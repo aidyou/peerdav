@@ -124,11 +124,22 @@ impl CachedRepository {
         }
     }
 }
+/// Transport identity is separate from the encrypted repository format.
+/// Only implemented transports are accepted; legacy connections are S3.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudProtocolId {
+    #[default]
+    S3,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CloudConnection {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub protocol_id: CloudProtocolId,
     pub config: S3Config,
     pub revision: u64,
     pub schedule: ScheduleConfig,
@@ -205,7 +216,13 @@ pub struct CloudMapping {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CloudConfigSnapshot {
+    #[serde(default = "system_proxy")]
+    pub client_proxy: ProxyMode,
+    #[serde(default)]
+    pub drive_proxies: std::collections::HashMap<String, bool>,
     pub connections: Vec<CloudConnection>,
+    #[serde(default)]
+    pub official_connections: Vec<super::official_types::OfficialConnection>,
     pub mappings: Vec<CloudMapping>,
     #[serde(default)]
     pub repositories: Vec<CachedRepository>,
@@ -215,10 +232,16 @@ pub struct CloudConfigSnapshot {
     #[serde(default)]
     pub mirror_mappings: Vec<crate::mirror::MirrorMapping>,
 }
+pub fn client_proxy() -> ProxyMode { ProxyMode::Client }
+pub fn system_proxy() -> ProxyMode { ProxyMode::Environment }
+
 impl Default for CloudConfigSnapshot {
     fn default() -> Self {
         Self {
+            client_proxy: system_proxy(),
+            drive_proxies: Default::default(),
             connections: Vec::new(),
+            official_connections: Vec::new(),
             mappings: Vec::new(),
             repositories: Vec::new(),
             append_repositories: Vec::new(),
@@ -255,7 +278,7 @@ pub struct SaveS3Input {
     pub clear_proxy_auth: bool,
     #[serde(default)]
     pub allow_insecure_http: bool,
-    #[serde(default)]
+    #[serde(default = "client_proxy")]
     pub proxy: ProxyMode,
     pub schedule: Option<ScheduleConfig>,
 }
@@ -271,8 +294,11 @@ pub struct ConnectionCredentials {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionRedacted {
+    #[serde(default)]
+    pub browser_capabilities: super::protocol_types::ConnectionBrowserCapabilities,
     pub id: String,
     pub name: String,
+    pub protocol_id: CloudProtocolId,
     pub endpoint: String,
     pub bucket: String,
     pub buckets: Vec<String>,
@@ -325,8 +351,10 @@ impl std::fmt::Debug for SaveS3Input {
 impl CloudConnection {
     pub fn redacted(&self) -> ConnectionRedacted {
         ConnectionRedacted {
+            browser_capabilities: super::protocol_types::ConnectionBrowserCapabilities { select_root: true, sync_drives: true },
             id: self.id.clone(),
             name: self.name.clone(),
+            protocol_id: self.protocol_id,
             endpoint: self.config.endpoint.clone(),
             bucket: self.config.bucket.clone(),
             buckets: if self.config.buckets.is_empty() {
@@ -342,6 +370,7 @@ impl CloudConnection {
             has_proxy_auth: matches!(&self.config.proxy, ProxyMode::Custom { username, password, .. } if username.is_some() || password.is_some()),
             proxy: match &self.config.proxy {
                 ProxyMode::Direct => ProxyMode::Direct,
+                ProxyMode::Client => ProxyMode::Client,
                 ProxyMode::Environment => ProxyMode::Environment,
                 ProxyMode::Custom { url, .. } => ProxyMode::Custom {
                     url: url.clone(),

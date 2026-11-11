@@ -4,6 +4,7 @@ use futures_util::future::BoxFuture;
 
 impl PeerManager {
     pub(crate) fn download_scope(&self, peer: &str) -> Result<String, AppError> {
+        self.vault.require_interface_unlocked().map_err(AppError::from)?;
         self.upload_scope(peer)
     }
 }

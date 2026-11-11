@@ -20,6 +20,7 @@ pub struct CloudCapabilities {
 #[serde(rename_all = "camelCase")]
 pub struct CloudRuntimeSnapshot {
     pub connections: Vec<ConnectionRedacted>,
+    pub official_connections: Vec<super::official_types::OfficialConnectionRedacted>,
     pub repositories: Vec<RepositoryRedacted>,
     pub append_repositories: Vec<crate::cloud::config_types::AppendRepositoryRedacted>,
     pub mappings: Vec<CloudMapping>,
@@ -72,6 +73,43 @@ pub struct LocalSyncEntry {
     pub is_dir: bool,
     pub size: u64,
     pub synced: bool,
+    /// Present in authenticated cloud metadata but absent from this local scan.
+    pub remote_only: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MappingPreparation {
+    pub mapping: CloudMapping,
+    pub entries: Vec<MappingPlanEntry>,
+    pub local_empty: bool,
+    pub remote_empty: bool,
+    pub local_digest: String,
+    pub remote_digest: String,
+    pub connection_revision: u64,
+    pub root_epoch: String,
+}
+
+pub(crate) struct PendingMapping {
+    pub preparation: MappingPreparation,
+    pub created: std::time::Instant,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MappingBindResult {
+    pub plan_id: Option<String>,
+    pub entries: Vec<MappingPlanEntry>,
+    pub mapping: Option<CloudMapping>,
+    pub run_id: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MappingPlanEntry {
+    pub path: String,
+    pub action: String,
+    pub is_dir: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]

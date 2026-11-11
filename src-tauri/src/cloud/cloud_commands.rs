@@ -7,6 +7,100 @@ use crate::AppError;
 use std::sync::Arc;
 
 #[tauri::command]
+pub fn client_proxy_settings(cloud: tauri::State<'_, SharedCloud>) -> Result<super::types::ProxyMode, AppError> {
+    cloud.0.admit()?;
+    let proxy = cloud.0.config.snapshot().map_err(super::runtime::config_error)?.client_proxy;
+    Ok(match proxy {
+        super::types::ProxyMode::Custom { url, username, .. } => super::types::ProxyMode::Custom { url, username, password: None },
+        other => other,
+    })
+}
+
+#[tauri::command]
+pub async fn save_client_proxy_settings(proxy: super::types::ProxyMode, cloud: tauri::State<'_, SharedCloud>) -> Result<(), AppError> {
+    cloud.0.admit()?;
+    let _network = cloud.0.network.write().await;
+    cloud.0.admit()?;
+    cloud.0.config.save_client_proxy(proxy).map_err(super::runtime::config_error)?;
+    cloud.0.official_refresh.lock().await.clear();
+    cloud.0.objects.lock().await.sessions.clear();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn drive_proxy_settings(connection_id: String, cloud: tauri::State<'_, SharedCloud>) -> Result<bool, AppError> {
+    cloud.0.admit()?;
+    let snapshot = cloud.0.config.snapshot().map_err(super::runtime::config_error)?;
+    if let Some(connection) = snapshot.connections.iter().find(|entry| entry.id == connection_id) {
+        return Ok(matches!(connection.config.proxy, super::types::ProxyMode::Direct));
+    }
+    if !snapshot.official_connections.iter().any(|entry| entry.id == connection_id) { return Err(super::runtime::config_error(super::config_types::ConfigError::NotFound("connection".into()))); }
+    Ok(snapshot.drive_proxies.get(&connection_id).copied().unwrap_or(false))
+}
+
+#[tauri::command]
+pub async fn save_drive_proxy_settings(connection_id: String, direct: bool, cloud: tauri::State<'_, SharedCloud>) -> Result<(), AppError> {
+    cloud.0.admit()?;
+    let _network = cloud.0.network.write().await;
+    cloud.0.admit()?;
+    cloud.0.config.save_drive_proxy(&connection_id, direct).map_err(super::runtime::config_error)?;
+    cloud.0.official_refresh.lock().await.remove(&connection_id);
+    cloud.0.objects.lock().await.sessions.remove(&connection_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn cloud_protocols() -> Result<Vec<super::protocol_types::ProtocolDescriptor>, AppError> {
+    Ok(super::protocol_registry::descriptors())
+}
+
+#[tauri::command]
+pub fn cloud_official_authorize(
+    provider: super::oauth_types::OfficialProvider, client_id: String, redirect_uri: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<super::oauth_types::AuthorizationStart, AppError> {
+    cloud.0.begin_official_authorization(provider, client_id, redirect_uri)
+}
+
+#[tauri::command]
+pub async fn cloud_official_cancel_authorization(
+    request_id: String, cloud: tauri::State<'_, SharedCloud>,
+) -> Result<(), AppError> {
+    cloud.0.cancel_official_authorization(&request_id).await
+}
+
+#[tauri::command]
+pub async fn cloud_official_begin_loopback(
+    app: tauri::AppHandle,
+    provider: super::oauth_types::OfficialProvider, client_id: String, redirect_uri: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<super::oauth_types::AuthorizationStart, AppError> {
+    use tauri_plugin_opener::OpenerExt;
+    let start = cloud.0.begin_loopback_authorization(provider, client_id, redirect_uri).await?;
+    if let Err(source) = app.opener().open_url(&start.authorization_url, None::<&str>) {
+        cloud.0.cancel_official_authorization(&start.request_id).await?;
+        return Err(AppError::from(crate::DomainError::Internal { detail: source.to_string() }));
+    }
+    Ok(start)
+}
+
+#[tauri::command]
+pub async fn cloud_official_wait_loopback(
+    request_id: String, name: String, client_secret: Option<String>, root_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<super::official_types::OfficialConnectionRedacted, AppError> {
+    cloud.0.wait_loopback_authorization(&request_id, name, client_secret, root_id).await
+}
+
+#[tauri::command]
+pub async fn cloud_official_complete_authorization(
+    request_id: String, callback: String, name: String, client_secret: Option<String>, root_id: String,
+    cloud: tauri::State<'_, SharedCloud>,
+) -> Result<super::official_types::OfficialConnectionRedacted, AppError> {
+    cloud.0.complete_official_authorization(&request_id, &callback, name, client_secret, root_id).await
+}
+
+#[tauri::command]
 pub async fn cloud_test_connection(
     connection_id: String,
     cloud: tauri::State<'_, SharedCloud>,
@@ -149,9 +243,10 @@ pub async fn cloud_local_status(
 #[tauri::command]
 pub async fn cloud_preview(
     mapping_id: String,
+    selection: Option<Vec<String>>,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<CloudPreview, AppError> {
-    cloud.0.preview(&mapping_id).await
+    cloud.0.preview_selection(&mapping_id, &selection.unwrap_or_default()).await
 }
 #[tauri::command]
 pub async fn cloud_sync(
@@ -247,6 +342,23 @@ pub async fn cloud_append_save_mapping(
     let result = cloud.0.save_append_mapping(input).await?;
     cloud.0.refresh_schedules().await?;
     Ok(result)
+}
+
+#[tauri::command]
+pub async fn cloud_prepare_mapping_bind(input: SaveAppendMappingInput, cloud: tauri::State<'_, SharedCloud>) -> Result<MappingBindResult, AppError> {
+    let result = cloud.0.prepare_mapping_bind(input).await?;
+    if result.mapping.is_some() { cloud.0.refresh_schedules().await?; }
+    Ok(result)
+}
+#[tauri::command]
+pub async fn cloud_confirm_mapping_bind(plan_id: String, confirmed: bool, cloud: tauri::State<'_, SharedCloud>) -> Result<MappingBindResult, AppError> {
+    let result = cloud.0.confirm_mapping_bind(&plan_id, confirmed).await?;
+    cloud.0.refresh_schedules().await?;
+    Ok(result)
+}
+#[tauri::command]
+pub async fn cloud_cancel_mapping_bind(plan_id: String, cloud: tauri::State<'_, SharedCloud>) -> Result<(), AppError> {
+    cloud.0.cancel_mapping_bind(&plan_id).await
 }
 
 pub fn shared(runtime: Arc<CloudRuntime>) -> SharedCloud {

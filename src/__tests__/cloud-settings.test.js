@@ -9,6 +9,7 @@ const { cloud, confirmAction, openDialog, listen, app } = vi.hoisted(() => ({
     preview: vi.fn(), sync: vi.fn(), cancel: vi.fn(), recoveryRecords: vi.fn(), restore: vi.fn(),
     probeBuckets: vi.fn(),
     connectionCredentials: vi.fn(),
+    protocols: vi.fn(), beginOfficialAuthorization: vi.fn(), beginLoopbackAuthorization: vi.fn(), waitLoopbackAuthorization: vi.fn(), cancelOfficialAuthorization: vi.fn(), completeOfficialAuthorization: vi.fn(),
   },
   confirmAction: vi.fn(), openDialog: vi.fn(), listen: vi.fn(),
   app: { handleFailure: vi.fn(), setNotice: vi.fn(), setError: vi.fn() },
@@ -41,6 +42,31 @@ async function mountCloud(data = rows) {
 beforeEach(() => { setLocale("zh-CN"); Object.values(cloud).forEach((fn) => fn.mockReset()); confirmAction.mockReset(); confirmAction.mockResolvedValue(true); openDialog.mockReset(); app.handleFailure.mockReset(); app.setNotice.mockReset(); app.setError.mockReset(); progressHandler = undefined; cloud.connectionCredentials.mockResolvedValue({ accessKey: "", secretKey: "", sessionToken: null }); });
 
 describe("CloudSettings", () => {
+  it("begins official authorization and cancels pending state on close", async () => {
+    cloud.protocols.mockResolvedValue([{ id: 'google_drive', name: 'Google Drive', auth: 'oauth2', fields: [
+      { key: 'clientId', labelZh: '应用客户端 ID' },
+      { key: 'clientSecret', labelZh: '应用客户端密钥（如需要）', secret: true },
+      { key: 'redirectUri', labelZh: '已注册的回调地址' },
+      { key: 'rootId', labelZh: '根文件夹 ID 或路径' },
+    ] }]);
+    cloud.beginLoopbackAuthorization.mockResolvedValue({ requestId: 'request', authorizationUrl: 'https://accounts.google.com/o/oauth2/v2/auth' });
+    cloud.waitLoopbackAuthorization.mockImplementation(() => new Promise(() => {}));
+    const wrapper = await mountCloud();
+    await wrapper.find('.official-add').trigger('click');
+    await flushPromises();
+    const form = wrapper.findAll('form').find(form => form.text().includes('应用客户端 ID'));
+    expect(form).toBeDefined();
+    const field = text => form.findAll('label').find(label => label.text() === text).find('input');
+    await field('名称').setValue('Google');
+    await field('应用客户端 ID').setValue('client');
+    await field('已注册的回调地址').setValue('http://127.0.0.1/callback');
+    const begin = wrapper.findAll('button').find(button => button.text() === '生成授权链接');
+    await begin.trigger('click'); await flushPromises();
+    expect(cloud.beginLoopbackAuthorization).toHaveBeenCalledWith(expect.objectContaining({ provider: 'google_drive', clientId: 'client' }));
+    expect(wrapper.find('a[target="_blank"]').attributes('rel')).toContain('noopener');
+    wrapper.unmount(); await flushPromises();
+    expect(cloud.cancelOfficialAuthorization).toHaveBeenCalledWith('request');
+  });
   it("defaults to a multi-drive list without connection or sync forms", async () => {
     const wrapper = await mountCloud();
     expect(wrapper.text()).toContain('Primary'); expect(wrapper.findAll('input')).toHaveLength(0);

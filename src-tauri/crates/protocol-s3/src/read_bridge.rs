@@ -174,6 +174,16 @@ impl ObjectStore for CoreS3ReadBridge {
             result.entry.map(metadata).ok_or(CloudError::Unsupported)
         })
     }
+    fn replace_edit<'a>(&'a self, key: &'a str, body: ObjectStream, etag: &'a str) -> BoxFuture<'a, Result<ObjectMetadata, CloudError>> {
+        Box::pin(async move {
+            let capabilities = self.0.store.verify_capabilities().await?;
+            if !capabilities.conditional_writes_verified || !capabilities.conditional_replace { return Err(CloudError::Unsupported); }
+            // Refresh the core capability snapshot only for this explicit write;
+            // ordinary browsing still does not probe or grant write trust.
+            let backend = CoreS3Backend::new(self.0.store.clone(), self.0.generation).map_err(original)?;
+            ObjectStore::put(&CoreS3ReadBridge(backend), key, body, PutCondition::MatchEtag(etag.into())).await
+        })
+    }
     fn delete_if_match<'a>(
         &'a self,
         key: &'a str,

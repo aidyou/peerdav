@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, h, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { ElMessageBox } from "element-plus";
@@ -14,8 +14,8 @@ const app = useAppContext();
 const data = ref({ repositories: [], appendRepositories: [], mappings: [], statuses: [], mirrorMappings: [] });
 const selectedBucket = ref("");
 const availableBuckets = computed(() => {
-  const connection = data.value.connections?.find((item) => item.id === props.connectionId);
-  return [...new Set([...(connection?.buckets || []), connection?.bucket, props.bucket].filter(Boolean))];
+  const connection = [...(data.value.connections || []), ...(data.value.officialConnections || [])].find((item) => item.id === props.connectionId);
+  return [...new Set([...(connection?.buckets || []), connection?.bucket, connection?.rootId, props.bucket].filter(Boolean))];
 });
 watch([() => props.bucket, availableBuckets], () => {
   if (!availableBuckets.value.includes(selectedBucket.value)) selectedBucket.value = availableBuckets.value.includes(props.bucket) ? props.bucket : availableBuckets.value[0] || "";
@@ -198,6 +198,20 @@ watch(() => props.connectionId, () => {
   preview.value = null; recovery.value = []; recoveryMappingId.value = ''; recoveryByMapping.value = {}; recoveryScan++; activeOperation.value = null; dismissedFailures.value = {}; mirrorCheckedAt.value = {}; state.value = "idle"; mirrorBusy.value = {}; mirrorStatus.value = {}; mirrorResults.value = {};
   void run((scope) => refresh(scope));
 }, { immediate: true });
+async function prepareBinding(input, logicalPath, scope) {
+  const plan = await cloud.prepareMappingBind(input, logicalPath);
+  if (!plan?.planId) return plan;
+  try {
+    if (scope !== generation || disposed) return null;
+    const body = h('div', [
+      h('p', t('drive.bindPlanHint')),
+      h('ul', { class: 'confirm-list', 'data-test': 'bind-plan-entries' }, (plan.entries || []).map(entry => h('li', { key: `${entry.action}:${entry.path}`, class: { 'is-danger': entry.action === 'delete' } }, `${t(`drive.plan.${entry.action}`)}: ${entry.path}`))),
+    ]);
+    if (!await confirmAction(body, t('drive.bindPlanTitle'), { danger: plan.entries?.some(entry => entry.action === 'delete'), confirmText: t('drive.bindAndSync') }) || scope !== generation || disposed) return null;
+    return await cloud.confirmMappingBind(plan.planId);
+  } finally { await cloud.cancelMappingBind(plan.planId); }
+}
+
 async function create() {
   if (!canCreate.value || isMirror.value) return;
   await run(async (scope) => {
@@ -211,8 +225,7 @@ async function create() {
     // form filled (retrying create would otherwise duplicate the drive).
     let bindingError = null;
     try {
-      const saved = await cloud.appendSaveMapping(null, { connectionId: props.connectionId, repositoryId: redacted.binding.repoId, localRoot: newDrive.value.localRoot, logicalPath, schedule: { enabled: createSchedule.value.enabled, interval: Math.max(60, Number(createSchedule.value.interval) || 900) } }, logicalPath);
-      if (createSchedule.value.enabled && saved?.id && scope === generation && !disposed) await showInitialPlan(saved, scope);
+      await prepareBinding({ connectionId: props.connectionId, repositoryId: redacted.binding.repoId, localRoot: newDrive.value.localRoot, logicalPath, schedule: { enabled: createSchedule.value.enabled, interval: Math.max(60, Number(createSchedule.value.interval) || 900) } }, logicalPath, scope);
     } catch (error) {
       bindingError = error;
     }
@@ -258,7 +271,7 @@ async function join() {
   const item = candidate.value;
   await run(async (scope) => {
     state.value = "loading";
-    const redacted = await cloud.appendJoin({ connectionId: props.connectionId, bucket: props.bucket, anchorKey: item.key, anchorFingerprint: item.fingerprint, repositoryId: item.repo_id, mode: item.descriptor.mode, acceptTofu: true, trustedFingerprint: null, password: password.value });
+    const redacted = await cloud.appendJoin({ connectionId: props.connectionId, bucket: selectedBucket.value || undefined, anchorKey: item.key, anchorFingerprint: item.fingerprint, repositoryId: item.repo_id, mode: item.descriptor.mode, acceptTofu: true, trustedFingerprint: null, password: password.value });
     if (scope !== generation || disposed) return;
     await refresh(scope);
     if (scope !== generation || disposed) return;
@@ -277,22 +290,11 @@ async function join() {
 // 不能再套一层 run()：join 已经持有 busy 锁，二次进入会被守卫吞掉。
 async function bindLogicalPath(scope, logicalPath) {
   state.value = "loading";
-  const saved = await cloud.appendSaveMapping(null, { connectionId: props.connectionId, repositoryId: joinedRepoId.value, localRoot: linkForm.value.localRoot, logicalPath, schedule: { enabled: false, interval: 900 } }, logicalPath);
-  if (scope !== generation || disposed) return;
+  const result = await prepareBinding({ connectionId: props.connectionId, repositoryId: joinedRepoId.value, localRoot: linkForm.value.localRoot, logicalPath, schedule: { enabled: false, interval: 900 } }, logicalPath, scope);
+  if (!result || scope !== generation || disposed) return;
   resetSecrets(); resetLink(); connectDialogOpen.value = false; await refresh(scope);
   if (scope !== generation || disposed) return;
   state.value = "saved"; emit("changed");
-  if (saved?.id) {
-    // Persist and close before preparing the initial transfer. The backend owns
-    // the sync worker; destructive/conflicting plans still need confirmation.
-    const plan = await cloud.preview(String(saved.id));
-    if (scope !== generation || disposed) return;
-    if ((plan.summary?.deletes || 0) > 0 || (plan.summary?.conflicts || 0) > 0) {
-      preview.value = { mappingId: String(saved.id), previewId: String(plan.previewId), summary: plan.summary };
-    } else {
-      await cloud.sync(String(saved.id), String(plan.previewId));
-    }
-  }
 }
 async function confirmBind() {
   const logicalPath = linkForm.value.selectedRoot || linkForm.value.newRoot.trim();
@@ -336,7 +338,9 @@ async function saveMapping() {
   const input = { ...mapping.value, connectionId: props.connectionId, schedule: { enabled: !!mapping.value.schedule.enabled, interval: Math.max(60, Number(mapping.value.schedule.interval) || 900) } };
   await run(async (scope) => {
     // Configuration, not a user-selectable protocol, determines the command.
-    if (isAppend) await cloud.appendSaveMapping(editingMappingId.value, input, input.logicalPath);
+    if (isAppend && !editingMappingId.value) {
+      if (!await prepareBinding(input, input.logicalPath, scope)) return;
+    } else if (isAppend) await cloud.appendSaveMapping(editingMappingId.value, input, input.logicalPath);
     else await cloud.saveMapping(editingMappingId.value, input);
     if (scope !== generation || disposed) return;
     resetMappingEditor(); mappingEditorOpen.value = false;
@@ -453,10 +457,6 @@ function confirmPicker() {
   mirrorForm.value.cloudPrefix = combined.replace(/^\/+|\/+$/g, "");
   pickerOpen.value = false;
 }
-async function showInitialPlan(item, scope) {
-  const result = await cloud.preview(String(item.id));
-  if (scope === generation && !disposed) preview.value = { mappingId: String(item.id), previewId: String(result.previewId), summary: result.summary };
-}
 function mappingRunning(item) { return ['scanning', 'uploading', 'publishing', 'applying'].includes(statuses.value.find((s) => s.mappingId === item.id)?.phase); }
 async function syncNow(item) {
   await run(async (scope) => {
@@ -481,7 +481,7 @@ async function applyPreview() { if (!previewHasChanges.value || !preview.value?.
 async function cancel(item) { await run(async (scope) => { await cloud.cancel(String(item.id)); await refresh(scope); }); }
 function loadRecovery(item) { recoveryMappingId.value = String(item.id); recovery.value = recoveryByMapping.value[item.id] || []; }
 async function restore(record) {
-  if (!record.relativePath || !recoveryMappingId.value) return;
+  if (!record.relativePath || !recoveryMappingId.value || mappingRunning({ id: recoveryMappingId.value })) return;
   const scope = generation;
   let destination;
   try { const result = await ElMessageBox.prompt(t("cloud.destinationPrompt"), t("cloud.restore"), { inputValue: record.relativePath, closeOnClickModal: false, confirmButtonText: t("confirm.ok"), cancelButtonText: t("confirm.cancel") }); destination = result.value; }
@@ -589,7 +589,7 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
           </div>
           <div v-if="recovery.length && recoveryMappingId === item.id" class="recovery-list">
             <p class="hint">{{ t('drive.recoveryFor', { path: recoveryMappingId }) }}</p>
-            <ul><li v-for="record in recovery" :key="record.id">{{ record.relativePath }} · {{ record.phase }}<el-button :disabled="busy" @click="restore(record)">{{ t('cloud.restore') }}</el-button></li></ul>
+            <ul><li v-for="record in recovery" :key="record.id">{{ record.relativePath }} · {{ record.phase }}<el-button :disabled="busy || mappingRunning({ id: recoveryMappingId })" @click="restore(record)">{{ t('cloud.restore') }}</el-button></li></ul>
           </div>
         </el-collapse-item>
       </el-collapse>

@@ -119,6 +119,7 @@ pub struct StorageCapabilities {
 pub enum ProxyMode {
     #[default]
     Direct,
+    Client,
     Environment,
     Custom {
         url: String,
@@ -131,6 +132,7 @@ impl fmt::Debug for ProxyMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Direct => f.write_str("Direct"),
+            Self::Client => f.write_str("Client"),
             Self::Environment => f.write_str("Environment"),
             Self::Custom { .. } => f.write_str("Custom([redacted])"),
         }

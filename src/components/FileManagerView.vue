@@ -31,6 +31,7 @@ const identity = (entry) => entry[props.identityField];
 const selected = (entry) => props.selection.some((item) => identity(item) === identity(entry));
 const attributes = (entry) => ({
   [props.identityField === "key" ? "data-key" : "data-path"]: identity(entry),
+  ...(entry.key !== undefined && entry.key === identity(entry) ? { 'data-key': entry.key } : {}),
 });
 </script>
 

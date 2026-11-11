@@ -106,6 +106,7 @@ impl ConnectionTransport {
             .timeout(Duration::from_secs(120));
         match mode {
             ProxyMode::Direct => {}
+            ProxyMode::Client => return Err(CloudError::InvalidConfig("client proxy must be resolved before transport construction".into())),
             ProxyMode::Custom {
                 url,
                 username,

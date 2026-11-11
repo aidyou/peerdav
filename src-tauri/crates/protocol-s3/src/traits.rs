@@ -31,6 +31,11 @@ pub trait ObjectStore: Send + Sync {
         body: ObjectStream,
         condition: PutCondition,
     ) -> BoxFuture<'a, Result<ObjectMetadata, CloudError>>;
+    /// Explicit user-authorized editing may probe conditional-write support.
+    fn replace_edit<'a>(&'a self, _key: &'a str, _body: ObjectStream, _etag: &'a str) -> BoxFuture<'a, Result<ObjectMetadata, CloudError>> {
+        Box::pin(async { Err(CloudError::Unsupported) })
+    }
+
     fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), CloudError>>;
 
     /// A HEAD followed by an unconditional DELETE is not a conditional delete.

@@ -182,10 +182,7 @@ pub async fn cloud_object_status_upload_directory(
     batch_id: String,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<ObjectUploadDirectoryDto, AppError> {
-    cloud
-        .0
-        .object_status_upload_directory(&connection_id, &batch_id)
-        .await
+    crate::traits::UploadQueueAdapter::status(&super::directory_types::S3UploadAdapter { runtime: &cloud.0, connection: &connection_id }, &batch_id).await
 }
 #[tauri::command]
 pub async fn cloud_object_page_upload_directory(
@@ -196,10 +193,7 @@ pub async fn cloud_object_page_upload_directory(
     limit: Option<usize>,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<DirectoryPageDto, AppError> {
-    cloud
-        .0
-        .object_page_upload_directory(&connection_id, &batch_id, directory_token, cursor, limit)
-        .await
+    crate::traits::UploadQueueAdapter::page(&super::directory_types::S3UploadAdapter { runtime: &cloud.0, connection: &connection_id }, &batch_id, directory_token, cursor, limit).await
 }
 #[tauri::command]
 pub async fn cloud_object_resolve_upload_directory_conflict(
@@ -210,16 +204,7 @@ pub async fn cloud_object_resolve_upload_directory_conflict(
     apply_to_remaining: bool,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<(), AppError> {
-    cloud
-        .0
-        .object_resolve_upload_directory_conflict(
-            &connection_id,
-            &batch_id,
-            &conflict_id,
-            decision,
-            apply_to_remaining,
-        )
-        .await
+    crate::traits::UploadQueueAdapter::resolve(&super::directory_types::S3UploadAdapter { runtime: &cloud.0, connection: &connection_id }, &batch_id, &conflict_id, decision, apply_to_remaining).await
 }
 #[tauri::command]
 pub async fn cloud_object_cancel_upload_directory(
@@ -227,10 +212,7 @@ pub async fn cloud_object_cancel_upload_directory(
     batch_id: String,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<(), AppError> {
-    cloud
-        .0
-        .object_cancel_upload_directory(&connection_id, &batch_id)
-        .await
+    crate::traits::UploadQueueAdapter::cancel(&super::directory_types::S3UploadAdapter { runtime: &cloud.0, connection: &connection_id }, &batch_id).await
 }
 #[tauri::command]
 pub async fn cloud_object_release_upload_directory(
@@ -238,10 +220,7 @@ pub async fn cloud_object_release_upload_directory(
     batch_id: String,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<(), AppError> {
-    cloud
-        .0
-        .object_release_upload_directory(&connection_id, &batch_id)
-        .await
+    crate::traits::UploadQueueAdapter::release(&super::directory_types::S3UploadAdapter { runtime: &cloud.0, connection: &connection_id }, &batch_id).await
 }
 
 #[tauri::command]

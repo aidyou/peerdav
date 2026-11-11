@@ -220,18 +220,17 @@ describe("append settings through unified invoke", () => {
     await fillPasswords(w); expect(w.find(".append-create").attributes("disabled")).toBeUndefined();
     await w.find(".append-create").trigger("click"); await flushPromises();
     expect(nativeInvoke).toHaveBeenCalledWith("cloud_create_sync_drive", { input: { connectionId: "c1", mode, password: "password-123", passwordConfirmation: "password-123" } });
-    expect(nativeInvoke).toHaveBeenCalledWith("cloud_append_save_mapping", { input: { mappingId: null, mapping: { connectionId: "c1", repositoryId: "new-repo", localRoot: "/local/Documents", logicalPath: "Documents", schedule: { enabled: false, interval: 900 } }, selectedRoot: "Documents" } });
+    expect(nativeInvoke).toHaveBeenCalledWith("cloud_prepare_mapping_bind", { input: { mappingId: null, mapping: { connectionId: "c1", repositoryId: "new-repo", localRoot: "/local/Documents", logicalPath: "Documents", schedule: { enabled: false, interval: 900 } }, selectedRoot: "Documents" } });
     await flushPromises();
     expect(app.handleFailure.mock.calls).toEqual([]);
     expect(w.find('.append-state').text()).toBe('Sync drive saved.');
     expect(changed).toHaveBeenCalledTimes(1);
     expect(w.find('[data-test=create-drive-dialog]').exists()).toBe(false); expect(nativeInvoke.mock.calls.some(([c]) => c === "cloud_test_connection")).toBe(false); w.unmount();
   });
-  it('binds creation to the selected bucket and preserves automatic sync until first confirmation', async () => {
+  it('binds an empty new drive directly and preserves the selected schedule', async () => {
     const original = nativeInvoke.getMockImplementation();
     nativeInvoke.mockImplementation(async (command, args) => {
-      if (command === 'cloud_append_save_mapping') { const item = { ...args.input.mapping, id: 'scheduled' }; rows.mappings.push(item); return item; }
-      if (command === 'cloud_preview') return { previewId: 'first-plan', summary: { uploads: 2 } };
+      if (command === 'cloud_prepare_mapping_bind') { const item = { ...args.input.mapping, id: 'scheduled' }; rows.mappings.push(item); return { mapping: item, runId: 1, planId: null, entries: [] }; }
       return original(command, args);
     });
     const w = await mountSettings(); await w.setProps({ bucket: 'photos' });
@@ -241,11 +240,9 @@ describe("append settings through unified invoke", () => {
     await w.find('.append-create').trigger('click'); await flushPromises();
     expect(nativeInvoke).toHaveBeenCalledWith('cloud_create_sync_drive', { input: { connectionId: 'c1', bucket: 'photos', mode: 'encrypted', password: 'password-123', passwordConfirmation: 'password-123' } });
     expect(rows.mappings[0].schedule).toEqual({ enabled: true, interval: 120 });
-    expect(nativeInvoke).toHaveBeenCalledWith('cloud_preview', { mappingId: 'scheduled' });
-    expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_sync')).toBe(false);
-    const apply = w.findAll('button').find(button => button.text() === 'Confirm and sync');
-    await apply.trigger('click'); await flushPromises();
-    expect(nativeInvoke).toHaveBeenCalledWith('cloud_sync', { mappingId: 'scheduled', previewId: 'first-plan' }); w.unmount();
+    expect(confirmAction).not.toHaveBeenCalled();
+    expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_preview' || command === 'cloud_sync')).toBe(false);
+    w.unmount();
   });
   it('scopes discovery and joining to the selected bucket', async () => {
     const w = await appendSettings(); await w.setProps({ bucket: 'photos' });
@@ -269,7 +266,7 @@ describe("append settings through unified invoke", () => {
     expect(app.handleFailure.mock.calls).toEqual([]);
     expect(w.find('.append-state').text()).toBe('Sync drive saved.');
     expect(changed).toHaveBeenCalledTimes(1);
-    expect(nativeInvoke).toHaveBeenCalledWith("cloud_append_save_mapping", { input: { mappingId: null, mapping: { connectionId: "c1", repositoryId: "joined-repo", localRoot: "/local/Documents", logicalPath: "docs", schedule: { enabled: false, interval: 900 } }, selectedRoot: "docs" } });
+    expect(nativeInvoke).toHaveBeenCalledWith("cloud_prepare_mapping_bind", { input: { mappingId: null, mapping: { connectionId: "c1", repositoryId: "joined-repo", localRoot: "/local/Documents", logicalPath: "docs", schedule: { enabled: false, interval: 900 } }, selectedRoot: "docs" } });
     expect(nativeInvoke.mock.calls.some(([c]) => c === "cloud_test_connection")).toBe(false); w.unmount();
   });
   it("asks for a root when the joined drive has several and binds the chosen one", async () => {
@@ -280,7 +277,7 @@ describe("append settings through unified invoke", () => {
     expect(nativeInvoke.mock.calls.some(([c]) => c === "cloud_append_save_mapping")).toBe(false);
     expect(w.find(".link-root").exists()).toBe(true);
     await w.find(".link-root").setValue("photos"); await w.find(".append-bind").trigger("click"); await flushPromises();
-    expect(nativeInvoke).toHaveBeenCalledWith("cloud_append_save_mapping", { input: { mappingId: null, mapping: { connectionId: "c1", repositoryId: "joined-repo", localRoot: "/local/Documents", logicalPath: "photos", schedule: { enabled: false, interval: 900 } }, selectedRoot: "photos" } });
+    expect(nativeInvoke).toHaveBeenCalledWith("cloud_prepare_mapping_bind", { input: { mappingId: null, mapping: { connectionId: "c1", repositoryId: "joined-repo", localRoot: "/local/Documents", logicalPath: "photos", schedule: { enabled: false, interval: 900 } }, selectedRoot: "photos" } });
     expect(w.find('.append-state').text()).toBe('Sync drive saved.'); expect(changed).toHaveBeenCalledTimes(1); w.unmount();
   });
   it("asks for a new root name when the joined drive is empty", async () => {
@@ -289,7 +286,7 @@ describe("append settings through unified invoke", () => {
     await w.find(".append-candidate").setValue("one"); await fillPasswords(w); await fillLinkLocalRoot(w); await w.find(".append-join").trigger("click"); await flushPromises();
     expect(w.find(".link-new-root").exists()).toBe(true);
     await w.find(".link-new-root").setValue("fresh-root"); await w.find(".append-bind").trigger("click"); await flushPromises();
-    expect(nativeInvoke).toHaveBeenCalledWith("cloud_append_save_mapping", { input: expect.objectContaining({ selectedRoot: "fresh-root", mapping: expect.objectContaining({ logicalPath: "fresh-root" }) }) }); w.unmount();
+    expect(nativeInvoke).toHaveBeenCalledWith("cloud_prepare_mapping_bind", { input: expect.objectContaining({ selectedRoot: "fresh-root", mapping: expect.objectContaining({ logicalPath: "fresh-root" }) }) }); w.unmount();
   });
   it("keeps the join button disabled until a local folder is chosen", async () => {
     const w = await appendSettings(); await w.find(".append-discover").trigger("click"); await flushPromises();
@@ -301,7 +298,7 @@ describe("append settings through unified invoke", () => {
     rows.appendRepositories.push({ connectionId: 'c1', protocol: 'append_v2', binding: { repoId: 'joined-repo', rootCandidates: ['docs'], appendMode: 'encrypted' } });
     const w = await appendSettings(); await w.find('.append-candidate').setValue('one'); await fillPasswords(w); await fillLinkLocalRoot(w);
     const original = nativeInvoke.getMockImplementation(); let joinDone; let saveDone;
-    nativeInvoke.mockImplementation((command, args) => command === 'cloud_append_join' ? new Promise(resolve => { joinDone = resolve; }) : command === 'cloud_append_save_mapping' ? new Promise(resolve => { saveDone = resolve; }) : original(command, args));
+    nativeInvoke.mockImplementation((command, args) => command === 'cloud_append_join' ? new Promise(resolve => { joinDone = resolve; }) : command === 'cloud_prepare_mapping_bind' ? new Promise(resolve => { saveDone = resolve; }) : original(command, args));
     await w.find('.append-join').trigger('click');
     expect(w.find('.append-join').attributes('loading')).toBe('true'); expect(w.find('.cancel-connect-drive').attributes('disabled')).toBeDefined();
     await w.find('.append-join').trigger('click'); expect(nativeInvoke.mock.calls.filter(([c]) => c === 'cloud_append_join')).toHaveLength(1);
@@ -311,34 +308,50 @@ describe("append settings through unified invoke", () => {
     expect(w.find('[data-test=connect-drive-dialog]').exists()).toBe(false);
     expect(nativeInvoke.mock.calls.some(([c]) => c === 'cloud_preview' || c === 'cloud_sync')).toBe(false); w.unmount();
   });
-  it.each([false, true])('saves and closes before initial sync; risky plan=%s needs confirmation', async (risky) => {
+  it.each([false, true])('confirms populated-folder plans before binding; delete=%s', async (risky) => {
     rows.appendRepositories.push({ connectionId: 'c1', protocol: 'append_v2', binding: { repoId: 'joined-repo', rootCandidates: ['docs'], appendMode: 'encrypted' } });
     const w = await appendSettings(); await w.find('.append-candidate').setValue('one'); await fillPasswords(w); await fillLinkLocalRoot(w);
-    const original = nativeInvoke.getMockImplementation(); let finishPlan;
+    const original = nativeInvoke.getMockImplementation(); let confirm;
+    confirmAction.mockImplementationOnce(() => new Promise(resolve => { confirm = resolve; }));
     nativeInvoke.mockImplementation((command, args) => {
-      if (command === 'cloud_append_save_mapping') { rows.mappings.push({ ...args.input.mapping, id: 'linked' }); return Promise.resolve({ id: 'linked' }); }
-      if (command === 'cloud_preview') return new Promise(resolve => { finishPlan = resolve; });
+      if (command === 'cloud_prepare_mapping_bind') return Promise.resolve({ planId: 'initial', entries: [{ path: 'remote.txt', action: 'download' }, ...(risky ? [{ path: 'removed.txt', action: 'delete' }] : [])] });
+      if (command === 'cloud_confirm_mapping_bind') { rows.mappings.push({ id: 'linked', connectionId: 'c1' }); return Promise.resolve({ mapping: { id: 'linked' }, runId: 1 }); }
       return original(command, args);
     });
     await w.find('.append-join').trigger('click'); await flushPromises();
+    expect(w.find('[data-test=connect-drive-dialog]').exists()).toBe(true);
+    expect(rows.mappings).toHaveLength(0);
+    expect(confirmAction).toHaveBeenCalledTimes(1);
+    expect(confirmAction.mock.calls[0][2].danger).toBe(risky);
+    expect(nativeInvoke.mock.calls.some(([c]) => c === 'cloud_confirm_mapping_bind')).toBe(false);
+    confirm(true); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_confirm_mapping_bind', { planId: 'initial', confirmed: true });
     expect(w.find('[data-test=connect-drive-dialog]').exists()).toBe(false);
-    expect(nativeInvoke).toHaveBeenCalledWith('cloud_preview', { mappingId: 'linked' });
-    expect(nativeInvoke.mock.calls.some(([c]) => c === 'cloud_sync')).toBe(false);
-    finishPlan({ previewId: 'initial', summary: { downloads: 1, deletes: risky ? 1 : 0, conflicts: 0 } }); await flushPromises();
-    if (risky) { expect(w.find('.cloud-preview').exists()).toBe(true); expect(nativeInvoke.mock.calls.some(([c]) => c === 'cloud_sync')).toBe(false); }
-    else expect(nativeInvoke).toHaveBeenCalledWith('cloud_sync', { mappingId: 'linked', previewId: 'initial' });
+    w.unmount();
+  });
+  it('cancels a populated-folder binding without publishing or starting it', async () => {
+    rows.appendRepositories.push({ connectionId: 'c1', protocol: 'append_v2', binding: { repoId: 'joined-repo', rootCandidates: ['docs'], appendMode: 'encrypted' } });
+    const w = await appendSettings(); await w.find('.append-candidate').setValue('one'); await fillPasswords(w); await fillLinkLocalRoot(w);
+    const original = nativeInvoke.getMockImplementation();
+    nativeInvoke.mockImplementation((command, args) => command === 'cloud_prepare_mapping_bind' ? Promise.resolve({ planId: 'cancelled-plan', entries: [{ path: 'file.txt', action: 'upload' }] }) : original(command, args));
+    confirmAction.mockResolvedValueOnce(false);
+    await w.find('.append-join').trigger('click'); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_cancel_mapping_bind', { planId: 'cancelled-plan' });
+    expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_confirm_mapping_bind' || command === 'cloud_sync' || command === 'cloud_append_save_mapping')).toBe(false);
+    expect(rows.mappings).toHaveLength(0);
+    expect(w.find('[data-test=connect-drive-dialog]').exists()).toBe(true);
     w.unmount();
   });
   it("does not preselect any authenticated root and routes append mapping separately", async () => {
     const w = await mountSettings(); await openMappingDialog(w); await w.find('.mapping-repository').setValue('append-repo'); await w.find('.mapping-local').setValue('/local'); expect(w.find(".append-root").element.value).toBe(""); await saveMappingButton(w).trigger("click"); expect(app.setError).toHaveBeenCalledWith("cloudAppend.rootRequired"); expect(nativeInvoke.mock.calls.some(([c]) => c === "cloud_append_save_mapping")).toBe(false);
     await w.find(".append-root").setValue("photos"); await saveMappingButton(w).trigger("click"); await flushPromises();
-    expect(nativeInvoke).toHaveBeenCalledWith("cloud_append_save_mapping", { input: { mappingId: null, mapping: { connectionId: "c1", repositoryId: "append-repo", localRoot: "/local", logicalPath: "photos", schedule: { enabled: false, interval: 900 } }, selectedRoot: "photos" } });
+    expect(nativeInvoke).toHaveBeenCalledWith("cloud_prepare_mapping_bind", { input: { mappingId: null, mapping: { connectionId: "c1", repositoryId: "append-repo", localRoot: "/local", logicalPath: "photos", schedule: { enabled: false, interval: 900 } }, selectedRoot: "photos" } });
     expect(nativeInvoke.mock.calls.some(([c]) => c === "cloud_save_mapping" || c === "cloud_test_connection")).toBe(false); w.unmount();
   });
   it("allows an explicitly named root only for an empty append repository", async () => {
     rows.appendRepositories[0].binding.rootCandidates = []; const w = await mountSettings(); await openMappingDialog(w); await w.find('.mapping-repository').setValue('append-repo'); await w.find('.mapping-local').setValue('/local');
     await w.find('.mapping-remote').setValue('new-root'); await saveMappingButton(w).trigger("click"); await flushPromises();
-    expect(nativeInvoke).toHaveBeenCalledWith("cloud_append_save_mapping", { input: expect.objectContaining({ selectedRoot: "new-root", mapping: expect.objectContaining({ logicalPath: "new-root" }) }) }); w.unmount();
+    expect(nativeInvoke).toHaveBeenCalledWith("cloud_prepare_mapping_bind", { input: expect.objectContaining({ selectedRoot: "new-root", mapping: expect.objectContaining({ logicalPath: "new-root" }) }) }); w.unmount();
   });
   it('timestamps the preview and clears stale failure details on retry', async () => {
     rows.mappings = [{ id: 'a1', connectionId: 'c1', repositoryId: 'append-repo', localRoot: '/local' }];
@@ -389,6 +402,18 @@ describe("append settings through unified invoke", () => {
     expect(w.find('.cloud-preview').text()).toContain('Already up to date');
     expect(w.find('.cloud-preview button').exists()).toBe(false);
     expect(w.find('.mapping-preview').attributes('loading')).toBe('false');
+    w.unmount();
+  });
+  it('disables recovery writes while the mapping is syncing', async () => {
+    rows.mappings = [{ id: 'a1', connectionId: 'c1', repositoryId: 'append-repo', localRoot: '/local', logicalPath: 'photos' }];
+    rows.statuses = [{ mappingId: 'a1', phase: 'uploading', runId: 1 }];
+    const original = nativeInvoke.getMockImplementation();
+    nativeInvoke.mockImplementation((command, args) => command === 'cloud_recovery_records' ? Promise.resolve([{ id: 'record', relativePath: 'old.txt', phase: 'completed' }]) : original(command, args));
+    const w = await mountSettings();
+    await w.find('.mapping-recovery').trigger('click'); await flushPromises();
+    expect(w.find('.recovery-list button').attributes('disabled')).toBeDefined();
+    await w.find('.recovery-list button').trigger('click'); await flushPromises();
+    expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_restore')).toBe(false);
     w.unmount();
   });
   it.each([false, true])('discovers recovery records in the background (records=%s)', async (hasRecords) => {

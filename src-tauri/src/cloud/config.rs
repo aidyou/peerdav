@@ -40,6 +40,14 @@ impl CloudConfigStore {
                 for mapping in &snapshot.mappings {
                     validate_mapping_protocol(mapping)?;
                 }
+                let mut identities = std::collections::HashSet::new();
+                for connection in &snapshot.connections { identities.insert(connection.id.as_str()); }
+                for connection in &snapshot.official_connections {
+                    connection.validate()?;
+                    if connection.id.is_empty() || connection.revision == 0 || !identities.insert(connection.id.as_str()) {
+                        return Err(ConfigError::Validation("invalid official connection identity".into()));
+                    }
+                }
                 Ok(snapshot)
             }
             Err(crate::DomainError::SecretNotFound { .. }) => Ok(CloudConfigSnapshot::default()),
@@ -51,6 +59,93 @@ impl CloudConfigStore {
         let bytes = Zeroizing::new(serde_json::to_vec(snapshot)?);
         self.vault.store_secret(SECRET_NAME, &bytes)?;
         Ok(())
+    }
+
+    /// Official credentials are encrypted by the same Vault transaction as S3.
+    pub fn save_official_connection(
+        &self,
+        mut connection: super::official_types::OfficialConnection,
+    ) -> Result<super::official_types::OfficialConnectionRedacted, ConfigError> {
+        let _guard = self.guard()?;
+        let mut snapshot = self.load_locked()?;
+        connection.validate()?;
+        if connection.id.is_empty() {
+            connection.id = crate::local_upload::token().map_err(|_| ConfigError::Validation("connection identity unavailable".into()))?;
+            connection.revision = 1;
+            snapshot.official_connections.push(connection.clone());
+        } else {
+            let existing = snapshot.official_connections.iter_mut().find(|entry| entry.id == connection.id)
+                .ok_or_else(|| ConfigError::NotFound("official connection".into()))?;
+            if existing.provider != connection.provider || existing.revision != connection.revision {
+                return Err(ConfigError::Validation("official connection changed".into()));
+            }
+            connection.revision = existing.revision.checked_add(1)
+                .ok_or_else(|| ConfigError::Validation("connection revision exhausted".into()))?;
+            *existing = connection.clone();
+        }
+        self.save_locked(&snapshot)?;
+        Ok(connection.redacted())
+    }
+
+    /// Token rotation does not change the account/root generation of active sessions.
+    pub fn rotate_official_token(&self, id: &str, revision: u64, token: &str) -> Result<(), ConfigError> {
+        if token.trim().is_empty() || token.len() > 16384 {
+            return Err(ConfigError::Validation("invalid refresh token".into()));
+        }
+        let _guard = self.guard()?;
+        let mut snapshot = self.load_locked()?;
+        let connection = snapshot.official_connections.iter_mut().find(|entry| entry.id == id && entry.revision == revision)
+            .ok_or_else(|| ConfigError::NotFound("official connection revision".into()))?;
+        connection.refresh_token = token.to_owned();
+        self.save_locked(&snapshot)
+    }
+
+    pub fn save_client_proxy(&self, mut proxy: ProxyMode) -> Result<(), ConfigError> {
+        let _guard = self.guard()?;
+        let mut snapshot = self.load_locked()?;
+        match &mut proxy {
+            ProxyMode::Client => return Err(ConfigError::Validation("client proxy cannot inherit itself".into())),
+            ProxyMode::Custom { url, username, password } => {
+                let parsed = url::Url::parse(url).map_err(|_| ConfigError::Validation("invalid HTTP proxy address".into()))?;
+                if parsed.scheme() != "http" || parsed.host_str().is_none() || !parsed.username().is_empty()
+                    || parsed.password().is_some() || parsed.query().is_some() || parsed.fragment().is_some()
+                    || !matches!(parsed.path(), "" | "/") {
+                    return Err(ConfigError::Validation("HTTP proxy requires an http://host:port address without credentials or path".into()));
+                }
+                if username.as_ref().is_some_and(|v| v.len() > 2048) || password.as_ref().is_some_and(|v| v.len() > 4096) {
+                    return Err(ConfigError::Validation("proxy credentials too long".into()));
+                }
+                if password.is_none() {
+                    if let ProxyMode::Custom { url: old_url, username: old_username, password: old_password } = &snapshot.client_proxy {
+                        if old_url == url && old_username == username { *password = old_password.clone(); }
+                    }
+                }
+            }
+            _ => {}
+        }
+        for connection in snapshot.connections.iter_mut().filter(|entry| matches!(entry.config.proxy, ProxyMode::Client)) {
+            connection.revision = connection.revision.checked_add(1).ok_or(ConfigError::RevisionOverflow)?;
+        }
+        for connection in &mut snapshot.official_connections {
+            connection.revision = connection.revision.checked_add(1).ok_or(ConfigError::RevisionOverflow)?;
+        }
+        snapshot.client_proxy = proxy;
+        self.save_locked(&snapshot)
+    }
+
+    pub fn save_drive_proxy(&self, id: &str, direct: bool) -> Result<(), ConfigError> {
+        let _guard = self.guard()?;
+        let mut snapshot = self.load_locked()?;
+        if let Some(connection) = snapshot.connections.iter_mut().find(|entry| entry.id == id) {
+            connection.config.proxy = if direct { ProxyMode::Direct } else { ProxyMode::Client };
+            connection.revision = connection.revision.checked_add(1).ok_or(ConfigError::RevisionOverflow)?;
+        } else if let Some(connection) = snapshot.official_connections.iter_mut().find(|entry| entry.id == id) {
+            connection.revision = connection.revision.checked_add(1).ok_or(ConfigError::RevisionOverflow)?;
+        } else {
+            return Err(ConfigError::NotFound("connection".into()));
+        }
+        snapshot.drive_proxies.insert(id.to_owned(), direct);
+        self.save_locked(&snapshot)
     }
 
     pub fn snapshot(&self) -> Result<CloudConfigSnapshot, ConfigError> {
@@ -197,6 +292,7 @@ impl CloudConfigStore {
         let connection = CloudConnection {
             id: id.clone(),
             name: input.name,
+            protocol_id: CloudProtocolId::S3,
             config,
             revision,
             schedule,
@@ -214,6 +310,7 @@ impl CloudConfigStore {
         let _guard = self.guard()?;
         let mut snapshot = self.load_locked()?;
         snapshot.connections.retain(|c| c.id != id);
+        snapshot.official_connections.retain(|c| c.id != id);
         snapshot.mappings.retain(|m| m.connection_id != id);
         snapshot.repositories.retain(|r| r.connection_id != id);
         snapshot
@@ -257,6 +354,32 @@ impl CloudConfigStore {
         protected: &[&Path],
         append: Option<AppendRepositoryBinding>,
     ) -> Result<CloudMapping, ConfigError> {
+        self.mapping_inner(id, input, protected, append, true, false)
+    }
+
+    pub(crate) fn prepare_mapping(
+        &self, input: AddMappingInput, protected: &[&Path], append: Option<AppendRepositoryBinding>,
+    ) -> Result<CloudMapping, ConfigError> {
+        let mut mapping = self.mapping_inner(None, input, protected, append, false, false)?;
+        // Stable prebinding identity preserves failed discovery reservations across
+        // cancel/retry/restart; it is never the executable mapping identity.
+        use sha2::{Digest, Sha256};
+        let identity = serde_json::to_vec(&(&mapping.connection_id, &mapping.repository_id, &mapping.local_root, &mapping.logical_path, &mapping.append_binding))?;
+        mapping.id = format!("prepare-{}", hex::encode(Sha256::digest(identity)));
+        Ok(mapping)
+    }
+
+    pub(crate) fn commit_prepared_mapping(&self, mapping: &CloudMapping, protected: &[&Path]) -> Result<CloudMapping, ConfigError> {
+        let input = AddMappingInput { connection_id: mapping.connection_id.clone(), repository_id: mapping.repository_id.clone(), local_root: mapping.local_root.clone(), logical_path: mapping.logical_path.clone(), schedule: mapping.schedule.clone() };
+        // Revalidate overlaps and the physical root immediately before publishing.
+        let id = random_id()?;
+        self.mapping_inner(Some(&id), input, protected, mapping.append_binding.clone(), true, true)
+    }
+
+    fn mapping_inner(
+        &self, id: Option<&str>, input: AddMappingInput, protected: &[&Path],
+        append: Option<AppendRepositoryBinding>, persist: bool, prepared: bool,
+    ) -> Result<CloudMapping, ConfigError> {
         let _guard = self.guard()?;
         let mut snapshot = self.load_locked()?;
         validate_schedule(&input.schedule)?;
@@ -264,10 +387,14 @@ impl CloudConfigStore {
             .connections
             .iter()
             .any(|c| c.id == input.connection_id)
+            && !snapshot.official_connections.iter().any(|c| c.id == input.connection_id)
         {
             return Err(ConfigError::Validation("connection does not exist".into()));
         }
-        if id.is_some() && !snapshot.mappings.iter().any(|m| Some(m.id.as_str()) == id) {
+        if prepared && snapshot.mappings.iter().any(|m| Some(m.id.as_str()) == id) {
+            return Err(ConfigError::Validation("prepared mapping already exists".into()));
+        }
+        if id.is_some() && !prepared && !snapshot.mappings.iter().any(|m| Some(m.id.as_str()) == id) {
             return Err(ConfigError::NotFound("mapping".into()));
         }
         let binding = crate::sync::root_state::bind_initial(input.local_root.clone())?;
@@ -335,7 +462,7 @@ impl CloudConfigStore {
         } else {
             snapshot.mappings.push(mapping.clone());
         }
-        self.save_locked(&snapshot)?;
+        if persist { self.save_locked(&snapshot)?; }
         Ok(mapping)
     }
 
@@ -415,15 +542,14 @@ impl CloudConfigStore {
     ) -> Result<crate::mirror::MirrorMapping, ConfigError> {
         let _guard = self.guard()?;
         let mut snapshot = self.load_locked()?;
-        let connection = snapshot.connections.iter()
-            .find(|c| c.id == input.connection_id)
-            .ok_or_else(|| ConfigError::NotFound("connection".into()))?;
+        let connection = snapshot.connections.iter().find(|c| c.id == input.connection_id);
+        let official = snapshot.official_connections.iter().find(|c| c.id == input.connection_id && c.provider == super::oauth_types::OfficialProvider::GoogleDrive);
+        let default_bucket = connection.map(|c| c.config.bucket.as_str()).or_else(|| official.map(|c| c.root_id.as_str())).ok_or_else(|| ConfigError::NotFound("connection".into()))?;
         let bucket = input.bucket.as_deref()
-            .or_else(|| input.id.as_ref().and_then(|id| snapshot.mirror_mappings.iter()
-                .find(|m| &m.id == id).and_then(|m| m.bucket.as_deref())))
-            .unwrap_or(&connection.config.bucket).to_owned();
-        if bucket != connection.config.bucket && !connection.config.buckets.contains(&bucket) {
-            return Err(ConfigError::Validation("请选择已配置的存储桶 / Select a configured bucket".into()));
+            .or_else(|| input.id.as_ref().and_then(|id| snapshot.mirror_mappings.iter().find(|m| &m.id == id).and_then(|m| m.bucket.as_deref())))
+            .unwrap_or(default_bucket).to_owned();
+        if connection.is_some_and(|c| bucket != c.config.bucket && !c.config.buckets.contains(&bucket)) || official.is_some_and(|c| bucket != c.root_id) {
+            return Err(ConfigError::Validation("请选择已配置的存储范围 / Select a configured storage scope".into()));
         }
         let cloud_prefix = crate::mirror::normalize_cloud_prefix(&input.cloud_prefix)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
@@ -483,7 +609,7 @@ impl CloudConfigStore {
                 ));
             }
             if existing.connection_id == mapping.connection_id
-                && existing.bucket.as_deref().unwrap_or(&connection.config.bucket) == bucket
+                && existing.bucket.as_deref().unwrap_or(default_bucket) == bucket
                 && mirror_prefix_overlap(&existing.cloud_prefix, &mapping.cloud_prefix)
             {
                 return Err(ConfigError::Validation(
@@ -685,6 +811,27 @@ mod tests {
     use super::*;
     use crate::mirror::SaveMirrorMappingInput;
 
+    #[test]
+    fn client_proxy_defaults_encrypts_credentials_and_preserves_password_on_edit() {
+        let (_dir, store) = store();
+        assert!(matches!(store.snapshot().expect("snapshot").client_proxy, ProxyMode::Environment));
+        store.save_client_proxy(ProxyMode::Custom { url: "http://127.0.0.1:7890".into(), username: Some("user".into()), password: Some("private".into()) }).expect("save");
+        store.save_client_proxy(ProxyMode::Custom { url: "http://127.0.0.1:7890".into(), username: Some("user".into()), password: None }).expect("retain");
+        let snapshot = store.snapshot().expect("snapshot");
+        assert!(matches!(&snapshot.client_proxy, ProxyMode::Custom { password: Some(value), .. } if value == "private"));
+        assert!(!format!("{snapshot:?}").contains("private"));
+        assert!(store.save_client_proxy(ProxyMode::Client).is_err());
+        for url in ["socks5://127.0.0.1:7890", "http://user:secret@127.0.0.1", "http://127.0.0.1/path", "http://127.0.0.1?secret=1"] {
+            assert!(store.save_client_proxy(ProxyMode::Custom { url: url.into(), username: None, password: None }).is_err());
+        }
+        let connection = store.save_connection(connection_input()).expect("connection");
+        store.save_drive_proxy(&connection.id, false).expect("inherit");
+        assert!(matches!(store.snapshot().expect("snapshot").connections[0].config.proxy, ProxyMode::Client));
+        store.save_drive_proxy(&connection.id, true).expect("direct");
+        assert!(matches!(store.snapshot().expect("snapshot").connections[0].config.proxy, ProxyMode::Direct));
+        assert!(store.save_drive_proxy("forged", false).is_err());
+    }
+
     fn store() -> (tempfile::TempDir, CloudConfigStore) {
         let dir = tempfile::tempdir().expect("tempdir");
         let vault = Arc::new(Vault::open(&dir.path().join("vault.pd")).expect("open"));
@@ -735,6 +882,27 @@ mod tests {
     }
 
     #[test]
+    fn preparing_mapping_does_not_publish_binding_or_schedule() {
+        let (dir, store) = store();
+        let connection = store.save_connection(connection_input()).unwrap();
+        let root = dir.path().join("pending");
+        std::fs::create_dir(&root).unwrap();
+        let input = AddMappingInput {
+            connection_id: connection.id, repository_id: "repository".into(),
+            local_root: root, logical_path: "docs".into(),
+            schedule: ScheduleConfig { enabled: true, interval: 900 },
+        };
+        let prepared = store.prepare_mapping(input.clone(), &[], None).unwrap();
+        let first_id = prepared.id.clone();
+        assert_eq!(store.prepare_mapping(input.clone(), &[], None).unwrap().id, first_id, "repreparing the same binding must reuse its durable budget scope");
+        assert!(prepared.schedule.enabled);
+        assert!(store.snapshot().unwrap().mappings.is_empty());
+        store.add_mapping(input.clone(), &[]).unwrap();
+        assert!(store.prepare_mapping(input, &[], None).is_err());
+        assert_eq!(store.snapshot().unwrap().mappings.len(), 1);
+    }
+
+    #[test]
     fn mirror_bucket_selection_persists_and_scopes_overlap_checks() {
         let (dir, store) = store();
         let mut input = connection_input();
@@ -770,6 +938,8 @@ mod tests {
         let root_a = dir.path().join("a");
         let nested = root_a.join("nested");
         let root_b = dir.path().join("b");
+        std::fs::create_dir_all(&nested).expect("nested root");
+        std::fs::create_dir(&root_b).expect("second root");
         store
             .save_mirror_mapping(mirror_input(&connection.id, &root_a, "docs"))
             .expect("first mapping");

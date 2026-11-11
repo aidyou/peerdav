@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("../invoke", () => ({ invoke: vi.fn(async () => null) }));
 import { invoke } from "../invoke";
 import { peerUploadBatch } from "../peer";
-import { cloudUploadAdapter, peerUploadAdapter } from "../uploadBatchAdapters";
+import { cloudUploadAdapter, peerUploadAdapter, fileUploadAdapter } from "../uploadBatchAdapters";
 
 beforeEach(() => invoke.mockClear());
 describe("peer batch IPC adapter", () => {
@@ -28,6 +28,24 @@ describe("peer batch IPC adapter", () => {
       ["peer_cancel_upload_batch", { peerId: "peer", batchId: "batch" }],
       ["peer_release_upload_batch", { peerId: "peer", batchId: "batch" }],
     ]);
+  });
+  it('routes every browser upload through an admitted session and strips unrelated fields', async () => {
+    const args = { sessionId: 'session', batchId: 'batch', localPath: '/private', connectionId: 'forged', peerId: 'forged' };
+    await fileUploadAdapter.start(args);
+    await fileUploadAdapter.status(args);
+    await fileUploadAdapter.cancel(args);
+    await fileUploadAdapter.release(args);
+    await fileUploadAdapter.page({ ...args, cursor: 'cursor', limit: 100 });
+    await fileUploadAdapter.resolve({ ...args, conflictId: 'conflict', decision: 'skip', applyToRemaining: false });
+    expect(invoke.mock.calls.map(([name]) => name)).toEqual(['file_upload_action', 'file_upload_action', 'file_upload_action', 'file_release_upload', 'file_upload_page', 'file_upload_resolve']);
+    for (const [, payload] of invoke.mock.calls) {
+      expect(payload).toMatchObject({ sessionId: 'session', batchId: 'batch' });
+      expect(payload).not.toHaveProperty('localPath');
+      expect(payload).not.toHaveProperty('connectionId');
+      expect(payload).not.toHaveProperty('peerId');
+    }
+    expect(fileUploadAdapter.overwriteAllowed({ etag: 'revision' })).toBe(false);
+    expect(fileUploadAdapter.overwriteAllowed({ etag: null, overwriteAllowed: true })).toBe(true);
   });
   it("allows Peer overwrite without weakening Cloud ETag safety", () => {
     expect(peerUploadAdapter.overwriteAllowed({ etag: null })).toBe(true);

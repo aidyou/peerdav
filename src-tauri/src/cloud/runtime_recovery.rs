@@ -76,8 +76,10 @@ impl CloudRuntime {
         destination: PathBuf,
     ) -> Result<(), AppError> {
         self.admit()?;
+        self.ensure_mapping_writable(mapping_id)?;
         let _network = self.network.write().await;
         self.admit()?;
+        self.ensure_mapping_writable(mapping_id)?;
         self.manager.stop_mapping(mapping_id).await?;
         let mapping = self.mapping(mapping_id)?;
         let epoch = Self::root_epoch(&mapping.local_root)?;

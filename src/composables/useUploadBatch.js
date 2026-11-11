@@ -35,10 +35,11 @@ export function useUploadBatch({ adapter, captureScope, scopeValid, canSelect, o
       uploadSession = null; uploadSelecting.value = false; uploadDialogOpen.value = false;
       uploadSummary.value = null; uploadPage.value = null; uploadPageLoading.value = false;
     }
-    if (session.batchId) {
-      await adapter.cancel(uploadArgs(session)).catch(reportUploadFailure);
-      await releaseUploadSession(session);
-    }
+    if (session.batchId) await adapter.cancel(uploadArgs(session)).catch(reportUploadFailure);
+    // A native picker/start can finish after navigation. Keep its admitted
+    // backend session alive until the late result has been cancelled/released.
+    if (session.settled) await session.settled;
+    await releaseUploadSession(session);
   }
   function applyUploadSummary(session, summary) {
     if (!uploadSessionValid(session)) return;
@@ -127,6 +128,8 @@ export function useUploadBatch({ adapter, captureScope, scopeValid, canSelect, o
     if (!canSelect() || uploadRunning.value) return;
     if (uploadSession) await closeUpload();
     const session = { scope: captureScope(), batchId: null, canceled: false, starting: true, statusEpoch: 0 };
+    let settle;
+    session.settled = new Promise(resolve => { settle = resolve; });
     uploadSession = session;
     uploadSelecting.value = true; uploadSummary.value = null; uploadPage.value = null;
     uploadBatchError.value = ""; uploadPageNotice.value = ""; uploadApplyRemaining.value = false; uploadResolving.value = false;
@@ -159,6 +162,7 @@ export function useUploadBatch({ adapter, captureScope, scopeValid, canSelect, o
       }
     } finally {
       session.starting = false;
+      settle();
       if (uploadSession === session) uploadSelecting.value = false;
     }
   }

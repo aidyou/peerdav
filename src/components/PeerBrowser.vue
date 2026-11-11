@@ -1,46 +1,101 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { ElMessageBox } from 'element-plus';
 import UploadBatchDialog from "./UploadBatchDialog.vue";
 import TransferQueueDialog from "./TransferQueueDialog.vue";
 import { useUploadBatch } from "../composables/useUploadBatch";
-import { peerUploadAdapter } from "../lib/uploadBatchAdapters";
+import { fileUploadAdapter } from "../lib/uploadBatchAdapters";
 import { useDownloadQueue } from "../composables/useDownloadQueue";
 
 import FileGlyph from "./FileGlyph.vue";
 import { selectionForClick } from "../lib/fileManagerAdapters";
 import FileManagerView from "./FileManagerView.vue";
 import FilePreviewDialog from "./FilePreviewDialog.vue";
+import OperationErrorDialog from './OperationErrorDialog.vue';
+import BrowserSkeleton from './BrowserSkeleton.vue';
 import { useAppContext } from "../lib/appContext";
 import { confirmAction } from "../lib/confirm";
 import { canPreview, fileKind, fileKindKey, isReadableText } from "../lib/fileKinds";
-import { t } from "../lib/i18n";
+import { t, locale } from "../lib/i18n";
 import { formatBytes } from "../lib/format";
 import { generalSettings } from "../lib/general";
-import { normalizeAppError } from "../lib/invoke";
+import { normalizeAppError, invoke as fileInvoke } from "../lib/invoke";
 import {
   MAX_PREVIEW_BYTES,
   previewFormat as detectPreviewFormat,
 } from "../lib/textPreview";
 import { useAction } from "../composables/useAction";
 
+// Shared ordinary file browser. The filename is retained for compatibility with
+// existing imports; protocol wiring lives in adapters, never in view templates.
+defineOptions({ name: 'FileBrowser' });
 const props = defineProps({
   peer: { type: Object, required: true },
+  adapter: { type: Object, default: null },
+  hideSidebar: { type: Boolean, default: false },
 });
 
 const app = useAppContext();
 const { busy, run } = useAction();
+const titlebarTarget = Boolean(typeof document !== 'undefined' && document.getElementById('titlebar-file-actions'));
 
-const VIEW_STORAGE_KEY = "peerdav.peerView";
+const VIEW_STORAGE_KEY = props.adapter ? 'peerdav.cloudView' : 'peerdav.peerView';
 const VIEW_MODES = ["icons", "list", "columns", "gallery"];
+let fileSession = null;
+const fileCapabilities = ref(null);
+let sessionOpening = null;
+let sessionGeneration = 0;
+async function closeFileSession() {
+  sessionGeneration++;
+  const previous = fileSession;
+  fileSession = null; fileCapabilities.value = null; sessionOpening = null;
+  filesPrepared.value = false;
+  await cancelUploadSession();
+  if (previous) await fileInvoke('file_close_session', { sessionId: previous.sessionId }).catch(app.handleFailure);
+}
+async function getFileSession() {
+  if (fileSession) return fileSession;
+  if (!sessionOpening) {
+    const generation = sessionGeneration;
+    const location = props.adapter?.location(activeShareId.value) || { protocol: 'peerdav', peerId: props.peer.id, shareId: activeShareId.value };
+    sessionOpening = fileInvoke('file_open_session', { location }).then(async session => {
+      if (generation !== sessionGeneration || browserDisposed) {
+        await fileInvoke('file_close_session', { sessionId: session.sessionId });
+        throw { code: 'TRANSFER_CANCELED', message: '' };
+      }
+      fileSession = session;
+      fileCapabilities.value = session.capabilities || null;
+      return session;
+    }).finally(() => { if (generation === sessionGeneration) sessionOpening = null; });
+  }
+  return sessionOpening;
+}
+const rootPath = computed(() => props.adapter?.root ?? '/');
+function entryDisplay(entry) {
+  if (!entry.isDir) return entry;
+  const driveKind = entry.driveKind || (entry.name === '_peerdav_encrypt' ? 'encrypted-drive' : entry.name === '_peerdav_mirror' ? 'mirror-drive' : null);
+  return driveKind ? { ...entry, driveKind, name: t(driveKind === 'encrypted-drive' ? 'cloudBrowser.encryptedDrive' : 'cloudBrowser.mirrorDrive') } : entry;
+}
 
 const peerShares = ref([]);
 const activeShareId = ref("");
 const peerPath = ref("/");
 const peerListing = ref(null);
+const navigationBreadcrumbs = ref([]);
+watch(locale, () => {
+  if (peerListing.value) peerListing.value = { ...peerListing.value, entries: peerListing.value.entries.map(entryDisplay) };
+  columnStack.value = columnStack.value.map(column => ({ ...column, entries: column.entries.map(entryDisplay) }));
+});
 const peerPreview = ref(null);
 const peerPreviewPath = ref("");
 const previewOpen = ref(false);
 const previewLimit = ref(null);
+const timeColumn = computed(() => {
+  if (!props.adapter) return 'modified';
+  const valid = value => (typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')) && Number.isFinite(Number(value)) && Number.isFinite(new Date(Number(value) * 1000).getTime());
+  if (peerListing.value?.entries.some(entry => valid(entry.modified))) return 'modified';
+  return peerListing.value?.entries.some(entry => valid(entry.created)) ? 'created' : '';
+});
 const peerEdit = ref(null);
 const viewMode = ref(readViewMode());
 const columnStack = ref([]);
@@ -62,21 +117,31 @@ let marqueeStart = null;
 let suppressClick = false;
 let browserDisposed = false;
 let uploadPollTimer;
-const canMutate = computed(() => Boolean(activeShare.value?.permissions?.canWrite) && !busy.value && !uploadRunning.value);
+const canMutate = computed(() => (props.adapter ? filesPrepared.value && fileCapabilities.value?.upload === true : Boolean(activeShare.value?.permissions?.canWrite)) && fileCapabilities.value?.upload !== false && !peerListing.value?.protected && !busy.value && !uploadRunning.value);
 const {
   uploadDialogOpen, uploadSummary, uploadPage, uploadRunning,
   uploadBatchError, uploadPageNotice, uploadApplyRemaining, uploadResolving, uploadOverwriteAllowed,
   selectUpload, pollUpload, cancelUpload, closeUpload, resolveUploadConflict, cancelUploadSession,
 } = useUploadBatch({
-  adapter: peerUploadAdapter,
-  captureScope: () => ({ peerId: props.peer.id, shareName: activeShare.value.name, shareId: activeShareId.value,
+  adapter: {
+    ...fileUploadAdapter,
+    select: async (scope, mode) => {
+      const token = navigationToken;
+      const session = await getFileSession();
+      if (browserDisposed || token !== navigationToken) return null;
+      scope.sessionId = session.sessionId;
+      return fileInvoke('file_select_upload', { sessionId: session.sessionId, id: scope.remoteDir ?? scope.prefix, mode, options: scope.options });
+    },
+  },
+  captureScope: () => props.adapter?.uploadScope(activeShare.value, peerPath.value) || ({ peerId: props.peer.id, shareName: activeShare.value.name, shareId: activeShareId.value,
     remoteDir: peerPath.value, options: { respectGitignore: generalSettings.respectGitignore, patterns: generalSettings.ignorePatterns } }),
-  scopeValid: (scope) => !browserDisposed && scope.peerId === props.peer.id && scope.shareId === activeShareId.value,
+  scopeValid: (scope) => !browserDisposed && (props.adapter ? props.adapter.validScope(scope, activeShareId.value) : scope.peerId === props.peer.id && scope.shareId === activeShareId.value),
   canSelect: () => canMutate.value,
   onFailure: (cause) => app.handleFailure(cause),
   onCompleted: (summary, scope) => {
     app.setNotice("peer.uploadFinished", { count: summary.completedFiles });
-    if (peerPath.value === scope.remoteDir) void loadPath(scope.remoteDir);
+    const path = scope.remoteDir ?? scope.prefix;
+    if (peerPath.value === path) void loadPath(path);
   },
 });
 const {
@@ -84,17 +149,25 @@ const {
   downloadResolving, downloadApplyRemaining, downloadPageLoading, downloadSummary, selectDownload, pollDownload,
   loadDownloadPage, cancelDownloadQueue, resolveDownloadConflict, closeDownloadQueue, revealDownloadRoot, disposeDownload,
 } = useDownloadQueue({
-  captureScope: () => ({ peerId: props.peer.id, shareId: activeShareId.value }),
-  scopeValid: (scope) => !browserDisposed && scope.peerId === props.peer.id && scope.shareId === activeShareId.value,
-  backend: (scope) => ({ backend: "peer", ...scope }),
+  captureScope: () => props.adapter?.downloadScope(activeShareId.value) || ({ peerId: props.peer.id, shareId: activeShareId.value }),
+  scopeValid: (scope) => !browserDisposed && (props.adapter ? props.adapter.validScope(scope, activeShareId.value) : scope.peerId === props.peer.id && scope.shareId === activeShareId.value),
+  backend: (scope) => props.adapter?.downloadBackend(scope) || ({ backend: "peer", ...scope }),
+  select: async (_scope, selection) => {
+    const token = navigationToken;
+    const session = await getFileSession();
+    if (browserDisposed || token !== navigationToken) return null;
+    return fileInvoke('file_select_download', { sessionId: session.sessionId, selection });
+  },
   onFailure: (cause) => app.handleFailure(cause),
 });
 onMounted(() => { uploadPollTimer = setInterval(() => { void pollUpload(); void pollDownload(); }, 1500); });
-watch([() => props.peer.id, activeShareId], () => { void cancelUploadSession(); void disposeDownload(); }, { flush: "sync" });
+watch([() => props.peer.id, activeShareId], () => { void closeFileSession(); void cancelUploadSession(); void disposeDownload(); }, { flush: "sync" });
 
 onBeforeUnmount(() => {
   browserDisposed = true;
+  void closeFileSession();
   clearInterval(uploadPollTimer);
+  clearTimeout(preparationTimer);
   void disposeDownload();
   void cancelUploadSession();
   window.removeEventListener("keydown", onModifierKeydown, true);
@@ -109,7 +182,7 @@ const activeShare = computed(
 );
 
 const canDeleteEntries = computed(() =>
-  Boolean(activeShare.value?.permissions?.canDelete),
+  (props.adapter ? filesPrepared.value && fileCapabilities.value?.delete === true : Boolean(activeShare.value?.permissions?.canDelete) && fileCapabilities.value?.delete !== false),
 );
 
 const peerHost = computed(() => {
@@ -124,13 +197,14 @@ const breadcrumbs = computed(() => {
   const crumbs = [
     {
       name: activeShare.value?.name || t("peer.root"),
-      path: "/",
+      id: rootPath.value,
     },
   ];
-  let path = "";
-  for (const segment of peerPath.value.split("/").filter(Boolean)) {
-    path += `/${segment}`;
-    crumbs.push({ name: segment, path });
+  const trail = peerListing.value?.breadcrumbs ?? navigationBreadcrumbs.value;
+  if (Array.isArray(trail)) {
+    return [...crumbs, ...trail
+      .filter(crumb => crumb.id !== rootPath.value)
+      .map(crumb => ({ ...crumb, name: crumb.name === '_peerdav_encrypt' ? t('cloudBrowser.encryptedDrive') : crumb.name === '_peerdav_mirror' ? t('cloudBrowser.mirrorDrive') : crumb.name }))];
   }
   return crumbs;
 });
@@ -200,7 +274,7 @@ watch(peerListing, () => {
 });
 
 const activePreview = computed(() =>
-  peerPreview.value && peerPreviewPath.value === selectedEntry.value?.path
+  peerPreview.value && peerPreviewPath.value === selectedEntry.value?.id
     ? peerPreview.value
     : null,
 );
@@ -290,11 +364,61 @@ function reset() {
 
 const navigating = ref(false);
 const loadFailed = ref(false);
+const listingError = ref(null);
+const operationError = ref(null);
+const preparationError = ref(null);
+const filesPrepared = ref(false);
+const preparingFiles = ref(false);
+const preparationHint = ref(false);
+let preparationTimer;
+async function prepareFiles() {
+  if (!props.adapter || preparingFiles.value) return;
+  const generation = sessionGeneration;
+  filesPrepared.value = false;
+  preparingFiles.value = true; preparationError.value = null;
+  preparationTimer = setTimeout(() => { if (!browserDisposed) preparationHint.value = true; }, 300);
+  try {
+    const session = await getFileSession();
+    await fileInvoke('file_prepare_session', { sessionId: session.sessionId });
+    if (browserDisposed || generation !== sessionGeneration) return;
+    filesPrepared.value = true;
+  } catch (error) {
+    if (!browserDisposed && generation === sessionGeneration) { preparationError.value = normalizeAppError(error); app.handleFailure(error); }
+  } finally {
+    clearTimeout(preparationTimer);
+    if (!browserDisposed && generation === sessionGeneration) { preparingFiles.value = false; preparationHint.value = false; }
+  }
+}
+async function createDirectory() {
+  if (busy.value || (props.adapter && !filesPrepared.value) || peerListing.value?.protected || fileCapabilities.value?.createDir !== true || (!props.adapter && !activeShare.value?.permissions?.canWrite)) return;
+  const token = navigationToken;
+  let answer;
+  try { answer = await ElMessageBox.prompt(t('peer.folderName'), t('peer.createFolder'), { confirmButtonText: t('common.confirm'), cancelButtonText: t('common.cancel'), inputValidator: value => Boolean(value?.trim()) && !/[\\/\0:]/.test(value) && !['.', '..'].includes(value) }); }
+  catch (error) { if (error === 'cancel' || error === 'close') return; throw error; }
+  if (browserDisposed || token !== navigationToken) return;
+  await run(async () => {
+    const session = await getFileSession();
+    const entry = await fileInvoke('file_create_directory', { sessionId: session.sessionId, id: peerPath.value, name: answer.value });
+    if (browserDisposed || token !== navigationToken) return;
+    const displayed = entryDisplay({ ...entry, ...(props.adapter ? { key: entry.id } : {}) });
+    const insert = page => page?.id === entry.parentId ? { ...page, entries: [...page.entries.filter(item => item.id !== entry.id), displayed].sort((a, b) => Number(b.isDir) - Number(a.isDir)) } : page;
+    peerListing.value = insert(peerListing.value);
+    columnStack.value = columnStack.value.map(insert);
+    app.setNotice('peer.folderCreated', { name: entry.name });
+  });
+}
+
+async function deleteCurrentFolder() {
+  if (!props.adapter || !canDeleteEntries.value || busy.value || peerListing.value?.protected) return;
+  if (peerPath.value === rootPath.value) { operationError.value = { code: 'CLOUD_DELETE_ROOT_FORBIDDEN', message: t('cloudBrowser.deleteRootForbidden') }; return; }
+  const currentName = breadcrumbs.value.find(crumb => crumb.id === peerPath.value)?.name || t('peer.root');
+  await deleteEntry({ id: peerPath.value, name: currentName, isDir: true });
+}
 let navigationToken = 0;
 
 function applyListing(listing) {
   peerListing.value = listing;
-  peerPath.value = listing.path;
+  peerPath.value = listing.id;
   clearSelection();
   clearPreview();
   if (viewMode.value === "columns") {
@@ -302,44 +426,60 @@ function applyListing(listing) {
   }
 }
 
-async function fetchListing(path) {
-  return app.invoke("list_peer_dir", {
-    peerId: props.peer.id,
-    shareId: activeShareId.value,
-    path,
-  });
+async function fetchListing(path, next = null) {
+  const session = await getFileSession();
+  const page = await fileInvoke('file_list', { sessionId: session.sessionId, id: path, next });
+  if (props.adapter && !page.complete && page.entries.length) app.setInfo?.('cloudBrowser.incomplete');
+  return { ...page, entries: page.entries.map(entry => entryDisplay({ ...entry, ...(props.adapter ? { key: entry.id } : {}) })).sort((a, b) => Number(b.isDir) - Number(a.isDir)), shareId: activeShareId.value, truncated: !page.complete };
+}
+async function loadMore() {
+  if (!peerListing.value?.next || navigating.value) return;
+  const token = navigationToken;
+  const previous = peerListing.value;
+  navigating.value = true;
+  try {
+    const page = await fetchListing(previous.id, previous.next);
+    if (token !== navigationToken) return;
+    // A later provider page may contain directories: regroup the merged list.
+    peerListing.value = { ...page, entries: [...new Map([...previous.entries, ...page.entries].map(entry => [entry.id, entry])).values()].sort((a, b) => Number(b.isDir) - Number(a.isDir)) };
+  } catch (error) { if (token === navigationToken) app.handleFailure(error); }
+  finally { if (token === navigationToken) navigating.value = false; }
 }
 
 async function rebuildColumnStack() {
   const current = peerListing.value;
   if (!current) return;
   const targetPath = peerPath.value;
-  const listings = [];
-
-  try {
-    for (const crumb of breadcrumbs.value) {
-      listings.push(
-        crumb.path === targetPath ? current : await fetchListing(crumb.path),
-      );
+  const token = navigationToken;
+  const levels = breadcrumbs.value.map(crumb => crumb.id === targetPath ? current : { id: crumb.id, entries: [], loading: true, complete: false });
+  columnStack.value = levels;
+  await Promise.all(levels.map(async (level, index) => {
+    if (level === current) return;
+    try {
+      const listing = await fetchListing(level.id);
+      if (browserDisposed || token !== navigationToken || viewMode.value !== 'columns' || peerPath.value !== targetPath) return;
+      columnStack.value[index] = listing;
+    } catch (error) {
+      if (browserDisposed || token !== navigationToken || viewMode.value !== 'columns' || peerPath.value !== targetPath) return;
+      columnStack.value[index] = { ...level, loading: false, failed: true };
+      operationError.value = normalizeAppError(error);
+      app.handleFailure(error);
     }
-  } catch (error) {
-    if (viewMode.value !== "columns" || peerPath.value !== targetPath) return;
-    app.handleFailure(error);
-    columnStack.value = [current];
-    return;
-  }
-
-  if (viewMode.value !== "columns" || peerPath.value !== targetPath) return;
-  columnStack.value = listings;
+  }));
 }
 
 // 进入目录时先更新地址栏并清空文件区放上 loading，让"已进入"立刻可见；
 // 令牌保证用户中途再导航时，旧请求返回的内容不会覆盖新目录。
 async function loadPath(path) {
   const token = ++navigationToken;
+  const knownTrail = breadcrumbs.value;
+  const ancestor = knownTrail.findIndex(crumb => crumb.id === path);
+  const entry = peerListing.value?.entries.find(entry => entry.id === path && entry.isDir);
+  navigationBreadcrumbs.value = ancestor >= 0 ? knownTrail.slice(1, ancestor + 1) : entry ? [...knownTrail.slice(1), { id: entry.id, name: entry.name }] : [];
   peerPath.value = path;
   peerListing.value = null;
   loadFailed.value = false;
+  listingError.value = null;
   clearSelection();
   clearPreview();
   navigating.value = true;
@@ -353,6 +493,7 @@ async function loadPath(path) {
   } catch (error) {
     if (token !== navigationToken) return;
     loadFailed.value = true;
+    listingError.value = normalizeAppError(error);
     app.handleFailure(error);
   } finally {
     if (token === navigationToken) navigating.value = false;
@@ -362,12 +503,14 @@ async function loadPath(path) {
 async function loadPeer() {
   reset();
   await run(async () => {
-    peerShares.value = await app.invoke("list_peer_shares", {
+    peerShares.value = props.adapter ? await props.adapter.roots() : await app.invoke("list_peer_shares", {
       peerId: props.peer.id,
     });
     if (peerShares.value.length) {
       activeShareId.value = peerShares.value[0].id;
-      await loadPath("/");
+      await getFileSession();
+      void prepareFiles();
+      await loadPath(rootPath.value);
     }
   });
 }
@@ -375,7 +518,7 @@ async function loadPeer() {
 async function openShare(shareId) {
   if (!props.peer.id) return;
   activeShareId.value = shareId;
-  void loadPath("/");
+  void loadPath(rootPath.value);
 }
 
 // 导航不再被 busy 阻塞：用户可以在下载等操作进行中继续切换目录，
@@ -387,11 +530,24 @@ async function browse(path) {
 
 async function refreshListing() {
   if (!activeShareId.value) return;
-  void loadPath(peerPath.value);
+  if (!peerListing.value) { void loadPath(peerPath.value); return; }
+  const token = ++navigationToken;
+  const path = peerPath.value;
+  clearSelection(); clearPreview();
+  navigating.value = true;
+  try {
+    const listing = await fetchListing(path);
+    if (token !== navigationToken || browserDisposed) return;
+    applyListing(listing);
+    operationError.value = null;
+    if (viewMode.value === 'columns') await rebuildColumnStack();
+  } catch (error) {
+    if (token === navigationToken && !browserDisposed) { operationError.value = normalizeAppError(error); app.handleFailure(error); }
+  } finally { if (token === navigationToken) navigating.value = false; }
 }
 
 function isSelected(entry) {
-  return selectedEntries.value.some((item) => item.path === entry?.path);
+  return selectedEntries.value.some((item) => item.id === entry?.id);
 }
 
 function setSelection(entries) {
@@ -473,7 +629,7 @@ window.addEventListener("keyup", onModifierKeyup, true);
 window.addEventListener("blur", resetHeldModifiers);
 
 function selectSingle(entry) {
-  selectionAnchor.value = entry.path;
+  selectionAnchor.value = entry.id;
   setSelection([entry]);
   if (viewMode.value === "gallery" && !entry.isDir && canPreview(entry)) {
     void previewEntry(entry);
@@ -500,7 +656,7 @@ function selectEntry(entry, event) {
   pointerModifiers.alt = false;
   pointerModifiers.shift = false;
   const result = selectionForClick({ entries: peerListing.value?.entries ?? [], selection: selectedEntries.value,
-    anchor: selectionAnchor.value, entry, identityField: "path", additive, ranged });
+    anchor: selectionAnchor.value, entry, identityField: "id", additive, ranged });
   if (result) {
     setSelection(result.selection);
     selectionAnchor.value = result.anchor;
@@ -559,7 +715,7 @@ function onMarqueeMove(event) {
     }
   }
   const listing = peerListing.value?.entries ?? [];
-  setSelection(listing.filter((entry) => hits.includes(entry.path)));
+  setSelection(listing.filter((entry) => hits.includes(entry.id)));
 }
 
 function onMarqueeUp(event) {
@@ -595,7 +751,7 @@ const marqueeStyle = computed(() => {
 
 function openEntry(entry) {
   if (entry.isDir) {
-    void browse(entry.path);
+    void browse(entry.id);
   } else if (canPreview(entry)) {
     void previewEntry(entry);
   }
@@ -607,7 +763,7 @@ function navigateSelection(delta) {
   const entries = peerListing.value?.entries ?? [];
   const length = entries.length;
   if (!length) return;
-  const current = entries.findIndex((entry) => entry.path === selectedEntry.value?.path);
+  const current = entries.findIndex((entry) => entry.id === selectedEntry.value?.id);
   const index =
     current === -1
       ? delta > 0
@@ -626,7 +782,7 @@ function goUpLevel() {
   if (!activeShareId.value || busy.value) return;
   const crumbs = breadcrumbs.value;
   if (crumbs.length <= 1) return;
-  void browse(crumbs[crumbs.length - 2].path);
+  void browse(crumbs[crumbs.length - 2].id);
 }
 
 // 快捷键说明面板：只列本视图真实实现的行为。修饰键标签按平台精确列出，
@@ -715,39 +871,42 @@ function onFileViewKeydown(event) {
   navigateSelection(event.key === forward ? 1 : -1);
 }
 
-async function loadColumn(entry, index) {
+async function loadColumn(entry, index, event) {
+  if (event?.detail > 1) return;
+  if (event && (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey)) { selectEntry(entry, event); return; }
   if (!entry.isDir) {
     selectSingle(entry);
     return;
   }
-  if (busy.value) return;
+  const token = ++navigationToken;
   loadingColumn.value = index;
+  peerPath.value = entry.id;
+  clearSelection(); clearPreview();
   try {
-    await run(async () => {
-      const listing = await fetchListing(entry.path);
-      peerListing.value = listing;
-      peerPath.value = listing.path;
-      clearPreview();
-      setSelection([entry]);
-      columnStack.value = [...columnStack.value.slice(0, index + 1), listing];
-    });
+    const listing = await fetchListing(entry.id);
+    if (browserDisposed || token !== navigationToken) return;
+    peerListing.value = listing;
+    peerPath.value = listing.id;
+    setSelection([entry]);
+    columnStack.value = [...columnStack.value.slice(0, index + 1), listing];
+  } catch (error) {
+    if (!browserDisposed && token === navigationToken) app.handleFailure(error);
   } finally {
-    // 失败时 run 会吞掉异常并走 handleFailure，这里保证指示器一定会撤掉。
-    if (loadingColumn.value === index) loadingColumn.value = -1;
+    if (token === navigationToken) loadingColumn.value = -1;
   }
 }
 
 function downloadEntry(entry) {
-  if (!entry || entry.isDir || busy.value) return;
-  return selectDownload({ mode: "single", path: entry.path });
+  if (!entry || entry.isDir || busy.value || fileCapabilities.value?.download === false) return;
+  return selectDownload({ mode: "single", id: entry.id });
 }
 function downloadDirectory(entry) {
-  if (!entry?.isDir || busy.value) return;
-  return selectDownload({ mode: "folder", path: entry.path });
+  if (!entry?.isDir || busy.value || fileCapabilities.value?.download === false || fileCapabilities.value?.downloadDirectory === false) return;
+  return selectDownload({ mode: "folder", id: entry.id });
 }
 function downloadBatch(entries) {
-  if (!entries.length || busy.value) return;
-  return selectDownload({ mode: "files", paths: entries.map((entry) => entry.path) });
+  if (!entries.length || busy.value || fileCapabilities.value?.download === false || (entries.some(entry => entry.isDir) && fileCapabilities.value?.downloadDirectory === false)) return;
+  return selectDownload({ mode: "files", ids: entries.map((entry) => entry.id) });
 }
 
 function runSelectionAction(action) {
@@ -757,7 +916,7 @@ function runSelectionAction(action) {
 }
 
 function downloadSelected(entries = selectedEntries.value) {
-  if (!entries.length || busy.value) return;
+  if (!entries.length || busy.value || fileCapabilities.value?.download === false || (entries.some(entry => entry.isDir) && fileCapabilities.value?.downloadDirectory === false)) return;
   if (entries.length === 1) {
     const entry = entries[0];
     if (entry.isDir) void downloadDirectory(entry);
@@ -767,7 +926,10 @@ function downloadSelected(entries = selectedEntries.value) {
   void downloadBatch(entries);
 }
 
-function chooseUploadFiles() { return selectUpload("files"); }
+function chooseUploadFiles() {
+  if (props.adapter) return selectUpload('single');
+  return selectUpload('files');
+}
 function chooseUploadFolder() { return selectUpload("folder"); }
 
 function previewUsesDialog(entry, preview) {
@@ -790,12 +952,12 @@ function closePreview() {
 }
 
 async function previewEntry(entry) {
-  if (!entry || entry.isDir || busy.value || !canPreview(entry)) return;
+  if (!entry || entry.isDir || busy.value || !canPreview(entry) || fileCapabilities.value?.preview === false) return;
   clearPreview();
   setSelection([entry]);
 
   if (Number(entry.size) > MAX_PREVIEW_BYTES) {
-    peerPreviewPath.value = entry.path;
+    peerPreviewPath.value = entry.id;
     previewLimit.value = {
       code: "PEER_PREVIEW_TOO_LARGE",
       size: Number(entry.size),
@@ -807,20 +969,17 @@ async function previewEntry(entry) {
 
   await run(async () => {
     try {
-      const preview = await app.invoke("preview_peer_file", {
-        peerId: props.peer.id,
-        shareId: activeShareId.value,
-        remotePath: entry.path,
-      });
+        const session = await getFileSession();
+        const preview = await fileInvoke('file_preview', { sessionId: session.sessionId, id: entry.id });
       peerPreview.value = preview;
-      peerPreviewPath.value = entry.path;
+      peerPreviewPath.value = entry.id;
       previewOpen.value = previewUsesDialog(entry, preview);
     } catch (error) {
       if (
         error?.code === "PEER_PREVIEW_TOO_LARGE" ||
         error?.code === "PEER_PREVIEW_TOO_MANY_LINES"
       ) {
-        peerPreviewPath.value = entry.path;
+        peerPreviewPath.value = entry.id;
         previewLimit.value = { code: error.code, ...(error.context ?? {}) };
         previewOpen.value = true;
         return;
@@ -830,25 +989,97 @@ async function previewEntry(entry) {
   });
 }
 
+async function onlinePreviewEntry(entry) {
+  await run(async () => {
+    const session = await getFileSession();
+    await fileInvoke('file_online_preview', { sessionId: session.sessionId, id: entry.id });
+  });
+}
+
 async function editEntry(entry) {
   if (!entry || entry.isDir || busy.value) return;
+  if (peerEdit.value) {
+    setPeerNotice('peer.editAlreadyOpen');
+    return;
+  }
   await run(async () => {
-    peerEdit.value = await app.invoke("prepare_peer_external_edit", {
-      peerId: props.peer.id,
-      shareId: activeShareId.value,
-      remotePath: entry.path,
-    });
-    setPeerNotice("peer.editOpened");
+    const session = await getFileSession();
+    const edit = await fileInvoke('file_prepare_edit', { sessionId: session.sessionId, id: entry.id });
+    peerEdit.value = edit;
+    setPeerNotice('peer.cloudEditOpened');
+  });
+}
+
+function applyDeletion(entry, result) {
+  if (!peerListing.value) return;
+  const deleted = new Set(result?.deleted || []);
+  const failed = result?.failed || [];
+  const removedTarget = failed.length === 0 && deleted.size > 0;
+  peerListing.value = { ...peerListing.value, entries: peerListing.value.entries.filter(item => {
+    if (deleted.has(item.id)) return false;
+    return !(removedTarget && item.id === entry.id);
+  }) };
+}
+
+async function deleteSelected(entries = selectedEntries.value) {
+  if (!entries.length || busy.value || !canDeleteEntries.value || peerListing.value?.protected) return;
+  if (entries.some(entry => entry.id === rootPath.value)) return;
+  const targets = [...new Map(entries.map(entry => [entry.id, entry])).values()];
+  if (targets.some(entry => entry.protected || entry.id === rootPath.value)) return;
+  const token = navigationToken;
+  await run(async () => {
+    const confirmed = await confirmAction(t('peer.deleteSelectedConfirm', { count: targets.length, names: targets.map(entry => entry.name).join('\n') }), t('common.delete'), { danger: true, confirmText: t('common.delete') });
+    if (!confirmed || browserDisposed || token !== navigationToken) return;
+    const session = await getFileSession();
+    let success = 0;
+    const failures = [];
+    for (const entry of targets) {
+      if (browserDisposed || token !== navigationToken) return;
+      try {
+        let result;
+        if (props.adapter) result = await props.adapter.remove(entry, () => !browserDisposed && token === navigationToken, session.sessionId, true);
+        else {
+          const plan = await fileInvoke('file_delete_plan', { sessionId: session.sessionId, id: entry.id });
+          if (browserDisposed || token !== navigationToken) return;
+          result = await fileInvoke('file_delete_execute', { sessionId: session.sessionId, planId: plan.planId, confirmed: true });
+        }
+        if (result === false) return;
+        if (browserDisposed || token !== navigationToken) return;
+        applyDeletion(entry, result);
+        if (result.failed?.length) failures.push(...result.failed.map(item => item.error));
+        else if (result.deleted?.length) success++;
+      } catch (error) { failures.push(normalizeAppError(error)); }
+    }
+    if (browserDisposed || token !== navigationToken) return;
+    if (failures.length) app.setError('cloudBrowser.deletePartial', { deleted: success, failed: failures.length, reason: failures[0]?.message });
+    else app.setNotice('cloudBrowser.deletedObjects', { count: success });
   });
 }
 
 async function deleteEntry(entry) {
-  if (!entry || busy.value || !canDeleteEntries.value) return;
+  if (!entry || entry.protected || peerListing.value?.protected || busy.value || !canDeleteEntries.value) return;
   await run(async () => {
     // 禁止删除共享根目录（相当于 rm -rf /）：其中的条目必须逐个提交删除。
-    if (entry.path === "/") {
-      throw { code: "PEER_DELETE_ROOT_FORBIDDEN", message: t("peer.deleteRootForbidden"), detail: null, context: { path: entry.path } };
+    if (entry.id === rootPath.value) {
+      throw { code: "PEER_DELETE_ROOT_FORBIDDEN", message: t("peer.deleteRootForbidden"), detail: null, context: { path: entry.id } };
     }
+    if (props.adapter) {
+      const token = navigationToken;
+      try {
+        const session = await getFileSession();
+        const result = await props.adapter.remove(entry, () => !browserDisposed && token === navigationToken, session.sessionId);
+        if (result === false || browserDisposed || token !== navigationToken) return;
+        applyDeletion(entry, result);
+        if (result.failed?.length) {
+          if (!result.deleted?.length) throw result.failed[0].error;
+        } else app.setNotice('peer.deleted', { name: entry.name });
+      } catch (error) {
+        if (!browserDisposed && token === navigationToken) operationError.value = normalizeAppError(error);
+        throw error;
+      }
+      return;
+    }
+    const token = navigationToken;
     const confirmed = await confirmAction(
       t(entry.isDir ? "peer.deleteFolderConfirm" : "peer.deleteFileConfirm", {
         name: entry.name,
@@ -856,20 +1087,22 @@ async function deleteEntry(entry) {
       t("common.delete"),
       { danger: true, confirmText: t("common.delete") },
     );
-    if (!confirmed) return;
+    if (!confirmed || browserDisposed || token !== navigationToken) return;
+    const session = await getFileSession();
+    const plan = await fileInvoke('file_delete_plan', { sessionId: session.sessionId, id: entry.id });
+    if (browserDisposed || token !== navigationToken) return;
 
-    if (peerEdit.value?.remotePath === entry.path) {
-      await app.invoke("discard_peer_external_edit", {
+    if (peerEdit.value?.id === entry.id) {
+      await fileInvoke('file_discard_edit', {
         editId: peerEdit.value.editId,
       });
       peerEdit.value = null;
     }
-    await app.invoke("delete_peer_entry", {
-      peerId: props.peer.id,
-      shareId: activeShareId.value,
-      remotePath: entry.path,
-    });
-    await loadPath(peerPath.value);
+    if (browserDisposed || token !== navigationToken) return;
+    const result = await fileInvoke('file_delete_execute', { sessionId: session.sessionId, planId: plan.planId, confirmed: true });
+    if (browserDisposed || token !== navigationToken) return;
+    applyDeletion(entry, result);
+    if (result.failed?.length) throw result.failed[0].error;
     app.setNotice("peer.deleted", { name: entry.name });
   });
 }
@@ -877,39 +1110,8 @@ async function deleteEntry(entry) {
 async function commitPeerEdit() {
   if (!peerEdit.value || busy.value) return;
   await run(async () => {
-    let result;
-    try {
-      result = await app.invoke("commit_peer_external_edit", {
-        editId: peerEdit.value.editId,
-        conflict: "fail",
-      });
-    } catch (error) {
-      const normalized = normalizeAppError(error);
-      if (normalized.code !== "TRANSFER_CONFLICT") throw error;
-      const overwrite = await confirmAction(
-        t("peer.editConflict"),
-        t("peer.uploadChanges"),
-        {
-          confirmText: t("peer.overwrite"),
-          cancelText: t("peer.skip"),
-          danger: true,
-        },
-      );
-      if (!overwrite) {
-        setPeerNotice("peer.editSkipped");
-        return;
-      }
-      result = await app.invoke("commit_peer_external_edit", {
-        editId: peerEdit.value.editId,
-        conflict: "overwrite",
-      });
-    }
-    if (result.transferred) {
-      setPeerNotice("peer.editUploaded", { path: result.remotePath });
-    } else {
-      setPeerNotice("peer.editNoChange");
-    }
-    peerEdit.value = null;
+    const transferred = await fileInvoke('file_commit_edit', { editId: peerEdit.value.editId });
+    setPeerNotice(transferred ? 'peer.editUploaded' : 'peer.editNoChange', { path: peerEdit.value.name });
     await loadPath(peerPath.value);
   });
 }
@@ -917,9 +1119,7 @@ async function commitPeerEdit() {
 async function discardPeerEdit() {
   if (!peerEdit.value || busy.value) return;
   await run(async () => {
-    await app.invoke("discard_peer_external_edit", {
-      editId: peerEdit.value.editId,
-    });
+    await fileInvoke('file_discard_edit', { editId: peerEdit.value.editId });
     peerEdit.value = null;
     setPeerNotice("peer.editDiscarded");
   });
@@ -935,7 +1135,7 @@ function formatSize(entry) {
 }
 
 function formatModified(seconds) {
-  if (!seconds) return "—";
+  if (seconds == null || seconds === '' || typeof seconds === 'boolean' || (typeof seconds === 'string' && !seconds.trim())) return "—";
   try {
     return new Intl.DateTimeFormat(document.documentElement.lang || undefined, {
       dateStyle: "medium",
@@ -946,13 +1146,14 @@ function formatModified(seconds) {
   }
 }
 
+defineExpose({ refresh: refreshListing });
 watch(() => props.peer.id, loadPeer, { immediate: true });
 </script>
 
 <template>
-  <div class="peer-browser">
+  <div class="peer-browser" :class="{ 'peer-browser--embedded': hideSidebar }">
     <div class="browser-body">
-      <aside class="browser-sidebar">
+      <aside v-if="!hideSidebar" class="browser-sidebar">
         <div class="sidebar-identity">
           <strong>{{ peer.label }}</strong>
           <span>{{ peerHost }}</span>
@@ -977,20 +1178,23 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
       </aside>
 
       <main class="browser-main">
+        <OperationErrorDialog v-if="preparationError" :error="preparationError" retryable recheck :busy="preparingFiles" @retry="prepareFiles" @close="preparationError = null" />
+        <OperationErrorDialog :error="operationError" retryable @retry="viewMode === 'columns' ? rebuildColumnStack() : refreshListing()" @close="operationError = null" />
         <div class="pathbar">
+          <BrowserSkeleton v-if="preparationHint" class="pathbar-status" compact />
           <div
             ref="breadcrumbsEl"
             class="breadcrumbs"
             aria-label="Breadcrumb"
             @wheel="scrollBreadcrumbs"
           >
-            <template v-for="(crumb, index) in breadcrumbs" :key="crumb.path">
+            <template v-for="(crumb, index) in breadcrumbs" :key="crumb.id">
               <span v-if="index" class="breadcrumb-sep">›</span>
               <button
                 type="button"
                 class="breadcrumb"
                 :class="{ 'is-current': index === breadcrumbs.length - 1 }"
-                @click="browse(crumb.path)"
+                @click="browse(crumb.id)"
               >
                 {{ crumb.name }}
               </button>
@@ -998,7 +1202,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
           </div>
         </div>
 
-        <Teleport to="#titlebar-file-actions">
+        <Teleport to="#titlebar-file-actions" :disabled="!titlebarTarget">
           <div class="pathbar-actions">
             <div class="view-switch" role="group" :aria-label="t('peer.viewMode')">
               <el-tooltip
@@ -1047,25 +1251,8 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
             </div>
             <span class="titlebar-divider" aria-hidden="true"></span>
             <div class="view-switch" role="group" :aria-label="t('peer.fileActions')">
-              <el-tooltip
-                :content="t('peer.refresh')"
-                placement="bottom"
-                :show-after="200"
-                :hide-after="0"
-                :enterable="false"
-              >
-                <button
-                  type="button"
-                  class="view-switch__button"
-                  :aria-label="t('peer.refresh')"
-                  :disabled="busy || !activeShareId"
-                  @click="refreshListing"
-                >
-                  <svg viewBox="0 0 24 24" aria-hidden="true">
-                    <path d="M20 11a8 8 0 1 0-2.3 5.7" />
-                    <path d="M20 5v6h-6" />
-                  </svg>
-                </button>
+              <el-tooltip v-if="fileCapabilities?.createDir && (adapter || activeShare?.permissions?.canWrite)" :content="t('peer.createFolder')" placement="bottom" :show-after="200" :hide-after="0" :enterable="false">
+                <button type="button" class="view-switch__button" data-test="create-directory" :aria-label="t('peer.createFolder')" :disabled="(adapter && !filesPrepared) || busy || peerListing?.protected || uploadRunning" @click="createDirectory"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5c0-.8.7-1.5 1.5-1.5h4l1.8 2H19c.8 0 1.5.7 1.5 1.5v8c0 .8-.7 1.5-1.5 1.5H5c-.8 0-1.5-.7-1.5-1.5z" /><path d="M12 11v6M9 14h6" /></svg></button>
               </el-tooltip>
               <el-tooltip
                 :content="t('peer.uploadFiles')"
@@ -1078,6 +1265,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                   type="button"
                   class="view-switch__button"
                   :aria-label="t('peer.uploadFiles')"
+                  data-test="upload"
                   :disabled="!canMutate"
                   @click="chooseUploadFiles"
                 >
@@ -1099,6 +1287,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                   type="button"
                   class="view-switch__button"
                   :aria-label="t('peer.uploadFolder')"
+                  data-test="upload-directory"
                   :disabled="!canMutate"
                   @click="chooseUploadFolder"
                 >
@@ -1108,6 +1297,14 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                   </svg>
                 </button>
               </el-tooltip>
+              <span class="titlebar-divider" aria-hidden="true"></span>
+              <el-tooltip v-if="adapter && fileCapabilities?.delete && !peerListing?.protected" :content="t('cloudBrowser.deletePrefix')" placement="bottom" :show-after="200" :hide-after="0" :enterable="false">
+                <button type="button" class="view-switch__button" data-test="delete-prefix" :aria-label="t('cloudBrowser.deletePrefix')" :disabled="!canDeleteEntries || busy || uploadRunning || peerListing?.protected || peerPath === rootPath || peerListing?.entries.some(entry => entry.protected)" @click="deleteCurrentFolder"><svg v-if="busy" class="action-spinner" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="34 20" /></svg><svg v-else viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V5h6v2M6 7l1 12h10l1-12" /></svg></button>
+              </el-tooltip>
+              <el-tooltip :content="t('peer.refresh')" placement="bottom" :show-after="200" :hide-after="0" :enterable="false">
+                <button type="button" class="view-switch__button" :aria-label="t('peer.refresh')" data-test="refresh" :disabled="busy || !activeShareId" @click="refreshListing"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7" /><path d="M20 5v6h-6" /></svg></button>
+              </el-tooltip>
+              <span class="titlebar-divider" aria-hidden="true"></span>
               <button
                 ref="shortcutsTriggerEl"
                 type="button"
@@ -1156,10 +1353,11 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
           @mousedown="onFileViewMousedown"
         >
           <div v-if="marquee" class="marquee" :style="marqueeStyle"></div>
-          <FileManagerView :entries="peerListing.entries" :mode="viewMode" :selection="selectedEntries"
+          <FileManagerView identity-field="id" column-identity-field="id" :entries="peerListing.entries" :mode="viewMode" :selection="selectedEntries"
             :columns="visibleColumns" :column-loading="loadingColumn !== -1" :append-loading-column="loadingColumn !== -1"
-            :partial="!!peerListing.truncated" time-column="modified" :entry-kind="entryKind" :format-size="formatSize" :format-modified="formatModified"
-            @select="selectEntry" @activate="openEntry" @column-select="(entry, event, column, index) => loadColumn(entry, index)"
+            :empty-label="adapter ? t('cloudBrowser.empty') : ''"
+            :partial="!!peerListing.truncated" :time-column="timeColumn" :time-label="t(timeColumn === 'created' ? 'cloudBrowser.created' : 'peer.modified')" :entry-kind="entryKind" :format-size="formatSize" :format-modified="formatModified"
+            @select="selectEntry" @activate="openEntry" @column-select="(entry, event, column, index) => loadColumn(entry, index, event)"
             @preview="previewEntry" @column-element="columnViewEl = $event" @column-wheel="scrollColumnView">
             <template #gallery-preview>
               <template v-if="galleryFile">
@@ -1212,13 +1410,14 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 <span>{{ t("peer.selectPreviewHint") }}</span>
               </div>
             </template>
+            <template #pagination><el-button v-if="peerListing.next" data-test="more" :disabled="navigating" @click="loadMore">{{ t('cloudBrowser.more') }}</el-button></template>
           </FileManagerView>
         </div>
 
         <!-- 加载中先清空旧内容并给出即时反馈；失败时提示可点击地址栏重试。 -->
         <div v-else class="file-view file-view--placeholder" :aria-busy="navigating">
           <FileManagerView v-if="navigating" :mode="viewMode" loading :entry-kind="entryKind" :format-size="formatSize" />
-          <p v-else class="file-empty">{{ t("peer.loadFailed") }}</p>
+          <div v-else class="file-empty"><p role="alert">{{ listingError?.message || t('peer.loadFailed') }}</p><el-button data-test="retry-load" @click="loadPath(peerPath)">{{ t('peer.refresh') }}</el-button></div>
         </div>
 
         <div
@@ -1253,20 +1452,23 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 v-if="viewMode !== 'columns'"
                 type="primary"
                 :disabled="busy"
-                @click="runSelectionAction(([entry]) => browse(entry.path))"
+                @click="runSelectionAction(([entry]) => browse(entry.id))"
               >
                 {{ t("peer.open") }}
               </el-button>
-              <el-button plain :disabled="busy" @click="runSelectionAction(([entry]) => downloadDirectory(entry))">
+              <el-button data-test="download" plain :disabled="busy || fileCapabilities?.download === false || fileCapabilities?.downloadDirectory === false" @click="runSelectionAction(([entry]) => downloadDirectory(entry))">
                 {{ t("peer.download") }}
               </el-button>
             </template>
             <template v-else-if="selectedEntries.length === 1">
-              <el-button plain :disabled="busy" @click="runSelectionAction(([entry]) => downloadEntry(entry))">
+              <el-button v-if="canPreview(selectedEntry) && fileCapabilities?.preview !== false" data-test="preview" plain :disabled="busy" @click="runSelectionAction(([entry]) => previewEntry(entry))">{{ t('peer.preview') }}</el-button>
+              <el-button v-if="fileCapabilities?.onlinePreview && selectedEntry.onlinePreview" data-test="online-preview" plain :disabled="busy" @click="runSelectionAction(([entry]) => onlinePreviewEntry(entry))">{{ t('peer.onlinePreview') }}</el-button>
+              <el-button data-test="download" plain :disabled="busy || fileCapabilities?.download === false" @click="runSelectionAction(([entry]) => downloadEntry(entry))">
                 {{ t("peer.download") }}
               </el-button>
               <el-button
-                v-if="isReadableText(selectedEntry)"
+                v-if="!selectedEntry.protected && !peerListing?.protected && (fileCapabilities?.externalEdit ?? !adapter) && (isReadableText(selectedEntry) || /\.(docx?|xlsx?|pptx?|odt|ods|odp|rtf|pages|numbers|key)$/i.test(selectedEntry.name))"
+                data-test="edit"
                 plain
                 :disabled="busy"
                 @click="runSelectionAction(([entry]) => editEntry(entry))"
@@ -1274,15 +1476,16 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 {{ t("peer.edit") }}
               </el-button>
             </template>
-            <el-button v-else type="primary" plain :disabled="busy" @click="runSelectionAction(downloadSelected)">
+            <el-button v-else data-test="download" type="primary" plain :disabled="busy || fileCapabilities?.download === false || (selectedEntries.some(entry => entry.isDir) && fileCapabilities?.downloadDirectory === false)" @click="runSelectionAction(downloadSelected)">
               {{ t("peer.download") }}
             </el-button>
             <el-button
-              v-if="canDeleteEntries && selectedEntries.length === 1"
+              v-if="canDeleteEntries && selectedEntries.every(entry => !entry.protected && entry.id !== rootPath) && !peerListing?.protected"
+              data-test="delete-file"
               type="danger"
               plain
               :disabled="busy"
-              @click="runSelectionAction(([entry]) => deleteEntry(entry))"
+              @click="runSelectionAction(entries => entries.length === 1 ? deleteEntry(entries[0]) : deleteSelected(entries))"
             >
               {{ t("common.delete") }}
             </el-button>
@@ -1291,7 +1494,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
         <section v-if="peerEdit" class="edit-panel">
           <div>
-            <strong>{{ t("peer.externalEdit", { path: peerEdit.remotePath }) }}</strong>
+            <strong>{{ t("peer.externalEdit", { path: peerEdit.name }) }}</strong>
             <p class="hint mono">{{ peerEdit.localPath }}</p>
           </div>
           <div class="actions">
@@ -1333,6 +1536,12 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 </template>
 
 <style scoped>
+.action-spinner { transform-box: view-box; transform-origin: 50% 50%; animation: file-spin 0.9s linear infinite; }
+@keyframes file-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .action-spinner { animation: none; } }
+.peer-browser--embedded { flex: 1; min-height: 0; }
+.peer-browser--embedded > .browser-body { grid-template-columns: minmax(0, 1fr); }
+.peer-browser--embedded .browser-main { padding: 0; }
 .peer-browser {
   position: relative;
   flex: 1;

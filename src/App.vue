@@ -22,7 +22,7 @@ import { APP_CONTEXT } from "./lib/appContext";
 import AppRail from "./components/AppRail.vue";
 import AuthView from "./components/AuthView.vue";
 import HomeView from "./components/HomeView.vue";
-import PeerBrowser from "./components/PeerBrowser.vue";
+import PeerBrowser from "./components/FileBrowser.vue";
 import CloudBrowser from "./components/CloudBrowser.vue";
 import SettingsView from "./components/SettingsView.vue";
 import TitleBarMenu from "./components/TitleBarMenu.vue";
@@ -102,7 +102,7 @@ async function refreshClouds() {
   try {
     const catalog = await cloud.list();
     if (appDisposed || version !== cloudRefreshVersion || !loggedIn.value || interfaceLocked.value) return;
-    clouds.value = catalog.connections || [];
+    clouds.value = [...(catalog.connections || []), ...(catalog.officialConnections || [])];
     if (workspaceView.value === "cloud" && !clouds.value.some((drive) => String(drive.id) === activeCloudConnectionId.value)) openHome();
   } catch (error) { if (!appDisposed && version === cloudRefreshVersion) handleFailure(error); }
 }

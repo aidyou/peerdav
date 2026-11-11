@@ -7,6 +7,12 @@ import { localizeMessage, t } from "./i18n.js";
  * never on the localized `message` text.
  */
 const ERROR_STRATEGIES = Object.freeze({
+  FILE_TARGET_AMBIGUOUS: "show",
+  FILE_SESSION_INVALID: "show",
+  FILE_CAPABILITY_UNAVAILABLE: "show",
+  FILE_LIST_LIMIT: "show",
+  CLOUD_OAUTH_FAILED: "show",
+  CLOUD_OFFICIAL_API: "show",
   UPDATE_NOT_CONFIGURED: "show",
   UPDATE_NOT_READY: "show",
   UPDATE_BUSY: "show",
@@ -85,8 +91,10 @@ const ERROR_STRATEGIES = Object.freeze({
   CLOUD_DISCOVERY_INCOMPLETE: "retry",
   CLOUD_DELETE_PLAN_STALE: "retry",
   CLOUD_DELETE_ROOT_FORBIDDEN: "show",
+  CLOUD_SYNC_BUSY: "show",
   CLOUD_CONFIRMATION_REQUIRED: "show",
   CLOUD_CANCELLED: "ignore",
+  PEER_DIRECTORY_CURSOR_RESET: "refresh",
   CLOUD_DIRECTORY_CURSOR_RESET: "refresh",
   CLOUD_PRECONDITION: "show",
   CLOUD_UPLOAD_PENDING_RECOVERY: "support",

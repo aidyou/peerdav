@@ -124,7 +124,10 @@ describe('mounted transfer dialogs', () => {
     const w = render(UploadBatchDialog, { ...rest, summary: { ...base, phase: 'uploading' } });
     await nextTick();
     expect(document.querySelector('.upload-dir__path').textContent).toContain('docs/a/very/long/path');
-    expect(document.querySelector('.upload-dir__state.is-active .upload-dir__spinner')).not.toBeNull();
+    const spinner = document.querySelector('.upload-dir__state.is-active .upload-dir__spinner');
+    expect(spinner).not.toBeNull();
+    expect(spinner.tagName.toLowerCase()).toBe('span');
+    expect(spinner.querySelector('svg circle')).not.toBeNull();
     await w.setProps({ summary: { ...base, phase: 'completed' } });
     expect(document.querySelector('.upload-dir__state.is-done svg')).not.toBeNull();
     await w.setProps({ summary: { ...base, phase: 'failed' } });

@@ -114,6 +114,13 @@ impl PhysicalRoot {
         }
         Ok(Self { dir, path })
     }
+    pub(crate) fn ensure_download_directory(&self, relative: &str) -> Result<(), ObjectServiceError> {
+        valid_relative_path(relative)?;
+        let parts: Vec<_> = relative.split('/').collect();
+        open_download_parent(self, &parts)?;
+        Ok(())
+    }
+
     pub(crate) fn relative_target_identity(
         &self,
         relative: &str,
@@ -776,6 +783,22 @@ impl ObjectService {
     fn target_identity(&self, key: &str) -> ProtectedIdentity {
         self.identity_with_prefix(key)
     }
+    pub(crate) async fn replace_edit(&self, key: &str, bytes: Vec<u8>, revision: &str) -> Result<ObjectMetadata, ObjectServiceError> {
+        valid_key(key)?;
+        let _lease = self.guard.begin_mutation(&self.target_identity(key))?;
+        if revision.is_empty() { return Err(ObjectServiceError::Cloud(CloudError::Precondition)); }
+        Ok(self.store.replace_edit(key, bytes_stream(Bytes::from(bytes)), revision).await?)
+    }
+
+    pub async fn create_directory(&self, prefix: &str) -> Result<(), ObjectServiceError> {
+        valid_prefix(prefix)?;
+        if prefix.trim_end_matches('/').is_empty() { return Err(ObjectServiceError::InvalidKey); }
+        let key = format!("{}/", prefix.trim_end_matches('/'));
+        let _lease = self.guard.begin_mutation(&self.target_identity(&key))?;
+        self.store.put(&key, bytes_stream(Bytes::new()), PutCondition::CreateOnly).await?;
+        Ok(())
+    }
+
     pub(crate) fn preflight_upload(&self, key: &str) -> Result<(), ObjectServiceError> {
         valid_key(key)?;
         let _lease = self.guard.begin_mutation(&self.target_identity(key))?;
@@ -1123,6 +1146,7 @@ fn within_prefix(prefix: &str, key: &str) -> bool {
             .is_some_and(|rest| prefix.ends_with('/') || rest.starts_with('/'))
 }
 fn valid_key(key: &str) -> Result<(), ObjectServiceError> {
+    let key = key.strip_suffix('/').unwrap_or(key);
     if key.is_empty()
         || key.contains(['\\', '\0', ':'])
         || key

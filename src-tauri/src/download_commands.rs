@@ -22,6 +22,7 @@ pub async fn transfer_select_download(
             share: share_id.clone(),
             scope: peers.download_scope(peer_id)?,
         }),
+        DownloadBackend::Official { .. } => return Err(crate::file_manager::service::invalid()),
         DownloadBackend::S3 { connection_id } => {
             let session = cloud.0.object_session(connection_id).await?;
             Arc::new(S3DownloadAdapter {
@@ -31,8 +32,19 @@ pub async fn transfer_select_download(
             })
         }
     };
+    select_download_with_adapter(app, queues.inner(), &cloud.0.vault, backend, selection, adapter).await
+}
+
+pub(crate) async fn select_download_with_adapter(
+    app: tauri::AppHandle,
+    queues: &SharedDownloads,
+    vault: &Arc<crate::Vault>,
+    backend: DownloadBackend,
+    selection: DownloadSelection,
+    adapter: Arc<dyn TransferQueueAdapter>,
+) -> Result<DownloadStatus, AppError> {
     adapter.validate().await?;
-    let vault = Arc::clone(&cloud.0.vault);
+    let vault = Arc::clone(vault);
     let selected = tokio::task::spawn_blocking(move || {
         let path = crate::picker_prefs::dialog(&app, crate::types::PickerDirection::Download)
             .blocking_pick_folder()

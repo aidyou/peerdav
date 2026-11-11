@@ -19,8 +19,14 @@ export function toSaveMappingInput(value = {}) {
 }
 
 export const cloud = Object.freeze({
+  protocols: () => invoke("cloud_protocols"),
+  beginOfficialAuthorization: ({ provider, clientId, redirectUri }) => invoke("cloud_official_authorize", { provider, clientId, redirectUri }),
+  beginLoopbackAuthorization: ({ provider, clientId, redirectUri }) => invoke("cloud_official_begin_loopback", { provider, clientId, redirectUri }),
+  waitLoopbackAuthorization: ({ requestId, name, clientSecret = null, rootId }) => invoke("cloud_official_wait_loopback", { requestId, name, clientSecret, rootId }),
+  cancelOfficialAuthorization: (requestId) => invoke("cloud_official_cancel_authorization", { requestId }),
+  completeOfficialAuthorization: ({ requestId, callback, name, clientSecret = null, rootId }) => invoke("cloud_official_complete_authorization", { requestId, callback, name, clientSecret, rootId }),
   list: () => invoke("cloud_list"),
-  probeBuckets: ({ endpoint, region = "", accessKey, secretKey, sessionToken = null, allowInsecureHttp = false, proxy = { mode: "direct" } }) => invoke("cloud_probe_buckets", { input: { endpoint, region, accessKey, secretKey, sessionToken, allowInsecureHttp, proxy } }),
+  probeBuckets: ({ endpoint, region = "", accessKey, secretKey, sessionToken = null, allowInsecureHttp = false, proxy = { mode: "client" } }) => invoke("cloud_probe_buckets", { input: { endpoint, region, accessKey, secretKey, sessionToken, allowInsecureHttp, proxy } }),
   connectionCredentials: (connectionId) => invoke("cloud_connection_credentials", { connectionId }),
   saveConnection: (input) => invoke("cloud_save_connection", { input: toSaveS3Input(input) }),
   testConnection: (connectionId) => invoke("cloud_test_connection", { connectionId }),
@@ -33,10 +39,13 @@ export const cloud = Object.freeze({
   appendCreate: ({ connectionId, mode, password, passwordConfirmation }) => invoke("cloud_append_create", { input: { connectionId, mode, password, passwordConfirmation } }),
   appendJoin: ({ connectionId, bucket, anchorKey, anchorFingerprint, repositoryId, mode, acceptTofu, trustedFingerprint, password }) => invoke("cloud_append_join", { input: { connectionId, ...(bucket ? { bucket } : {}), anchorKey, anchorFingerprint, repositoryId, mode, acceptTofu: acceptTofu === true, trustedFingerprint: trustedFingerprint || null, password } }),
   appendSaveMapping: (mappingId, mapping, selectedRoot) => invoke("cloud_append_save_mapping", { input: { mappingId: mappingId || null, mapping: toSaveMappingInput(mapping), selectedRoot } }),
+  prepareMappingBind: (mapping, selectedRoot) => invoke("cloud_prepare_mapping_bind", { input: { mappingId: null, mapping: toSaveMappingInput(mapping), selectedRoot } }),
+  confirmMappingBind: (planId) => invoke("cloud_confirm_mapping_bind", { planId, confirmed: true }),
+  cancelMappingBind: (planId) => invoke("cloud_cancel_mapping_bind", { planId }),
   deleteMapping: (mappingId) => invoke("cloud_delete_mapping", { mappingId }),
   localEntries: (mappingId) => invoke("cloud_local_entries", { mappingId }),
   localStatus: (mappingId) => invoke("cloud_local_status", { mappingId }),
-  preview: (mappingId) => invoke("cloud_preview", { mappingId }),
+  preview: (mappingId, selection) => invoke("cloud_preview", { mappingId, ...(selection?.length ? { selection } : {}) }),
   sync: (mappingId, previewId) => invoke("cloud_sync", { mappingId, previewId }),
   cancel: (mappingId) => invoke("cloud_cancel", { mappingId }),
   recoveryRecords: (mappingId) => invoke("cloud_recovery_records", { mappingId }),
@@ -92,7 +101,7 @@ export function objectChildren(objects, prefix) {
 }
 
 export function blankConnection() {
-  return { id: "", name: "", endpoint: "", bucket: "", buckets: [], region: "", prefix: "", pathStyle: false, accessKey: "", secretKey: "", sessionToken: "", allowInsecureHttp: false, proxy: { mode: "direct" }, schedule: { enabled: false, interval: 900 }, encrypted: true, clearCredentials: false, clearSessionToken: false, clearProxyAuth: false };
+  return { id: "", name: "", endpoint: "", bucket: "", buckets: [], region: "", prefix: "", pathStyle: false, accessKey: "", secretKey: "", sessionToken: "", allowInsecureHttp: false, proxy: { mode: "client" }, schedule: { enabled: false, interval: 900 }, encrypted: true, clearCredentials: false, clearSessionToken: false, clearProxyAuth: false };
 }
 
 export function blankMapping() {
