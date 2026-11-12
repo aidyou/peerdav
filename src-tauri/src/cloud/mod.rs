@@ -34,6 +34,7 @@ pub mod official_runtime;
 // adapter file remains on disk and is excluded by `official_drives/mod.rs`.
 mod official_drives;
 mod google_store;
+mod official_store;
 mod proxy;
 pub mod service;
 mod local_files;

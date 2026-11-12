@@ -6,6 +6,39 @@ pub(crate) fn oauth_error(error: OAuthError) -> AppError {
     AppError::from(DomainError::Cloud { code: "CLOUD_OAUTH_FAILED", user_reason: "网盘授权失败 / Drive authorization failed", source: Box::new(error) })
 }
 
+pub(crate) fn official_endpoint(provider: OfficialProvider) -> &'static str {
+    match provider {
+        OfficialProvider::GoogleDrive => "https://www.googleapis.com/drive/v3",
+        OfficialProvider::OneDrive => "https://graph.microsoft.com/v1.0",
+        OfficialProvider::BaiduNetdisk => "https://pan.baidu.com/rest/2.0/xpan",
+        OfficialProvider::Dropbox => "https://api.dropboxapi.com/2",
+        OfficialProvider::YandexDisk => "https://cloud-api.yandex.net/v1",
+    }
+}
+
+impl CloudRuntime {
+    /// Object-store view used by append repositories and mirror sync. Google
+    /// keeps its dedicated adapter; the other official providers share the
+    /// file-API adapter.
+    pub(crate) fn official_store(&self, connection: &str) -> Result<Option<std::sync::Arc<dyn super::traits::ObjectStore>>, AppError> {
+        self.admit()?;
+        let snapshot = self.config.snapshot().map_err(super::runtime::config_error)?;
+        let Some(entry) = snapshot.official_connections.iter().find(|entry| entry.id == connection) else { return Ok(None); };
+        if entry.provider == OfficialProvider::GoogleDrive { return self.google_store(connection); }
+        if entry.provider == OfficialProvider::YandexDisk {
+            return Err(AppError { code: "CLOUD_UNSUPPORTED".into(), message: "此协议的同步尚未实现 / Sync is not implemented for this protocol".into(), detail: None, context: None });
+        }
+        Ok(Some(std::sync::Arc::new(super::official_store::OfficialObjectStore::new(
+            self.weak_self.clone(),
+            entry.id.clone(),
+            entry.revision,
+            entry.root_id.clone(),
+            entry.provider,
+            official_endpoint(entry.provider).into(),
+        ))))
+    }
+}
+
 impl CloudRuntime {
     pub fn begin_official_authorization(&self, provider: OfficialProvider, client_id: String, redirect_uri: String) -> Result<AuthorizationStart, AppError> {
         self.admit()?;
@@ -148,4 +181,35 @@ impl CloudRuntime {
 
 pub(crate) fn api_error(error: super::official_api_types::OfficialApiError) -> AppError {
     AppError::from(DomainError::Cloud { code: "CLOUD_OFFICIAL_API", user_reason: "网盘请求失败 / Drive request failed", source: Box::new(error) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn official_store_exposes_non_google_providers_without_network() {
+        let data = tempfile::tempdir().expect("data");
+        let vault = std::sync::Arc::new(crate::Vault::open(&data.path().join("vault.pd")).expect("vault"));
+        vault.initialize(data.path().to_str().expect("path"), "admin", "password 123").expect("init");
+        let runtime = CloudRuntime::new(vault, std::sync::Arc::new(crate::sync::traits::NoopSyncEvents), data.path().to_owned());
+        runtime.resume().expect("resume");
+        for provider in [OfficialProvider::BaiduNetdisk, OfficialProvider::Dropbox, OfficialProvider::OneDrive] {
+            let connection = runtime.config.save_official_connection(crate::cloud::official_types::OfficialConnection {
+                id: String::new(), name: format!("{provider:?}"), provider,
+                config_version: 1, revision: 0, client_id: "client".into(), client_secret: None,
+                refresh_token: "offline".into(), root_id: "/".into(),
+            }).expect("connection");
+            let store = runtime.official_store(&connection.id).expect("store").expect("official provider");
+            let scope = store.scope().expect("scope");
+            assert_eq!(scope.endpoint, official_endpoint(provider));
+            assert_eq!(scope.bucket, "/");
+        }
+        let yandex = runtime.config.save_official_connection(crate::cloud::official_types::OfficialConnection {
+            id: String::new(), name: "Yandex".into(), provider: OfficialProvider::YandexDisk,
+            config_version: 1, revision: 0, client_id: "client".into(), client_secret: None,
+            refresh_token: "offline".into(), root_id: "disk:/".into(),
+        }).expect("yandex connection");
+        assert!(runtime.official_store(&yandex.id).is_err());
+    }
 }

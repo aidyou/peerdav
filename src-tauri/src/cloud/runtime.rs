@@ -544,7 +544,7 @@ impl CloudRuntime {
         let relative = crate::mirror::normalize_cloud_prefix(prefix).map_err(AppError::from)?;
         let full_prefix = crate::mirror::mirror_root_prefix(&relative);
         self.append_storage(connection_id, bucket)?;
-        let store: Arc<dyn ObjectStore> = if let Some(store) = self.google_store(connection_id)? { store }
+        let store: Arc<dyn ObjectStore> = if let Some(store) = self.official_store(connection_id)? { store }
             else { Arc::new(S3Store::new(self.append_config(connection_id, bucket)?).map_err(cloud_error)?) };
         let page = store.list_page(&full_prefix, next).await.map_err(cloud_error)?;
         Ok(super::object_runtime_types::ObjectPageDto {
@@ -659,10 +659,9 @@ impl CloudRuntime {
         confirmed_plan: Option<String>,
         manual: bool,
     ) -> Result<crate::mirror::MirrorSyncResult, AppError> {
-        let (store, endpoint, bucket): (Arc<dyn ObjectStore>, String, String) = if let Some(store) = self.google_store(&mapping.connection_id)? {
-            let entry = self.config.snapshot().map_err(config_error)?.official_connections.into_iter().find(|entry| entry.id == mapping.connection_id).ok_or_else(|| config_error(ConfigError::NotFound("connection".into())))?;
-            if mapping.bucket.as_ref().is_some_and(|bucket| bucket != &entry.root_id) { return Err(runtime_error("CLOUD_CONFIG_INVALID", "网盘根范围不匹配 / Drive root scope mismatch")); }
-            (store, "https://www.googleapis.com/drive/v3".into(), entry.root_id)
+        let (store, endpoint, bucket): (Arc<dyn ObjectStore>, String, String) = if let Some(store) = self.official_store(&mapping.connection_id)? {
+            let storage = self.append_storage(&mapping.connection_id, mapping.bucket.as_deref())?;
+            (store, storage.endpoint, storage.bucket)
         } else {
             let mut connection = self.connection(&mapping.connection_id)?;
             if let Some(bucket) = &mapping.bucket {

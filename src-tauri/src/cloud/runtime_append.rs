@@ -65,18 +65,18 @@ impl CloudRuntime {
     pub(super) fn append_storage(&self, connection: &str, bucket: Option<&str>) -> Result<AppendStorage, AppError> {
         if let Some(entry) = self.config.snapshot().map_err(config_error)?.official_connections.into_iter().find(|entry| entry.id == connection) {
             if bucket.is_some_and(|bucket| bucket != entry.root_id) { return Err(runtime_error("CLOUD_CONFIG_INVALID", "网盘根范围不匹配 / Drive root scope mismatch")); }
-            return Ok(AppendStorage { endpoint: "https://www.googleapis.com/drive/v3".into(), bucket: entry.root_id, prefix: String::new() });
+            return Ok(AppendStorage { endpoint: super::super::official_runtime::official_endpoint(entry.provider).into(), bucket: entry.root_id, prefix: String::new() });
         }
         let config = self.append_config(connection, bucket)?;
         Ok(AppendStorage { endpoint: config.endpoint, bucket: config.bucket, prefix: config.prefix })
     }
 
     fn append_store(&self, connection: &str) -> Result<Arc<dyn ObjectStore>, AppError> {
-        if let Some(store) = self.google_store(connection)? { return Ok(store); }
+        if let Some(store) = self.official_store(connection)? { return Ok(store); }
         Ok(Arc::new(S3Store::new(self.append_config(connection, None)?).map_err(cloud_error)?))
     }
     fn bound_append_store(&self, cached: &CachedAppendRepository) -> Result<Arc<dyn ObjectStore>, AppError> {
-        if let Some(store) = self.google_store(&cached.connection_id)? {
+        if let Some(store) = self.official_store(&cached.connection_id)? {
             let binding = self.append_storage(&cached.connection_id, None)?;
             if cached.binding.storage.as_ref() != Some(&binding) { return Err(runtime_error("CLOUD_PREVIEW_STALE", "同步盘存储范围已变化 / Sync storage scope changed")); }
             return Ok(store);
@@ -96,7 +96,7 @@ impl CloudRuntime {
         let _permit = self.network.read().await;
         self.admit()?;
         self.append_storage(connection, bucket)?;
-        let store: Arc<dyn ObjectStore> = if let Some(store) = self.google_store(connection)? { store }
+        let store: Arc<dyn ObjectStore> = if let Some(store) = self.official_store(connection)? { store }
             else { Arc::new(S3Store::new(self.append_config(connection, bucket)?).map_err(cloud_error)?) };
         AppendRepository::discover_anchors(store.as_ref()).await.map_err(append_error)
     }
@@ -178,7 +178,7 @@ impl CloudRuntime {
                 .map_err(append_error)?;
         selected.source = TrustSource::AcceptedTofu;
         let storage = Some(self.append_storage(&input.connection_id, input.bucket.as_deref())?);
-        let store: Arc<dyn ObjectStore> = if let Some(store) = self.google_store(&input.connection_id)? { store }
+        let store: Arc<dyn ObjectStore> = if let Some(store) = self.official_store(&input.connection_id)? { store }
             else { Arc::new(S3Store::new(self.append_config(&input.connection_id, input.bucket.as_deref())?).map_err(cloud_error)?) };
         store
             .put(
@@ -235,7 +235,7 @@ impl CloudRuntime {
             source,
         };
         let storage = Some(self.append_storage(&input.connection_id, input.bucket.as_deref())?);
-        let store: Arc<dyn ObjectStore> = if let Some(store) = self.google_store(&input.connection_id)? { store }
+        let store: Arc<dyn ObjectStore> = if let Some(store) = self.official_store(&input.connection_id)? { store }
             else { Arc::new(S3Store::new(self.append_config(&input.connection_id, input.bucket.as_deref())?).map_err(cloud_error)?) };
         AppendRepository::open_selected(store.clone(), selected.clone(), password.as_bytes())
             .await

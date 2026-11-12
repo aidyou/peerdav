@@ -82,10 +82,36 @@ impl OfficialConnection {
 
     pub fn redacted(&self) -> OfficialConnectionRedacted {
         OfficialConnectionRedacted {
-            browser_capabilities: super::protocol_types::ConnectionBrowserCapabilities { select_root: false, sync_drives: self.provider == OfficialProvider::GoogleDrive },
+            browser_capabilities: super::protocol_types::ConnectionBrowserCapabilities { select_root: false, sync_drives: self.provider != OfficialProvider::YandexDisk },
             id: self.id.clone(), name: self.name.clone(), protocol_id: self.provider,
             config_version: self.config_version, revision: self.revision,
             root_id: self.root_id.clone(), has_credentials: !self.refresh_token.is_empty(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connection(provider: OfficialProvider) -> OfficialConnection {
+        OfficialConnection {
+            id: "id".into(), name: "drive".into(), provider,
+            config_version: 1, revision: 1, client_id: "client".into(), client_secret: None,
+            refresh_token: "refresh".into(),
+            root_id: match provider {
+                OfficialProvider::BaiduNetdisk | OfficialProvider::Dropbox => "/".into(),
+                OfficialProvider::YandexDisk => "disk:/".into(),
+                _ => "root".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn sync_capabilities_follow_the_wired_object_store_adapters() {
+        for provider in [OfficialProvider::GoogleDrive, OfficialProvider::OneDrive, OfficialProvider::BaiduNetdisk, OfficialProvider::Dropbox] {
+            assert!(connection(provider).redacted().browser_capabilities.sync_drives, "{provider:?}");
+        }
+        assert!(!connection(OfficialProvider::YandexDisk).redacted().browser_capabilities.sync_drives);
     }
 }

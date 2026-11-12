@@ -33,7 +33,7 @@ pub fn descriptors() -> Vec<ProtocolDescriptor> {
         // 百度 OAuth 的 client_id 是应用控制台的 AppKey（API Key），不是 AppID。
         let baidu = id == "baidu_netdisk";
         descriptors.push(ProtocolDescriptor {
-            id, name, config_version: 1, auth: "oauth2", browse_only: id != "google_drive",
+            id, name, config_version: 1, auth: "oauth2", browse_only: false,
             fields: vec![
                 field("clientId", "string",
                     if baidu { "AppKey（API Key，不是 AppID）" } else { "应用客户端 ID" },
@@ -61,7 +61,7 @@ mod tests {
         let mut ids = std::collections::HashSet::new();
         for descriptor in &descriptors {
             assert!(ids.insert(descriptor.id));
-            assert_eq!(descriptor.browse_only, descriptor.auth == "oauth2" && descriptor.id != "google_drive");
+            assert!(!descriptor.browse_only);
             let mut keys = std::collections::HashSet::new();
             for field in &descriptor.fields {
                 assert!(keys.insert(field.key));

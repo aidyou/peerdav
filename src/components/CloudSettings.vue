@@ -22,8 +22,8 @@ const probing = ref(false);
 const buckets = ref([]);
 const officialOpen = ref(false);
 const protocolDescriptors = ref([]);
-// OneDrive 暂时从「连接网盘」下拉隐藏：其开发者应用注册在多数环境被拦截。恢复时清空此列表即可（后端协议仍保留）。
-const hiddenOfficialProtocolIds = ['one_drive'];
+// 官方网盘全部开放；OneDrive 已补齐上传与同步能力。
+const hiddenOfficialProtocolIds = [];
 const officialDescriptors = computed(() => protocolDescriptors.value.filter(item => item.auth === 'oauth2' && !hiddenOfficialProtocolIds.includes(item.id)));
 const officialFields = computed(() => officialDescriptors.value.find(item => item.id === official.value.provider)?.fields || []);
 async function openOfficial() {

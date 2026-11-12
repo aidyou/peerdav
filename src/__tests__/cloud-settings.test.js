@@ -113,23 +113,14 @@ describe("CloudSettings", () => {
     expect(nameValue()).toBe('百度网盘');
     wrapper.unmount();
   });
-  it("keeps OneDrive out of the official protocol selector", async () => {
-    // 唯一 oauth2 协议为 OneDrive：被暂时隐藏后没有可用协议，授权对话框不应打开。
+  it("opens OneDrive in the official protocol selector", async () => {
     cloud.protocols.mockResolvedValue([{ id: 'one_drive', name: 'OneDrive', auth: 'oauth2', fields: [{ key: 'clientId', labelZh: '应用客户端 ID' }] }]);
     const wrapper = await mountCloud();
     await wrapper.find('.official-add').trigger('click'); await flushPromises();
-    expect(wrapper.findAll('form').some(f => f.text().includes('应用客户端 ID'))).toBe(false);
-    // 存在其它 oauth2 协议时对话框正常打开，默认按 Google Drive 填充名称。
-    cloud.protocols.mockResolvedValue([
-      { id: 'google_drive', name: 'Google Drive', auth: 'oauth2', fields: [{ key: 'clientId', labelZh: '应用客户端 ID' }] },
-      { id: 'one_drive', name: 'OneDrive', auth: 'oauth2', fields: [] },
-    ]);
-    const withGoogle = await mountCloud();
-    await withGoogle.find('.official-add').trigger('click'); await flushPromises();
-    const form = withGoogle.findAll('form').find(f => f.text().includes('应用客户端 ID'));
+    const form = wrapper.findAll('form').find(f => f.text().includes('应用客户端 ID'));
     expect(form).toBeTruthy();
-    expect(form.findAll('label').find(l => l.text() === '名称').find('input').element.value).toBe('Google Drive');
-    wrapper.unmount(); withGoogle.unmount();
+    expect(form.findAll('label').find(l => l.text() === '名称').find('input').element.value).toBe('OneDrive');
+    wrapper.unmount();
   });
   it("prefills the connection name from the chosen provider and keeps it on edit or custom", async () => {
     const wrapper = await mountCloud(); await wrapper.find('.connection-add').trigger('click');
