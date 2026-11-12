@@ -16,6 +16,10 @@ impl OfficialApi {
 
     pub(crate) fn item_url(&self, id: &str) -> Result<url::Url, OfficialApiError> {
         if id.is_empty() || id.len() > 4096 || matches!(id, "." | "..") || id.contains(['/', '\\', '\0']) { return Err(OfficialApiError::InvalidInput); }
+        // Graph addresses the drive root as `/me/drive/root`, not as an item id.
+        if self.provider == OfficialProvider::OneDrive && id == "root" {
+            return url::Url::parse("https://graph.microsoft.com/v1.0/me/drive/root").map_err(|_| OfficialApiError::InvalidInput);
+        }
         let base = match self.provider {
             OfficialProvider::GoogleDrive => "https://www.googleapis.com/drive/v3/files/",
             OfficialProvider::OneDrive => "https://graph.microsoft.com/v1.0/me/drive/items/",
@@ -708,6 +712,8 @@ mod tests {
         assert_eq!(created.path(), "/v1.0/me/drive/items/parent:/a%20b%20%E6%96%87.txt:/content");
         let replaced = api.onedrive_upload_url("item", None).expect("replace url");
         assert_eq!(replaced.path(), "/v1.0/me/drive/items/item/content");
+        assert_eq!(api.item_url("root").expect("root url").path(), "/v1.0/me/drive/root");
+        assert_eq!(api.onedrive_upload_url("root", Some("a.txt")).expect("root upload").path(), "/v1.0/me/drive/root:/a.txt:/content");
         for name in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
             assert!(api.onedrive_upload_url("parent", Some(name)).is_err(), "{name:?}");
         }
