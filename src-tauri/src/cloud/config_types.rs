@@ -235,6 +235,32 @@ pub struct CloudConfigSnapshot {
 pub fn client_proxy() -> ProxyMode { ProxyMode::Client }
 pub fn system_proxy() -> ProxyMode { ProxyMode::Environment }
 
+impl Zeroize for CloudConfigSnapshot {
+    fn zeroize(&mut self) {
+        fn clear_proxy(proxy: &mut ProxyMode) {
+            if let ProxyMode::Custom { url, username, password } = proxy {
+                url.zeroize();
+                username.zeroize();
+                password.zeroize();
+            }
+        }
+        clear_proxy(&mut self.client_proxy);
+        for connection in &mut self.connections {
+            connection.config.access_key.zeroize();
+            connection.config.secret_key.zeroize();
+            connection.config.session_token.zeroize();
+            clear_proxy(&mut connection.config.proxy);
+        }
+        for connection in &mut self.official_connections {
+            connection.client_secret.zeroize();
+            connection.refresh_token.zeroize();
+        }
+        // Repository types zeroize passwords/master keys in their Drop impls.
+        self.repositories.clear();
+        self.append_repositories.clear();
+    }
+}
+
 impl Default for CloudConfigSnapshot {
     fn default() -> Self {
         Self {

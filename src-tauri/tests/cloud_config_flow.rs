@@ -51,6 +51,56 @@ fn legacy_mapping() -> serde_json::Value {
 }
 
 #[test]
+fn settings_snapshot_cloud_is_shared_and_respects_lock_reset_and_failed_saves() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("vault.pd");
+    let vault = Arc::new(Vault::open(&path).expect("open"));
+    let initialized = vault.initialize(dir.path().to_str().expect("path"), "admin", "password 123").expect("init");
+    let first = CloudConfigStore::new(vault.clone());
+    let second = CloudConfigStore::new(vault.clone());
+    first.save_client_proxy(ProxyMode::Direct).expect("save");
+    assert_eq!(second.snapshot().expect("shared").client_proxy, ProxyMode::Direct);
+    let db = rusqlite::Connection::open(&path).expect("db");
+    db.execute_batch("CREATE TRIGGER reject_cloud BEFORE INSERT ON secrets BEGIN SELECT RAISE(FAIL, 'read only'); END;").expect("trigger");
+    assert!(first.save_client_proxy(ProxyMode::Environment).is_err());
+    assert_eq!(second.snapshot().expect("unchanged").client_proxy, ProxyMode::Direct);
+    db.execute_batch("DROP TRIGGER reject_cloud; UPDATE secrets SET ciphertext = X'00' WHERE name = 'cloud.peerdav-s3.config';").expect("corrupt disk only");
+    assert_eq!(first.snapshot().expect("cached").client_proxy, ProxyMode::Direct);
+    vault.lock().expect("lock");
+    assert!(first.snapshot().is_err());
+    vault.reload_key(None).expect("unlock");
+    assert!(second.snapshot().is_err(), "unlock must not resurrect stale cache");
+    vault.lock().expect("lock before reset");
+    vault.reset_lost_key(&initialized.recovery_code, dir.path().to_str().expect("path"), "admin", "password 123").expect("reset");
+    assert_eq!(first.snapshot().expect("reset cache").client_proxy, ProxyMode::Environment);
+    first.save_client_proxy(ProxyMode::Direct).expect("save after reset");
+    drop(first);
+    drop(second);
+    drop(vault);
+    let reopened = Arc::new(Vault::open(&path).expect("restart"));
+    assert_eq!(CloudConfigStore::new(reopened).snapshot().expect("persisted").client_proxy, ProxyMode::Direct);
+}
+
+#[test]
+fn settings_snapshot_cloud_concurrent_handles_preserve_all_updates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vault = Arc::new(Vault::open(&dir.path().join("vault.pd")).expect("open"));
+    vault.initialize(dir.path().to_str().expect("path"), "admin", "password 123").expect("init");
+    std::thread::scope(|scope| {
+        for index in 0..8 {
+            let vault = vault.clone();
+            scope.spawn(move || {
+                let store = CloudConfigStore::new(vault);
+                let mut value = input();
+                value.name = format!("connection-{index}");
+                store.save_connection(value).expect("concurrent update");
+            });
+        }
+    });
+    assert_eq!(CloudConfigStore::new(vault).snapshot().expect("all updates").connections.len(), 8);
+}
+
+#[test]
 fn mirror_and_repository_mappings_cannot_share_local_trees() {
     let (dir, store) = store();
     let connection = store.save_connection(input()).unwrap();

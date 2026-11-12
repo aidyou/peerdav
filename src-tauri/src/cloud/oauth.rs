@@ -15,6 +15,8 @@ impl OfficialProvider {
             Self::GoogleDrive => "https://accounts.google.com/o/oauth2/v2/auth",
             Self::OneDrive => "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
             Self::BaiduNetdisk => "https://openapi.baidu.com/oauth/2.0/authorize",
+            Self::Dropbox => "https://www.dropbox.com/oauth2/authorize",
+            Self::YandexDisk => "https://oauth.yandex.com/authorize",
         }
     }
     pub fn token_endpoint(self) -> &'static str {
@@ -22,13 +24,29 @@ impl OfficialProvider {
             Self::GoogleDrive => "https://oauth2.googleapis.com/token",
             Self::OneDrive => "https://login.microsoftonline.com/common/oauth2/v2.0/token",
             Self::BaiduNetdisk => "https://openapi.baidu.com/oauth/2.0/token",
+            Self::Dropbox => "https://api.dropboxapi.com/oauth2/token",
+            Self::YandexDisk => "https://oauth.yandex.com/token",
         }
     }
-    fn scope(self) -> &'static str {
+    /// Providers with an authorization-code flow that accepts PKCE
+    /// (`code_challenge`/`code_verifier`), so a desktop client holds no secret.
+    pub fn supports_pkce(self) -> bool {
+        matches!(self, Self::GoogleDrive | Self::OneDrive | Self::Dropbox | Self::YandexDisk)
+    }
+    /// Dropbox only issues a refresh token when the authorization request asks
+    /// for offline access.
+    fn requests_offline_access(self) -> bool {
+        self == Self::Dropbox
+    }
+    /// `None` means the provider takes permissions from the registered app and
+    /// must not receive an explicit scope parameter (Yandex ID).
+    fn scope(self) -> Option<&'static str> {
         match self {
-            Self::GoogleDrive => "https://www.googleapis.com/auth/drive",
-            Self::OneDrive => "offline_access Files.ReadWrite",
-            Self::BaiduNetdisk => "basic netdisk",
+            Self::GoogleDrive => Some("https://www.googleapis.com/auth/drive"),
+            Self::OneDrive => Some("offline_access Files.ReadWrite"),
+            Self::BaiduNetdisk => Some("basic netdisk"),
+            Self::Dropbox => Some("files.metadata.read files.metadata.write files.content.read files.content.write"),
+            Self::YandexDisk => None,
         }
     }
 }
@@ -58,14 +76,17 @@ impl OAuthAuthorizations {
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("response_type", "code").append_pair("client_id", &client_id)
-                .append_pair("redirect_uri", &redirect_uri).append_pair("state", state.as_str())
-                .append_pair("scope", provider.scope());
-            if provider != OfficialProvider::BaiduNetdisk {
+                .append_pair("redirect_uri", &redirect_uri).append_pair("state", state.as_str());
+            if let Some(scope) = provider.scope() { query.append_pair("scope", scope); }
+            if provider.supports_pkce() {
                 query.append_pair("code_challenge", &URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes())))
                     .append_pair("code_challenge_method", "S256");
             }
             if provider == OfficialProvider::GoogleDrive {
                 query.append_pair("access_type", "offline").append_pair("prompt", "consent");
+            }
+            if provider.requests_offline_access() {
+                query.append_pair("token_access_type", "offline");
             }
         }
         let mut pending = self.pending.lock().map_err(|_| OAuthError::StateUnavailable)?;
@@ -101,7 +122,7 @@ impl OAuthAuthorizations {
         if url != expected { return Err(OAuthError::InvalidState); }
         let mut form = vec![("grant_type".into(), "authorization_code".into()),
             ("client_id".into(), item.client_id), ("redirect_uri".into(), item.redirect_uri), ("code".into(), code.into())];
-        if item.provider != OfficialProvider::BaiduNetdisk {
+        if item.provider.supports_pkce() {
             form.push(("code_verifier".into(), item.verifier.to_string()));
         }
         Ok(TokenExchange { provider: item.provider, form: Zeroizing::new(form) })
@@ -248,20 +269,39 @@ mod tests {
         assert_eq!(serde_json::to_string(&OfficialProvider::GoogleDrive).expect("serialize"), "\"google_drive\"");
         assert_eq!(serde_json::to_string(&OfficialProvider::OneDrive).expect("serialize"), "\"one_drive\"");
         assert_eq!(serde_json::to_string(&OfficialProvider::BaiduNetdisk).expect("serialize"), "\"baidu_netdisk\"");
+        assert_eq!(serde_json::to_string(&OfficialProvider::Dropbox).expect("serialize"), "\"dropbox\"");
+        assert_eq!(serde_json::to_string(&OfficialProvider::YandexDisk).expect("serialize"), "\"yandex_disk\"");
+    }
+
+    #[test]
+    fn only_secretless_providers_add_pkce_and_yandex_omits_scope() {
+        for provider in [OfficialProvider::GoogleDrive, OfficialProvider::OneDrive, OfficialProvider::Dropbox, OfficialProvider::YandexDisk] {
+            assert!(provider.supports_pkce(), "{provider:?}");
+        }
+        assert!(!OfficialProvider::BaiduNetdisk.supports_pkce());
+        let auth = OAuthAuthorizations::default();
+        let start = auth.begin(OfficialProvider::YandexDisk, "client".into(), "http://127.0.0.1:7777/oauth/callback".into()).expect("begin");
+        let url = url::Url::parse(&start.authorization_url).expect("url");
+        assert!(!url.query_pairs().any(|(key, _)| key == "scope"));
+        assert!(url.query_pairs().any(|(key, _)| key == "code_challenge"));
+        let dropbox = auth.begin(OfficialProvider::Dropbox, "client".into(), "http://127.0.0.1:7777/oauth/callback".into()).expect("begin");
+        let dropbox = url::Url::parse(&dropbox.authorization_url).expect("url");
+        assert!(dropbox.query_pairs().any(|(key, value)| key == "token_access_type" && value == "offline"));
     }
 
     #[test]
     fn official_requests_bind_state_redirect_and_single_use() {
-        for provider in [OfficialProvider::GoogleDrive, OfficialProvider::OneDrive, OfficialProvider::BaiduNetdisk] {
+        for provider in [OfficialProvider::GoogleDrive, OfficialProvider::OneDrive, OfficialProvider::BaiduNetdisk, OfficialProvider::Dropbox, OfficialProvider::YandexDisk] {
             let auth = OAuthAuthorizations::default();
             let start = auth.begin(provider, "client".into(), "http://127.0.0.1:7777/callback".into()).expect("begin");
             let url = url::Url::parse(&start.authorization_url).expect("url");
             let state = url.query_pairs().find(|(k, _)| k == "state").expect("state").1.into_owned();
             assert_eq!(url.scheme(), "https");
-            assert_eq!(url.query_pairs().any(|(k, _)| k == "code_challenge"), provider != OfficialProvider::BaiduNetdisk);
+            assert_eq!(url.query_pairs().any(|(k, _)| k == "code_challenge"), provider.supports_pkce());
             let callback = format!("http://127.0.0.1:7777/callback?code=code&state={state}");
             let form = auth.complete(&start.request_id, &callback).expect("valid callback");
             assert!(form.form.iter().any(|(key, value)| key == "code" && value == "code"));
+            assert_eq!(form.form.iter().any(|(key, _)| key == "code_verifier"), provider.supports_pkce());
             assert!(auth.complete(&start.request_id, &callback).is_err());
         }
     }

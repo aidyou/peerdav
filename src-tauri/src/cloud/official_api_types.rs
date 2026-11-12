@@ -7,6 +7,7 @@ pub struct OfficialApi {
     pub(crate) client: reqwest::Client,
     pub(crate) provider: super::oauth_types::OfficialProvider,
     pub(crate) access_token: Zeroizing<String>,
+    pub(crate) drive: Option<Box<dyn super::official_drives::OfficialDrive>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -33,6 +34,8 @@ pub struct OfficialPage {
 pub enum OfficialApiError {
     #[error("网盘参数无效 / Invalid drive request")]
     InvalidInput,
+    #[error("网盘功能暂不支持 / Drive operation not supported")]
+    Unsupported,
     #[error("网盘响应无效 / Invalid drive response")]
     InvalidResponse,
     #[error("网盘请求失败 / Drive request failed")]

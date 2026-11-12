@@ -67,6 +67,7 @@ fn ipc_shapes_include_complete_delete_snapshot() -> Result<(), Box<dyn std::erro
         serde_json::json!({ "planId": "opaque", "expiresAtUnix": 10, "objectCount": 1, "connectionRevision": 3, "entries": [{"key":"data/file","size":42,"etag":"etag","protected":false}] })
     );
     let page = peerdav_lib::cloud::object_runtime_types::ObjectPageDto {
+        breadcrumbs: Vec::new(),
         prefix: String::new(),
         objects: vec![peerdav_lib::cloud::object_runtime_types::ObjectEntryDto {
             key: "protected/file".into(),

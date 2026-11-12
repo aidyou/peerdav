@@ -26,6 +26,8 @@ pub enum OfficialProvider {
     GoogleDrive,
     OneDrive,
     BaiduNetdisk,
+    Dropbox,
+    YandexDisk,
 }
 
 #[derive(Clone, Serialize)]

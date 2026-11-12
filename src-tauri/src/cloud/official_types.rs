@@ -72,6 +72,8 @@ impl OfficialConnection {
             || self.client_secret.as_ref().is_some_and(|value| value.len() > 16384)
             || (self.provider == OfficialProvider::BaiduNetdisk && (!self.root_id.starts_with('/')
                 || self.root_id.split('/').any(|part| matches!(part, "." | ".."))))
+            || (self.provider == OfficialProvider::Dropbox && !self.root_id.starts_with('/'))
+            || (self.provider == OfficialProvider::YandexDisk && !self.root_id.starts_with("disk:/"))
             || self.root_id.contains('\0') {
             return Err(super::config_types::ConfigError::Validation("invalid official connection configuration".into()));
         }

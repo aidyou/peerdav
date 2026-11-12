@@ -105,6 +105,17 @@ mod tests {
         OfficialPage { entries: ids.iter().map(|id| OfficialEntry { id: (*id).into(), name: "same.txt".into(),
             is_dir, size: 7, content_type: None, revision: None, online_preview: false }).collect(), next: None, complete: true }
     }
+
+    #[test]
+    fn revision_extraction_covers_dropbox_and_microsoft_etags() {
+        let provider = crate::cloud::oauth_types::OfficialProvider::Dropbox;
+        let meta = serde_json::json!({ "rev": "abc123", "path_display": "/a.txt" });
+        assert_eq!(delete_revision(provider, &meta).expect("revision"), "dropbox-rev:abc123");
+        assert!(delete_revision(provider, &serde_json::json!({ "rev": "" })).is_err());
+        let microsoft = serde_json::json!({ "eTag": "\"etag\"" });
+        assert_eq!(delete_revision(crate::cloud::oauth_types::OfficialProvider::OneDrive, &microsoft).expect("etag"), "\"etag\"");
+    }
+
     #[tokio::test]
     async fn google_upload_selection_has_no_network_side_effects_and_cancellation_releases_handles() {
         let data = tempfile::tempdir().expect("data");
@@ -304,6 +315,8 @@ fn listing_limit() -> AppError {
 fn delete_revision(provider: crate::cloud::oauth_types::OfficialProvider, meta: &serde_json::Value) -> Result<String, AppError> {
     meta.get("eTag").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned)
         .or_else(|| (provider == crate::cloud::oauth_types::OfficialProvider::GoogleDrive).then(|| meta.get("version").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).map(|v| format!("google-version:{v}"))).flatten())
+        .or_else(|| (provider == crate::cloud::oauth_types::OfficialProvider::Dropbox).then(|| meta.get("rev").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).map(|v| format!("dropbox-rev:{v}"))).flatten())
+        .or_else(|| (provider == crate::cloud::oauth_types::OfficialProvider::BaiduNetdisk).then(|| meta.get("md5").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).map(|v| format!("baidu-md5:{v}")).or_else(|| meta.get("fs_id").and_then(serde_json::Value::as_u64).map(|v| format!("baidu-fs:{v}")))).flatten())
         .ok_or_else(|| crate::cloud::official_runtime::api_error(crate::cloud::official_api_types::OfficialApiError::InvalidResponse))
 }
 
@@ -409,7 +422,12 @@ impl BrowserBackend for OfficialBrowserBackend {
         })
     }
     fn capabilities(&self) -> FileCapabilities {
-        FileCapabilities { delete_confirmation: DeleteConfirmation::Entry, list: true, preview: self.provider != crate::cloud::oauth_types::OfficialProvider::BaiduNetdisk, upload: self.provider == crate::cloud::oauth_types::OfficialProvider::GoogleDrive, download: self.provider != crate::cloud::oauth_types::OfficialProvider::BaiduNetdisk, download_directory: self.provider != crate::cloud::oauth_types::OfficialProvider::BaiduNetdisk, delete: self.provider != crate::cloud::oauth_types::OfficialProvider::BaiduNetdisk, create_dir: self.provider != crate::cloud::oauth_types::OfficialProvider::BaiduNetdisk, rename: false, external_edit: self.provider != crate::cloud::oauth_types::OfficialProvider::BaiduNetdisk, online_preview: self.provider != crate::cloud::oauth_types::OfficialProvider::BaiduNetdisk }
+        FileCapabilities { delete_confirmation: DeleteConfirmation::Entry, list: true, preview: true,
+            upload: matches!(self.provider, crate::cloud::oauth_types::OfficialProvider::GoogleDrive | crate::cloud::oauth_types::OfficialProvider::Dropbox | crate::cloud::oauth_types::OfficialProvider::BaiduNetdisk),
+            download: true, download_directory: true,
+            delete: true, create_dir: true,
+            rename: false, external_edit: true,
+            online_preview: matches!(self.provider, crate::cloud::oauth_types::OfficialProvider::GoogleDrive | crate::cloud::oauth_types::OfficialProvider::OneDrive) }
     }
     fn admit<'a>(&'a self, _: &'a PeerManager, cloud: &'a CloudRuntime) -> BoxFuture<'a, Result<(), AppError>> {
         Box::pin(async move {

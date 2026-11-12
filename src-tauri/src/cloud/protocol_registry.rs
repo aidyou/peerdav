@@ -22,7 +22,14 @@ pub fn descriptors() -> Vec<ProtocolDescriptor> {
             field("pathStyle", "boolean", "路径寻址", "Path-style addressing", false, false, true),
         ],
     }];
-    for (id, name) in [("google_drive", "Google Drive"), ("one_drive", "OneDrive"), ("baidu_netdisk", "百度网盘 / Baidu Netdisk")] {
+    // Yandex Disk is intentionally not advertised yet: its developer account is
+    // still unconfirmed, so its adapter stays disabled in `official_drives`.
+    for (id, name) in [
+        ("google_drive", "Google Drive"),
+        ("one_drive", "OneDrive"),
+        ("baidu_netdisk", "百度网盘 / Baidu Netdisk"),
+        ("dropbox", "Dropbox"),
+    ] {
         descriptors.push(ProtocolDescriptor {
             id, name, config_version: 1, auth: "oauth2", browse_only: id != "google_drive",
             fields: vec![
@@ -41,7 +48,7 @@ mod tests {
     #[test]
     fn descriptors_are_unique_and_never_advertise_unimplemented_drivers() {
         let descriptors = super::descriptors();
-        assert_eq!(descriptors.len(), 4);
+        assert_eq!(descriptors.len(), 5);
         assert_eq!(descriptors[0].id, "s3");
         let mut ids = std::collections::HashSet::new();
         for descriptor in &descriptors {

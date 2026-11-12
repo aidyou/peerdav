@@ -122,7 +122,9 @@ impl CloudRuntime {
             tokens.access_token
         };
         drop(cache);
-        let api = OfficialApi { #[cfg(test)] fixture: self.official_fixture.lock().ok().and_then(|value| value.clone()), client: self.official_http_client(Some(connection_id))?, provider: connection.provider, access_token };
+        let client = self.official_http_client(Some(connection_id))?;
+        let drive = super::official_drives::create(connection.provider, client.clone(), access_token.clone());
+        let api = OfficialApi { #[cfg(test)] fixture: self.official_fixture.lock().ok().and_then(|value| value.clone()), client, provider: connection.provider, access_token, drive };
         Ok((connection, api))
     }
 

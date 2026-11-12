@@ -1,6 +1,8 @@
 //! SQLite persistence. Only non-secret metadata and AEAD ciphertext are
 //! stored; the vault key never touches this layer.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -16,6 +18,10 @@ use crate::types::{
 /// Thin SQLite wrapper used by the vault.
 pub(crate) struct Database {
     conn: Connection,
+    // Access is serialized by Vault's database mutex, including persistence
+    // and snapshot publication. RefCell preserves the shared write API.
+    meta: RefCell<HashMap<String, String>>,
+    config: RefCell<HashMap<String, String>>,
 }
 
 impl Database {
@@ -57,7 +63,17 @@ impl Database {
             .map_err(database_error("configure connection"))?;
         Self::initialize_schema(&conn)?;
 
-        Ok(Self { conn })
+        let meta = Self::load_settings(&conn, "SELECT key, value FROM meta")?;
+        let config = Self::load_settings(&conn, "SELECT key, value FROM config")?;
+        Ok(Self { conn, meta: RefCell::new(meta), config: RefCell::new(config) })
+    }
+
+    fn load_settings(conn: &Connection, sql: &str) -> Result<HashMap<String, String>, DomainError> {
+        let mut statement = conn.prepare(sql).map_err(database_error("prepare settings snapshot"))?;
+        statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(database_error("read settings snapshot"))?
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(database_error("decode settings snapshot"))
     }
 
     fn initialize_schema(conn: &Connection) -> Result<(), DomainError> {
@@ -123,24 +139,11 @@ impl Database {
     }
 
     pub(crate) fn is_initialized(&self) -> Result<bool, DomainError> {
-        self.conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM meta WHERE key = ?1)",
-                params![META_SCHEMA_VERSION],
-                |row| row.get(0),
-            )
-            .map_err(database_error("check initialization"))
+        Ok(self.meta.borrow().contains_key(META_SCHEMA_VERSION))
     }
 
     pub(crate) fn read_meta(&self, key: &str) -> Result<Option<String>, DomainError> {
-        self.conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(database_error("read metadata"))
+        Ok(self.meta.borrow().get(key).cloned())
     }
 
     pub(crate) fn write_meta(&self, key: &str, value: &str) -> Result<(), DomainError> {
@@ -151,18 +154,12 @@ impl Database {
                 params![key, value],
             )
             .map_err(database_error("write metadata"))?;
+        self.meta.borrow_mut().insert(key.to_owned(), value.to_owned());
         Ok(())
     }
 
     pub(crate) fn read_config(&self, key: &str) -> Result<Option<String>, DomainError> {
-        self.conn
-            .query_row(
-                "SELECT value FROM config WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(database_error("read configuration"))
+        Ok(self.config.borrow().get(key).cloned())
     }
 
     pub(crate) fn write_config(&self, key: &str, value: &str) -> Result<(), DomainError> {
@@ -173,6 +170,7 @@ impl Database {
                 params![key, value],
             )
             .map_err(database_error("write configuration"))?;
+        self.config.borrow_mut().insert(key.to_owned(), value.to_owned());
         Ok(())
     }
 
@@ -256,7 +254,9 @@ impl Database {
 
         transaction
             .commit()
-            .map_err(database_error("commit initialization"))
+            .map_err(database_error("commit initialization"))?;
+        self.meta.get_mut().extend(meta.iter().map(|(key, value)| ((*key).to_owned(), value.clone())));
+        Ok(())
     }
 
     /// Replaces only the encrypted secret catalog and updates vault metadata.
@@ -298,7 +298,9 @@ impl Database {
 
         transaction
             .commit()
-            .map_err(database_error("commit vault reset"))
+            .map_err(database_error("commit vault reset"))?;
+        self.meta.get_mut().extend(meta_updates.iter().map(|(key, value)| ((*key).to_owned(), value.clone())));
+        Ok(())
     }
 
     pub(crate) fn insert_share(
@@ -790,6 +792,33 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod settings_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn config_snapshot_is_preloaded_and_only_published_after_commit() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.pd");
+        {
+            let db = Database::open(&path)?;
+            db.write_config("theme", "dark")?;
+        }
+        let db = Database::open(&path)?;
+        db.conn.execute_batch("UPDATE config SET value = 'external'; CREATE TRIGGER reject_config BEFORE INSERT ON config BEGIN SELECT RAISE(FAIL, 'read only'); END;")?;
+        assert_eq!(db.read_config("theme")?, Some("dark".into()));
+        assert_eq!(db.read_config("missing")?, None);
+        assert!(db.write_config("theme", "failed").is_err());
+        assert_eq!(db.read_config("theme")?, Some("dark".into()));
+        db.conn.execute_batch("DROP TRIGGER reject_config")?;
+        db.write_config("theme", "light")?;
+        assert_eq!(db.read_config("theme")?, Some("light".into()));
+        drop(db);
+        assert_eq!(Database::open(&path)?.read_config("theme")?, Some("light".into()));
+        Ok(())
+    }
 }
 
 fn database_error(operation: &'static str) -> impl FnOnce(rusqlite::Error) -> DomainError {

@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, MutexGuard};
 
 use rand::RngCore;
 use zeroize::Zeroizing;
@@ -16,43 +16,35 @@ const INDEX_KEY_SECRET: &str = "cloud.local-index-key";
 /// Short-lived in-process guard. It never crosses an await or performs network I/O.
 pub struct CloudConfigStore {
     vault: Arc<Vault>,
-    lock: Mutex<()>,
 }
 
 impl CloudConfigStore {
     pub fn new(vault: Arc<Vault>) -> Self {
-        Self {
-            vault,
-            lock: Mutex::new(()),
-        }
+        Self { vault }
     }
 
     fn guard(&self) -> Result<MutexGuard<'_, ()>, ConfigError> {
-        self.lock
-            .lock()
-            .map_err(|_| ConfigError::Validation("cloud config lock poisoned".into()))
+        self.vault.cloud_config_guard()
     }
 
     fn load_locked(&self) -> Result<CloudConfigSnapshot, ConfigError> {
-        match self.vault.load_secret(SECRET_NAME) {
-            Ok(bytes) => {
-                let snapshot: CloudConfigSnapshot = serde_json::from_slice(&bytes)?;
-                for mapping in &snapshot.mappings {
-                    validate_mapping_protocol(mapping)?;
-                }
-                let mut identities = std::collections::HashSet::new();
-                for connection in &snapshot.connections { identities.insert(connection.id.as_str()); }
-                for connection in &snapshot.official_connections {
-                    connection.validate()?;
-                    if connection.id.is_empty() || connection.revision == 0 || !identities.insert(connection.id.as_str()) {
-                        return Err(ConfigError::Validation("invalid official connection identity".into()));
-                    }
-                }
-                Ok(snapshot)
-            }
-            Err(crate::DomainError::SecretNotFound { .. }) => Ok(CloudConfigSnapshot::default()),
-            Err(error) => Err(error.into()),
+        self.vault.cloud_config_snapshot()
+    }
+
+    pub(crate) fn decode_snapshot(bytes: &[u8]) -> Result<CloudConfigSnapshot, ConfigError> {
+        let snapshot: CloudConfigSnapshot = serde_json::from_slice(bytes)?;
+        for mapping in &snapshot.mappings {
+            validate_mapping_protocol(mapping)?;
         }
+        let mut identities = std::collections::HashSet::new();
+        for connection in &snapshot.connections { identities.insert(connection.id.as_str()); }
+        for connection in &snapshot.official_connections {
+            connection.validate()?;
+            if connection.id.is_empty() || connection.revision == 0 || !identities.insert(connection.id.as_str()) {
+                return Err(ConfigError::Validation("invalid official connection identity".into()));
+            }
+        }
+        Ok(snapshot)
     }
 
     fn save_locked(&self, snapshot: &CloudConfigSnapshot) -> Result<(), ConfigError> {

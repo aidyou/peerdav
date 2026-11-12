@@ -30,6 +30,9 @@ pub mod official_types;
 pub mod official_api;
 pub mod official_api_types;
 pub mod official_runtime;
+// Yandex Disk stays disabled until its developer account is confirmed; its
+// adapter file remains on disk and is excluded by `official_drives/mod.rs`.
+mod official_drives;
 mod google_store;
 mod proxy;
 pub mod service;

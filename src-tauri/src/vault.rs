@@ -42,6 +42,8 @@ struct Session {
     /// startup, so the UI can show a recovery path instead of a password form.
     key_error: Option<&'static str>,
     transfer_cancel: tokio_util::sync::CancellationToken,
+    /// Shared by all CloudConfigStore handles; discarded with the vault key.
+    cloud_config: Option<Zeroizing<crate::cloud::config_types::CloudConfigSnapshot>>,
 }
 
 /// Process-wide vault handle. The database mutex serializes sensitive
@@ -50,6 +52,7 @@ pub struct Vault {
     path: PathBuf,
     db: Mutex<Database>,
     session: Mutex<Session>,
+    cloud_config_write: Mutex<()>,
     identity: crate::types::DeviceIdentity,
 }
 
@@ -59,6 +62,7 @@ impl Vault {
             path: path.to_path_buf(),
             db: Mutex::new(Database::open(path)?),
             session: Mutex::new(Session::default()),
+            cloud_config_write: Mutex::new(()),
             identity: crate::tls::load_identity(path)?,
         };
         if let Err(error) = vault.auto_load_key() {
@@ -67,7 +71,16 @@ impl Vault {
                 crate::error::error_chain(&error)
             );
         }
+        vault.warm_cloud_config();
         Ok(vault)
+    }
+
+    fn warm_cloud_config(&self) {
+        if self.is_unlocked() {
+            if let Err(error) = self.cloud_config_snapshot() {
+                log::warn!("cloud settings initialization failed: {}", crate::error::error_chain(&error));
+            }
+        }
     }
 
     pub(crate) fn identity(&self) -> &crate::types::DeviceIdentity {
@@ -188,12 +201,14 @@ impl Vault {
 
         {
             let mut session = self.session()?;
+            session.cloud_config = None;
             session.key = Some(key);
             session.admin = None;
             session.interface_locked = false;
             session.key_error = None;
         }
 
+        self.warm_cloud_config();
         Ok(InitializeVaultResult {
             admin_username,
             vault_status: self.status()?,
@@ -212,6 +227,7 @@ impl Vault {
         admin_username: &str,
         admin_password: &str,
     ) -> Result<ResetVaultResult, DomainError> {
+        let _config = self.cloud_lifecycle_guard()?;
         admin::validate_username(admin_username)?;
         admin::validate_password(admin_password)?;
         let admin_username = admin_username.trim().to_owned();
@@ -266,12 +282,14 @@ impl Vault {
 
         {
             let mut session = self.session()?;
+            session.cloud_config = None;
             session.key = Some(key);
             session.admin = None;
             session.interface_locked = false;
             session.key_error = None;
         }
 
+        self.warm_cloud_config();
         Ok(ResetVaultResult {
             admin_username,
             vault_status: self.status()?,
@@ -284,6 +302,7 @@ impl Vault {
     /// path selected by the user. The persisted path is updated only after the
     /// candidate key has been verified against the vault.
     pub fn reload_key(&self, path: Option<&str>) -> Result<VaultStatus, DomainError> {
+        let _config = self.cloud_lifecycle_guard()?;
         let configured = {
             let db = self.db()?;
             if !db.is_initialized()? {
@@ -305,19 +324,23 @@ impl Vault {
 
         {
             let mut session = self.session()?;
+            session.cloud_config = None;
             session.key = Some(material.key);
             session.key_error = None;
         }
+        self.warm_cloud_config();
         self.status()
     }
 
     /// Drops and zeroizes the in-memory key. The database remains usable for
     /// status checks but all secret operations require reloading the key file.
     pub fn lock(&self) -> Result<VaultStatus, DomainError> {
+        let _config = self.cloud_lifecycle_guard()?;
         {
             let mut session = self.session()?;
             session.transfer_cancel.cancel();
             session.transfer_cancel = tokio_util::sync::CancellationToken::new();
+            session.cloud_config = None;
             session.key = None;
             session.admin = None;
             session.interface_locked = false;
@@ -393,10 +416,59 @@ impl Vault {
         validate_secret_name(name)?;
 
         let db = self.db()?;
-        let session = self.session()?;
+        let mut session = self.session()?;
         let key = require_key(&session)?;
         let (nonce, ciphertext) = crypto::encrypt(key, name.as_bytes(), plaintext)?;
-        db.put_secret(name, &nonce, &ciphertext)
+        db.put_secret(name, &nonce, &ciphertext)?;
+        if name == "cloud.peerdav-s3.config" {
+            session.cloud_config = match crate::cloud::config::CloudConfigStore::decode_snapshot(plaintext) {
+                Ok(snapshot) => Some(Zeroizing::new(snapshot)),
+                Err(error) => {
+                    // Raw secret writes remain supported (including migration
+                    // tooling); never keep the previous snapshot on decode failure.
+                    log::warn!("stored cloud settings cannot be cached: {}", crate::error::error_chain(&error));
+                    None
+                }
+            };
+        }
+        Ok(())
+    }
+
+    fn cloud_lifecycle_guard(&self) -> Result<MutexGuard<'_, ()>, DomainError> {
+        self.cloud_config_write.lock().map_err(|_| DomainError::Internal { detail: "cloud config lock poisoned".into() })
+    }
+
+    pub(crate) fn cloud_config_guard(&self) -> Result<MutexGuard<'_, ()>, crate::cloud::config_types::ConfigError> {
+        self.cloud_config_write.lock().map_err(|_| crate::cloud::config_types::ConfigError::Validation("cloud config lock poisoned".into()))
+    }
+
+    /// Reads the process-wide cloud snapshot under the same session lock that
+    /// owns the key. Never returns cached credentials after lock/reset.
+    pub(crate) fn cloud_config_snapshot(&self) -> Result<crate::cloud::config_types::CloudConfigSnapshot, crate::cloud::config_types::ConfigError> {
+        {
+            let session = self.session()?;
+            require_key(&session)?;
+            if let Some(snapshot) = &session.cloud_config {
+                return Ok((**snapshot).clone());
+            }
+        }
+        // Cold path retains the established database -> session lock order,
+        // then rechecks because a writer/unlock may have populated the cache.
+        let db = self.db()?;
+        let mut session = self.session()?;
+        let key = require_key(&session)?;
+        if let Some(snapshot) = &session.cloud_config {
+            return Ok((**snapshot).clone());
+        }
+        let snapshot = match db.read_secret("cloud.peerdav-s3.config")? {
+            Some(record) => {
+                let bytes = decrypt_record(key, "cloud.peerdav-s3.config", &record.nonce, &record.ciphertext)?;
+                crate::cloud::config::CloudConfigStore::decode_snapshot(&bytes)?
+            }
+            None => crate::cloud::config_types::CloudConfigSnapshot::default(),
+        };
+        session.cloud_config = Some(Zeroizing::new(snapshot.clone()));
+        Ok(snapshot)
     }
 
     /// Loads and authenticates an encrypted secret record.
@@ -710,6 +782,7 @@ impl Vault {
         match self.load_key_material(Path::new(&path)) {
             Ok(material) => {
                 let mut session = self.session()?;
+                session.cloud_config = None;
                 session.key = Some(material.key);
                 session.key_error = None;
                 Ok(())

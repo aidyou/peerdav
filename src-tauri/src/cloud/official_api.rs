@@ -10,7 +10,8 @@ impl OfficialApi {
         if access_token.is_empty() { return Err(OfficialApiError::InvalidInput); }
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(30)).build().map_err(OfficialApiError::Transport)?;
-        Ok(Self { #[cfg(test)] fixture: None, client, provider, access_token })
+        let drive = super::official_drives::create(provider, client.clone(), access_token.clone());
+        Ok(Self { #[cfg(test)] fixture: None, client, provider, access_token, drive })
     }
 
     pub(crate) fn item_url(&self, id: &str) -> Result<url::Url, OfficialApiError> {
@@ -18,7 +19,9 @@ impl OfficialApi {
         let base = match self.provider {
             OfficialProvider::GoogleDrive => "https://www.googleapis.com/drive/v3/files/",
             OfficialProvider::OneDrive => "https://graph.microsoft.com/v1.0/me/drive/items/",
-            OfficialProvider::BaiduNetdisk => return Err(OfficialApiError::InvalidInput),
+            OfficialProvider::BaiduNetdisk | OfficialProvider::Dropbox | OfficialProvider::YandexDisk => {
+                return Err(OfficialApiError::InvalidInput)
+            }
         };
         let mut url = url::Url::parse(base).map_err(|_| OfficialApiError::InvalidInput)?;
         url.path_segments_mut().map_err(|_| OfficialApiError::InvalidInput)?.pop_if_empty().push(id);
@@ -56,15 +59,20 @@ impl OfficialApi {
     }
 
     pub(crate) async fn metadata(&self, id: &str) -> Result<Value, OfficialApiError> {
+        if let Some(drive) = &self.drive { return drive.metadata(id).await; }
         let mut request = self.client.get(self.item_url(id)?).bearer_auth(self.access_token.as_str());
         request = match self.provider {
             OfficialProvider::GoogleDrive => request.query(&[("fields", "id,name,version,trashed,webViewLink"), ("supportsAllDrives", "true")]),
-            _ => request.query(&[("$select", "id,name,eTag,webUrl")]),
+            OfficialProvider::OneDrive => request.query(&[("$select", "id,name,eTag,webUrl")]),
+            OfficialProvider::BaiduNetdisk | OfficialProvider::Dropbox | OfficialProvider::YandexDisk => {
+                return Err(OfficialApiError::InvalidInput)
+            }
         };
         self.mutation_response(request).await
     }
 
     pub(crate) async fn replace_content(&self, id: &str, expected: &str, bytes: Vec<u8>) -> Result<String, OfficialApiError> {
+        if let Some(drive) = &self.drive { return drive.replace_content(id, expected, bytes).await; }
         if expected.is_empty() { return Err(OfficialApiError::InvalidInput); }
         let mut url = self.item_url(id)?;
         let request = match self.provider {
@@ -92,6 +100,7 @@ impl OfficialApi {
     }
 
     pub(crate) async fn move_item(&self, id: &str, from: &str, destination: &str) -> Result<(), OfficialApiError> {
+        if let Some(drive) = &self.drive { return drive.move_item(id, from, destination).await; }
         let url = self.item_url(id)?;
         self.item_url(destination)?;
         let request = match self.provider {
@@ -104,6 +113,7 @@ impl OfficialApi {
     }
 
     pub(crate) async fn delete_item(&self, id: &str, revision: &str) -> Result<(), OfficialApiError> {
+        if let Some(drive) = &self.drive { return drive.delete_item(id, revision).await; }
         let url = self.item_url(id)?;
         // Google trash is recoverable and includes folder descendants. Graph DELETE
         // likewise moves personal drive items to the recycle bin.
@@ -147,6 +157,10 @@ impl OfficialApi {
     }
 
     pub(crate) async fn upload_new_progress(&self, parent: &str, name: &str, file: std::fs::File, size: u64, progress: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Result<(), OfficialApiError> {
+        if let Some(drive) = &self.drive {
+            drive.upload_new(parent, name, file, size, Some(progress)).await?;
+            return Ok(());
+        }
         self.mutation_response(self.upload_request(parent, name, file, size, Some(progress))?).await?;
         Ok(())
     }
@@ -156,6 +170,7 @@ impl OfficialApi {
     }
 
     pub(crate) async fn replace_file_stream_progress(&self, id: &str, file: std::fs::File, size: u64, expected: Option<&str>, progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>) -> Result<(), OfficialApiError> {
+        if let Some(drive) = &self.drive { return drive.replace_file_stream(id, file, size, expected, progress).await; }
         use futures_util::StreamExt;
         if self.provider != OfficialProvider::GoogleDrive { return Err(OfficialApiError::InvalidInput); }
         if let Some(expected) = expected {
@@ -173,17 +188,20 @@ impl OfficialApi {
     }
 
     pub(crate) async fn upload_object(&self, parent: &str, name: &str, file: std::fs::File, size: u64) -> Result<String, OfficialApiError> {
+        if let Some(drive) = &self.drive { return drive.upload_new(parent, name, file, size, None).await; }
         let value = self.mutation_response(self.upload_request(parent, name, file, size, None)?).await?;
         value.get("id").and_then(Value::as_str).map(str::to_owned).ok_or(OfficialApiError::InvalidResponse)
     }
 
     pub(crate) async fn create_folder_id(&self, parent: &str, name: &str) -> Result<String, OfficialApiError> {
+        if let Some(drive) = &self.drive { return drive.create_folder_id(parent, name).await; }
         if self.provider != OfficialProvider::GoogleDrive { return Err(OfficialApiError::InvalidInput); }
         let value = self.mutation_response(self.client.post("https://www.googleapis.com/drive/v3/files").query(&[("supportsAllDrives", "true")]).bearer_auth(self.access_token.as_str()).json(&serde_json::json!({"name":name,"mimeType":"application/vnd.google-apps.folder","parents":[parent]}))).await?;
         value.get("id").and_then(Value::as_str).map(str::to_owned).ok_or(OfficialApiError::InvalidResponse)
     }
 
     pub(crate) async fn create_folder(&self, parent: &str, name: &str) -> Result<String, OfficialApiError> {
+        if let Some(drive) = &self.drive { return drive.create_folder(parent, name).await; }
         if name.trim().is_empty() || name.contains(['/', '\\', '\0']) || matches!(name, "." | "..") { return Err(OfficialApiError::InvalidInput); }
         let request = match self.provider {
             OfficialProvider::GoogleDrive => self.client.post("https://www.googleapis.com/drive/v3/files")
@@ -218,17 +236,21 @@ impl OfficialApi {
     }
 
     pub(crate) async fn export(&self, id: &str, mime: &str) -> Result<reqwest::Response, OfficialApiError> {
+        if let Some(drive) = &self.drive { return drive.export(id, mime).await; }
         self.media_request(self.export_request(id, mime)?).await
     }
 
     pub async fn media(&self, id: &str) -> Result<reqwest::Response, OfficialApiError> {
+        if let Some(drive) = &self.drive { return drive.media(id).await; }
         if id.is_empty() || id.len() > 4096 || matches!(id, "." | "..") || id.contains(['/', '\\', '\0']) {
             return Err(OfficialApiError::InvalidInput);
         }
         let (base, tail) = match self.provider {
             OfficialProvider::GoogleDrive => ("https://www.googleapis.com/drive/v3/files/", None),
             OfficialProvider::OneDrive => ("https://graph.microsoft.com/v1.0/me/drive/items/", Some("content")),
-            OfficialProvider::BaiduNetdisk => return Err(OfficialApiError::InvalidInput),
+            OfficialProvider::BaiduNetdisk | OfficialProvider::Dropbox | OfficialProvider::YandexDisk => {
+                return Err(OfficialApiError::InvalidInput)
+            }
         };
         let mut url = url::Url::parse(base).map_err(|_| OfficialApiError::InvalidInput)?;
         {
@@ -275,6 +297,7 @@ impl OfficialApi {
     }
 
     pub async fn list(&self, parent: &str, cursor: Option<&str>) -> Result<OfficialPage, OfficialApiError> {
+        if let Some(drive) = &self.drive { return drive.list(parent, cursor).await; }
         if matches!(parent, "." | "..") || parent.contains('\0') {
             return Err(OfficialApiError::InvalidInput);
         }
@@ -319,6 +342,9 @@ impl OfficialApi {
                     .query(&[("method", "list"), ("access_token", self.access_token.as_str()),
                         ("dir", parent), ("start", &start.to_string()), ("limit", "200")])
             }
+            OfficialProvider::Dropbox | OfficialProvider::YandexDisk => {
+                return Err(OfficialApiError::Unsupported)
+            }
         };
         Ok(request)
     }
@@ -338,8 +364,13 @@ impl OfficialApi {
         }
         if !status.is_success() {
             let payload: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-            let reason = payload.pointer("/error/message").or_else(|| payload.get("errmsg"))
-                .and_then(Value::as_str).unwrap_or("Drive request rejected");
+            let reason = match self.provider {
+                OfficialProvider::GoogleDrive | OfficialProvider::OneDrive | OfficialProvider::BaiduNetdisk => {
+                    payload.pointer("/error/message").or_else(|| payload.get("errmsg"))
+                        .and_then(Value::as_str).unwrap_or("Drive request rejected")
+                }
+                OfficialProvider::Dropbox | OfficialProvider::YandexDisk => "Drive request rejected",
+            };
             let message = reason.chars().take(2048).collect::<String>().replace(self.access_token.as_str(), "[redacted]");
             return Err(OfficialApiError::Http { status: status.as_u16(), message });
         }
@@ -372,7 +403,12 @@ fn string(value: &Value, key: &str) -> Result<String, OfficialApiError> {
 }
 
 fn parse_page(provider: OfficialProvider, payload: Value, cursor: Option<&str>) -> Result<OfficialPage, OfficialApiError> {
-    let key = match provider { OfficialProvider::GoogleDrive => "files", OfficialProvider::OneDrive => "value", OfficialProvider::BaiduNetdisk => "list" };
+    let key = match provider {
+        OfficialProvider::GoogleDrive => "files",
+        OfficialProvider::OneDrive => "value",
+        OfficialProvider::BaiduNetdisk => "list",
+        OfficialProvider::Dropbox | OfficialProvider::YandexDisk => return Err(OfficialApiError::InvalidResponse),
+    };
     if provider == OfficialProvider::BaiduNetdisk && payload.get("errno").and_then(Value::as_i64) != Some(0) {
         return Err(OfficialApiError::Provider {
             code: payload.get("errno").map(Value::to_string).unwrap_or_default(),
@@ -409,6 +445,7 @@ fn parse_page(provider: OfficialProvider, payload: Value, cursor: Option<&str>) 
                 online_preview: false,
                 revision: item.get("md5").and_then(Value::as_str).map(str::to_owned),
             },
+            OfficialProvider::Dropbox | OfficialProvider::YandexDisk => return Err(OfficialApiError::InvalidResponse),
         };
         if !seen.insert(entry.id.clone()) || entry.name.contains(['/', '\\', '\0']) || matches!(entry.name.as_str(), "." | "..") {
             return Err(OfficialApiError::InvalidResponse);
@@ -431,6 +468,7 @@ fn parse_page(provider: OfficialProvider, payload: Value, cursor: Option<&str>) 
         OfficialProvider::BaiduNetdisk => if entries.len() == 200 {
             Some(cursor.unwrap_or("0").parse::<u64>().map_err(|_| OfficialApiError::InvalidInput)?.checked_add(200).ok_or(OfficialApiError::InvalidResponse)?.to_string())
         } else { None },
+        OfficialProvider::Dropbox | OfficialProvider::YandexDisk => return Err(OfficialApiError::InvalidResponse),
     };
     if next.as_deref().is_some_and(|value| value.is_empty() || Some(value) == cursor) { return Err(OfficialApiError::InvalidResponse); }
     let complete = next.is_none() && payload.get("incompleteSearch").and_then(Value::as_bool) != Some(true);
@@ -616,6 +654,7 @@ mod tests {
                     assert_eq!(request.url().path(), "/v1.0/me/drive/root/children");
                 }
                 OfficialProvider::BaiduNetdisk => assert_eq!(request.url().host_str(), Some("pan.baidu.com")),
+                OfficialProvider::Dropbox | OfficialProvider::YandexDisk => unreachable!("legacy dispatcher only"),
             }
         }
     }

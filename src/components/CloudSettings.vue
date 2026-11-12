@@ -54,7 +54,8 @@ const official = ref({ provider: 'google_drive', name: '', clientId: '', clientS
 const loopbackWaiting = ref(false);
 let authorizationVersion = 0;
 function changeOfficialProvider() {
-  official.value.rootId = official.value.provider === 'baidu_netdisk' ? '/' : 'root';
+  const roots = { baidu_netdisk: '/', dropbox: '/', yandex_disk: 'disk:/' };
+  official.value.rootId = roots[official.value.provider] ?? 'root';
 }
 async function cancelOfficial() {
   authorizationVersion++;

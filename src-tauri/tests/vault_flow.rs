@@ -48,6 +48,22 @@ fn status(initialized: bool, unlocked: bool, key_file: Option<String>) -> VaultS
 }
 
 #[test]
+fn settings_snapshot_reads_memory_and_keeps_failed_writes_out() {
+    let (_directory, path, vault) = open_vault();
+    vault.set_setting("cache.test", "saved").expect("save");
+    let db = Connection::open(&path).expect("external connection");
+    db.execute("UPDATE meta SET value = 'external' WHERE key = 'cache.test'", []).expect("external update");
+    assert_eq!(vault.get_setting("cache.test").expect("memory"), Some("saved".into()));
+    db.execute_batch("CREATE TRIGGER reject_setting BEFORE INSERT ON meta WHEN NEW.key = 'cache.test' BEGIN SELECT RAISE(FAIL, 'read only setting'); END;").expect("trigger");
+    assert!(vault.set_setting("cache.test", "failed").is_err());
+    assert_eq!(vault.get_setting("cache.test").expect("unchanged"), Some("saved".into()));
+    assert_eq!(vault.get_setting("missing").expect("missing"), None);
+    drop(vault);
+    let reopened = Vault::open(&path).expect("reopen");
+    assert_eq!(reopened.get_setting("cache.test").expect("reload"), Some("external".into()));
+}
+
+#[test]
 fn first_run_creates_key_file_and_encrypted_vault() {
     let (directory, path, vault) = open_vault();
 
