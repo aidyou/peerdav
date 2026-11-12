@@ -944,7 +944,6 @@ async function changeAutostart(value) {
            成组的数据录入也走行式列表，提交动作收在列表尾行。
            面板级动作（立即锁屏、退出登录）挂在组标题右侧的小胶囊上，不占一行。 -->
       <section v-if="app.settingsTab === 'general'" id="pane-general" class="settings-pane" role="region" aria-labelledby="tab-general">
-        <NetworkProxySettings />
         <div class="settings-group">
           <h3 class="group-title">{{ t("settings.groupAppearance") }}</h3>
           <div class="settings-rows">
@@ -1058,6 +1057,7 @@ async function changeAutostart(value) {
           <p class="settings-group__footnote">{{ t("ignore.hint") }}</p>
         </div>
 
+        <NetworkProxySettings />
         <div class="settings-group">
           <h3 class="group-title">{{ t("updates.title") }}</h3>
           <div class="settings-rows">
@@ -1180,8 +1180,8 @@ async function changeAutostart(value) {
           <div class="settings-rows">
             <div class="settings-row">
               <span class="settings-row__label">{{ t("auth.machineId") }}</span>
-              <!-- 机器码是 64 位十六进制，手抄不现实：整串做成可点击的文本按钮，
-                   悬停提示与无障碍名都用同一句 i18n，点击即复制并回报结果。 -->
+              <!-- 机器码是 64 位十六进制，手抄不现实：放进只读输入框单行展示，不再换行撑破行高；
+                   外层可点击区承载复制与无障碍名，悬停提示与点击复制沿用同一句 i18n。 -->
               <el-tooltip
                 :content="t('settings.copyMachineId')"
                 placement="top"
@@ -1189,10 +1189,10 @@ async function changeAutostart(value) {
                 :hide-after="0"
                 :enterable="false"
               >
-                <button type="button" class="settings-row__value settings-row__copy mono"
+                <div class="settings-row__control settings-row__copy machine-id-field"
                   :aria-label="t('settings.copyMachineId')" @click="copyMachineId">
-                  {{ app.deviceFingerprint }}
-                </button>
+                  <el-input :model-value="app.deviceFingerprint" readonly :aria-label="t('settings.copyMachineId')" />
+                </div>
               </el-tooltip>
             </div>
           </div>
@@ -2139,6 +2139,20 @@ html[data-theme="dark"] .tray-icon-preview--mono {
   outline: 2px solid var(--el-color-primary);
   outline-offset: 3px;
   border-radius: 4px;
+}
+
+/* 机器码只读输入框：整行可点复制，等宽字体，去掉文本按钮遗留的下划线悬停态。 */
+.machine-id-field {
+  cursor: pointer;
+}
+
+.machine-id-field:hover {
+  text-decoration: none;
+}
+
+.machine-id-field :deep(.el-input__inner) {
+  cursor: pointer;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 /* 右侧控件列统一 240px：数字框加单位合起来的宽度，与下面快捷键输入框

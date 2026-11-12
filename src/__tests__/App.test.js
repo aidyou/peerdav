@@ -1731,7 +1731,7 @@ describe("settings information architecture", () => {
       wrapper
         .findAll("#pane-general .group-title")
         .map((node) => node.text()),
-    ).toEqual(["网络代理", "外观", "系统集成", "锁屏", "忽略规则", "软件更新", "会话"]);
+    ).toEqual(["外观", "系统集成", "锁屏", "忽略规则", "网络代理", "软件更新", "会话"]);
     const ignoreGroup = wrapper.find('[data-testid="ignore-settings"]');
     expect(ignoreGroup.find('[role="switch"]').attributes("aria-checked")).toBe("true");
     await ignoreGroup.find('[role="switch"]').trigger("click");
@@ -1802,8 +1802,10 @@ describe("settings information architecture", () => {
         .map((node) => node.text()),
     ).toEqual(["WebDAV 服务", "局域网发现", "本机标识"]);
 
-    // 机器码是只读标识，不再挤在提示段落里。
-    expect(wrapper.find("#pane-service .settings-row__value").text()).toBe("a".repeat(64));
+    // 机器码是只读标识：放进只读输入框单行展示，不再换行，值通过 input 的 value 校验。
+    const machineInput = wrapper.find("#pane-service .machine-id-field input");
+    expect(machineInput.attributes("readonly")).toBeDefined();
+    expect(machineInput.element.value).toBe("a".repeat(64));
 
     const networksRow = () =>
       wrapper

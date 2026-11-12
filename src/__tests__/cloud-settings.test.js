@@ -83,7 +83,8 @@ describe("CloudSettings", () => {
     await flushPromises();
     const form = wrapper.findAll('form').find(form => form.text().includes('应用客户端 ID'));
     expect(form).toBeDefined();
-    expect(form.find('details').text()).toContain('网络代理');
+    expect(form.text()).toContain('网络代理');
+    expect(form.find('details').exists()).toBe(false);
     expect(form.find('[data-test=official-proxy]').exists()).toBe(true);
     const field = text => form.findAll('label').find(label => label.text() === text).find('input');
     await field('名称').setValue('Google');
@@ -96,6 +97,52 @@ describe("CloudSettings", () => {
     expect(wrapper.find('a[target="_blank"]').attributes('rel')).toContain('noopener');
     wrapper.unmount(); await flushPromises();
     expect(cloud.cancelOfficialAuthorization).toHaveBeenCalledWith('request');
+  });
+  it("auto-fills the official name from the selected protocol", async () => {
+    cloud.protocols.mockResolvedValue([
+      { id: 'google_drive', name: 'Google Drive', auth: 'oauth2', fields: [{ key: 'clientId', labelZh: '应用客户端 ID' }] },
+      { id: 'baidu_netdisk', name: '百度网盘', auth: 'oauth2', fields: [] },
+    ]);
+    const wrapper = await mountCloud();
+    await wrapper.find('.official-add').trigger('click'); await flushPromises();
+    const form = wrapper.findAll('form').find(f => f.text().includes('应用客户端 ID'));
+    const nameValue = () => form.findAll('label').find(l => l.text() === '名称').find('input').element.value;
+    expect(nameValue()).toBe('Google Drive');
+    const protocolSelect = wrapper.findComponent({ name: 'ElSelect' });
+    protocolSelect.vm.$emit('update:modelValue', 'baidu_netdisk'); protocolSelect.vm.$emit('change', 'baidu_netdisk'); await flushPromises();
+    expect(nameValue()).toBe('百度网盘');
+    wrapper.unmount();
+  });
+  it("keeps OneDrive out of the official protocol selector", async () => {
+    // 唯一 oauth2 协议为 OneDrive：被暂时隐藏后没有可用协议，授权对话框不应打开。
+    cloud.protocols.mockResolvedValue([{ id: 'one_drive', name: 'OneDrive', auth: 'oauth2', fields: [{ key: 'clientId', labelZh: '应用客户端 ID' }] }]);
+    const wrapper = await mountCloud();
+    await wrapper.find('.official-add').trigger('click'); await flushPromises();
+    expect(wrapper.findAll('form').some(f => f.text().includes('应用客户端 ID'))).toBe(false);
+    // 存在其它 oauth2 协议时对话框正常打开，默认按 Google Drive 填充名称。
+    cloud.protocols.mockResolvedValue([
+      { id: 'google_drive', name: 'Google Drive', auth: 'oauth2', fields: [{ key: 'clientId', labelZh: '应用客户端 ID' }] },
+      { id: 'one_drive', name: 'OneDrive', auth: 'oauth2', fields: [] },
+    ]);
+    const withGoogle = await mountCloud();
+    await withGoogle.find('.official-add').trigger('click'); await flushPromises();
+    const form = withGoogle.findAll('form').find(f => f.text().includes('应用客户端 ID'));
+    expect(form).toBeTruthy();
+    expect(form.findAll('label').find(l => l.text() === '名称').find('input').element.value).toBe('Google Drive');
+    wrapper.unmount(); withGoogle.unmount();
+  });
+  it("prefills the connection name from the chosen provider and keeps it on edit or custom", async () => {
+    const wrapper = await mountCloud(); await wrapper.find('.connection-add').trigger('click');
+    const pick = (value) => { const s = wrapper.findComponent({ name: 'ElSelect' }); s.vm.$emit('update:modelValue', value); s.vm.$emit('change', value); };
+    pick('aws'); await flushPromises();
+    expect(wrapper.find('.connection-name input').element.value).toBe('Amazon S3');
+    pick(''); await flushPromises();
+    expect(wrapper.find('.connection-name input').element.value).toBe('Amazon S3');
+    wrapper.unmount();
+    const editing = await mountCloud({ ...rows, connections: [{ id: 'c1', name: 'Primary', endpoint: 'https://custom.example', bucket: 'b' }] });
+    await editing.find('.connection-edit').trigger('click'); await flushPromises();
+    expect(editing.find('.connection-name input').element.value).toBe('Primary');
+    editing.unmount();
   });
   it("defaults to a multi-drive list without connection or sync forms", async () => {
     const wrapper = await mountCloud();
