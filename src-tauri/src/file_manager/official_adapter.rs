@@ -112,8 +112,47 @@ mod tests {
         let meta = serde_json::json!({ "rev": "abc123", "path_display": "/a.txt" });
         assert_eq!(delete_revision(provider, &meta).expect("revision"), "dropbox-rev:abc123");
         assert!(delete_revision(provider, &serde_json::json!({ "rev": "" })).is_err());
+        assert_eq!(delete_revision(provider, &serde_json::json!({ "id": "id:folder", "path_display": "/docs" })).expect("folder id"), "dropbox-id:id:folder");
         let microsoft = serde_json::json!({ "eTag": "\"etag\"" });
         assert_eq!(delete_revision(crate::cloud::oauth_types::OfficialProvider::OneDrive, &microsoft).expect("etag"), "\"etag\"");
+    }
+
+    #[tokio::test]
+    async fn upload_selection_follows_advertised_provider_capabilities() {
+        use crate::cloud::oauth_types::OfficialProvider;
+        for (provider, allowed) in [
+            (OfficialProvider::Dropbox, true),
+            (OfficialProvider::BaiduNetdisk, true),
+            (OfficialProvider::OneDrive, false),
+        ] {
+            let data = tempfile::tempdir().expect("data");
+            let vault = Arc::new(crate::Vault::open(&data.path().join("vault.pd")).expect("vault"));
+            vault.initialize(data.path().to_str().expect("path"), "admin", "password 123").expect("init");
+            let config = crate::cloud::config::CloudConfigStore::new(vault.clone());
+            let connection = config.save_official_connection(crate::cloud::official_types::OfficialConnection {
+                id: String::new(), name: "Drive".into(), provider,
+                config_version: 1, revision: 0, client_id: "client".into(), client_secret: None,
+                refresh_token: "invalid-offline".into(), root_id: "/".into(),
+            }).expect("connection");
+            let runtime = CloudRuntime::new(vault.clone(), Arc::new(crate::sync::traits::NoopSyncEvents), data.path().to_owned());
+            runtime.resume().expect("resume");
+            let peers = Arc::new(PeerManager::new(vault, data.path().join("peer-temp")).expect("peers"));
+            let mut backend = backend();
+            backend.connection_id = connection.id;
+            backend.revision = connection.revision;
+            backend.provider = provider;
+            backend.root_id = "/".into();
+            let file = data.path().join("a.txt");
+            std::fs::write(&file, "abc").expect("file");
+            let result = backend.select_upload(&peers, &runtime, String::new(), vec![file], UploadMode::Files, Default::default()).await;
+            if allowed {
+                let FileUploadDto::Cloud(selected) = result.expect("advertised upload selection") else { panic!("cloud queue") };
+                assert_eq!(selected.total_files, 1);
+                backend.release_upload(&peers, &runtime, &selected.batch_id).await.expect("release");
+            } else {
+                assert_eq!(result.expect_err("unadvertised upload").code, "FILE_CAPABILITY_UNAVAILABLE");
+            }
+        }
     }
 
     #[tokio::test]
@@ -316,6 +355,9 @@ fn delete_revision(provider: crate::cloud::oauth_types::OfficialProvider, meta: 
     meta.get("eTag").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned)
         .or_else(|| (provider == crate::cloud::oauth_types::OfficialProvider::GoogleDrive).then(|| meta.get("version").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).map(|v| format!("google-version:{v}"))).flatten())
         .or_else(|| (provider == crate::cloud::oauth_types::OfficialProvider::Dropbox).then(|| meta.get("rev").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).map(|v| format!("dropbox-rev:{v}"))).flatten())
+        // Dropbox folders have no rev; delete_v2 is not conditional, so the
+        // stable entry id is enough to satisfy the confirmation boundary.
+        .or_else(|| (provider == crate::cloud::oauth_types::OfficialProvider::Dropbox).then(|| meta.get("id").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).map(|v| format!("dropbox-id:{v}"))).flatten())
         .or_else(|| (provider == crate::cloud::oauth_types::OfficialProvider::BaiduNetdisk).then(|| meta.get("md5").and_then(serde_json::Value::as_str).filter(|s| !s.is_empty()).map(|v| format!("baidu-md5:{v}")).or_else(|| meta.get("fs_id").and_then(serde_json::Value::as_u64).map(|v| format!("baidu-fs:{v}")))).flatten())
         .ok_or_else(|| crate::cloud::official_runtime::api_error(crate::cloud::official_api_types::OfficialApiError::InvalidResponse))
 }
@@ -526,7 +568,7 @@ impl BrowserBackend for OfficialBrowserBackend {
         Box::pin(async move {
             self.admit_write(peers, cloud, &path).await?;
             if paths.is_empty() || paths.len() > 256 || (!matches!(mode, UploadMode::Files) && paths.len() != 1) { return Err(super::service::invalid()); }
-            if self.provider != crate::cloud::oauth_types::OfficialProvider::GoogleDrive { return Err(unsupported()); }
+            if !self.capabilities().upload { return Err(unsupported()); }
             if self.uploads.lock().await.len() >= 4 { return Err(listing_limit()); }
             let parent = if path.is_empty() { self.root_id.clone() } else { self.directories.lock().await.get(&path).cloned().ok_or_else(super::service::invalid)? };
             let folder = matches!(mode, UploadMode::Folder);

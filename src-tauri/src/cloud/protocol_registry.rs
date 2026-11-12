@@ -30,13 +30,21 @@ pub fn descriptors() -> Vec<ProtocolDescriptor> {
         ("baidu_netdisk", "百度网盘 / Baidu Netdisk"),
         ("dropbox", "Dropbox"),
     ] {
+        // 百度 OAuth 的 client_id 是应用控制台的 AppKey（API Key），不是 AppID。
+        let baidu = id == "baidu_netdisk";
         descriptors.push(ProtocolDescriptor {
             id, name, config_version: 1, auth: "oauth2", browse_only: id != "google_drive",
             fields: vec![
-                field("clientId", "string", "应用客户端 ID", "Application client ID", true, false, false),
-                field("clientSecret", "string", "应用客户端密钥（如需要）", "Application client secret (if required)", false, true, false),
+                field("clientId", "string",
+                    if baidu { "AppKey（API Key，不是 AppID）" } else { "应用客户端 ID" },
+                    if baidu { "AppKey (API Key, not AppID)" } else { "Application client ID" }, true, false, false),
+                field("clientSecret", "string",
+                    if baidu { "Secret Key" } else { "应用客户端密钥（如需要）" },
+                    if baidu { "Secret Key" } else { "Application client secret (if required)" }, false, true, false),
                 field("redirectUri", "url", "已注册的回调地址", "Registered redirect URI", true, false, false),
-                field("rootId", "string", "根文件夹 ID 或路径", "Root folder ID or path", true, false, false),
+                field("rootId", "string",
+                    if baidu { "根目录路径（如 /）" } else { "根文件夹 ID 或路径" },
+                    if baidu { "Root folder path (for example /)" } else { "Root folder ID or path" }, true, false, false),
             ],
         });
     }
@@ -63,5 +71,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn baidu_fields_name_the_oauth_app_key_explicitly() {
+        let descriptors = super::descriptors();
+        let baidu = descriptors.iter().find(|descriptor| descriptor.id == "baidu_netdisk").expect("baidu descriptor");
+        let label = |key| baidu.fields.iter().find(|field| field.key == key).expect("baidu field");
+        assert!(label("clientId").label_zh.contains("AppKey") && label("clientId").label_zh.contains("API Key"));
+        assert!(label("clientId").label_en.contains("AppKey") && label("clientId").label_en.contains("API Key"));
+        assert!(label("clientSecret").label_zh.contains("Secret Key"));
+        assert!(label("clientSecret").label_en.contains("Secret Key"));
+        let google = descriptors.iter().find(|descriptor| descriptor.id == "google_drive").expect("google descriptor");
+        assert_eq!(google.fields.iter().find(|field| field.key == "clientId").expect("client id").label_zh, "应用客户端 ID");
     }
 }

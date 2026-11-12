@@ -169,6 +169,13 @@ pub struct CreateAppendRepositoryInput {
     pub mode: crate::sync::append_types::AppendMode,
     pub password: String,
     pub password_confirmation: String,
+    /// First local binding supplied by the create dialog. When present, validate
+    /// it before writing the remote anchor so an overlap cannot leave an orphan
+    /// repository behind.
+    #[serde(default)]
+    pub local_root: Option<String>,
+    #[serde(default)]
+    pub logical_path: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

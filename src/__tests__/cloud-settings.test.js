@@ -160,6 +160,21 @@ describe("CloudSettings", () => {
     expect(wrapper.find('.connection-editor').findAll('label').filter((l) => !l.element.closest('details'))).toHaveLength(5);
     expect(wrapper.findAll('input[type="checkbox"]').every((i) => !i.element.checked)).toBe(true); wrapper.unmount();
   });
+  it("places the HTTP opt-in beside the address and enables it for MinIO by default", async () => {
+    const wrapper = await mountCloud(); await wrapper.find('.connection-add').trigger('click');
+    const row = wrapper.find('.connection-url-row');
+    expect(row.find('.connection-url').exists()).toBe(true);
+    expect(row.find('.connection-inline-switch').text()).toContain('允许 HTTP');
+    expect(row.find('input[type="checkbox"]').element.checked).toBe(false);
+    const select = wrapper.findComponent({ name: 'ElSelect' });
+    select.vm.$emit('update:modelValue', 'minio'); select.vm.$emit('change', 'minio'); await flushPromises();
+    expect(row.find('input[type="checkbox"]').element.checked).toBe(true);
+    expect(wrapper.findAll('.connection-advanced input[type="checkbox"]')[0].element.checked).toBe(true);
+    expect(wrapper.find('.connection-advanced').text()).not.toContain('允许 HTTP');
+    select.vm.$emit('update:modelValue', 'aws'); select.vm.$emit('change', 'aws'); await flushPromises();
+    expect(row.find('input[type="checkbox"]').element.checked).toBe(false);
+    wrapper.unmount();
+  });
   it("infers Qiniu into the service endpoint, probes buckets, and keeps HTTP opt-in", async () => {
     cloud.probeBuckets.mockResolvedValue([{ name: 'peerdav' }]);
     const wrapper = await mountCloud(); await wrapper.find('.connection-add').trigger('click');

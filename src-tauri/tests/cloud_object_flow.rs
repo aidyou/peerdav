@@ -35,6 +35,8 @@ struct Calls {
     delete_race: bool,
     conditional_delete_unsupported: bool,
     upload_keys: Vec<String>,
+    put_keys: Vec<String>,
+    put_conditions: Vec<PutCondition>,
     stat_keys: Vec<String>,
     list_prefixes: Vec<String>,
     complete_unknown: bool,
@@ -149,10 +151,15 @@ impl ObjectStore for FakeStore {
         &'a self,
         key: &'a str,
         mut body: ObjectStream,
-        _condition: PutCondition,
+        condition: PutCondition,
     ) -> futures_util::future::BoxFuture<'a, Result<ObjectMetadata, CloudError>> {
         Box::pin(async move {
-            self.calls.lock().unwrap().put += 1;
+            {
+                let mut calls = self.calls.lock().unwrap();
+                calls.put += 1;
+                calls.put_keys.push(key.into());
+                calls.put_conditions.push(condition);
+            }
             while body.next().await.is_some() {}
             Ok(Self::meta(key))
         })
@@ -559,7 +566,12 @@ async fn empty_directory_creation_uses_guarded_marker_and_rejects_root() {
     let svc = service(store, "");
     svc.discover("").await.expect("discover protection");
     svc.create_directory("folder/").await.expect("create marker");
-    assert_eq!(calls.lock().expect("calls").put, 1);
+    {
+        let calls = calls.lock().expect("calls");
+        assert_eq!(calls.put, 1);
+        assert_eq!(calls.put_keys, ["folder/.peerdav-directory"]);
+        assert!(matches!(calls.put_conditions[0], PutCondition::Any));
+    }
     assert!(svc.create_directory("").await.is_err());
     assert!(svc.create_directory("../").await.is_err());
     assert_eq!(calls.lock().expect("calls").put, 1);
@@ -567,12 +579,12 @@ async fn empty_directory_creation_uses_guarded_marker_and_rejects_root() {
 
 #[tokio::test]
 async fn empty_directory_marker_can_be_planned_and_deleted_without_root_access() {
-    let (store, calls) = FakeStore::new(vec![page(&["empty/"], None)]);
+    let (store, calls) = FakeStore::new(vec![page(&["empty/.peerdav-directory"], None)]);
     let svc = service(store, "");
     svc.discover("").await.expect("discover");
     let plan = svc.delete_plan("empty/", 4_000_000_000).await.expect("marker delete plan");
     assert_eq!(svc.execute_delete(&plan, true).await.expect("delete marker").len(), 1);
-    assert_eq!(calls.lock().expect("calls").deletes, ["empty/"]);
+    assert_eq!(calls.lock().expect("calls").deletes, ["empty/.peerdav-directory"]);
     assert!(svc.delete_plan("/", 4_000_000_000).await.is_err());
 }
 

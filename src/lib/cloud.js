@@ -37,7 +37,7 @@ export const cloud = Object.freeze({
   joinRepository: (args) => invoke("cloud_join_repository", args),
   saveMapping: (mappingId, input) => invoke("cloud_save_mapping", { mappingId, input: toSaveMappingInput(input) }),
   appendDiscover: (connectionId, bucket) => invoke("cloud_append_discover", { connectionId, ...(bucket ? { bucket } : {}) }),
-  createSyncDrive: ({ connectionId, bucket, mode, password, passwordConfirmation }) => invoke("cloud_create_sync_drive", { input: { connectionId, ...(bucket ? { bucket } : {}), mode, password, passwordConfirmation } }),
+  createSyncDrive: ({ connectionId, bucket, mode, password, passwordConfirmation, localRoot = null, logicalPath = null }) => invoke("cloud_create_sync_drive", { input: { connectionId, ...(bucket ? { bucket } : {}), mode, password, passwordConfirmation, localRoot, logicalPath } }),
   appendCreate: ({ connectionId, mode, password, passwordConfirmation }) => invoke("cloud_append_create", { input: { connectionId, mode, password, passwordConfirmation } }),
   appendJoin: ({ connectionId, bucket, anchorKey, anchorFingerprint, repositoryId, mode, acceptTofu, trustedFingerprint, password }) => invoke("cloud_append_join", { input: { connectionId, ...(bucket ? { bucket } : {}), anchorKey, anchorFingerprint, repositoryId, mode, acceptTofu: acceptTofu === true, trustedFingerprint: trustedFingerprint || null, password } }),
   appendSaveMapping: (mappingId, mapping, selectedRoot) => invoke("cloud_append_save_mapping", { input: { mappingId: mappingId || null, mapping: toSaveMappingInput(mapping), selectedRoot } }),

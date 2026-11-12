@@ -220,7 +220,7 @@ async function create() {
   await run(async (scope) => {
     state.value = "loading";
     const logicalPath = newDrive.value.logicalPath.trim() || folderName(newDrive.value.localRoot);
-    const redacted = await cloud.createSyncDrive({ connectionId: props.connectionId, bucket: selectedBucket.value, mode: createMode.value, password: newDrive.value.password, passwordConfirmation: newDrive.value.confirmation });
+    const redacted = await cloud.createSyncDrive({ connectionId: props.connectionId, bucket: selectedBucket.value, mode: createMode.value, password: newDrive.value.password, passwordConfirmation: newDrive.value.confirmation, localRoot: newDrive.value.localRoot, logicalPath });
     if (scope !== generation || disposed) return;
     // Bind the first local folder in the same step so a new drive always has
     // something to sync instead of looking like a no-op. The drive already

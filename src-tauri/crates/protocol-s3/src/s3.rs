@@ -117,6 +117,14 @@ impl S3Store {
             validate_key(config.prefix.trim_end_matches('/'))?;
             config.prefix = format!("{}/", config.prefix.trim_end_matches('/'));
         }
+        // object_store 0.14.2 omits the bucket from the request path when a
+        // custom endpoint with a port (or an IP/loopback host) is configured
+        // with virtual-host addressing. MinIO then receives `HEAD /key` and
+        // answers 400. Path-style is the only valid mode for those endpoints,
+        // including configurations persisted before this normalization.
+        if !config.path_style && requires_path_style(&url) {
+            config.path_style = true;
+        }
         let transport = ConnectionTransport::new(&config.proxy)?;
         let mut builder = object_store::aws::AmazonS3Builder::new()
             .with_region(&config.region)
@@ -408,6 +416,12 @@ pub fn is_private(host: Option<&str>) -> bool {
                 IpAddr::V6(ip) => ip.is_unique_local() || ip.is_loopback(),
             })
     })
+}
+
+/// Virtual-host addressing needs a DNS name without a custom port. IP literals,
+/// loopback names and explicit ports are incompatible with bucket subdomains.
+fn requires_path_style(url: &url::Url) -> bool {
+    url.port().is_some() || is_private(url.host_str())
 }
 
 fn validate_key(key: &str) -> Result<(), CloudError> {
@@ -941,6 +955,37 @@ mod cfgtest {
             }
         });
         S3Store::test_store(backend, factory)
+    }
+
+    #[test]
+    fn custom_endpoint_addressing_never_drops_the_bucket() {
+        let parse = |value: &str| url::Url::parse(value).expect("url");
+        for endpoint in [
+            "http://127.0.0.1:9000",
+            "http://localhost:9000",
+            "https://minio.example.com:9000",
+            "http://[::1]:9000",
+        ] {
+            assert!(requires_path_style(&parse(endpoint)), "{endpoint}");
+        }
+        for endpoint in ["https://s3.us-east-1.amazonaws.com", "https://minio.example.com"] {
+            assert!(!requires_path_style(&parse(endpoint)), "{endpoint}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_bridge_put_any_supports_directory_marker_without_cas() {
+        let bridge = crate::CoreS3ReadBridge(
+            crate::CoreS3Backend::new(Arc::new(store()), 1).expect("backend"),
+        );
+        let result = ObjectStore::put(
+            &bridge,
+            "dir/.peerdav-directory",
+            stream::iter([Ok(Bytes::new())]).boxed(),
+            PutCondition::Any,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[tokio::test]

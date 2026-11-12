@@ -82,6 +82,7 @@ async fn qiniu_production_crud_mirror_append_acceptance() {
         let repo = runtime.create_sync_drive(CreateAppendRepositoryInput {
             connection_id: connection.id.clone(), bucket: Some("peerdav".into()), mode: AppendMode::Encrypted,
             password: "acceptance-only-password".into(), password_confirmation: "acceptance-only-password".into(),
+            local_root: None, logical_path: None,
         }).await.map_err(|_| "create append")?;
         let mapping = runtime.save_append_mapping(SaveAppendMappingInput {
             mapping_id: None, selected_root: "docs".into(), mapping: AddMappingInput {
@@ -1152,6 +1153,8 @@ async fn sync_drive_create_join_sync_both_modes_without_cas_probe_or_control_hea
                 mode: mode.clone(),
                 password: "append password".into(),
                 password_confirmation: "append password".into(),
+                local_root: None,
+                logical_path: None,
             })
             .await
             .unwrap();
@@ -1391,6 +1394,7 @@ async fn sync_drive_storage_stays_bound_after_connection_changes() {
         connection_id: connection.id.clone(), bucket: Some("fixture".into()),
         mode: AppendMode::Encrypted, password: "bound password".into(),
         password_confirmation: "bound password".into(),
+        local_root: None, logical_path: None,
     }).await.expect("create in selected bucket");
     let storage = created.binding.storage.as_ref().expect("durable binding");
     assert_eq!(storage.bucket, "fixture");

@@ -84,7 +84,7 @@ async fn google_sync_roundtrip(mode: crate::sync::append_types::AppendMode, choi
     assert!(store.put(key, crate::cloud::bytes_stream(bytes::Bytes::from_static(b"changed")), PutCondition::Any).await.is_err());
     assert!(store.put(key, crate::cloud::bytes_stream(bytes::Bytes::new()), PutCondition::CreateOnly).await.is_err());
     assert!(store.delete("/").await.is_err());
-    let created = runtime.create_sync_drive(crate::cloud::runtime_types::CreateAppendRepositoryInput { bucket: Some("root".into()), connection_id: connection.id.clone(), mode, password: "password 123".into(), password_confirmation: "password 123".into() }).await.expect("create Google sync repository");
+    let created = runtime.create_sync_drive(crate::cloud::runtime_types::CreateAppendRepositoryInput { bucket: Some("root".into()), connection_id: connection.id.clone(), mode, password: "password 123".into(), password_confirmation: "password 123".into(), local_root: None, logical_path: None }).await.expect("create Google sync repository");
     assert!(!created.binding.repo_id.is_empty());
     let discovered = runtime.discover_append_in_bucket(&connection.id, Some("root")).await.expect("discover Google repository");
     assert_eq!(discovered.len(), 1);

@@ -24,6 +24,9 @@ use crate::sync::repository_types::decode_head;
 const MAX_PAGES: usize = 1000;
 const MAX_ENTRIES: usize = 100_000;
 const MAX_PLAN_TTL: u64 = 24 * 60 * 60;
+/// Zero-byte object that keeps an otherwise empty S3 prefix visible. The exact
+/// key is hidden from listings and rendered as the containing folder.
+pub(crate) const DIRECTORY_MARKER: &str = ".peerdav-directory";
 
 #[derive(Debug, Error)]
 pub enum ObjectServiceError {
@@ -611,6 +614,7 @@ impl ObjectService {
     pub fn is_protected(&self, key: &str) -> Result<bool, ObjectServiceError> {
         // A protection target is a precise key or prefix, not a folder path:
         // unlike browse prefixes it must not carry a trailing separator.
+        if key.ends_with('/') { return Err(ObjectServiceError::InvalidKey); }
         if !key.is_empty() {
             valid_key(key)?;
         }
@@ -787,15 +791,39 @@ impl ObjectService {
         valid_key(key)?;
         let _lease = self.guard.begin_mutation(&self.target_identity(key))?;
         if revision.is_empty() { return Err(ObjectServiceError::Cloud(CloudError::Precondition)); }
-        Ok(self.store.replace_edit(key, bytes_stream(Bytes::from(bytes)), revision).await?)
+        let bytes = Bytes::from(bytes);
+        match self.store.replace_edit(key, bytes_stream(bytes.clone()), revision).await {
+            Ok(meta) => Ok(meta),
+            // Providers such as MinIO do not enforce conditional PUT. Keep the
+            // revision check as close to the overwrite as possible and use an
+            // ordinary write; the edit session already required user intent.
+            Err(CloudError::Unsupported) => {
+                let current = self.store.stat(key).await?;
+                if current.etag.as_deref() != Some(revision) { return Err(CloudError::Precondition.into()); }
+                Ok(self.store.put(key, bytes_stream(bytes), PutCondition::Any).await?)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub async fn create_directory(&self, prefix: &str) -> Result<(), ObjectServiceError> {
         valid_prefix(prefix)?;
         if prefix.trim_end_matches('/').is_empty() { return Err(ObjectServiceError::InvalidKey); }
-        let key = format!("{}/", prefix.trim_end_matches('/'));
+        // object_store 0.14 cannot represent a key ending with '/', so a real
+        // `dir/` marker would be written as `dir`. Keep an explicit marker
+        // object instead; object listing converts it back into a virtual folder
+        // and hides the marker key.
+        let key = format!("{}/{}", prefix.trim_end_matches('/'), DIRECTORY_MARKER);
         let _lease = self.guard.begin_mutation(&self.target_identity(&key))?;
-        self.store.put(&key, bytes_stream(Bytes::new()), PutCondition::CreateOnly).await?;
+        match self.store.stat(&key).await {
+            Ok(_) => return Ok(()),
+            Err(CloudError::NotFound) => {}
+            Err(error) => return Err(error.into()),
+        }
+        // The marker is an ordinary zero-byte object; do not require the
+        // conditional-create capability that is only granted to verified CAS
+        // repositories.
+        self.store.put(&key, bytes_stream(Bytes::new()), PutCondition::Any).await?;
         Ok(())
     }
 
@@ -1034,6 +1062,82 @@ fn register_discovered_protection(
         Ok(()) => Ok(()),
         Err(ObjectGuardError::Conflict) if guard.is_protected(&identity)? => Ok(()),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod edit_fallback_tests {
+    use super::super::types::{ObjectListing, ObjectStoreScope, StorageCapabilities};
+    use super::*;
+    use futures_util::{StreamExt, future::BoxFuture, stream};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct Store {
+        meta: Mutex<Option<ObjectMetadata>>,
+        condition: Mutex<Option<PutCondition>>,
+        puts: AtomicUsize,
+    }
+    impl ObjectStore for Store {
+        fn scope(&self) -> Option<ObjectStoreScope> {
+            Some(ObjectStoreScope { endpoint: "https://edit.invalid".into(), bucket: "bucket".into(), prefix: String::new() })
+        }
+        fn capabilities(&self) -> StorageCapabilities { StorageCapabilities::default() }
+        fn list<'a>(&'a self, _: &'a str) -> ObjectListing<'a> { stream::empty().boxed() }
+        fn stat<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<ObjectMetadata, CloudError>> {
+            Box::pin(async move {
+                self.meta.lock().map_err(|_| CloudError::Unsupported)?.clone()
+                    .filter(|meta| meta.key == key).ok_or(CloudError::NotFound)
+            })
+        }
+        fn get<'a>(&'a self, _: &'a str, _: Option<std::ops::Range<u64>>) -> BoxFuture<'a, Result<ObjectStream, CloudError>> {
+            Box::pin(async { Err(CloudError::Unsupported) })
+        }
+        fn put<'a>(&'a self, key: &'a str, mut body: ObjectStream, condition: PutCondition) -> BoxFuture<'a, Result<ObjectMetadata, CloudError>> {
+            Box::pin(async move {
+                self.puts.fetch_add(1, Ordering::SeqCst);
+                *self.condition.lock().map_err(|_| CloudError::Unsupported)? = Some(condition);
+                let mut size = 0usize;
+                while let Some(chunk) = body.next().await {
+                    size = size.checked_add(chunk?.len()).ok_or(CloudError::PayloadTooLarge)?;
+                }
+                let meta = ObjectMetadata { key: key.into(), size: size as u64, etag: Some("v2".into()) };
+                *self.meta.lock().map_err(|_| CloudError::Unsupported)? = Some(meta.clone());
+                Ok(meta)
+            })
+        }
+        fn delete<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), CloudError>> {
+            Box::pin(async { Err(CloudError::Unsupported) })
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_falls_back_to_revision_checked_overwrite() {
+        let dir = tempfile::tempdir().expect("temp");
+        let guard = ObjectGuard::open(dir.path().join("guard.db"), &[7; 32]).expect("guard");
+        let identity = ProtectedIdentity {
+            endpoint: "https://edit.invalid".into(), bucket: "bucket".into(),
+            prefix: String::new(), alias: "alias".into(),
+        };
+        guard.register_storage_identity(&identity, crate::cloud::StorageIdentityAssociation::New).expect("identity");
+        guard.mark_discovery_complete(&identity).expect("discovery");
+        let store = Arc::new(Store {
+            meta: Mutex::new(Some(ObjectMetadata { key: "file".into(), size: 3, etag: Some("v1".into()) })),
+            condition: Mutex::new(None),
+            puts: AtomicUsize::new(0),
+        });
+        let service = ObjectService::try_new(store.clone(), guard, identity, "rev").expect("service");
+        let meta = service.replace_edit("file", b"new".to_vec(), "v1").await.expect("fallback edit");
+        assert_eq!(meta.etag.as_deref(), Some("v2"));
+        assert!(matches!(*store.condition.lock().expect("condition"), Some(PutCondition::Any)));
+        assert_eq!(store.puts.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            service.replace_edit("file", b"stale".to_vec(), "stale").await,
+            Err(ObjectServiceError::Cloud(CloudError::Precondition))
+        ));
+        assert_eq!(store.puts.load(Ordering::SeqCst), 1);
     }
 }
 

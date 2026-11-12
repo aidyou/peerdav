@@ -183,6 +183,10 @@ function applyProvider(value) {
     connection.value.name = item.label;
     url.value = item.endpoint;
     changeUrl(item.endpoint);
+    // MinIO/自建通常使用内网 http 端点，默认勾选允许 HTTP；切换其他厂商恢复安全默认。
+    connection.value.allowInsecureHttp = value === "minio";
+    // MinIO/自建无法使用 bucket 子域名虚拟主机寻址，默认改用路径寻址。
+    if (value === "minio") connection.value.pathStyle = true;
   }
 }
 async function probe() {
@@ -365,6 +369,7 @@ onMounted(refresh);
         <label>{{ t('drive.protocol') }}<el-select v-model="official.provider" :disabled="officialBusy || !!authorization" @change="changeOfficialProvider"><el-option v-for="item in officialDescriptors" :key="item.id" :value="item.id" :label="item.name" /></el-select></label>
         <label>{{ t('cloud.name') }}<el-input v-model="official.name" :disabled="officialBusy || loopbackWaiting" /></label>
         <label v-for="field in officialFields" :key="field.key">{{ locale === 'zh-CN' ? field.labelZh : field.labelEn }}<el-input v-model="official[field.key]" :type="field.secret ? 'password' : 'text'" :autocomplete="field.secret ? 'new-password' : 'off'" :disabled="officialBusy || loopbackWaiting || (!!authorization && ['clientId', 'redirectUri'].includes(field.key))" /></label>
+        <p v-if="official.provider === 'baidu_netdisk'" class="hint" data-test="baidu-credentials-hint">{{ t('drive.baiduCredentialsHint') }}</p>
         <label>{{ t('network.title') }}<el-select v-model="official.direct" data-test="official-proxy" :disabled="officialBusy || !!authorization"><el-option :value="false" :label="t('network.client')" /><el-option :value="true" :label="t('cloud.proxyDirect')" /></el-select></label>
         <p class="hint">{{ t('drive.officialProxyHint') }}</p>
         <p v-if="loopbackWaiting" class="hint" role="status">{{ t('drive.waitingAuthorization') }}</p>
@@ -411,7 +416,15 @@ onMounted(refresh);
         </label>
         <p v-if="providerHint" class="hint">{{ providerHint }}</p>
         <label class="required"><span class="label">{{ t('cloud.name') }}</span><el-input v-model="connection.name" class="connection-name" /></label>
-        <label class="required"><span class="label">{{ t('drive.url') }}</span><el-input :model-value="url" class="connection-url" @update:model-value="changeUrl" /></label>
+        <label class="required"><span class="label">{{ t('drive.url') }}</span>
+          <span class="connection-url-row">
+            <el-input :model-value="url" class="connection-url" @update:model-value="changeUrl" />
+            <span class="connection-inline-switch">
+              <el-switch v-model="connection.allowInsecureHttp" :aria-label="t('cloud.allowInsecureHttp')" />
+              <span>{{ t('cloud.allowInsecureHttp') }}</span>
+            </span>
+          </span>
+        </label>
         <p class="hint">{{ t('drive.urlHint') }}</p>
         <label class="required"><span class="label">{{ t('cloud.accessKey') }}</span><el-input v-model="connection.accessKey" type="password" autocomplete="off" class="connection-access-key" show-password /></label>
         <label class="required"><span class="label">{{ t('cloud.secretKey') }}</span><el-input v-model="connection.secretKey" type="password" autocomplete="new-password" class="connection-secret-key" show-password /></label>
@@ -431,8 +444,7 @@ onMounted(refresh);
             <label>{{ t("cloud.sessionToken") }}<el-input v-model="connection.sessionToken" type="password" /></label>
             <label>{{ t("network.title") }}<el-select v-model="connection.proxy.mode" :aria-label="t('network.title')"><el-option value="client" :label="t('network.client')" /><el-option value="direct" :label="t('cloud.proxyDirect')" /></el-select></label>
             <template v-if="connection.proxy.mode === 'custom'"><label>{{ t("cloud.proxyUrl") }}<el-input v-model="connection.proxy.url" /></label><label>{{ t("cloud.proxyUsername") }}<el-input v-model="connection.proxy.username" /></label><label>{{ t("cloud.proxyPassword") }}<el-input v-model="connection.proxy.password" type="password" /></label></template>
-            <label class="connection-switch">{{ t("cloud.allowInsecureHttp") }}<el-switch v-model="connection.allowInsecureHttp" /></label>
-            <label class="connection-switch">{{ t("cloud.pathStyle") }}<el-switch v-model="connection.pathStyle" /></label>
+            <label class="connection-switch">{{ t("cloud.pathStyle") }}<el-switch v-model="connection.pathStyle" data-test="connection-path-style" /></label>
             <label class="connection-switch">{{ t("cloud.clearCredentials") }}<el-switch v-model="connection.clearCredentials" /></label>
             <label class="connection-switch">{{ t("cloud.clearSessionToken") }}<el-switch v-model="connection.clearSessionToken" /></label>
             <label class="connection-switch">{{ t("cloud.clearProxyAuth") }}<el-switch v-model="connection.clearProxyAuth" /></label>
@@ -807,6 +819,28 @@ onMounted(refresh);
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+/* 地址行：允许 HTTP 与地址输入框同行，窄窗口下输入框先收缩。 */
+.connection-url-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.connection-url-row .connection-url {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.connection-inline-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--app-text-strong);
+  white-space: nowrap;
 }
 
 /* 弹窗表单：下拉框铺满列宽，与输入框对齐。 */

@@ -135,9 +135,10 @@ impl CloudRuntime {
                 "新密码至少需要 6 位且确认必须一致 / New passwords require at least 6 characters and matching confirmation",
             ));
         }
+        let repo_id = hex::encode(rand::random::<[u8; 16]>());
         let descriptor = Descriptor {
             version: 2,
-            repo_id: hex::encode(rand::random::<[u8; 16]>()),
+            repo_id: repo_id.clone(),
             mode: input.mode,
             chunker: Chunker {
                 name: "fastcdc".into(),
@@ -150,6 +151,28 @@ impl CloudRuntime {
                 seed: 0,
             },
         };
+        match (input.local_root.as_deref(), input.logical_path.as_deref()) {
+            (Some(local_root), Some(logical_path)) => {
+                // Reject an overlapping first binding before the remote anchor
+                // exists; otherwise a failed bind leaves an orphan repository.
+                self.config.prepare_mapping(
+                    crate::cloud::config_types::AddMappingInput {
+                        connection_id: input.connection_id.clone(),
+                        repository_id: repo_id,
+                        local_root: std::path::PathBuf::from(local_root),
+                        logical_path: logical_path.to_owned(),
+                        schedule: crate::cloud::config_types::ScheduleConfig::default(),
+                    },
+                    &[self.data_dir.as_path()],
+                    None,
+                ).map_err(config_error)?;
+            }
+            (None, None) => {}
+            _ => return Err(runtime_error(
+                "CLOUD_CONFIG_INVALID",
+                "本地目录与云端目录必须同时提供 / Local root and logical path must be supplied together",
+            )),
+        }
         let (object, mut selected) =
             AppendRepository::prepare_anchor(descriptor, password.as_bytes())
                 .map_err(append_error)?;

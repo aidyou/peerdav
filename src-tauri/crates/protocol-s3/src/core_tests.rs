@@ -251,3 +251,42 @@ async fn core_http_ignored_range_is_rejected_not_relabelled() {
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn private_endpoint_never_drops_bucket_from_request_path() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listen");
+    let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut request = vec![0u8; 8192];
+        let n = socket.read(&mut request).await.expect("read");
+        let request = String::from_utf8_lossy(&request[..n]).into_owned();
+        socket
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write");
+        request
+    });
+    let store = S3Store::new(S3Config {
+        endpoint,
+        bucket: "bucket".into(),
+        region: "us-east-1".into(),
+        prefix: String::new(),
+        // Older MinIO/self-hosted connections may still persist virtual-host
+        // addressing even though the endpoint cannot support it.
+        path_style: false,
+        access_key: "a".into(),
+        secret_key: "b".into(),
+        session_token: None,
+        buckets: vec![],
+        allow_insecure_http: true,
+        proxy: ProxyMode::Direct,
+    })
+    .expect("store");
+    assert!(store.core_stat("a.txt").await.is_err());
+    let request = server.await.expect("server");
+    assert!(
+        request.starts_with("HEAD /bucket/a.txt HTTP/1.1\r\n"),
+        "bucket must stay in the request path: {request}"
+    );
+}

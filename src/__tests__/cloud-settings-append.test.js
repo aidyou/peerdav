@@ -219,7 +219,7 @@ describe("append settings through unified invoke", () => {
     if (mode === "authenticated_plain") expect(w.find(".create-mode-hint").text()).toContain("stored in plaintext");
     await fillPasswords(w); expect(w.find(".append-create").attributes("disabled")).toBeUndefined();
     await w.find(".append-create").trigger("click"); await flushPromises();
-    expect(nativeInvoke).toHaveBeenCalledWith("cloud_create_sync_drive", { input: { connectionId: "c1", mode, password: "password-123", passwordConfirmation: "password-123" } });
+    expect(nativeInvoke).toHaveBeenCalledWith("cloud_create_sync_drive", { input: { connectionId: "c1", mode, password: "password-123", passwordConfirmation: "password-123", localRoot: "/local/Documents", logicalPath: "Documents" } });
     expect(nativeInvoke).toHaveBeenCalledWith("cloud_prepare_mapping_bind", { input: { mappingId: null, mapping: { connectionId: "c1", repositoryId: "new-repo", localRoot: "/local/Documents", logicalPath: "Documents", schedule: { enabled: false, interval: 120 } }, selectedRoot: "Documents" } });
     await flushPromises();
     expect(app.handleFailure.mock.calls).toEqual([]);
@@ -238,7 +238,7 @@ describe("append settings through unified invoke", () => {
     await w.find('.create-schedule input[type=checkbox]').setValue(true);
     expect(w.find('.create-schedule input[type=number]').exists()).toBe(false);
     await w.find('.append-create').trigger('click'); await flushPromises();
-    expect(nativeInvoke).toHaveBeenCalledWith('cloud_create_sync_drive', { input: { connectionId: 'c1', bucket: 'photos', mode: 'encrypted', password: 'password-123', passwordConfirmation: 'password-123' } });
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_create_sync_drive', { input: { connectionId: 'c1', bucket: 'photos', mode: 'encrypted', password: 'password-123', passwordConfirmation: 'password-123', localRoot: '/local/Documents', logicalPath: 'Documents' } });
     expect(rows.mappings[0].schedule).toEqual({ enabled: true, interval: 120 });
     expect(confirmAction).not.toHaveBeenCalled();
     expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_preview' || command === 'cloud_sync')).toBe(false);

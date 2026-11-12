@@ -430,15 +430,31 @@ impl CloudConfigStore {
         if logical.is_empty() || logical.split('/').any(|part| part == "." || part == "..") {
             return Err(ConfigError::Validation("logical path is invalid".into()));
         }
-        if snapshot.mappings.iter().any(|m| {
+        // Retries and double-submits of the same binding must be idempotent;
+        // only a different binding that overlaps is a conflict.
+        if let Some(existing) = snapshot.mappings.iter().find(|m| {
+            Some(m.id.as_str()) != id
+                && m.connection_id == input.connection_id
+                && m.repository_id == input.repository_id
+                && m.local_root == root
+                && m.logical_path == logical
+        }) {
+            return Ok(existing.clone());
+        }
+        if let Some(conflict) = snapshot.mappings.iter().find(|m| {
             Some(m.id.as_str()) != id
                 && ((m.local_root.starts_with(&root) || root.starts_with(&m.local_root))
                     || (m.repository_id == input.repository_id
                         && logical_overlap(&m.logical_path, &logical)))
         }) {
-            return Err(ConfigError::Validation(
-                "mapping overlaps an existing mapping".into(),
-            ));
+            let name = snapshot.connections.iter().find(|c| c.id == conflict.connection_id).map(|c| c.name.clone())
+                .or_else(|| snapshot.official_connections.iter().find(|c| c.id == conflict.connection_id).map(|c| c.name.clone()))
+                .unwrap_or_else(|| conflict.connection_id.clone());
+            return Err(ConfigError::Validation(format!(
+                "mapping overlaps an existing mapping: {name} / {} -> {}",
+                conflict.local_root.display(),
+                conflict.logical_path
+            )));
         }
         if snapshot
             .mirror_mappings
@@ -923,9 +939,35 @@ mod tests {
         assert_eq!(store.prepare_mapping(input.clone(), &[], None).unwrap().id, first_id, "repreparing the same binding must reuse its durable budget scope");
         assert!(prepared.schedule.enabled);
         assert!(store.snapshot().unwrap().mappings.is_empty());
-        store.add_mapping(input.clone(), &[]).unwrap();
-        assert!(store.prepare_mapping(input, &[], None).is_err());
+        let added = store.add_mapping(input.clone(), &[]).unwrap();
+        let repeated = store.prepare_mapping(input, &[], None).unwrap();
+        assert!(repeated.id.starts_with("prepare-"));
+        assert_eq!(repeated.repository_id, added.repository_id);
+        assert_eq!(repeated.local_root, added.local_root);
+        let committed = store.commit_prepared_mapping(&repeated, &[]).unwrap();
+        assert_eq!(committed.id, added.id, "confirmation retry reuses the stored mapping");
         assert_eq!(store.snapshot().unwrap().mappings.len(), 1);
+    }
+
+    #[test]
+    fn overlapping_mapping_error_identifies_the_existing_binding() {
+        let (dir, store) = store();
+        let connection = store.save_connection(connection_input()).unwrap();
+        let root = dir.path().join("mapped");
+        std::fs::create_dir(&root).unwrap();
+        let schedule = ScheduleConfig { enabled: false, interval: 900 };
+        store.add_mapping(AddMappingInput {
+            connection_id: connection.id.clone(), repository_id: "repo-a".into(),
+            local_root: root.clone(), logical_path: "docs".into(), schedule: schedule.clone(),
+        }, &[]).unwrap();
+        let nested = root.join("child");
+        std::fs::create_dir(&nested).unwrap();
+        let error = store.prepare_mapping(AddMappingInput {
+            connection_id: connection.id, repository_id: "repo-b".into(),
+            local_root: nested, logical_path: "child".into(), schedule,
+        }, &[], None).unwrap_err().to_string();
+        assert!(error.contains("mapping overlaps an existing mapping"), "{error}");
+        assert!(error.contains("main") && error.contains("mapped") && error.contains("docs"), "{error}");
     }
 
     #[test]

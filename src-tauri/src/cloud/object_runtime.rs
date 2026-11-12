@@ -25,6 +25,28 @@ fn local(error: std::io::Error) -> AppError {
 fn state_error() -> AppError {
     app(ObjectServiceError::InvalidLocalCapability)
 }
+
+/// Empty directories are persisted as a zero-byte marker object. Listings must
+/// never expose the marker itself; they return the containing virtual folder
+/// instead so the directory survives a refresh.
+fn is_directory_marker(key: &str) -> bool {
+    key.rsplit('/').next() == Some(super::object_service::DIRECTORY_MARKER)
+}
+
+fn directory_marker_child(key: &str, prefix: &str) -> Option<String> {
+    let base = if prefix.is_empty() || prefix.ends_with('/') {
+        prefix.to_owned()
+    } else {
+        format!("{prefix}/")
+    };
+    let rest = key.strip_prefix(&base)?;
+    let (directory, marker) = rest.rsplit_once('/')?;
+    if marker != super::object_service::DIRECTORY_MARKER || directory.is_empty() {
+        return None;
+    }
+    let first = directory.split('/').find(|segment| !segment.is_empty())?;
+    Some(format!("{base}{first}/"))
+}
 pub(crate) fn random_id() -> Result<String, AppError> {
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng
@@ -1814,6 +1836,26 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
+    async fn directory_markers_render_as_virtual_folders_and_stay_hidden() -> Result<(), TestError> {
+        let f = fixture().await?;
+        f.runtime.resume()?;
+        f.store.extra_objects.lock().await.extend([
+            "empty/.peerdav-directory".into(),
+            "nested/deep/.peerdav-directory".into(),
+        ]);
+        let root = f.runtime.object_list("connection", "", None).await?;
+        assert!(root.objects.iter().any(|entry| entry.key == "empty/" && entry.size == 0));
+        assert!(root.objects.iter().any(|entry| entry.key == "nested/"));
+        assert!(root.objects.iter().all(|entry| !is_directory_marker(&entry.key)));
+        let empty = f.runtime.object_list("connection", "empty/", None).await?;
+        assert!(empty.objects.is_empty());
+        let nested = f.runtime.object_list("connection", "nested/", None).await?;
+        assert!(nested.objects.iter().any(|entry| entry.key == "nested/deep/"));
+        let deep = f.runtime.object_list("connection", "nested/deep/", None).await?;
+        assert!(deep.objects.is_empty());
+        Ok(())
+    }
+    #[tokio::test]
     async fn unified_delete_plan_is_bound_expiring_and_single_use() -> Result<(), TestError> {
         use crate::file_manager::types::*;
         let f = fixture().await?;
@@ -2838,18 +2880,33 @@ impl CloudRuntime {
             .service
             .is_within_protected(page.prefix.trim_end_matches('/'))
             .map_err(app)?;
-        let objects = page
-            .objects
-            .into_iter()
-            .map(|metadata| {
-                Ok(ObjectEntryDto {
+        let objects = {
+            let mut emitted = std::collections::HashSet::new();
+            let mut objects = Vec::with_capacity(page.objects.len());
+            for metadata in page.objects {
+                if is_directory_marker(&metadata.key) {
+                    if let Some(key) = directory_marker_child(&metadata.key, &page.prefix) {
+                        if emitted.insert(key.clone()) {
+                            objects.push(ObjectEntryDto {
+                                protected: session.service.is_within_protected(key.trim_end_matches('/')).map_err(app)?,
+                                key,
+                                size: 0,
+                                etag: None,
+                            });
+                        }
+                    }
+                    continue;
+                }
+                if !emitted.insert(metadata.key.clone()) { continue; }
+                objects.push(ObjectEntryDto {
                     protected: session.service.is_protected(&metadata.key).map_err(app)?,
                     key: metadata.key,
                     size: metadata.size,
                     etag: metadata.etag,
-                })
-            })
-            .collect::<Result<Vec<_>, AppError>>()?;
+                });
+            }
+            objects
+        };
         let mut breadcrumbs = vec![crate::file_manager::types::FileBreadcrumbDto { id: String::new(), name: session.bucket.clone() }];
         breadcrumbs.extend(crate::file_manager::service::path_breadcrumbs(&page.prefix));
         let config = self.config.snapshot().map_err(super::runtime::config_error)?;

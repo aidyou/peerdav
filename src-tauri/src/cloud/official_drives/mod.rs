@@ -1,8 +1,9 @@
 //! Official drive protocol adapters: each provider owns its own wire protocol.
 //!
-//! Only Dropbox is compiled today. The Yandex Disk adapter stays on disk but is
-//! disabled until its developer account is confirmed; re-enable `yandex` here
-//! and its branch in `traits::create` together.
+//! Baidu Netdisk and Dropbox are compiled and wired into `traits::create`.
+//! The Yandex Disk adapter stays on disk but is disabled until its developer
+//! account is confirmed; re-enable `yandex` here and its branch in
+//! `traits::create` together.
 mod common;
 mod baidu;
 mod dropbox;
