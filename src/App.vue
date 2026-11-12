@@ -79,7 +79,9 @@ let connectionRefreshInFlight = false;
 // 渲染，后台刷新再替换，避免每次进入都闪一次骨架屏。
 const adminShares = ref([]);
 const adminAuthorizations = ref([]);
-const adminLoading = ref(true);
+const adminSharesLoading = ref(true);
+const pendingRequestsLoading = ref(true);
+const adminAuthorizationsLoading = ref(true);
 // 每台已连接服务器的实时共享数。放在共享上下文里，首页重挂载时不会先掉成「—」。
 const peerShareCounts = ref({});
 const peers = ref([]);
@@ -637,25 +639,38 @@ async function refreshServerStatus() {
 
 /* 审批入站申请在首页控台与设置页「客户端」里是同一个动作：入口放在共享上下文，
    避免两处各自拼 admin 参数、各自刷新列表而出现短暂不一致。 */
-let adminRefreshVersion = 0;
+// Each catalog owns its request, stale-response guard and loading state. A slow
+// authorization request must not delay shares or pending clients becoming visible.
+function createAdminRefresh(command, target, loading, key) {
+  let version = 0;
+  return async () => {
+    const requestVersion = ++version;
+    loading.value = true;
+    try {
+      const result = await invoke(command, { username: adminUsername.value, password: serverPassword.value });
+      if (requestVersion === version) target.value = stableList(result, key);
+    } catch (error) {
+      if (requestVersion === version) handleFailure(error);
+    } finally {
+      if (requestVersion === version) loading.value = false;
+    }
+  };
+}
+const refreshAdminShares = createAdminRefresh('list_shares', adminShares, adminSharesLoading, entry => entry.id);
+const refreshPendingClients = createAdminRefresh('list_pending_requests', pendingRequests, pendingRequestsLoading, entry => entry.machineId ?? entry.id);
+const refreshAuthorizations = createAdminRefresh('list_authorizations', adminAuthorizations, adminAuthorizationsLoading, entry => entry.machineId ?? entry.id);
+
+// Mutation callers may await completion of the refresh, but each block commits
+// independently and handles its own failure. Page entry never waits on this group.
 async function refreshAdminData() {
-  const version = ++adminRefreshVersion;
-  adminLoading.value = true;
-  try {
-    const args = { username: adminUsername.value, password: serverPassword.value };
-    const [shares, pending, authorizations] = await Promise.all([
-      invoke("list_shares", args),
-      invoke("list_pending_requests", args),
-      invoke("list_authorizations", args),
-    ]);
-    if (version !== adminRefreshVersion) return;
-    adminShares.value = stableList(shares, (entry) => entry.id);
-    pendingRequests.value = stableList(pending, (entry) => entry.machineId ?? entry.id);
-    adminAuthorizations.value = stableList(authorizations, (entry) => entry.machineId ?? entry.id);
-    await refreshServerStatus();
-  } finally {
-    if (version === adminRefreshVersion) adminLoading.value = false;
-  }
+  const shares = refreshAdminShares();
+  const pending = refreshPendingClients();
+  const authorizations = refreshAuthorizations();
+  const status = refreshServerStatus();
+  await shares;
+  await pending;
+  await authorizations;
+  await status;
 }
 
 async function refreshPendingRequests() {
@@ -917,7 +932,12 @@ provide(
     refreshAccessRequests,
     adminShares,
     adminAuthorizations,
-    adminLoading,
+    adminSharesLoading,
+    pendingRequestsLoading,
+    adminAuthorizationsLoading,
+    refreshAdminShares,
+    refreshPendingClients,
+    refreshAuthorizations,
     peerShareCounts,
     peers,
     peersLoading,

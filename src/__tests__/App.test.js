@@ -230,7 +230,7 @@ async function clickBarButton(wrapper, label) {
 }
 
 async function waitForSettingsPaint() {
-  await new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
+  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
   await flushPromises();
 }
 
@@ -1431,6 +1431,96 @@ describe("home workspace", () => {
     wrapper.unmount();
     vi.restoreAllMocks();
   });
+  it.each(['shares', 'clients'])('keeps the %s skeleton through the first rendering frame', async (tab) => {
+    const frames = new Map();
+    let frameId = 0;
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => {
+      frames.set(++frameId, callback);
+      return frameId;
+    });
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(id => frames.delete(id));
+    const runFrame = () => {
+      const batch = [...frames.values()];
+      frames.clear();
+      for (const callback of batch) callback(0);
+    };
+    let wrapper;
+    try {
+      wrapper = await mountReady({ admin_session: async () => ({ username: 'admin', mustChangePassword: false }) });
+      await wrapper.find('button[aria-label="打开设置"]').trigger('click');
+      await flushPromises();
+      invoke.mockClear();
+      await wrapper.find(`#tab-${tab}`).trigger('click');
+      expect(wrapper.find(`#pane-${tab} .list-skeleton`).exists()).toBe(true);
+      runFrame();
+      // A timer is not evidence of a paint: the event loop may run it before
+      // another rendering opportunity. Even in that order, keep the skeleton.
+      await new Promise(resolve => setTimeout(resolve, 0));
+      await flushPromises();
+      expect(wrapper.find(`#pane-${tab} .list-skeleton`).exists()).toBe(true);
+      expect(invoke.mock.calls.some(([name]) => ['list_shares', 'list_pending_requests', 'list_authorizations'].includes(name))).toBe(false);
+      expect(frames.size).toBeGreaterThan(0);
+      runFrame();
+      await flushPromises();
+      expect(invoke.mock.calls.some(([name]) => name === (tab === 'shares' ? 'list_shares' : 'list_pending_requests'))).toBe(true);
+      // Leaving with the next frame pending must not start hidden requests.
+      await wrapper.find('#tab-general').trigger('click');
+      await wrapper.find(`#tab-${tab}`).trigger('click');
+      runFrame();
+      const canceledBeforeUnmount = window.cancelAnimationFrame.mock.calls.length;
+      wrapper.unmount();
+      wrapper = null;
+      expect(window.cancelAnimationFrame.mock.calls.length).toBeGreaterThan(canceledBeforeUnmount);
+      invoke.mockClear();
+      // Element Plus transitions also own frames; drain those without assuming
+      // the component under test is the only animation-frame consumer.
+      runFrame();
+      runFrame();
+      await flushPromises();
+      expect(invoke.mock.calls.some(([name]) => ['list_shares', 'list_pending_requests', 'list_authorizations'].includes(name))).toBe(false);
+    } finally {
+      wrapper?.unmount();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('loads shares without requesting unrelated client data', async () => {
+    const wrapper = await mountReady({ admin_session: async () => ({ username: 'admin', mustChangePassword: false }) });
+    await wrapper.find('button[aria-label="打开设置"]').trigger('click');
+    await flushPromises();
+    invoke.mockClear();
+    await wrapper.find('#tab-shares').trigger('click');
+    expect(wrapper.find('#pane-shares .list-skeleton').exists()).toBe(true);
+    await waitForSettingsPaint();
+    expect(invoke.mock.calls.some(([name]) => name === 'list_shares')).toBe(true);
+    for (const command of ['list_pending_requests', 'list_authorizations', 'server_status']) {
+      expect(invoke.mock.calls.some(([name]) => name === command)).toBe(false);
+    }
+    wrapper.unmount();
+  });
+
+  it('shows pending clients while authorizations are still loading or fail', async () => {
+    let rejectAuthorizations;
+    const wrapper = await mountReady({ admin_session: async () => ({ username: 'admin', mustChangePassword: false }) });
+    await wrapper.find('button[aria-label="打开设置"]').trigger('click');
+    await flushPromises();
+    mockCommands({
+      list_authorizations: () => new Promise((_, reject) => { rejectAuthorizations = reject; }),
+      list_pending_requests: async () => [{ id: 'pending-fast', deviceName: 'Fast client', peerIp: '127.0.0.1', attempts: 1 }],
+    });
+    await wrapper.find('#tab-clients').trigger('click');
+    expect(wrapper.find('#pane-clients .list-skeleton').exists()).toBe(true);
+    await waitForSettingsPaint();
+    expect(wrapper.find('#pane-clients').text()).toContain('Fast client');
+    expect(wrapper.find('#pane-clients .list-skeleton').exists()).toBe(true);
+    rejectAuthorizations({ code: 'TEST_AUTH_LOAD', message: 'Authorization unavailable' });
+    await flushPromises();
+    expect(wrapper.find('#pane-clients').text()).toContain('Fast client');
+    expect(wrapper.find('#pane-clients .list-skeleton').exists()).toBe(false);
+    expect(latestErrorMessage()).toContain('Authorization unavailable');
+    wrapper.unmount();
+  });
+
   it("renders settings without waiting for unrelated backend initialization", async () => {
     localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
     const wrapper = await mountReady({ admin_session: async () => ({ username: 'admin', mustChangePassword: false }) });
@@ -1475,9 +1565,12 @@ describe("home workspace", () => {
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
     await flushPromises();
     await wrapper.find("#tab-shares").trigger("click");
+    // Even cached lists mount after the navigation frame, not inside the click frame.
+    expect(wrapper.find('#pane-shares .list-skeleton').exists()).toBe(true);
+    expect(wrapper.find('#pane-shares .share-collapse').exists()).toBe(false);
     await waitForSettingsPaint();
 
-    // 数据已经缓存在共享上下文里：重新进入时直接渲染旧列表，不再闪骨架屏。
+    // 数据已经缓存在共享上下文里：首帧之后直接渲染旧列表，无需等刷新响应。
     expect(wrapper.findAll(".list-skeleton")).toHaveLength(0);
     expect(wrapper.text()).toContain("Docs");
 
@@ -1900,9 +1993,10 @@ describe("settings information architecture", () => {
     expect(wrapper.findAll(".list-skeleton")).toHaveLength(1);
     expect(wrapper.find("#pane-shares .share-empty").exists()).toBe(false);
 
-    // 客户端两个折叠面板：入站列表等管理员数据，出站列表等发现快照与已保存对等端。
+    // 客户端入站已独立返回，不再等待尚未完成的共享目录请求；仅出站仍加载。
     await clickButton(wrapper, "客户端");
-    expect(wrapper.findAll(".list-skeleton")).toHaveLength(2);
+    expect(wrapper.findAll(".list-skeleton")).toHaveLength(1);
+    expect(wrapper.findAll(".client-empty")).toHaveLength(1);
 
     for (const resolvers of Object.values(pending)) {
       for (const resolve of resolvers) resolve([]);

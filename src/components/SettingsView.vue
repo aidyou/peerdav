@@ -232,12 +232,12 @@ const bindOptions = computed(() =>
   }),
 );
 
-// 管理数据（共享、授权、待审批）由一次 loadAdminData 拉取；加载中的列表显示骨架屏。
+// 管理数据按块独立加载；共享上下文保留已有列表供后台刷新时展示。
 // 数据本身存在共享上下文里：重新进入设置页先用旧数据渲染，后台刷新再替换，
 // 不再每次进入都闪一次骨架屏。
 const shares = toRef(app, "adminShares");
 const authorizations = toRef(app, "adminAuthorizations");
-const adminLoading = toRef(app, "adminLoading");
+const adminSharesLoading = toRef(app, "adminSharesLoading");
 
 const shareName = ref("");
 const shareRoot = ref("");
@@ -282,6 +282,7 @@ function permissionFlags(share) {
 }
 
 const inboundEntries = computed(() => {
+  if (panePending.value) return [];
   const pending = app.pendingRequests.map((request) => ({
     key: `pending-${request.id}`,
     status: "pending",
@@ -390,6 +391,7 @@ function buildOutboundEntry(server, peer, accessEntry) {
 }
 
 const outboundEntries = computed(() => {
+  if (panePending.value) return [];
   const rows = [];
   const coveredPeers = new Set();
   const coveredAccess = new Set();
@@ -414,18 +416,19 @@ const outboundEntries = computed(() => {
   }
   return stableList(rows, (entry) => entry.identity);
 });
-// 骨架屏仅用于「还没有任何数据」的首屏；已有数据时的刷新继续渲染旧行，避免整块闪烁。
-const panePending = ref(false);
+// The navigation frame stays lightweight even when cached lists are large.
+// Once painted, cached rows remain visible while missing sources load.
+const panePending = ref(['shares', 'clients'].includes(app.settingsTab));
 const sharesLoading = computed(
-  () => (adminLoading.value || panePending.value) && shares.value.length === 0,
+  () => panePending.value || (adminSharesLoading.value && shares.value.length === 0),
 );
 const inboundLoading = computed(
-  () => (adminLoading.value || panePending.value) && inboundEntries.value.length === 0,
+  () => panePending.value || app.pendingRequestsLoading || app.adminAuthorizationsLoading,
 );
 const outboundLoading = computed(
   () =>
-    (app.peersLoading || app.discoveredLoading) &&
-    outboundEntries.value.length === 0,
+    panePending.value || ((app.peersLoading || app.discoveredLoading) &&
+    outboundEntries.value.length === 0),
 );
 
 const manualOpen = ref(false);
@@ -835,29 +838,32 @@ function loadVisibleSettings(tab) {
   initializedPanes.add(tab);
   if (tab === 'general') { void loadAutostart(); void loadTrayIconStyle(); }
   if (tab === 'service') { void loadServiceSettings(); void loadLocalNetworks(); void loadLanAddress(); }
-  if (tab === 'shares' || tab === 'clients') {
-    void loadInitialData();
-    if (tab === 'shares') void loadLocalNetworks();
+  if (tab === 'shares') {
+    void app.refreshAdminShares();
+    void loadLocalNetworks();
+  }
+  if (tab === 'clients') {
+    void app.refreshPendingClients();
+    void app.refreshAuthorizations();
   }
   // CloudSettings owns cloud loading; don't issue a duplicate cloud_list here.
 }
 let paneFrame = null;
-let paneTimer = null;
 function scheduleVisibleSettings(tab) {
   if (paneFrame !== null) cancelAnimationFrame(paneFrame);
-  if (paneTimer !== null) clearTimeout(paneTimer);
-  panePending.value = !initializedPanes.has(tab) && (tab === 'shares' || tab === 'clients');
+  paneFrame = null;
+  panePending.value = tab === 'shares' || tab === 'clients';
   if (!panePending.value) { loadVisibleSettings(tab); return; }
-  // Vue patches the active tab and skeleton first. The timer after rAF yields
-  // a paint opportunity before IPC serialization and backend work start.
+  // rAF runs BEFORE paint. A zero-delay timer after it can still replace the
+  // skeleton before the WebView presents that frame. Keep the lightweight DOM
+  // for a full rendering opportunity, then start work in the following frame.
   paneFrame = requestAnimationFrame(() => {
-    paneFrame = null;
-    paneTimer = setTimeout(() => {
-      paneTimer = null;
+    paneFrame = requestAnimationFrame(() => {
+      paneFrame = null;
       if (disposed || app.settingsTab !== tab) return;
       loadVisibleSettings(tab);
       panePending.value = false;
-    }, 0);
+    });
   });
 }
 watch(() => app.settingsTab, scheduleVisibleSettings);
@@ -866,7 +872,6 @@ onMounted(() => { scheduleVisibleSettings(app.settingsTab); });
 onBeforeUnmount(() => {
   disposed = true;
   if (paneFrame !== null) cancelAnimationFrame(paneFrame);
-  if (paneTimer !== null) clearTimeout(paneTimer);
 });
 
 async function loadAutostart() {
@@ -895,15 +900,6 @@ async function changeAutostart(value) {
   }
 }
 
-/// Initial load after sign-in keeps the login notice visible; later reloads
-/// happen right after a user action, inside that action's `run`.
-async function loadInitialData() {
-  try {
-    await loadAdminData();
-  } catch (error) {
-    app.handleFailure(error);
-  }
-}
 </script>
 
 <template>
@@ -1470,7 +1466,7 @@ async function loadInitialData() {
 
             <list-skeleton v-if="inboundLoading" :rows="3" />
             <el-collapse
-              v-else-if="inboundEntries.length"
+              v-if="inboundEntries.length && !panePending"
               v-model="activeInboundIds"
               class="client-collapse"
             >
@@ -1545,7 +1541,7 @@ async function loadInitialData() {
                 </ul>
               </el-collapse-item>
             </el-collapse>
-            <div v-else class="client-empty">
+            <div v-else-if="!inboundLoading" class="client-empty">
               <span class="client-empty__icon" aria-hidden="true">
                 <svg viewBox="0 0 24 24">
                   <circle cx="8.5" cy="15.5" r="3.5" />
