@@ -18,7 +18,7 @@ export function useDownloadQueue({ captureScope, scopeValid, backend, select = (
   const args = (s) => ({ queueId: s.queueId });
   const downloadRunning = computed(() => downloadSelecting.value || downloadCanceling.value || ["selected", "running", "conflict", "cancelling", "canceling"].includes(downloadState.value?.phase));
   const downloadSummary = computed(() => t("peer.downloadSummary", { finished: (downloadState.value?.completedFiles || 0) + (downloadState.value?.skippedFiles || 0), total: downloadState.value?.totalFiles || 0 }));
-  const downloadQueue = computed(() => downloadPage.value.items.map((item) => ({ ...item, transferId: item.id, status: ({ completed: "done", running: "downloading", failed: "error", skipped: "skipped" })[item.phase] || item.phase })));
+  const downloadQueue = computed(() => downloadPage.value.items.map((item) => ({ ...item, transferId: item.id, status: ({ completed: "done", running: "downloading", active: "downloading", failed: "error", skipped: "skipped" })[item.phase] || item.phase })));
   function apply(s, state) {
     if (!valid(s)) return;
     if (state.conflict?.conflictId === s.resolvedConflictId) state = { ...state, conflict: null };

@@ -110,7 +110,10 @@ async fn discover_inner<S: ObjectStore + ?Sized>(
         journal: Some((index, operation)),
     };
     let limits = DiscoveryLimits::default();
+    let phase_started = std::time::Instant::now();
     let repo = open_metered(store.clone(), binding, password, &mut meter, &limits).await?;
+    log::debug!(target: "peerdav::preview", "operation={operation} stage=repository_open elapsed_ms={}", phase_started.elapsed().as_millis());
+    let listing_started = std::time::Instant::now();
     let prefix = format!("{APPEND_ROOT}/{}/commits/", repo.repo_id());
     let mut token = None;
     let mut tokens = HashSet::new();
@@ -152,6 +155,7 @@ async fn discover_inner<S: ObjectStore + ?Sized>(
             }
         }
     }
+    log::debug!(target: "peerdav::preview", "operation={operation} stage=commit_listing elapsed_ms={} requests={} pages={} candidates={}", listing_started.elapsed().as_millis(), meter.requests, meter.pages, meter.raw_entries);
     // Known candidates are history, not frontier. Read and reserve one key at a
     // time without evicting entries or materializing full index records.
     let mut roots = Vec::new();
@@ -179,7 +183,9 @@ async fn discover_inner<S: ObjectStore + ?Sized>(
         roots.push(commit_reference(&key, &prefix)?);
         after = key;
     }
+    let validation_started = std::time::Instant::now();
     let result = validate_metered(store, repo.repo_id(), &repo, &roots, &mut meter, &limits, validate_blocks).await;
+    log::debug!(target: "peerdav::preview", "operation={operation} stage=metadata_validation elapsed_ms={} roots={} requests={} validate_blocks={} ok={}", validation_started.elapsed().as_millis(), roots.len(), meter.requests, validate_blocks, result.is_ok());
     if !validate_blocks {
         // Linking only authenticates metadata. Do not persist full-validation
         // markers or let the metadata-only result escape into the sync engine.
@@ -282,7 +288,9 @@ async fn open_metered<S: ObjectStore + ?Sized>(
     ) {
         return Err(AppendError::TrustRejected);
     }
+    let opened_at = std::time::Instant::now();
     let bytes = get(store.as_ref(), &binding.key, meter, limits).await?;
+    log::debug!(target: "peerdav::preview", "stage=anchor_fetch elapsed_ms={}", opened_at.elapsed().as_millis());
     if hex::encode(Sha256::digest(&bytes)) != binding.fingerprint {
         return Err(AppendError::FingerprintMismatch);
     }
@@ -294,7 +302,10 @@ async fn open_metered<S: ObjectStore + ?Sized>(
     {
         return Err(AppendError::Invalid("anchor binding"));
     }
-    AppendRepository::new(store, anchor, password)
+    let kdf_started = std::time::Instant::now();
+    let result = AppendRepository::new(store, anchor, password);
+    log::debug!(target: "peerdav::preview", "stage=anchor_unlock elapsed_ms={} ok={}", kdf_started.elapsed().as_millis(), result.is_ok());
+    result
 }
 
 fn commit_reference(key: &str, prefix: &str) -> Result<CommitRef, AppendError> {

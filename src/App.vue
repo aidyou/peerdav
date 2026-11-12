@@ -1845,6 +1845,29 @@ body:has(.window-frame) .el-overlay-dialog {
   height: var(--el-component-size);
 }
 
+/* All dialog footers share one action-spacing contract, including teleports.
+   Keep custom summary/action layouts intact; only their action group uses gap. */
+:root .el-dialog__footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+:root .el-dialog__footer > .dialog-footer {
+  width: 100%;
+}
+:root .el-dialog__footer .dialog-footer__actions,
+:root .el-dialog__footer .operation-error__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+:root .el-dialog__footer .el-button + .el-button {
+  margin-left: 0;
+}
+
 :root .el-input__wrapper,
 :root .el-select__wrapper {
   height: var(--el-component-size);

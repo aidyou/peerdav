@@ -6,6 +6,7 @@ use super::{
     scan_types::ScanOptions,
     traits::BlockReader,
 };
+use futures_util::{stream, StreamExt};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -281,7 +282,11 @@ pub async fn materialize<B: BlockReader>(
         };
         let mut tmp = tempfile::NamedTempFile::new_in(private)
             .map_err(|_| EngineError::Changed(target.clone()))?;
-        for block in &file.blocks {
+        // Ordered buffering overlaps network reads while retaining file order.
+        // At most four authenticated CDC blocks (4 * 8 MiB plaintext) are live.
+        let block_target = &target;
+        let mut pending = stream::iter(file.blocks.iter().cloned()).map(|block: super::merge_types::BlockRef| async move {
+            let target = (*block_target).clone();
             check()?;
             let len =
                 usize::try_from(block.len).map_err(|_| EngineError::Changed(target.clone()))?;
@@ -318,6 +323,11 @@ pub async fn materialize<B: BlockReader>(
                     .await
                     .map_err(MaterializeError::Block)?,
             };
+            Ok::<_, MaterializeError<B::Error>>(bytes)
+        }).buffered(4);
+        while let Some(bytes) = pending.next().await {
+            check()?;
+            let bytes = bytes?;
             std::io::Write::write_all(&mut tmp, &bytes)
                 .map_err(|_| EngineError::Changed(target.clone()))?;
         }

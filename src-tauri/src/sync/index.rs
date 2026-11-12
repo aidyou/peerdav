@@ -132,6 +132,27 @@ impl SyncIndex {
         Ok(())
     }
 
+    /// Commit the disposable local fingerprint ledger in one transaction.
+    /// It is separate from materialized baselines and never grants deletion authority.
+    pub(crate) fn save_scan_ledger(
+        &self,
+        files: &std::collections::BTreeMap<String, crate::sync::scan_types::FileScan>,
+        previous: &std::collections::BTreeMap<String, crate::sync::scan_types::FileScan>,
+    ) -> Result<(), IndexError> {
+        let tx = self.connection.unchecked_transaction()?;
+        for (path, file) in files {
+            if previous.get(path) != Some(file) { self.write_record("scan-file-v1", path, file)?; }
+        }
+        for path in previous.keys().filter(|path| !files.contains_key(*path)) {
+            let scope = self.scope()?;
+            let token = self.token("scan-file-v1", path)?;
+            self.connection.execute("DELETE FROM records WHERE scope=?1 AND token=?2", params![scope.as_slice(), token.as_slice()])?;
+        }
+        self.write_record("scan-ledger-v1", "paths", &files.keys().collect::<Vec<_>>())?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn load<T: DeserializeOwned>(
         &self,
         category: &str,

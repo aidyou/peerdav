@@ -52,6 +52,9 @@ pub struct DownloadItem {
     /// 文件字节大小，供下载队列展示“大小”列与行内进度分母。
     pub size: u64,
     pub phase: String,
+    pub transferred: Option<u64>,
+    #[serde(skip)]
+    pub(crate) progress: Arc<AtomicU64>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

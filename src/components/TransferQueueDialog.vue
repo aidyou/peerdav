@@ -21,7 +21,7 @@ const showProcessed = computed(() => processed.value > 0 || total.value > 0);
 // 行内进度只用于正在下载的那一行；分母取该行文件大小（后端已透传）。
 const progressFor = (item) => {
   if (item.status !== "downloading") return null;
-  const transferred = props.queueState?.currentTransferred;
+  const transferred = item.transferred ?? props.queueState?.currentTransferred;
   if (transferred == null || !item.size) return null;
   return Math.min(100, Math.round((transferred / item.size) * 100));
 };

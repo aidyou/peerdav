@@ -158,6 +158,50 @@ fn concurrent_directory_addition_invalidates_full_scan() {
 }
 
 #[test]
+fn unchanged_scan_reuses_content_fingerprints() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = tempdir().expect("root");
+    fs::write(root.path().join("a"), b"unchanged").expect("file");
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counter = reads.clone();
+    let options = peerdav_lib::sync::scan_types::ScanOptions {
+        on_chunk: Some(Arc::new(move |_| { counter.fetch_add(1, Ordering::SeqCst); })),
+        ..Default::default()
+    };
+    let first = peerdav_lib::sync::scan::scan(root.path(), &options).expect("first");
+    reads.store(0, Ordering::SeqCst);
+    let second = peerdav_lib::sync::scan::scan(root.path(), &options).expect("second");
+    assert_eq!(first, second);
+    assert_eq!(reads.load(Ordering::SeqCst), 0, "unchanged files must not be read again");
+}
+
+#[test]
+fn incremental_scan_detects_equal_size_changes_moves_and_timestamp_only_updates() {
+    use peerdav_lib::sync::{scan::scan, scan_types::ScanOptions};
+    use std::time::{Duration, SystemTime};
+    let root = tempdir().expect("root");
+    let outside = tempdir().expect("outside");
+    fs::write(root.path().join("a"), b"before").expect("file");
+    let initial = scan(root.path(), &ScanOptions::default()).expect("initial");
+    fs::write(root.path().join("a"), b"edited").expect("equal length change");
+    let changed = scan(root.path(), &ScanOptions::default()).expect("changed");
+    assert_ne!(initial.files[0].whole_file_hash, changed.files[0].whole_file_hash);
+    let file = fs::File::options().write(true).open(root.path().join("a")).expect("open");
+    file.set_times(fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(10))).expect("touch");
+    let touched = scan(root.path(), &ScanOptions::default()).expect("touch scan");
+    assert_eq!(changed.files[0].whole_file_hash, touched.files[0].whole_file_hash);
+    fs::rename(root.path().join("a"), root.path().join("renamed")).expect("rename");
+    assert_eq!(scan(root.path(), &ScanOptions::default()).expect("rename scan").files[0].path, "renamed");
+    fs::rename(root.path().join("renamed"), outside.path().join("a")).expect("move out");
+    assert!(scan(root.path(), &ScanOptions::default()).expect("removed").files.is_empty());
+    fs::rename(outside.path().join("a"), root.path().join("arrived")).expect("move in");
+    fs::write(root.path().join(".arrived.swp"), b"ignore").expect("swap");
+    let arrived = scan(root.path(), &ScanOptions::default()).expect("arrived");
+    assert_eq!(arrived.files.len(), 1);
+    assert_eq!(arrived.files[0].path, "arrived");
+}
+
+#[test]
 fn portable_reserved_paths_and_overlapping_roots_are_rejected() {
     use peerdav_lib::sync::paths::{validate_relative, validate_root_protection};
     use std::path::Path;

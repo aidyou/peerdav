@@ -15,6 +15,9 @@ use std::{
 
 #[derive(Default)]
 struct State {
+    delay: bool,
+    active: usize,
+    peak: usize,
     objects: BTreeMap<String, Vec<u8>>,
     requests: Vec<Request>,
     page_size: usize,
@@ -74,6 +77,14 @@ impl Remote {
             .filter(|r| r.operation == operation)
             .map(|r| r.bytes)
             .collect()
+    }
+    pub fn measure_parallelism(&self) { self.0.lock().unwrap().delay = true; }
+    pub fn peak_parallelism(&self) -> usize { self.0.lock().unwrap().peak }
+    async fn latency(&self) {
+        if !self.0.lock().unwrap().delay { return; }
+        { let mut state = self.0.lock().unwrap(); state.active += 1; state.peak = state.peak.max(state.active); }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        self.0.lock().unwrap().active -= 1;
     }
     pub fn store(&self) -> FakeStore {
         FakeStore(self.clone())
@@ -208,6 +219,7 @@ impl ObjectStore for FakeStore {
         range: Option<Range<u64>>,
     ) -> BoxFuture<'a, Result<ObjectStream, CloudError>> {
         Box::pin(async move {
+            self.0.latency().await;
             let mut s = self.0.0.lock().unwrap();
             let allowed = s
                 .get_visible
@@ -250,6 +262,7 @@ impl ObjectStore for FakeStore {
         condition: PutCondition,
     ) -> BoxFuture<'a, Result<ObjectMetadata, CloudError>> {
         Box::pin(async move {
+            self.0.latency().await;
             let mut bytes = Vec::new();
             while let Some(p) = body.next().await {
                 bytes.extend_from_slice(&p?);

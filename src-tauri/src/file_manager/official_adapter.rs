@@ -38,12 +38,9 @@ impl OfficialBrowserBackend {
     async fn admit_write(&self, peers: &PeerManager, cloud: &CloudRuntime, path: &str) -> Result<(), AppError> {
         self.admit(peers, cloud).await?;
         if self.protected_path(path).await { return Err(super::service::unavailable()); }
-        let config = cloud.config.snapshot().map_err(crate::cloud::runtime::config_error)?;
-        if config.mappings.iter().filter(|m| m.connection_id == self.connection_id).map(|m| m.id.as_str())
-            .chain(config.mirror_mappings.iter().filter(|m| m.connection_id == self.connection_id).map(|m| m.id.as_str()))
-            .any(|id| matches!(cloud.manager.status(id).phase, crate::sync::manager_types::SyncPhase::Scanning | crate::sync::manager_types::SyncPhase::Uploading | crate::sync::manager_types::SyncPhase::Publishing | crate::sync::manager_types::SyncPhase::Applying)) {
-            return Err(AppError { code: "CLOUD_SYNC_BUSY".into(), message: "同步进行中，暂不能修改网盘 / Sync in progress; drive writes are frozen".into(), detail: None, context: None });
-        }
+        // Sync data lives in reserved namespaces. Guard the target's provider
+        // ancestry, not every write on the connection when any mapping is busy.
+        // This also applies when a previously selected upload starts later.
         Ok(())
     }
 
@@ -171,10 +168,33 @@ mod tests {
         let file = data.path().join("a.txt");
         let FileUploadDto::Cloud(pending) = backend.select_upload(&peers, &runtime, String::new(), vec![file], UploadMode::Files, Default::default()).await.expect("select before sync") else { panic!("cloud queue") };
         let mirror_root = tempfile::tempdir().expect("mirror root");
-        let mirror = runtime.save_mirror_mapping(crate::mirror::SaveMirrorMappingInput { id: None, connection_id: backend.connection_id.clone(), bucket: Some("root".into()), local_root: mirror_root.path().to_owned(), cloud_prefix: "sample".into(), schedule: Default::default() }).expect("mirror mapping");
-        runtime.manager.report_status(crate::sync::manager_types::SyncStatus { mapping_id: mirror.id, run_id: None, phase: crate::sync::manager_types::SyncPhase::Scanning, detail: None });
-        assert_eq!(backend.admit_write(&peers, &runtime, "").await.expect_err("mirror freezes ordinary upload").code, "CLOUD_SYNC_BUSY");
-        assert_eq!(backend.upload_action(&peers, &runtime, &pending.batch_id, UploadAction::Start).await.expect_err("recheck queued upload at start").code, "CLOUD_SYNC_BUSY");
+        let mirror = runtime.save_mirror_mapping(crate::mirror::SaveMirrorMappingInput { id: None, connection_id: backend.connection_id.clone(), bucket: Some("root".into()), local_root: mirror_root.path().to_owned(), cloud_prefix: "sample".into(), full_check: false, schedule: Default::default() }).expect("mirror mapping");
+        let mut sync_page = self::page(&["sync-namespace"], true);
+        sync_page.entries[0].name = "_peerdav_mirror".into();
+        backend.map_page("", "root", sync_page).await.expect("sync namespace");
+        backend.map_page("sync-namespace", "sync-namespace", self::page(&["sync-child"], true)).await.expect("sync child");
+        backend.map_page("", "root", self::page(&["ordinary"], true)).await.expect("ordinary sibling");
+        backend.map_page("ordinary", "ordinary", self::page(&["ordinary-child"], true)).await.expect("ordinary nested folder");
+        for phase in [crate::sync::manager_types::SyncPhase::Frozen, crate::sync::manager_types::SyncPhase::Scanning, crate::sync::manager_types::SyncPhase::Uploading, crate::sync::manager_types::SyncPhase::Publishing, crate::sync::manager_types::SyncPhase::Applying] {
+            runtime.manager.report_status(crate::sync::manager_types::SyncStatus { mapping_id: mirror.id.clone(), run_id: None, phase, detail: None });
+            for path in ["", "ordinary", "ordinary-child"] {
+                backend.admit_write(&peers, &runtime, path).await.expect("sync must not freeze unrelated folders");
+            }
+            for path in ["sync-namespace", "sync-child"] {
+                assert_eq!(backend.admit_write(&peers, &runtime, path).await.expect_err("sync namespace remains protected").code, "FILE_CAPABILITY_UNAVAILABLE");
+            }
+        }
+        let FileUploadDto::Cloud(during_sync) = backend.select_upload(&peers, &runtime, "ordinary-child".into(), vec![data.path().join("a.txt")], UploadMode::Files, Default::default()).await.expect("ordinary upload selection while sync runs") else { panic!("cloud queue") };
+        backend.release_upload(&peers, &runtime, &during_sync.batch_id).await.expect("release independent queue");
+        for path in ["sync-namespace", "sync-child"] {
+            assert_eq!(backend.create_dir(&peers, &runtime, path, "new").await.expect_err("protected creation").code, "FILE_CAPABILITY_UNAVAILABLE");
+            assert_eq!(backend.delete_plan(&peers, &runtime, path).await.expect_err("protected deletion").code, "FILE_CAPABILITY_UNAVAILABLE");
+            assert_eq!(backend.move_entry(&peers, &runtime, path, "ordinary").await.expect_err("protected source").code, "FILE_CAPABILITY_UNAVAILABLE");
+            assert_eq!(backend.move_entry(&peers, &runtime, "ordinary", path).await.expect_err("protected destination").code, "FILE_CAPABILITY_UNAVAILABLE");
+        }
+        // A queued upload must still recheck its target, not only its selection-time admission.
+        backend.uploads.lock().await.get_mut(&pending.batch_id).expect("pending queue").status.prefix = "sync-child".into();
+        assert_eq!(backend.upload_action(&peers, &runtime, &pending.batch_id, UploadAction::Start).await.expect_err("recheck queued target at start").code, "FILE_CAPABILITY_UNAVAILABLE");
         backend.upload_action(&peers, &runtime, &pending.batch_id, UploadAction::Cancel).await.expect("cancel remains available while frozen");
         backend.release_upload(&peers, &runtime, &pending.batch_id).await.expect("release frozen queue");
         assert!(backend.select_upload(&peers, &runtime, "forged/".into(), Vec::new(), UploadMode::Files, Default::default()).await.is_err());

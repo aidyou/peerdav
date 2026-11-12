@@ -345,6 +345,58 @@ impl AppendPublisher {
             if cancel.load(Ordering::Relaxed) {
                 return Err(PublishError::Cancelled);
             }
+            // Only independent blocks overlap. Trees and the visibility commit
+            // retain their original ordered publication and uncertainty states.
+            let start = op.next_object;
+            let mut batch = Vec::new();
+            let mut live_bytes = 0usize;
+            for ordinal in start..op.objects.len().min(start + 4) {
+                let object = &op.objects[ordinal];
+                if !object.key.contains("/blocks/") || live_bytes.saturating_add(object.len) > 32 * 1024 * 1024 { break; }
+                live_bytes += object.len;
+                batch.push((object.clone(), index.frozen_bytes(&op, ordinal)?));
+            }
+            if batch.len() > 1 {
+                for (_, bytes) in &batch { Self::charge(index, &mut op, 0, bytes.len())?; }
+                let checked = futures_util::future::join_all(batch.into_iter().map(|(object, bytes)| async move {
+                    let exists = match store.get(&object.key, None).await {
+                        Ok(mut body) => {
+                            let mut offset = 0usize;
+                            while let Some(chunk) = body.next().await {
+                                let chunk = chunk?;
+                                let end = offset.checked_add(chunk.len()).ok_or(PublishError::Invalid("remote bytes"))?;
+                                if bytes.get(offset..end) != Some(chunk.as_ref()) { return Err(PublishError::Invalid("remote bytes differ from frozen object")); }
+                                offset = end;
+                            }
+                            if offset != bytes.len() { return Err(PublishError::Invalid("remote object length")); }
+                            true
+                        }
+                        Err(CloudError::NotFound) => false,
+                        Err(error) => return Err(error.into()),
+                    };
+                    Ok::<_, PublishError>((object, bytes, exists))
+                })).await;
+                let checked = checked.into_iter().collect::<Result<Vec<_>, _>>()?;
+                let count = checked.len();
+                let mut writes = Vec::new();
+                for (object, bytes, exists) in checked {
+                    if !exists {
+                        if cancel.load(Ordering::Relaxed) { return Err(PublishError::Cancelled); }
+                        Self::charge(index, &mut op, bytes.len() as u64, 0)?;
+                        writes.push(async move {
+                            let body = Box::pin(stream::once(async move { Ok(Bytes::from(bytes)) }));
+                            store.put(&object.key, body, PutCondition::Any).await
+                        });
+                    }
+                }
+                // Drain all dispatched writes even when one fails. A retry starts
+                // at the same frozen batch and authenticates any completed copies.
+                let results = futures_util::future::join_all(writes).await;
+                for result in results { result?; }
+                op.next_object += count;
+                index.save_publication(&op)?;
+                continue;
+            }
             let ordinal = op.next_object;
             let object = op.objects[ordinal].clone();
             let bytes = index.frozen_bytes(&op, ordinal)?;

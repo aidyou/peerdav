@@ -23,6 +23,7 @@ pub async fn save_client_proxy_settings(proxy: super::types::ProxyMode, cloud: t
     cloud.0.admit()?;
     cloud.0.config.save_client_proxy(proxy).map_err(super::runtime::config_error)?;
     cloud.0.official_refresh.lock().await.clear();
+    cloud.0.official_clients.lock().map_err(|_| AppError::from(crate::DomainError::Internal { detail: "HTTP client cache lock poisoned".into() }))?.clear();
     cloud.0.objects.lock().await.sessions.clear();
     Ok(())
 }
@@ -45,6 +46,7 @@ pub async fn save_drive_proxy_settings(connection_id: String, direct: bool, clou
     cloud.0.admit()?;
     cloud.0.config.save_drive_proxy(&connection_id, direct).map_err(super::runtime::config_error)?;
     cloud.0.official_refresh.lock().await.remove(&connection_id);
+    cloud.0.official_clients.lock().map_err(|_| AppError::from(crate::DomainError::Internal { detail: "HTTP client cache lock poisoned".into() }))?.remove(&connection_id);
     cloud.0.objects.lock().await.sessions.remove(&connection_id);
     Ok(())
 }
@@ -258,6 +260,11 @@ pub async fn cloud_local_preview(mapping_id: String, path: String, cloud: tauri:
 pub async fn cloud_local_open(app: tauri::AppHandle, mapping_id: String, path: String, cloud: tauri::State<'_, SharedCloud>) -> Result<(), AppError> {
     cloud.0.local_file_open(&app, &mapping_id, &path).await
 }
+#[tauri::command]
+pub async fn cloud_local_create_directory(mapping_id: String, path: String, cloud: tauri::State<'_, SharedCloud>) -> Result<(), AppError> {
+    cloud.0.local_create_directory(&mapping_id, &path).await
+}
+
 #[tauri::command]
 pub async fn cloud_local_mutate(mapping_id: String, path: String, destination: Option<String>, confirmed: bool, cloud: tauri::State<'_, SharedCloud>) -> Result<(), AppError> {
     if !confirmed { return Err(AppError { code: "CLOUD_CONFIRMATION_REQUIRED".into(), message: "请确认本地文件操作 / Confirm local file operation".into(), detail: None, context: None }); }

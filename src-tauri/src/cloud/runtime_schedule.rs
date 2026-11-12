@@ -9,7 +9,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
 
-use super::config_types::MIN_SCHEDULE_INTERVAL;
+use super::config_types::DEFAULT_SCHEDULE_INTERVAL;
 use super::runtime::CloudRuntime;
 use crate::AppError;
 
@@ -150,29 +150,17 @@ impl CloudRuntime {
         mapping_id: impl Into<String>,
     ) -> Result<ScheduleHandle, AppError> {
         let mapping_id = mapping_id.into();
-        let (interval, enabled) = match mapping_id.strip_prefix("mirror:") {
-            Some(id) => {
-                let mapping = self.mirror_mapping(id)?;
-                (mapping.schedule.interval, mapping.schedule.enabled)
-            }
-            None => {
-                let mapping = self.mapping(&mapping_id)?;
-                (mapping.schedule.interval, mapping.schedule.enabled)
-            }
+        let enabled = match mapping_id.strip_prefix("mirror:") {
+            Some(id) => self.mirror_mapping(id)?.schedule.enabled,
+            None => self.mapping(&mapping_id)?.schedule.enabled,
         };
-        if interval < MIN_SCHEDULE_INTERVAL {
-            return Err(schedule_error(
-                "CLOUD_SCHEDULE_INTERVAL",
-                "定时同步间隔不能少于 60 秒 / Schedule interval must be at least 60 seconds",
-            ));
-        }
         if !enabled {
             return Err(schedule_error(
                 "CLOUD_SCHEDULE_DISABLED",
                 "定时同步未启用 / Schedule is disabled",
             ));
         }
-        let seconds = interval.min(u64::MAX / 1000);
+        let seconds = DEFAULT_SCHEDULE_INTERVAL;
         let weak = Arc::downgrade(self);
         let source: TickSource = Arc::new(move |id| {
             let weak: Weak<CloudRuntime> = weak.clone();
@@ -185,7 +173,7 @@ impl CloudRuntime {
                 }
                 match id.strip_prefix("mirror:") {
                     // 手动同步仍在跑时本轮跳过：MIRROR_BUSY 不是错误，不报给用户。
-                    Some(mirror_id) => match runtime.mirror_sync(mirror_id, false, None).await {
+                    Some(mirror_id) => match runtime.mirror_sync_mode(mirror_id, false, None, false).await {
                         Ok(_) => Ok(()),
                         Err(error) if error.code == "MIRROR_BUSY" => Ok(()),
                         Err(error) => Err(error),
@@ -212,6 +200,62 @@ impl CloudRuntime {
             source,
             reporter,
         ))
+    }
+
+    pub(super) fn start_change_watch(self: &Arc<Self>, mapping: &super::config_types::CloudMapping) -> Result<ScheduleHandle, AppError> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let weak = Arc::downgrade(self);
+        let reporter = weak.clone();
+        let watcher = crate::file_watch::watch(&mapping.local_root, true, move |event| {
+            if let Err(error) = event {
+                if let Some(runtime) = reporter.upgrade() { runtime.object_report(crate::DomainError::Internal { detail: error.to_string() }.into()); }
+            }
+            match sender.try_send(()) {
+                Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+            }
+        }).map_err(|error| AppError::from(crate::DomainError::Internal { detail: error.to_string() }))?;
+        let id = mapping.id.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stopped = cancel.clone();
+        let task = tokio::spawn(async move {
+            let _watcher = watcher;
+            while !stopped.load(Ordering::Acquire) {
+                tokio::select! {
+                    value = receiver.recv() => { if value.is_none() { break; } },
+                    _ = time::sleep(Duration::from_millis(250)) => continue,
+                }
+                // Trailing-edge debounce with a hard deadline: sustained writes
+                // must not keep a worker alive forever during shutdown.
+                let deadline = time::Instant::now() + Duration::from_secs(3);
+                loop {
+                    if stopped.load(Ordering::Acquire) { return; }
+                    match time::timeout(Duration::from_millis(800), receiver.recv()).await {
+                        Ok(Some(())) if time::Instant::now() < deadline => continue,
+                        _ => break,
+                    }
+                }
+                let Some(runtime) = weak.upgrade() else { break; };
+                if !runtime.is_open() { break; }
+                if runtime.manager.is_running(&id) {
+                    // Keep one pending reconciliation while a run owns the drive.
+                    time::sleep(Duration::from_millis(250)).await;
+                    // A completed run may have written the triggering paths; a
+                    // preview below distinguishes actual changes from echoes.
+                    while runtime.manager.is_running(&id) && !stopped.load(Ordering::Acquire) {
+                        time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
+                if stopped.load(Ordering::Acquire) { break; }
+                let result = std::panic::AssertUnwindSafe(runtime.scheduled_sync(&id)).catch_unwind().await;
+                match result {
+                    Ok(Ok(())) => {},
+                    Ok(Err(error)) if matches!(error.code.as_str(), "SYNC_ALREADY_RUNNING" | "CLOUD_SCHEDULE_PAUSED") => {},
+                    Ok(Err(error)) => runtime.manager.report_background(error),
+                    Err(_) => runtime.manager.report_background(schedule_error("CLOUD_WATCH_FAILED", "文件监控任务异常 / File watch task failed")),
+                }
+            }
+        });
+        Ok(ScheduleHandle::new(cancel, task))
     }
 
     /// Timer entry point. Internal previews validate freshness, but never grant
@@ -245,6 +289,8 @@ impl CloudRuntime {
                 ));
             }
             let preview = self.preview(mapping_id).await?;
+            if preview.counts.uploads == 0 && preview.counts.downloads == 0 && preview.counts.deletes == 0 && preview.counts.conflicts == 0
+                && self.open_append_index(&mapping, &root_epoch)?.pending_epoch().map_err(|error| schedule_error("CLOUD_INDEX", &error.to_string()))?.is_none() { return Ok(()); }
             self.sync_from_preview(mapping_id, &preview.preview_id, true)
                 .await?;
             return Ok(());
@@ -314,6 +360,15 @@ impl CloudSchedules {
             return Ok(());
         }
         let mut first_error = None;
+        for mapping in mappings.iter().filter(|mapping| mapping.schedule.enabled) {
+            if !runtime.is_open() { break; }
+            match runtime.start_change_watch(mapping) {
+                Ok(handle) => {
+                    self.handles.lock().map_err(|_| schedule_error("CLOUD_SCHEDULE_LOCK", "监控状态不可用 / Watch state unavailable"))?.insert(format!("watch:{}", mapping.id), handle);
+                }
+                Err(error) => { runtime.manager.report_background(error); }
+            }
+        }
         for (id, _interval) in wanted {
             if !runtime.is_open() {
                 break;

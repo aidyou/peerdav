@@ -933,7 +933,7 @@ async fn mirror_runtime_works_without_conditional_writes_and_recovers_baseline()
     input.bucket = "other".into();
     input.buckets = vec!["other".into(), "fixture".into()];
     let connection = runtime.save_connection(input).unwrap();
-    fixture.state.objects.lock().unwrap().insert("runtime/_peerdav_mirror/docs/remote.txt".into(), b"remote first".to_vec());
+    fixture.state.objects.lock().unwrap().insert("runtime/_peerdav_mirror/docs/files/remote.txt".into(), b"remote first".to_vec());
     let folders = runtime.mirror_folders(&connection.id, Some("fixture"), "docs", None).await.unwrap();
     assert_eq!(folders.objects.len(), 1);
     assert_eq!(runtime.mirror_folders(&connection.id, Some("unknown"), "", None).await.unwrap_err().code, "CLOUD_CONFIG_INVALID");
@@ -970,7 +970,7 @@ async fn mirror_runtime_works_without_conditional_writes_and_recovers_baseline()
     };
     assert!(deleted.failures.is_empty());
     assert_eq!(deleted.deleted_cloud, 1);
-    assert!(!fixture.state.objects.lock().unwrap().contains_key("runtime/_peerdav_mirror/docs/中文 100%.txt"));
+    assert!(!fixture.state.objects.lock().unwrap().contains_key("runtime/_peerdav_mirror/docs/files/中文 100%.txt"));
     assert!(fixture.state.conditional_puts.lock().unwrap().is_empty());
     assert!(fixture.state.requests.lock().unwrap().iter().all(|(_, key)| !key.contains(".probe")));
     runtime.stop_and_clear().await.unwrap();
@@ -1405,7 +1405,7 @@ async fn sync_drive_storage_stays_bound_after_connection_changes() {
         mapping_id: None, selected_root: "root".into(), mapping: AddMappingInput {
             connection_id: connection.id.clone(), repository_id: created.binding.repo_id.clone(),
             local_root: local.path().to_owned(), logical_path: "root".into(),
-            schedule: ScheduleConfig { enabled: true, interval: 60 },
+            schedule: ScheduleConfig { enabled: true, interval: 3600 },
         },
     };
     let prepared = runtime.prepare_append_mapping(mapping_input()).await.expect("prepare without binding");
@@ -1453,6 +1453,20 @@ async fn sync_drive_storage_stays_bound_after_connection_changes() {
     let objects = fixture.state.objects.lock().expect("objects").clone();
     assert!(objects.keys().all(|key| key.starts_with(&format!("runtime/{APPEND_ROOT}/"))));
     assert!(objects.values().all(|bytes| !bytes.windows(payload.len()).any(|window| window == payload)));
+    runtime.refresh_schedules().await.expect("start filesystem monitoring");
+    let previous_run = runtime.snapshot().expect("snapshot").statuses.into_iter().find(|status| status.mapping_id == mapping.id).and_then(|status| status.run_id);
+    std::fs::write(local.path().join("watched.txt"), b"automatic content").expect("external edit");
+    tokio::time::timeout(std::time::Duration::from_secs(90), async {
+        loop {
+            let status = runtime.snapshot().expect("snapshot").statuses.into_iter().find(|status| status.mapping_id == mapping.id);
+            if status.is_some_and(|status| status.run_id != previous_run && status.phase == SyncPhase::Completed) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }).await.expect("filesystem event automatically synchronizes without timer tick");
+    assert!(runtime.local_sync_entries(&mapping.id).await.expect("watch status").iter().any(|entry| entry.path == "watched.txt" && entry.synced));
+    // Stop watchers before continuing the explicit manual-deletion assertions.
+    runtime.stop_and_clear().await.expect("stop monitored runtime");
+    runtime.resume().expect("resume manual runtime");
     std::fs::remove_file(local.path().join("docs/private.txt")).expect("delete child");
     let entries = runtime.local_sync_entries(&mapping.id).await.expect("pending delete");
     assert!(entries.iter().any(|entry| entry.path == "docs" && !entry.synced));
@@ -1496,6 +1510,7 @@ async fn sync_drive_storage_stays_bound_after_connection_changes() {
     std::fs::remove_dir(empty_local.path().join("docs")).expect("clear downloaded directory");
     std::fs::remove_file(empty_local.path().join("local-only.txt")).expect("clear local");
     std::fs::remove_file(empty_local.path().join("later.txt")).expect("clear later");
+    std::fs::remove_file(empty_local.path().join("watched.txt")).expect("clear monitored file");
     let mut empty_input = mapping_input();
     empty_input.mapping.local_root = empty_local.path().to_owned();
     let direct_download = runtime.prepare_mapping_bind(empty_input).await.expect("empty local binds without confirmation");

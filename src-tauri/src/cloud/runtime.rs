@@ -378,6 +378,7 @@ pub struct CloudRuntime {
     pub(crate) official_authorizations: super::oauth_types::OAuthAuthorizations,
     pub(crate) official_callbacks: tokio::sync::Mutex<HashMap<String, super::oauth_types::LoopbackAuthorization>>,
     pub(crate) official_callback_cancels: tokio::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>,
+    pub(crate) official_clients: std::sync::Mutex<HashMap<String, (super::types::ProxyMode, reqwest::Client)>>,
     pub(crate) official_refresh: tokio::sync::Mutex<HashMap<String, super::oauth_types::CachedAccessToken>>,
     pub(super) pending_mappings: tokio::sync::Mutex<HashMap<String, PendingMapping>>,
     tickets: Mutex<HashMap<String, Ticket>>,
@@ -398,6 +399,7 @@ impl CloudRuntime {
             official_authorizations: super::oauth_types::OAuthAuthorizations::default(),
             official_callbacks: tokio::sync::Mutex::new(HashMap::new()),
             official_callback_cancels: tokio::sync::Mutex::new(HashMap::new()),
+            official_clients: std::sync::Mutex::new(HashMap::new()),
             official_refresh: tokio::sync::Mutex::new(HashMap::new()),
             objects: tokio::sync::Mutex::new(super::object_runtime_types::ObjectState::new()),
             vault,
@@ -433,9 +435,11 @@ impl CloudRuntime {
             }
         }
         let _p = self.network.write().await;
+        crate::sync::scan_ledger::clear().map_err(|error| runtime_error("CLOUD_SCAN_FAILED", &error.to_string()))?;
         self.pending_mappings.lock().await.clear();
         self.official_authorizations.clear().map_err(super::official_runtime::oauth_error)?;
         self.official_refresh.lock().await.clear();
+        self.official_clients.lock().map_err(|_| AppError::from(DomainError::Internal { detail: "HTTP client cache lock poisoned".into() }))?.clear();
         match self.tickets.lock() {
             Ok(mut tickets) => tickets.clear(),
             Err(poisoned) => {
@@ -538,7 +542,7 @@ impl CloudRuntime {
         let _permit = self.network.read().await;
         self.object_admit()?;
         let relative = crate::mirror::normalize_cloud_prefix(prefix).map_err(AppError::from)?;
-        let full_prefix = crate::mirror::cloud_key(&relative, "");
+        let full_prefix = crate::mirror::mirror_root_prefix(&relative);
         self.append_storage(connection_id, bucket)?;
         let store: Arc<dyn ObjectStore> = if let Some(store) = self.google_store(connection_id)? { store }
             else { Arc::new(S3Store::new(self.append_config(connection_id, bucket)?).map_err(cloud_error)?) };
@@ -608,6 +612,16 @@ impl CloudRuntime {
         force_mass_delete: bool,
         confirmed_plan: Option<String>,
     ) -> Result<crate::mirror::MirrorSyncResult, AppError> {
+        self.mirror_sync_mode(mapping_id, force_mass_delete, confirmed_plan, true).await
+    }
+
+    pub(crate) async fn mirror_sync_mode(
+        self: &Arc<Self>,
+        mapping_id: &str,
+        force_mass_delete: bool,
+        confirmed_plan: Option<String>,
+        manual: bool,
+    ) -> Result<crate::mirror::MirrorSyncResult, AppError> {
         self.admit()?;
         let mapping = self.mirror_mapping(mapping_id)?;
         let cancel = {
@@ -633,6 +647,7 @@ impl CloudRuntime {
             Arc::clone(&cancel),
             force_mass_delete,
             confirmed_plan,
+            manual,
         )
         .await
     }
@@ -642,6 +657,7 @@ impl CloudRuntime {
         cancel: Arc<AtomicBool>,
         force_mass_delete: bool,
         confirmed_plan: Option<String>,
+        manual: bool,
     ) -> Result<crate::mirror::MirrorSyncResult, AppError> {
         let (store, endpoint, bucket): (Arc<dyn ObjectStore>, String, String) = if let Some(store) = self.google_store(&mapping.connection_id)? {
             let entry = self.config.snapshot().map_err(config_error)?.official_connections.into_iter().find(|entry| entry.id == mapping.connection_id).ok_or_else(|| config_error(ConfigError::NotFound("connection".into())))?;
@@ -660,11 +676,14 @@ impl CloudRuntime {
         self.manager.report_status(SyncStatus {
             mapping_id: mapping.id.clone(),
             run_id: None,
-            phase: SyncPhase::Scanning,
-            detail: None,
+            phase: SyncPhase::Frozen,
+            detail: Some("正在核对或修复镜像账本 / Validating or repairing mirror ledger".into()),
         });
-        let result =
-            crate::mirror::run_sync(store, &mapping, &self.data_dir, &context, cancel).await;
+        let result = if manual {
+            crate::mirror::run_sync(store, &mapping, &self.data_dir, &context, cancel).await
+        } else {
+            crate::mirror::run_sync_mode(store, &mapping, &self.data_dir, &context, cancel, false).await
+        };
         let partial_error = result
             .as_ref()
             .ok()
@@ -895,10 +914,22 @@ impl CloudRuntime {
             .map_err(|e| runtime_error("CLOUD_SCAN_FAILED", &e.to_string()))
     }
     pub(super) fn admit_sync_idle(&self, mapping_id: &str) -> Result<(), AppError> {
+        if self.manager.status(mapping_id).phase == SyncPhase::Frozen {
+            return Err(runtime_error("SYNC_FROZEN", "同步盘正在核对或修复账本，请稍后重试 / Drive ledger is being validated or repaired; try again later"));
+        }
         if self.manager.is_running(mapping_id) {
             return Err(runtime_error("SYNC_ALREADY_RUNNING", "此同步盘正在同步，已忽略重复请求 / This drive is syncing; duplicate request ignored"));
         }
         Ok(())
+    }
+
+    pub(super) fn configure_scan_ledger(&self, mapping: &CloudMapping, epoch: &str) -> Result<(), AppError> {
+        crate::sync::scan_ledger::configure(&mapping.local_root, crate::sync::scan_ledger_types::LedgerStorage {
+            path: self.data_dir.join("cloud-scan.sqlite"),
+            key: self.config.get_or_create_index_key().map_err(config_error)?,
+            repository: mapping.repository_id.clone(),
+            scope: Self::index_scope(mapping, epoch),
+        }).map_err(|error| runtime_error("CLOUD_SCAN_FAILED", &error.to_string()))
     }
 
     pub async fn preview(&self, id: &str) -> Result<CloudPreview, AppError> {
@@ -906,11 +937,17 @@ impl CloudRuntime {
     }
 
     pub async fn preview_selection(&self, id: &str, selection: &[String]) -> Result<CloudPreview, AppError> {
+        let trace = hex::encode(rand::random::<[u8; 8]>());
+        let started = Instant::now();
+        log::debug!(target: "peerdav::preview", "trace={trace} stage=start selected={}", selection.len());
         self.admit_sync_idle(id)?;
         if selection.len() > 1000 { return Err(runtime_error("CLOUD_CONFIG_INVALID", "选中条目过多 / Too many selected entries")); }
         for path in selection { crate::sync::namespace::components(path).map_err(|error| runtime_error("CLOUD_CONFIG_INVALID", &error.to_string()))?; }
         self.admit()?;
+        let lock_started = Instant::now();
         let _p = self.network.read().await;
+        log::debug!(target: "peerdav::preview", "trace={trace} stage=network_lock elapsed_ms={}", lock_started.elapsed().as_millis());
+        let local_started = Instant::now();
         self.admit()?;
         let m = self
             .config
@@ -921,6 +958,7 @@ impl CloudRuntime {
             .find(|m| m.id == id)
             .ok_or_else(|| config_error(ConfigError::NotFound("mapping".into())))?;
         let epoch = Self::root_epoch(&m.local_root)?;
+        self.configure_scan_ledger(&m, &epoch)?;
         let cancel = Arc::clone(&self.cancel);
         let root = m.local_root.clone();
         let report = tokio::task::spawn_blocking(move || {
@@ -935,10 +973,11 @@ impl CloudRuntime {
         .await
         .map_err(|_| runtime_error("CLOUD_SCAN_FAILED", "扫描任务异常退出 / Scan task failed"))?
         .map_err(|e| runtime_error("CLOUD_SCAN_FAILED", &e.to_string()))?;
+        log::debug!(target: "peerdav::preview", "trace={trace} stage=local_scan elapsed_ms={} files={} directories={}", local_started.elapsed().as_millis(), report.files.len(), report.directories.len());
         if !selection.is_empty() && m.protocol != StorageProtocol::AppendV2 { return Err(runtime_error("CLOUD_CONFIG_INVALID", "此旧版同步盘不支持选中同步 / Selected sync is unavailable for this legacy drive")); }
         let digest = Self::digest(&report)?;
         let (total, rev, head_commit) = if m.protocol == StorageProtocol::AppendV2 {
-            let (counts, signature) = self.append_preview_selection(&m, &epoch, selection).await?;
+            let (counts, signature) = self.append_preview_report(&m, &epoch, selection, report.clone(), &trace).await?;
             (
                 counts,
                 self.connection_revision(&m.connection_id)?,
@@ -1003,6 +1042,7 @@ impl CloudRuntime {
             (total, rev, head.commit)
         };
 
+        let ticket_started = Instant::now();
         let id = hex::encode(rand::random::<[u8; 16]>());
         let ticket = Ticket {
             selection: selection.to_vec(),
@@ -1037,6 +1077,8 @@ impl CloudRuntime {
             tickets.remove(&oldest);
         }
         tickets.insert(id.clone(), ticket);
+        log::debug!(target: "peerdav::preview", "trace={trace} stage=ticket_save elapsed_ms={}", ticket_started.elapsed().as_millis());
+        log::debug!(target: "peerdav::preview", "trace={trace} stage=complete total_ms={} uploads={} downloads={} deletes={} conflicts={}", started.elapsed().as_millis(), total.uploads, total.downloads, total.deletes, total.conflicts);
         Ok(CloudPreview {
             preview_id: id,
             mapping_id: m.id,
@@ -1122,7 +1164,7 @@ impl CloudRuntime {
         if !ticket.selection.is_empty() { self.validate_scheduled_root(&m)?; }
         self.authorize_root_for_manual(&m, &ticket.root, true)?;
         if m.protocol == StorageProtocol::AppendV2 {
-            let (_, signature) = self.append_preview_state(&m, &ticket.epoch).await?;
+            let (_, signature) = self.append_preview_report(&m, &ticket.epoch, &[], check, &ticket.id).await?;
             if self.connection_revision(&m.connection_id)? != ticket.revision
                 || Some(signature) != ticket.head
             {
@@ -1204,7 +1246,7 @@ impl CloudRuntime {
         )
     }
     pub(crate) fn ensure_mapping_writable(&self, id: &str) -> Result<(), AppError> {
-        if matches!(self.manager.status(id).phase, SyncPhase::Scanning | SyncPhase::Uploading | SyncPhase::Publishing | SyncPhase::Applying) {
+        if matches!(self.manager.status(id).phase, SyncPhase::Frozen | SyncPhase::Scanning | SyncPhase::Uploading | SyncPhase::Publishing | SyncPhase::Applying) {
             return Err(runtime_error("CLOUD_SYNC_BUSY", "同步中，暂不可写入 / Sync is running; writes are temporarily disabled"));
         }
         Ok(())

@@ -23,6 +23,8 @@ pub(crate) fn item(
         relative_path,
         size,
         phase: "pending".into(),
+        transferred: None,
+        progress: Arc::new(AtomicU64::new(0)),
     })
 }
 impl DownloadQueues {
@@ -136,6 +138,40 @@ impl DownloadQueues {
             )
         };
         let operation = async {
+            // Fully fresh file-only selections can transfer concurrently without
+            // changing interactive conflict ordering. Existing targets and folder
+            // plans keep the original decision path below.
+            let fresh = items.len() > 1 && items.iter().all(|item| !item.is_dir)
+                && items.iter().map(|item| root.relative_target_exists(&item.relative_path).map_err(app)).collect::<Result<Vec<_>, _>>()?.iter().all(|exists| !exists);
+            if fresh {
+                for start in (0..items.len()).step_by(4) {
+                    if cancel.is_cancelled() { return Err(AppError::from(DomainError::TransferCanceled)); }
+                    adapter.validate().await?;
+                    let end = (start + 4).min(items.len());
+                    {
+                        let mut map = self.queues.lock().await;
+                        let q = map.get_mut(id).ok_or_else(invalid)?;
+                        for item in &mut q.items[start..end] { item.phase = "active".into(); }
+                    }
+                    let results = futures_util::future::join_all(items[start..end].iter().map(|item| {
+                        let progress = Arc::clone(&item.progress);
+                        let callback: crate::peer::TransferProgressCallback = Arc::new(move |bytes, _| { progress.store(bytes, Ordering::Relaxed); });
+                        adapter.execute(item, &root, false, cancel.clone(), Some(callback))
+                    })).await;
+                    let mut failure = None;
+                    let mut map = self.queues.lock().await;
+                    let q = map.get_mut(id).ok_or_else(invalid)?;
+                    for (offset, result) in results.into_iter().enumerate() {
+                        match result {
+                            Ok(()) => { q.items[start + offset].phase = "completed".into(); q.status.completed_files += 1; }
+                            Err(error) => { q.items[start + offset].phase = "failed".into(); if failure.is_none() { failure = Some(error); } }
+                        }
+                    }
+                    if let Some(error) = failure { return Err(error); }
+                }
+                if cancel.is_cancelled() { return Err(AppError::from(DomainError::TransferCanceled)); }
+                return Ok(());
+            }
             let mut policy = crate::types::QueueConflictPolicy::default();
             for (index, item) in items.iter().enumerate() {
                 if cancel.is_cancelled() { return Err(AppError::from(DomainError::TransferCanceled)); }
@@ -277,7 +313,10 @@ impl DownloadQueues {
         }
         let end = (offset + limit).min(q.items.len());
         Ok(DownloadPage {
-            items: q.items[offset..end].to_vec(),
+            items: q.items[offset..end].iter().cloned().map(|mut item| {
+                if item.phase == "active" { item.transferred = Some(item.progress.load(Ordering::Relaxed)); }
+                item
+            }).collect(),
             next_offset: (end < q.items.len()).then_some(end),
         })
     }
@@ -378,6 +417,8 @@ mod tests {
     struct Adapter {
         calls: Arc<AtomicUsize>,
     }
+    static ACTIVE_DOWNLOADS: AtomicUsize = AtomicUsize::new(0);
+    static PEAK_DOWNLOADS: AtomicUsize = AtomicUsize::new(0);
     impl TransferQueueAdapter for Adapter {
         fn cancellation(&self) -> Result<tokio_util::sync::CancellationToken, AppError> {
             Ok(tokio_util::sync::CancellationToken::new())
@@ -409,6 +450,10 @@ mod tests {
         ) -> BoxFuture<'a, Result<(), AppError>> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
+                let active = ACTIVE_DOWNLOADS.fetch_add(1, Ordering::SeqCst) + 1;
+                PEAK_DOWNLOADS.fetch_max(active, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                ACTIVE_DOWNLOADS.fetch_sub(1, Ordering::SeqCst);
                 let mut source = tempfile::NamedTempFile::new().unwrap();
                 std::io::Write::write_all(&mut source, b"new").unwrap();
                 root.install_download(&item.relative_path, source.path(), overwrite, &cancel)
@@ -429,6 +474,23 @@ mod tests {
         .await
         .unwrap()
     }
+    #[tokio::test]
+    async fn fresh_files_download_concurrently_and_join_before_release() {
+        PEAK_DOWNLOADS.store(0, Ordering::SeqCst);
+        let dir = tempfile::tempdir().expect("dir");
+        let queues = Arc::new(DownloadQueues::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let q = queues.select(DownloadBackend::S3 { connection_id: "test".into() }, DownloadSelection::Files { paths: vec![] }, crate::cloud::PhysicalRoot::open(dir.path()).expect("root"), Arc::new(Adapter { calls: calls.clone() })).await.expect("queue");
+        queues.start(&q.queue_id).await.expect("start");
+        let end = wait(&queues, &q.queue_id, "completed").await;
+        assert_eq!(end.completed_files, 2);
+        assert_eq!(PEAK_DOWNLOADS.load(Ordering::SeqCst), 2);
+        assert_eq!(ACTIVE_DOWNLOADS.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(dir.path().join("a")).expect("a"), b"new");
+        assert_eq!(std::fs::read(dir.path().join("b")).expect("b"), b"new");
+        queues.release(&q.queue_id).await.expect("release");
+    }
+
     #[tokio::test]
     async fn empty_directories_are_installed_without_file_payload_requests() {
         let dir = tempfile::tempdir().expect("dir");

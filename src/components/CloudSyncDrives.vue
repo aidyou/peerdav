@@ -33,8 +33,8 @@ const createModeHint = computed(() => createMode.value === "mirror"
   : createMode.value === "authenticated_plain" ? "drive.modeAuthenticatedPlainHint" : "drive.modeEncryptedHint");
 const passwordHint = computed(() => createMode.value === "authenticated_plain"
   ? "drive.passwordHintAuthenticatedPlain" : "drive.passwordHintEncrypted");
-const createSchedule = ref({ enabled: false, interval: 900 });
-function resetCreateMode() { createMode.value = "encrypted"; createSchedule.value = { enabled: false, interval: 900 }; }
+const createSchedule = ref({ enabled: false, interval: 120 });
+function resetCreateMode() { createMode.value = "encrypted"; createSchedule.value = { enabled: false, interval: 120 }; }
 function closeAddMenu(event) { if (!event.target?.closest?.(".add-menu")) addMenuOpen.value = false; }
 function openCreateDialog() { addMenuOpen.value = false; connectDialogOpen.value = false; mappingEditorOpen.value = false; resetNewDrive(); resetCreateMode(); resetMirror(); state.value = "idle"; createDialogOpen.value = true; }
 function openConnectDialog() { addMenuOpen.value = false; createDialogOpen.value = false; mappingEditorOpen.value = false; resetLink(); state.value = "idle"; connectDialogOpen.value = true; void discover(); }
@@ -67,7 +67,7 @@ const linkForm = ref({ localRoot: "", selectedRoot: "", newRoot: "" });
 const linkRoots = ref([]);
 const joinedRepoId = ref("");
 // 镜像同步：创建表单与运行状态。
-const mirrorForm = ref({ localRoot: "", cloudPrefix: "" });
+const mirrorForm = ref({ localRoot: "", cloudPrefix: "", fullCheck: false });
 const remoteFolderEdited = ref(false);
 const mirrorFolderEdited = ref(false);
 const mirrorBusy = ref({});
@@ -157,7 +157,7 @@ function fail(error) {
 function resetSecrets() { password.value = ""; }
 function resetNewDrive() { resetBucket(); remoteFolderEdited.value = false; newDrive.value = { localRoot: "", logicalPath: "", password: "", confirmation: "" }; }
 function resetLink() { linkForm.value = { localRoot: "", selectedRoot: "", newRoot: "" }; linkRoots.value = []; joinedRepoId.value = ""; candidates.value = []; selectedCandidateKey.value = ""; resetSecrets(); }
-function resetMirror() { editingMirrorId.value = null; mirrorFolderEdited.value = false; mirrorForm.value = { localRoot: "", cloudPrefix: "" }; }
+function resetMirror() { editingMirrorId.value = null; mirrorFolderEdited.value = false; mirrorForm.value = { localRoot: "", cloudPrefix: "", fullCheck: false }; }
 // Remote folder defaults to the chosen local folder's name, which keeps the
 // one-step create usable without asking non-technical users to name things twice.
 function folderName(path) { const parts = String(path).split(/[\\/]+/).filter(Boolean); return parts.length ? parts[parts.length - 1] : t("drive.defaultFolder"); }
@@ -228,7 +228,7 @@ async function create() {
     // form filled (retrying create would otherwise duplicate the drive).
     let bindingError = null;
     try {
-      await prepareBinding({ connectionId: props.connectionId, repositoryId: redacted.binding.repoId, localRoot: newDrive.value.localRoot, logicalPath, schedule: { enabled: createSchedule.value.enabled, interval: Math.max(60, Number(createSchedule.value.interval) || 900) } }, logicalPath, scope);
+      await prepareBinding({ connectionId: props.connectionId, repositoryId: redacted.binding.repoId, localRoot: newDrive.value.localRoot, logicalPath, schedule: { enabled: createSchedule.value.enabled, interval: 120 } }, logicalPath, scope);
     } catch (error) {
       bindingError = error;
     }
@@ -245,14 +245,14 @@ function editMirror(item) {
   editingMirrorId.value = item.id;
   selectedBucket.value = item.bucket || availableBuckets.value[0] || '';
   mirrorFolderEdited.value = true;
-  mirrorForm.value = { localRoot: item.localRoot, cloudPrefix: item.cloudPrefix || '' };
-  createSchedule.value = { enabled: !!item.schedule?.enabled, interval: item.schedule?.interval || 900 };
+  mirrorForm.value = { localRoot: item.localRoot, cloudPrefix: item.cloudPrefix || '', fullCheck: !!item.fullCheck };
+  createSchedule.value = { enabled: !!item.schedule?.enabled, interval: 120 };
 }
 async function createMirror() {
   if (!canCreateMirror.value || !isMirror.value) return;
   await run(async (scope) => {
     state.value = "loading";
-    await cloud.mirrorSaveMapping({ id: editingMirrorId.value, connectionId: props.connectionId, bucket: selectedBucket.value || undefined, localRoot: mirrorForm.value.localRoot.trim(), cloudPrefix: mirrorForm.value.cloudPrefix.trim(), schedule: { ...createSchedule.value, interval: Math.max(60, Number(createSchedule.value.interval) || 900) } });
+    await cloud.mirrorSaveMapping({ id: editingMirrorId.value, connectionId: props.connectionId, bucket: selectedBucket.value || undefined, localRoot: mirrorForm.value.localRoot.trim(), cloudPrefix: mirrorForm.value.cloudPrefix.trim(), fullCheck: mirrorForm.value.fullCheck, schedule: { ...createSchedule.value, interval: 120 } });
     if (scope !== generation || disposed) return;
     resetMirror(); resetNewDrive(); resetCreateMode(); createDialogOpen.value = false; await refresh(scope);
     if (scope !== generation || disposed) return;
@@ -293,7 +293,7 @@ async function join() {
 // 不能再套一层 run()：join 已经持有 busy 锁，二次进入会被守卫吞掉。
 async function bindLogicalPath(scope, logicalPath) {
   state.value = "loading";
-  const result = await prepareBinding({ connectionId: props.connectionId, repositoryId: joinedRepoId.value, localRoot: linkForm.value.localRoot, logicalPath, schedule: { enabled: false, interval: 900 } }, logicalPath, scope);
+  const result = await prepareBinding({ connectionId: props.connectionId, repositoryId: joinedRepoId.value, localRoot: linkForm.value.localRoot, logicalPath, schedule: { enabled: false, interval: 120 } }, logicalPath, scope);
   if (!result || scope !== generation || disposed) return;
   resetSecrets(); resetLink(); connectDialogOpen.value = false; await refresh(scope);
   if (scope !== generation || disposed) return;
@@ -338,7 +338,7 @@ async function saveMapping() {
   if (!selectedRepository.value || !mapping.value.localRoot) { app.setError("drive.mappingRequired"); return; }
   const isAppend = selectedRepository.value.append;
   if (isAppend && (!mapping.value.logicalPath || (roots.value.length && !roots.value.includes(mapping.value.logicalPath)))) { app.setError("cloudAppend.rootRequired"); return; }
-  const input = { ...mapping.value, connectionId: props.connectionId, schedule: { enabled: !!mapping.value.schedule.enabled, interval: Math.max(60, Number(mapping.value.schedule.interval) || 900) } };
+  const input = { ...mapping.value, connectionId: props.connectionId, schedule: { enabled: !!mapping.value.schedule.enabled, interval: 120 } };
   await run(async (scope) => {
     // Configuration, not a user-selectable protocol, determines the command.
     if (isAppend && !editingMappingId.value) {
@@ -399,10 +399,10 @@ async function syncMirror(id, force = false, planId = null) {
 async function cancelMirror(id) {
   try { await cloud.mirrorCancel(id); } catch (error) { fail(error); }
 }
-// 镜像映射的自动同步开关与间隔：直接回写后端，调度器随后会按新配置重建定时任务。
-async function changeMappingSchedule(item, enabled, interval) {
+// 自动同步固定每两分钟检查一次，界面仅保留启停开关。
+async function changeMappingSchedule(item, enabled) {
   await run(async (scope) => {
-    const input = { connectionId: item.connectionId, repositoryId: item.repositoryId, localRoot: item.localRoot, logicalPath: item.logicalPath, schedule: { enabled, interval: Math.max(60, Number(interval) || 900) } };
+    const input = { connectionId: item.connectionId, repositoryId: item.repositoryId, localRoot: item.localRoot, logicalPath: item.logicalPath, schedule: { enabled, interval: 120 } };
     if (mappingRepository(item)?.append) await cloud.appendSaveMapping(item.id, input, item.logicalPath);
     else await cloud.saveMapping(item.id, input);
     if (scope !== generation || disposed) return;
@@ -412,15 +412,7 @@ async function changeMappingSchedule(item, enabled, interval) {
 }
 async function toggleMirrorSchedule(item, enabled) {
   await run(async (scope) => {
-    await cloud.mirrorSaveMapping({ id: item.id, connectionId: item.connectionId, bucket: item.bucket, localRoot: item.localRoot, cloudPrefix: item.cloudPrefix, schedule: { enabled, interval: item.schedule?.interval || 900 } });
-    if (scope !== generation || disposed) return;
-    await refresh(scope);
-  });
-}
-async function changeMirrorInterval(item, interval) {
-  const value = Math.max(60, Number(interval) || 900);
-  await run(async (scope) => {
-    await cloud.mirrorSaveMapping({ id: item.id, connectionId: item.connectionId, bucket: item.bucket, localRoot: item.localRoot, cloudPrefix: item.cloudPrefix, schedule: { enabled: !!item.schedule?.enabled, interval: value } });
+    await cloud.mirrorSaveMapping({ id: item.id, connectionId: item.connectionId, bucket: item.bucket, localRoot: item.localRoot, cloudPrefix: item.cloudPrefix, fullCheck: !!item.fullCheck, schedule: { enabled, interval: 120 } });
     if (scope !== generation || disposed) return;
     await refresh(scope);
   });
@@ -460,7 +452,7 @@ function confirmPicker() {
   mirrorForm.value.cloudPrefix = combined.replace(/^\/+|\/+$/g, "");
   pickerOpen.value = false;
 }
-function mappingRunning(item) { return ['scanning', 'uploading', 'publishing', 'applying'].includes(statuses.value.find((s) => s.mappingId === item.id)?.phase); }
+function mappingRunning(item) { return ['frozen', 'scanning', 'uploading', 'publishing', 'applying'].includes(statuses.value.find((s) => s.mappingId === item.id)?.phase); }
 async function syncNow(item) {
   if (mappingRunning(item)) { app.setNotice('cloud.syncAlreadyRunning'); return; }
   await run(async (scope) => {
@@ -495,6 +487,7 @@ async function restore(record) {
 }
 function mirrorStatusText(item) {
   const status = mirrorStatus.value[item.id];
+  if (status?.phase === 'frozen') return phaseLabel('frozen');
   if (mirrorBusy.value[item.id]) return t("cloud.phaseScanning");
   if (status?.phase === 'failed') return t('drive.lastSyncFailed');
   if (status) return `${phaseLabel(status.phase)}${status.detail ? ` · ${status.detail}` : ""}`;
@@ -575,9 +568,8 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
           </ul>
           <div class="client-item__block mapping-actions">
             <label class="mapping-schedule mirror-schedule">
-              <el-switch :model-value="!!item.schedule?.enabled" :disabled="busy || mappingRunning(item)" @update:model-value="changeMappingSchedule(item, $event, item.schedule?.interval)" />
+              <el-switch :model-value="!!item.schedule?.enabled" :disabled="busy || mappingRunning(item)" @update:model-value="changeMappingSchedule(item, $event)" />
               <span>{{ t('cloud.schedule') }}</span>
-              <input :value="item.schedule?.interval || 900" :aria-label="t('drive.syncInterval')" type="number" min="60" step="60" :disabled="busy || mappingRunning(item) || !item.schedule?.enabled" @change="changeMappingSchedule(item, !!item.schedule?.enabled, $event.target.value)" />
             </label>
             <el-button class="mapping-preview" :loading="operationLoading('preview', item.id)" :disabled="busy || mappingRunning(item)" @click="showPreview(item)">{{ t('drive.preflight') }}</el-button>
             <el-button class="mapping-edit" :disabled="busy" @click="editMapping(item)">{{ t('cloud.edit') }}</el-button>
@@ -642,7 +634,6 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
             <label class="mirror-schedule">
               <el-switch :model-value="!!item.schedule?.enabled" :disabled="busy || mirrorBusy[item.id]" @update:model-value="toggleMirrorSchedule(item, $event)" />
               <span>{{ t('cloud.schedule') }}</span>
-              <input :value="item.schedule?.interval || 900" class="mirror-interval" type="number" min="60" step="60" :disabled="busy || mirrorBusy[item.id] || !item.schedule?.enabled" @change="changeMirrorInterval(item, $event.target.value)" />
             </label>
             <details v-if="mirrorResults[item.id]?.conflicts?.length" class="mirror-conflicts">
               <summary>{{ t('drive.mirrorConflicts', { count: mirrorResults[item.id].conflicts.length }) }}</summary>
@@ -713,7 +704,11 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
             <el-input v-model="newDrive.logicalPath" @update:model-value="remoteFolderEdited = true" class="new-drive-folder" :placeholder="t('drive.folderDefaultHint')" :disabled="busy" />
           </label>
         </template>
-        <label class="settings-row create-schedule"><span>{{ t('cloud.schedule') }}</span><el-switch v-model="createSchedule.enabled" :disabled="busy" /><input v-model="createSchedule.interval" type="number" min="60" step="60" :disabled="busy || !createSchedule.enabled" /></label>
+        <label class="settings-row create-schedule"><span>{{ t('cloud.schedule') }}</span><el-switch v-model="createSchedule.enabled" :disabled="busy" /></label>
+        <template v-if="isMirror">
+          <label class="settings-row mirror-full-check"><span>{{ t('drive.fullCheck') }}</span><el-switch v-model="mirrorForm.fullCheck" :disabled="busy" /></label>
+          <p class="hint">{{ t('drive.fullCheckHint') }}</p>
+        </template>
         <p v-if="createSchedule.enabled && !isMirror" class="hint">{{ t('drive.initialSyncHint') }}</p>
         <template v-if="needsPassword">
           <label class="settings-row"><span>{{ t('cloud.password') }}</span>
@@ -795,7 +790,7 @@ onBeforeUnmount(() => { disposed = true; generation++; if (unlisten) Promise.res
         <label class="settings-row"><span>{{ t('drive.folder') }}</span><el-select v-if="selectedRepository?.append && roots.length" v-model="mapping.logicalPath" class="append-root" :disabled="busy"><el-option v-for="(root, index) in roots" :key="root" :value="root" :label="t('drive.folderNumber', { number: index + 1, name: root })" /></el-select><el-input v-else v-model="mapping.logicalPath" class="mapping-remote" :placeholder="t('drive.newFolder')" :disabled="busy" /></label>
         <p>{{ t('drive.folderHint') }}</p>
         <!-- 新映射的自动同步由后端在首次保存时保持关闭，仅在编辑现有映射时提供开关。 -->
-        <label v-if="editingMappingId" class="settings-row"><span>{{ t('cloud.schedule') }}</span><div class="field-inline"><el-switch v-model="mapping.schedule.enabled" :disabled="busy" /><input v-model.number="mapping.schedule.interval" :disabled="busy" type="number" min="60" step="60" /></div></label>
+        <label v-if="editingMappingId" class="settings-row"><span>{{ t('cloud.schedule') }}</span><el-switch v-model="mapping.schedule.enabled" :disabled="busy" /></label>
       </div>
       <template #footer>
         <el-button class="cancel-mapping" :disabled="busy" @click="closeMappingDialog">{{ t('common.cancel') }}</el-button>
@@ -899,6 +894,6 @@ summary { cursor: pointer; padding: .7rem 0; }
 :deep(.el-dialog) { box-sizing: border-box; display: flex; flex-direction: column; max-height: calc(100vh - var(--titlebar-height, 42px) - 20px); margin: 0 auto; padding: 0; }
 :deep(.el-dialog__header) { box-sizing: border-box; margin: 0; padding: 18px 15px 10px; }
 :deep(.el-dialog__body) { box-sizing: border-box; flex: 1 1 auto; overflow-y: auto; padding: 6px 15px; }
-:deep(.el-dialog__footer) { box-sizing: border-box; display: flex; justify-content: flex-end; gap: 12px; padding: 10px 15px 18px; }
+:deep(.el-dialog__footer) { box-sizing: border-box; padding: 10px 15px 18px; }
 :deep(.el-dialog__footer .el-button + .el-button) { margin-left: 0; }
 </style>

@@ -1,6 +1,5 @@
 <script setup>
-import { computed, onMounted, onBeforeUnmount, ref, toRef } from "vue";
-import { listen } from "@tauri-apps/api/event";
+import { computed, onMounted, onBeforeUnmount, ref, toRef, watch } from "vue";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   disable as disableAutostart,
@@ -97,8 +96,6 @@ const cloudLoading = ref(false);
 const cloudPreview = ref(null);
 const cloudProgress = ref(null);
 const cloudRecovery = ref([]);
-let cloudUnlisten = null;
-let cloudPoll = null;
 
 function cloudFailure(error) { app.handleFailure(error); }
 async function loadCloud() {
@@ -418,11 +415,12 @@ const outboundEntries = computed(() => {
   return stableList(rows, (entry) => entry.identity);
 });
 // 骨架屏仅用于「还没有任何数据」的首屏；已有数据时的刷新继续渲染旧行，避免整块闪烁。
+const panePending = ref(false);
 const sharesLoading = computed(
-  () => adminLoading.value && shares.value.length === 0,
+  () => (adminLoading.value || panePending.value) && shares.value.length === 0,
 );
 const inboundLoading = computed(
-  () => adminLoading.value && inboundEntries.value.length === 0,
+  () => (adminLoading.value || panePending.value) && inboundEntries.value.length === 0,
 );
 const outboundLoading = computed(
   () =>
@@ -829,26 +827,46 @@ async function chooseVaultKey() {
   });
 }
 
-// Render local controls immediately; each backend-backed control owns its
-// loading state. Network discovery and cloud initialization must not gate navigation.
-function loadInitialSettings() {
-  void loadServiceSettings();
-  void loadLocalNetworks();
-  void loadLanAddress();
-  void loadAutostart();
-  void loadTrayIconStyle();
-  void loadCloud();
+// Load backend data only for the visible pane; never gate the local settings shell.
+const initializedPanes = new Set();
+let disposed = false;
+function loadVisibleSettings(tab) {
+  if (disposed || initializedPanes.has(tab)) return;
+  initializedPanes.add(tab);
+  if (tab === 'general') { void loadAutostart(); void loadTrayIconStyle(); }
+  if (tab === 'service') { void loadServiceSettings(); void loadLocalNetworks(); void loadLanAddress(); }
+  if (tab === 'shares' || tab === 'clients') {
+    void loadInitialData();
+    if (tab === 'shares') void loadLocalNetworks();
+  }
+  // CloudSettings owns cloud loading; don't issue a duplicate cloud_list here.
 }
-onMounted(() => {
-  void loadInitialSettings();
-  void loadInitialData();
-  cloudPoll = setInterval(() => { if (app.settingsTab === "cloud") void loadCloud(); }, 15000);
-  void listen("app://cloud-progress", (event) => { cloudProgress.value = event.payload; }).then((unlisten) => { cloudUnlisten = unlisten; }).catch((error) => console.error("cloud progress listener", error));
-});
+let paneFrame = null;
+let paneTimer = null;
+function scheduleVisibleSettings(tab) {
+  if (paneFrame !== null) cancelAnimationFrame(paneFrame);
+  if (paneTimer !== null) clearTimeout(paneTimer);
+  panePending.value = !initializedPanes.has(tab) && (tab === 'shares' || tab === 'clients');
+  if (!panePending.value) { loadVisibleSettings(tab); return; }
+  // Vue patches the active tab and skeleton first. The timer after rAF yields
+  // a paint opportunity before IPC serialization and backend work start.
+  paneFrame = requestAnimationFrame(() => {
+    paneFrame = null;
+    paneTimer = setTimeout(() => {
+      paneTimer = null;
+      if (disposed || app.settingsTab !== tab) return;
+      loadVisibleSettings(tab);
+      panePending.value = false;
+    }, 0);
+  });
+}
+watch(() => app.settingsTab, scheduleVisibleSettings);
+onMounted(() => { scheduleVisibleSettings(app.settingsTab); });
 
 onBeforeUnmount(() => {
-  if (cloudPoll) clearInterval(cloudPoll);
-  if (cloudUnlisten) cloudUnlisten();
+  disposed = true;
+  if (paneFrame !== null) cancelAnimationFrame(paneFrame);
+  if (paneTimer !== null) clearTimeout(paneTimer);
 });
 
 async function loadAutostart() {

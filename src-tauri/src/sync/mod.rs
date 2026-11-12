@@ -33,6 +33,8 @@ pub mod root_types;
 pub mod sandbox;
 pub mod sandbox_types;
 pub mod scan;
+pub(crate) mod scan_ledger;
+pub(crate) mod scan_ledger_types;
 pub mod scan_types;
 pub mod scheduler;
 pub mod traits;

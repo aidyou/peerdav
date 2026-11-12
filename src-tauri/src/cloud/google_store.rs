@@ -52,6 +52,9 @@ impl GoogleObjectStore {
         Err(CloudError::PrefixViolation)
     }
     async fn parent(&self, key: &str) -> Result<(String, String), CloudError> {
+        // Concurrent block uploads may share a not-yet-created folder. Serialize
+        // directory creation only; file bodies still transfer concurrently.
+        let _parent = self.parents.lock().await;
         super::object_service::valid_relative_path(key).map_err(error)?;
         let mut parts: Vec<_> = key.split('/').collect();
         let name = parts.pop().ok_or(CloudError::PrefixViolation)?.to_owned();
@@ -189,6 +192,6 @@ impl super::runtime::CloudRuntime {
         let snapshot = self.config.snapshot().map_err(super::runtime::config_error)?;
         let Some(entry) = snapshot.official_connections.into_iter().find(|entry| entry.id == connection) else { return Ok(None); };
         if entry.provider != super::oauth_types::OfficialProvider::GoogleDrive { return Err(crate::AppError { code: "CLOUD_UNSUPPORTED".into(), message: "此协议的同步尚未实现 / Sync is not implemented for this protocol".into(), detail: None, context: None }); }
-        Ok(Some(Arc::new(GoogleObjectStore { runtime: self.weak_self.clone(), connection: entry.id, revision: entry.revision, root: entry.root_id })))
+        Ok(Some(Arc::new(GoogleObjectStore { parents: tokio::sync::Mutex::new(()), runtime: self.weak_self.clone(), connection: entry.id, revision: entry.revision, root: entry.root_id })))
     }
 }

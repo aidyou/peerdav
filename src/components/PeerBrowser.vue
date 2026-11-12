@@ -7,6 +7,7 @@ import { useUploadBatch } from "../composables/useUploadBatch";
 import { fileUploadAdapter } from "../lib/uploadBatchAdapters";
 import { useDownloadQueue } from "../composables/useDownloadQueue";
 
+import DirectoryTreePicker from './DirectoryTreePicker.vue';
 import FileGlyph from "./FileGlyph.vue";
 import { selectionForClick } from "../lib/fileManagerAdapters";
 import FileManagerView from "./FileManagerView.vue";
@@ -46,30 +47,22 @@ const fileCapabilities = ref(null);
 const supportsMove = ref(false);
 const moveOpen = ref(false);
 const moveDestination = ref('');
-const moveFolders = ref([]);
-const moveCrumbs = ref([]);
 const moveLoading = ref(false);
 async function listMoveFolders(id = '') {
-  moveLoading.value = true;
   const generation = sessionGeneration;
-  try {
-    const session = await getFileSession();
-    let next = null;
-    const folders = [];
-    const seen = new Set();
-    let crumbs = [];
-    do {
-      const page = await fileInvoke('file_list', { sessionId: session.sessionId, id, next });
-      if (browserDisposed || generation !== sessionGeneration) return;
-      folders.push(...page.entries.filter(entry => entry.isDir && !entry.protected && !selectedEntries.value.some(source => source.id === entry.id)));
-      crumbs = page.breadcrumbs || [];
-      next = page.next;
-      if (next && (seen.has(next) || seen.size >= 1000)) throw { code: 'FILE_LIST_LIMIT', message: t('cloudBrowser.invalidPlan') };
-      if (next) seen.add(next);
-    } while (next);
-    moveFolders.value = folders; moveCrumbs.value = crumbs; moveDestination.value = id;
-  } catch (error) { app.handleFailure(error); }
-  finally { moveLoading.value = false; }
+  const session = await getFileSession();
+  let next = null;
+  const folders = [];
+  const seen = new Set();
+  do {
+    const page = await fileInvoke('file_list', { sessionId: session.sessionId, id, next });
+    if (browserDisposed || generation !== sessionGeneration) return [];
+    folders.push(...page.entries.filter(entry => entry.isDir && !entry.protected && !selectedEntries.value.some(source => source.id === entry.id)));
+    next = page.next;
+    if (next && (seen.has(next) || seen.size >= 1000)) throw { code: 'FILE_LIST_LIMIT', message: t('cloudBrowser.invalidPlan') };
+    if (next) seen.add(next);
+  } while (next);
+  return folders;
 }
 async function dropMove(sources, target) {
   if (!supportsMove.value || busy.value || !target.isDir) return;
@@ -78,7 +71,7 @@ async function dropMove(sources, target) {
   setSelection(sources); moveDestination.value = target.id;
   await moveSelected();
 }
-async function showMove() { moveOpen.value = true; await listMoveFolders(); }
+function showMove() { moveDestination.value = ''; moveOpen.value = true; }
 async function moveSelected() {
   if (moveLoading.value || !supportsMove.value) return;
   const selected = selectedEntries.value.slice();
@@ -247,7 +240,7 @@ const peerHost = computed(() => {
   }
 });
 
-const breadcrumbs = computed(() => peerListing.value?.breadcrumbs ?? navigationBreadcrumbs.value ?? []);
+const breadcrumbs = computed(() => (peerListing.value?.breadcrumbs ?? navigationBreadcrumbs.value ?? []).map(crumb => ({ ...crumb, name: crumb.name === '_peerdav_encrypt' ? t('cloudBrowser.encryptedDrive') : crumb.name === '_peerdav_mirror' ? t('cloudBrowser.mirrorDrive') : crumb.name })));
 
 const breadcrumbsEl = ref(null);
 
@@ -1450,7 +1443,6 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
 
         <div v-if="selectedEntries.length" class="selection-bar">
           <div class="selection-actions">
-            <el-tooltip v-if="adapter && supportsMove" :content="t('drive.move')" placement="top" :show-after="200" :enterable="false"><button type="button" class="bar-action" data-test="move" :aria-label="t('drive.move')" :disabled="busy || selectedEntries.some(entry => entry.protected)" @click="showMove"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v11H3ZM12 14h6m-3-3 3 3-3 3"/></svg></button></el-tooltip>
             <template v-if="selectedEntries.length === 1 && selectedEntry.isDir">
               <el-tooltip v-if="viewMode !== 'columns'" :content="t('peer.open')" placement="top" :show-after="200" :hide-after="0" :enterable="false">
                 <button
@@ -1511,6 +1503,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10" /><path d="m8 10 4 4 4-4" /><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" /></svg>
               </button>
             </el-tooltip>
+            <el-tooltip v-if="adapter && supportsMove" :content="t('drive.move')" placement="top" :show-after="200" :enterable="false"><button type="button" class="bar-action" data-test="move" :aria-label="t('drive.move')" :disabled="busy || selectedEntries.some(entry => entry.protected)" @click="showMove"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v11H3ZM12 14h6m-3-3 3 3-3 3"/></svg></button></el-tooltip>
             <el-tooltip
               v-if="canDeleteEntries && selectedEntries.every(entry => !entry.protected && entry.id !== rootPath) && !peerListing?.protected"
               :content="t('common.delete')"
@@ -1530,7 +1523,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16" /><path d="M9 7V5h6v2" /><path d="M6 7l1 12h10l1-12" /></svg>
               </button>
             </el-tooltip>
-            <el-tooltip v-if="selectedEntries.length > 1" :content="t('peer.clearSelection')" placement="top" :show-after="200" :hide-after="0" :enterable="false">
+            <el-tooltip :content="t('peer.clearSelection')" placement="top" :show-after="200" :hide-after="0" :enterable="false">
               <button type="button" class="bar-action" data-test="clear-selection" :aria-label="t('peer.clearSelection')" :disabled="busy" @click="clearSelection">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
               </button>
@@ -1570,8 +1563,7 @@ watch(() => props.peer.id, loadPeer, { immediate: true });
       @close="closeUpload" @cancel="cancelUpload" @resolve="resolveUploadConflict" />
 
     <el-dialog v-model="moveOpen" :title="t('drive.move')" width="480px">
-      <nav :aria-label="t('drive.moveDestination')"><button v-for="crumb in moveCrumbs" :key="crumb.id" type="button" class="breadcrumb" :disabled="moveLoading" @click="listMoveFolders(crumb.id)">{{ crumb.name }}</button></nav>
-      <div v-loading="moveLoading"><button v-for="folder in moveFolders" :key="folder.id" type="button" class="share-link" @click="listMoveFolders(folder.id)"><FileGlyph :entry="folder"/><span>{{ folder.name }}</span></button></div>
+      <DirectoryTreePicker :open="moveOpen" v-model="moveDestination" :load-children="listMoveFolders" @loading="moveLoading = $event" @error="app.handleFailure" />
       <template #footer><el-button @click="moveOpen = false">{{ t('common.cancel') }}</el-button><el-button type="primary" :disabled="moveLoading" @click="moveSelected">{{ t('drive.move') }}</el-button></template>
     </el-dialog>
     <FilePreviewDialog

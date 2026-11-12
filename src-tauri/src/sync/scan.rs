@@ -93,13 +93,21 @@ pub fn scan(root: &Path, options: &ScanOptions) -> Result<ScanReport, ScanError>
     if !options.ignored.is_empty() {
         return Err(ScanError::UnsupportedIgnore);
     }
+    let ledger = super::scan_ledger::ledger(root)?;
+    let mut ledger = ledger.lock().map_err(|_| ScanError::RootChanged)?;
+    super::scan_ledger::restore(&mut ledger)?;
+    let persisted = ledger.files.clone();
+    let generation = ledger.generation.load(Ordering::Acquire);
+    if generation != ledger.observed || ledger.failed.load(Ordering::Acquire) { ledger.files.clear(); }
+    let dirty = std::mem::take(&mut *ledger.dirty.lock().map_err(|_| ScanError::RootChanged)?);
+    ledger.files.retain(|path, _| !dirty.iter().any(|changed| Path::new(path).starts_with(changed)));
     let mut report = ScanReport {
         files: Vec::new(),
         directories: vec![String::new()],
         ignored_paths: Vec::new(),
         complete: false,
     };
-    walk(&root_dir, Path::new(""), root, options, &mut report)?;
+    walk(&root_dir, Path::new(""), root, options, &mut report, &ledger.files)?;
     canceled(options)?;
     let after = open_root_nofollow(root)?
         .dir_metadata()
@@ -108,6 +116,20 @@ pub fn scan(root: &Path, options: &ScanOptions) -> Result<ScanReport, ScanError>
         return Err(ScanError::RootChanged);
     }
     report.complete = true;
+    ledger.observed = generation;
+    // The ledger is an optimization, not an additional unbounded copy of the
+    // full scan. Oversized entries stay uncached and are verified normally.
+    let mut remaining = 8 * 1024 * 1024_usize;
+    ledger.files = report.files.iter().filter_map(|file| {
+        let bytes = file.path.len().saturating_add(256).saturating_add(file.blocks.len().saturating_mul(160));
+        if bytes > remaining { return None; }
+        remaining -= bytes;
+        Some((file.path.clone(), file.clone()))
+    }).collect();
+    if let Err(error) = super::scan_ledger::persist(&ledger, &persisted) {
+        ledger.files.clear(); ledger.loaded = false;
+        return Err(error);
+    }
     Ok(report)
 }
 
@@ -117,6 +139,7 @@ fn walk(
     display_root: &Path,
     options: &ScanOptions,
     report: &mut ScanReport,
+    cached: &std::collections::BTreeMap<String, FileScan>,
 ) -> Result<(), ScanError> {
     canceled(options)?;
     if rel.components().count() > 128 || report.files.len() + report.directories.len() > 100_000 {
@@ -155,7 +178,7 @@ fn walk(
             report
                 .directories
                 .push(child.to_string_lossy().into_owned());
-            walk(&sub, &child, display_root, options, report)?;
+            walk(&sub, &child, display_root, options, report, cached)?;
             let sub_after = sub.dir_metadata().map_err(|e| io_err(&path, e))?;
             if identity(&sub_after)? != sub_id {
                 return Err(ScanError::UnsafeEntry(child.display().to_string()));
@@ -171,6 +194,21 @@ fn walk(
             let before_id = identity(&before)?;
             if before_id != identity(&metadata)? {
                 return Err(ScanError::UnsafeEntry(child.display().to_string()));
+            }
+            if let Some(previous) = cached.get(child.to_string_lossy().as_ref()).filter(|previous| {
+                previous.inode == before_id.inode && previous.device == before_id.device
+                    && previous.size == before.len()
+                    && before.modified().ok().map(stamp) == Some(previous.modified)
+                    && ctime_stamp(&before) == previous.changed
+            }) {
+                let after = dir.symlink_metadata(&name).map_err(|e| io_err(&path, e))?;
+                if after.file_type().is_symlink() || identity(&after)? != before_id
+                    || after.len() != before.len() || after.modified().ok() != before.modified().ok()
+                    || ctime_stamp(&after) != ctime_stamp(&before) {
+                    return Err(ScanError::UnsafeEntry(child.display().to_string()));
+                }
+                report.files.push(previous.clone());
+                continue;
             }
             let mut whole = Sha256::new();
             let mut blocks = Vec::new();

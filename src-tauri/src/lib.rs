@@ -15,6 +15,8 @@ mod official_download;
 mod error;
 pub mod file_manager;
 mod fs;
+mod file_watch;
+mod file_watch_types;
 mod ignore_rules;
 mod keyfile;
 mod logging;
@@ -365,6 +367,7 @@ pub fn run() {
                     cloud::cloud_commands::cloud_local_preview,
                     cloud::cloud_commands::cloud_local_open,
                     cloud::cloud_commands::cloud_local_mutate,
+                    cloud::cloud_commands::cloud_local_create_directory,
                     cloud::cloud_commands::cloud_preview,
                     cloud::cloud_commands::cloud_sync,
                     cloud::cloud_commands::mirror_folders,

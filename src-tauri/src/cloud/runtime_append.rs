@@ -547,6 +547,7 @@ impl CloudRuntime {
         let mapping_digest = Self::mapping_digest(&mapping)?;
         let connection_revision = self.connection_revision(&mapping.connection_id)?;
         let epoch = Self::root_epoch(&mapping.local_root)?;
+        self.configure_scan_ledger(&mapping, &epoch)?;
         let revisions = if mapping.protocol == StorageProtocol::AppendV2 {
             self.append_cached(&mapping)?;
             let index = self.open_append_index(&mapping, &epoch)?;
@@ -645,26 +646,28 @@ impl CloudRuntime {
         Ok(entries)
     }
 
-    pub(super) async fn append_preview_state(
-        &self,
-        mapping: &CloudMapping,
-        epoch: &str,
-    ) -> Result<(PreviewCounts, String), AppError> {
-        self.append_preview_selection(mapping, epoch, &[]).await
-    }
-
-    pub(super) async fn append_preview_selection(
+    pub(super) async fn append_preview_report(
         &self, mapping: &CloudMapping, epoch: &str, selection: &[String],
+        mut report: crate::sync::scan_types::ScanReport,
+        trace: &str,
     ) -> Result<(PreviewCounts, String), AppError> {
+        let started = std::time::Instant::now();
+        report.directories.retain(|path| !path.is_empty());
         let cached = self.append_cached(mapping)?;
+        let lock_started = std::time::Instant::now();
         let _metadata = self.metadata_guard(&mapping, &epoch).await;
+        log::debug!(target: "peerdav::preview", "trace={trace} stage=metadata_lock elapsed_ms={}", lock_started.elapsed().as_millis());
+        let index_started = std::time::Instant::now();
         let mut index = self.open_append_index(mapping, epoch)?;
+        log::debug!(target: "peerdav::preview", "trace={trace} stage=index_open elapsed_ms={}", index_started.elapsed().as_millis());
         // Separate metadata-only previews from older full-discovery attempts:
         // an exhausted legacy payload budget must not poison metadata browsing.
         // Retries within this slot still retain every reservation.
         let operation = index
             .begin_run("preview-metadata-v1", &hex::encode(rand::random::<[u8; 16]>()))
             .map_err(append_error)?;
+        log::debug!(target: "peerdav::preview", "trace={trace} operation={operation} stage=discovery_start");
+        let remote_started = std::time::Instant::now();
         let closure = append_discovery::discover_metadata(
             self.bound_append_store(&cached)?,
             &trust(&cached.binding),
@@ -672,8 +675,10 @@ impl CloudRuntime {
             &mut index,
             &operation,
         )
-        .await
-        .map_err(append_error)?;
+        .await;
+        log::debug!(target: "peerdav::preview", "trace={trace} stage=remote_metadata elapsed_ms={} ok={}", remote_started.elapsed().as_millis(), closure.is_ok());
+        let closure = closure.map_err(append_error)?;
+        let compare_started = std::time::Instant::now();
         let remote = revisions(&closure)?;
         let projection = crate::sync::namespace::project_scoped(
             &merge::project(&remote).map_err(append_error)?,
@@ -689,21 +694,6 @@ impl CloudRuntime {
             &mapping.logical_path,
         )
         .map_err(append_error)?;
-        let local_root = mapping.local_root.clone();
-        let cancel = Arc::clone(&self.cancel);
-        let mut report = tokio::task::spawn_blocking(move || {
-            scan(
-                &local_root,
-                &ScanOptions {
-                    cancel,
-                    ..Default::default()
-                },
-            )
-        })
-        .await
-        .map_err(append_error)?
-        .map_err(append_error)?;
-        report.directories.retain(|path| !path.is_empty());
         let signature = hex::encode(Sha256::digest(
             serde_json::to_vec(&closure).map_err(append_error)?,
         ));
@@ -717,7 +707,9 @@ impl CloudRuntime {
         let mut projection = projection;
         base.entries.retain(|entry| includes(&entry.projection_path.join("/")) || includes(&entry.logical_path.join("/")));
         projection.entries.retain(|entry| includes(&entry.projection_path.join("/")) || includes(&entry.logical_path.join("/")));
-        Ok((preview_counts(&report, &base, &projection), signature))
+        let counts = preview_counts(&report, &base, &projection);
+        log::debug!(target: "peerdav::preview", "trace={trace} stage=compare_and_journal elapsed_ms={} append_total_ms={} remote_revisions={}", compare_started.elapsed().as_millis(), started.elapsed().as_millis(), remote.len());
+        Ok((counts, signature))
     }
     pub(crate) async fn start_append_worker(
         &self,

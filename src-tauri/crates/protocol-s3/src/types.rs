@@ -114,7 +114,7 @@ pub struct StorageCapabilities {
     pub conditional_writes_verified: bool,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProxyMode {
     #[default]

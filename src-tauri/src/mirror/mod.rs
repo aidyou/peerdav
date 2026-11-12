@@ -6,6 +6,8 @@
 // `.conflict.{机器名}.{时间}` 副本。
 
 mod baseline;
+mod ledger;
+mod ledger_types;
 mod runtime;
 mod scan;
 mod sync;
@@ -13,6 +15,8 @@ mod types;
 
 pub use baseline::remove as remove_baseline;
 pub use runtime::{MirrorRunContext, run_sync};
+pub(crate) use runtime::run_sync_mode;
+pub(crate) use types::mirror_root_prefix;
 pub(crate) use types::{MASS_DELETE_ABSOLUTE, MASS_DELETE_MINIMUM, MASS_DELETE_PERCENT};
 pub use types::{
     MirrorError, MirrorMapping, MirrorSyncResult, SaveMirrorMappingInput, cloud_key, normalize_cloud_prefix,

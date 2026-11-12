@@ -84,6 +84,37 @@ pub(crate) fn fixture() -> (
     (dir, index, remote, repo, objects, root)
 }
 #[tokio::test]
+async fn bounded_parallel_blocks_preserve_commit_order_and_retry() {
+    let (_dir, mut index, remote, repo, objects, _) = fixture();
+    let mut blocks = vec![objects[0].clone()];
+    let mut bindings = Vec::new();
+    for n in 0..8u8 {
+        let (key, bytes) = repo.seal_block(&[n; 32]).unwrap();
+        let envelope: Envelope = serde_json::from_slice(&bytes).unwrap();
+        bindings.push(BlockBinding { block_id: envelope.logical_id, len: envelope.plaintext_len, object: ObjectRef { kind: "block".into(), digest: key.rsplit('/').next().unwrap().into() } });
+        blocks.push(PreparedObject::new(key, bytes));
+    }
+    let envelope: Envelope = serde_json::from_slice(blocks[0].bytes()).unwrap();
+    bindings.push(BlockBinding { block_id: envelope.logical_id, len: envelope.plaintext_len, object: ObjectRef { kind: "block".into(), digest: blocks[0].key().rsplit('/').next().unwrap().into() } });
+    let (root, bytes) = repo.seal_tree(&Tree { version: 2, repo_id: repo.repo_id().into(), directory: "root".into(), entries: vec![], children: vec![], bindings }).unwrap();
+    blocks.push(PreparedObject::new(format!("{APPEND_ROOT}/{}/trees/{}", repo.repo_id(), root.digest), bytes));
+    let id = "11".repeat(16);
+    let (reference, bytes) = repo.seal_commit(&Commit { version: 2, repo_id: repo.repo_id().into(), operation_id: id.clone(), parents: vec![], root: root.clone() }).unwrap();
+    blocks.push(PreparedObject::new(format!("{APPEND_ROOT}/{}/commits/{}-{}", repo.repo_id(), id, reference.digest), bytes));
+    AppendPublisher::prepare(&mut index, &repo, &id, &[], root, &blocks).unwrap();
+    remote.measure_parallelism(); remote.drop_next_put_response();
+    assert!(AppendPublisher::resume(&mut index, &remote.store(), &id, &AtomicBool::new(false)).await.is_err());
+    assert_eq!(index.frozen_operation(&id).unwrap().unwrap().next_object, 0);
+    assert_eq!(AppendPublisher::resume(&mut index, &remote.store(), &id, &AtomicBool::new(false)).await.unwrap(), Some(OperationState::Published));
+    assert_eq!(remote.peak_parallelism(), 4);
+    let requests = remote.requests();
+    let puts: Vec<_> = requests.iter().filter(|r| r.operation == "put").collect();
+    assert!(puts.last().unwrap().key.contains("/commits/"));
+    assert_eq!(puts.len(), blocks.len());
+    assert_eq!(index.discovery_budget(&id).unwrap().requests, blocks.len() * 2 + 4);
+}
+
+#[tokio::test]
 async fn durable_prepare_order_any_only_and_steady_state() {
     let (_dir, mut index, remote, repo, objects, root) = fixture();
     let id = "11".repeat(16);

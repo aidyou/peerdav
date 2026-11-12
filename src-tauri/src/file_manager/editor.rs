@@ -15,8 +15,9 @@ pub(crate) fn editable_name(name: &str) -> bool {
     matches!(extension, "txt" | "md" | "markdown" | "json" | "jsonl" | "yaml" | "yml" | "toml" | "xml" | "csv" | "tsv" | "log" | "rs" | "js" | "jsx" | "ts" | "tsx" | "vue" | "py" | "go" | "java" | "c" | "h" | "cpp" | "hpp" | "css" | "scss" | "html" | "sql" | "sh" | "bash" | "zsh" | "ini" | "conf" | "cfg" | "rtf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp" | "pages" | "numbers" | "key")
 }
 
-pub(crate) fn content_event(kind: &notify::EventKind) -> bool {
-    matches!(kind, notify::EventKind::Create(_) | notify::EventKind::Modify(notify::event::ModifyKind::Data(_) | notify::event::ModifyKind::Name(_)))
+#[cfg(test)]
+fn content_event(kind: &notify::EventKind) -> bool {
+    crate::file_watch::content_event(kind) && !matches!(kind, notify::EventKind::Remove(_))
 }
 
 pub(crate) async fn read_local(path: &Path) -> Result<Vec<u8>, AppError> {
@@ -114,22 +115,20 @@ impl FileSessions {
 // Ignore deletes/metadata; a create/rename targeting the registered path also
 // handles editors which save through an atomic replacement.
 pub(crate) fn start_watch(app: tauri::AppHandle, sessions: SharedFileSessions, peers: Arc<PeerManager>, cloud: Arc<CloudRuntime>, info: FileEditDto) -> Result<(), AppError> {
-    use notify::Watcher;
     let local = std::path::PathBuf::from(&info.local_path);
     let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
     let target = local.clone();
     let watcher_cloud = cloud.clone();
-    let mut watcher = notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
+    let watcher = crate::file_watch::watch(local.parent().ok_or_else(invalid)?, false, move |event| {
         let relevant = match event {
-            Ok(event) => content_event(&event.kind) && event.paths.iter().any(|path| path == &target),
-            Err(error) => { watcher_cloud.object_report(crate::DomainError::Internal { detail: format!("editor watch error: {error}") }.into()); false }
+            Ok(crate::file_watch_types::FileChange::Paths(paths)) => paths.iter().any(|path| path == &target),
+            Ok(crate::file_watch_types::FileChange::Rescan) => true,
+            Err(error) => { watcher_cloud.object_report(crate::DomainError::Internal { detail: format!("editor watch error: {error}") }.into()); true }
         };
         if relevant {
             match sender.try_send(()) { Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}, Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {} }
         }
     }).map_err(|e| AppError::from(crate::DomainError::Internal { detail: e.to_string() }))?;
-    watcher.watch(local.parent().ok_or_else(invalid)?, notify::RecursiveMode::NonRecursive)
-        .map_err(|e| AppError::from(crate::DomainError::Internal { detail: e.to_string() }))?;
     let worker_cloud = cloud.clone();
     let worker_id = info.edit_id.clone();
     let worker = tauri::async_runtime::spawn(async move {

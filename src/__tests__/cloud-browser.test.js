@@ -114,7 +114,7 @@ beforeEach(() => {
     const catalog = await handlers.cloud_list();
     const connection = catalog.officialConnections?.find(item => item.id === 'c1');
     const rootName = connection?.name || 'main';
-    const fullCrumbs = [{ id: '', name: rootName }, ...crumbs.filter(crumb => (crumb.id ?? crumb.path) !== '').map(crumb => ({ ...crumb, name: crumb.name === '_peerdav_encrypt' ? t('cloudBrowser.encryptedDrive') : crumb.name === '_peerdav_mirror' ? t('cloudBrowser.mirrorDrive') : crumb.name }))];
+    const fullCrumbs = [{ id: '', name: rootName }, ...crumbs.filter(crumb => (crumb.id ?? crumb.path) !== '')];
     return { ...page, id: page.id ?? path, breadcrumbs: fullCrumbs.map(({ path, ...crumb }) => ({ ...crumb, id: crumb.id ?? path })), entries: page.entries.map(({ path, ...entry }) => ({ ...entry, id: entry.id ?? path })) };
   });
 });
@@ -349,6 +349,25 @@ describe("official cloud sessions", () => {
     } finally { prompt.mockRestore(); }
   });
 
+  it.each(['en', 'zh-CN'])('localizes reserved breadcrumbs without changing their identities (%s)', async language => {
+    setLocale(language);
+    handlers.file_list = () => ({ id: '_peerdav_encrypt/', breadcrumbs: [{ id: '_peerdav_encrypt/', name: '_peerdav_encrypt' }], entries: [], complete: true });
+    const wrapper = await browser();
+    expect(wrapper.find('.breadcrumbs').text()).toContain(t('cloudBrowser.encryptedDrive'));
+    expect(wrapper.find('.breadcrumbs').text()).not.toContain('_peerdav_encrypt');
+    await wrapper.findAll('.breadcrumbs button').at(-1).trigger('click'); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith('file_list', expect.objectContaining({ id: '_peerdav_encrypt/' }));
+  });
+  it('uses the shared expandable tree for remote moves without losing sibling folders', async () => {
+    handlers.file_open_session = () => ({ sessionId: 'official', root: '', supportsMove: true, capabilities: { preview: true } });
+    handlers.file_list = ({ id }) => ({ id, entries: id === 'folder' ? [{ id: 'child', name: 'Child', isDir: true }] : [{ id: 'source', name: 'a.txt', isDir: false }, { id: 'folder', name: 'Folder', isDir: true }, { id: 'sibling', name: 'Sibling', isDir: true }], complete: true });
+    const wrapper = await browser('list');
+    await wrapper.find('[data-key="source"]').trigger('click'); await flushPromises();
+    await click(wrapper, '[data-test=move]');
+    const tree = wrapper.findComponent({ name: 'DirectoryTreePicker' });
+    expect((await tree.props('loadChildren')('')).map(entry => entry.id)).toEqual(['folder', 'sibling']);
+    expect((await tree.props('loadChildren')('folder')).map(entry => entry.id)).toEqual(['child']);
+  });
   it.each([false, true])('confirms remote drag moves before invoking file_move (%s)', async confirmed => {
     confirmAction.mockResolvedValue(confirmed);
     handlers.file_open_session = () => ({ sessionId: 'official', root: '', supportsMove: true, capabilities: { preview: true } });
@@ -371,7 +390,8 @@ describe("official cloud sessions", () => {
     await wrapper.find('[data-key="~61"]').trigger('click');
     expect(wrapper.find('[data-test=preview]').exists()).toBe(true);
     expect(wrapper.find('[data-test=online-preview]').exists()).toBe(true);
-    expect(wrapper.find('.selection-actions').findAll('button').at(-1).attributes('data-test')).toBe('delete-file');
+    expect(wrapper.find('.selection-actions').findAll('button').at(-2).attributes('data-test')).toBe('delete-file');
+    expect(wrapper.find('.selection-actions').findAll('button').at(-1).attributes('data-test')).toBe('clear-selection');
     await click(wrapper, '[data-test=edit]');
     expect(nativeInvoke).toHaveBeenCalledWith('file_prepare_edit', { sessionId: 'official', id: '~61' });
     expect(wrapper.find('.edit-panel').text()).toContain('/data/editor/edit/notes.txt');
@@ -574,6 +594,75 @@ describe("local sync-drive contents", () => {
   const catalog = () => ({ connections: [{ id: 'c1', name: 'Main', bucket: 'main', buckets: ['main', 'photos'] }], mappings: [{ id: 'm1', connectionId: 'c1', repositoryId: 'r1', localRoot: '/local/Documents' }, { id: 'm2', connectionId: 'c1', repositoryId: 'r2', localRoot: '/local/Pictures' }] });
   const contents = () => [{ path: 'docs', name: 'docs', isDir: true, size: 0, synced: false }, { path: 'docs/new.txt', name: 'new.txt', isDir: false, size: 4, synced: false }, { path: 'done.txt', name: 'done.txt', isDir: false, size: 2, synced: true }];
   beforeEach(() => { handlers.cloud_list = catalog; handlers.cloud_local_entries = contents; handlers.cloud_local_status = contents; handlers.cloud_status = () => []; handlers.cloud_preview = () => ({ previewId: 'plan', summary: { uploads: 1, downloads: 0, deletes: 0, conflicts: 0 } }); handlers.cloud_sync = () => ({ runId: 1 }); });
+  it.each(['ctrlKey', 'altKey', 'metaKey'])('retains local %s selection when click loses modifiers and clears single/multiple selection', async modifier => {
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    const first = wrapper.find('[data-path="done.txt"]'), second = wrapper.find('[data-path="docs"]');
+    await first.trigger('click');
+    expect(wrapper.find('[data-test="local-clear-selection"]').exists()).toBe(true);
+    await second.trigger('mousedown', { button: 0, [modifier]: true }); await second.trigger('click');
+    expect(wrapper.findAll('[aria-selected="true"]')).toHaveLength(2);
+    await click(wrapper, '[data-test="local-clear-selection"]');
+    expect(wrapper.findAll('[aria-selected="true"]')).toHaveLength(0);
+    expect(wrapper.find('.local-selection-bar').exists()).toBe(false);
+    await first.trigger('click'); await click(wrapper, '[data-test="local-clear-selection"]');
+    expect(wrapper.find('.local-selection-bar').exists()).toBe(false);
+  });
+  it('keeps local column modifier clicks as selection without opening directories', async () => {
+    const wrapper = await browser('columns'); await click(wrapper, '.drive-link');
+    await wrapper.find('[data-path="done.txt"]').trigger('click');
+    await wrapper.find('[data-path="docs"]').trigger('click', { altKey: true });
+    expect(wrapper.findAll('.column-row.is-selected')).toHaveLength(2);
+    expect(nativeInvoke).not.toHaveBeenCalledWith('cloud_local_entries', { mappingId: 'm1', path: 'docs' });
+  });
+  it('uses held keys as the local WebKit fallback and resets them on blur', async () => {
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    await wrapper.find('[data-path="done.txt"]').trigger('click');
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Alt' }));
+    await wrapper.find('[data-path="docs"]').trigger('click');
+    expect(wrapper.findAll('[aria-selected="true"]')).toHaveLength(2);
+    window.dispatchEvent(new Event('blur'));
+    await wrapper.find('[data-path="docs"]').trigger('click');
+    expect(wrapper.findAll('[aria-selected="true"]')).toHaveLength(1);
+  });
+  it('supports local keyboard selection, escape and marquee with click suppression', async () => {
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    const area = wrapper.find('.local-file-view');
+    await area.trigger('keydown', { key: 'a', ctrlKey: true });
+    expect(wrapper.findAll('[aria-selected="true"]')).toHaveLength(2);
+    await area.trigger('keydown', { key: 'Escape' });
+    expect(wrapper.find('.local-selection-bar').exists()).toBe(false);
+    for (const [index, row] of wrapper.findAll('[data-path]').entries()) row.element.getBoundingClientRect = () => ({ left: 10, right: 100, top: index * 25 + 10, bottom: index * 25 + 30, width: 90, height: 20 });
+    await area.trigger('mousedown', { button: 0, clientX: 0, clientY: 0 });
+    window.dispatchEvent(new MouseEvent('mousemove', { clientX: 110, clientY: 80 })); await flushPromises();
+    expect(wrapper.findAll('[aria-selected="true"]')).toHaveLength(2);
+    window.dispatchEvent(new MouseEvent('mouseup', { clientX: 110, clientY: 80 }));
+    await wrapper.find('[data-path="done.txt"]').trigger('click');
+    expect(wrapper.findAll('[aria-selected="true"]')).toHaveLength(2);
+  });
+  it('creates local folders before scoped sync and places the icon after edit', async () => {
+    const prompt = vi.spyOn(ElMessageBox, 'prompt').mockResolvedValue({ value: 'New folder' });
+    handlers.cloud_local_create_directory = () => null;
+    try {
+      const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+      expect(wrapper.find('[data-test="local-edit"]').element.nextElementSibling?.dataset.test).toBe('local-create-directory');
+      await click(wrapper, '[data-test="local-create-directory"]');
+      expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_create_directory', { mappingId: 'm1', path: 'New folder' });
+      expect(nativeInvoke).toHaveBeenCalledWith('cloud_preview', { mappingId: 'm1', selection: ['New folder'] });
+      const commands = nativeInvoke.mock.calls.map(([command]) => command);
+      expect(commands.indexOf('cloud_local_create_directory')).toBeLessThan(commands.indexOf('cloud_preview'));
+      expect(commands).not.toContain('file_create_directory');
+    } finally { prompt.mockRestore(); }
+  });
+  it('does not create a folder after switching drives during the prompt', async () => {
+    const pending = deferred(); const prompt = vi.spyOn(ElMessageBox, 'prompt').mockReturnValue(pending.promise);
+    try {
+      const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+      await click(wrapper, '[data-test="local-create-directory"]');
+      await wrapper.findAll('.drive-link')[1].trigger('click'); await flushPromises();
+      pending.resolve({ value: 'stale' }); await flushPromises();
+      expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_local_create_directory')).toBe(false);
+    } finally { prompt.mockRestore(); }
+  });
   it('supports additive local selection and disables file-only actions for multiple entries', async () => {
     const wrapper = await browser('list'); await click(wrapper, '.drive-link');
     await wrapper.find('[data-path="done.txt"]').trigger('click');
@@ -611,15 +700,77 @@ describe("local sync-drive contents", () => {
     const toolbar = wrapper.find('.local-titlebar-actions');
     expect(toolbar.findAll('[role="group"]')).toHaveLength(3);
     expect(toolbar.findAll('.titlebar-divider')).toHaveLength(3);
-    expect(toolbar.findAll('.view-switch__button')).toHaveLength(12);
+    expect(toolbar.findAll('.view-switch__button')).toHaveLength(13);
     await wrapper.find('[data-path="done.txt"]').trigger('click'); await flushPromises();
-    expect(wrapper.find('.local-selection-bar').findAll('.bar-action')).toHaveLength(5);
+    expect(wrapper.find('.local-selection-bar').findAll('.bar-action')).toHaveLength(6);
     await click(wrapper, '[data-test="local-bar-preview"]');
     expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_preview', { mappingId: 'm1', path: 'done.txt' });
     expect(wrapper.text()).toContain('local text');
     await click(wrapper, '[data-test="local-open"]');
     expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_open', { mappingId: 'm1', path: 'done.txt' });
     expect(nativeInvoke.mock.calls.some(([command]) => ['file_select_download', 'file_select_upload', 'cloud_object_preview'].includes(command))).toBe(false);
+  });
+  it('pins the local statusbar to the viewport bottom at full width', () => {
+    const style = cloudBrowserSource.match(/\.local-statusbar\s*\{([^}]+)\}/)[1];
+    expect(style).toMatch(/position:\s*fixed/);
+    expect(style).toMatch(/bottom:\s*0/);
+    expect(style).toMatch(/width:\s*100%/);
+    expect(style).toMatch(/box-sizing:\s*border-box/);
+    expect(style).not.toMatch(/(?:^|;)\s*left\s*:/);
+    expect(style).not.toMatch(/background(?:-color)?\s*:/);
+  });
+  it('shows only direct children in the local move tree when the listing contains the whole drive', async () => {
+    handlers.cloud_local_entries = () => [
+      { path: 'test', name: 'test', isDir: true, size: 0 },
+      { path: 'test/hh', name: 'hh', isDir: true, size: 0 },
+      { path: 'done.txt', name: 'done.txt', isDir: false, size: 2 },
+    ];
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    await wrapper.find('[data-path="done.txt"]').trigger('click');
+    await click(wrapper, '[data-test="local-move"]');
+    const tree = wrapper.findComponent({ name: 'DirectoryTreePicker' });
+    const load = tree.props('loadChildren');
+    expect((await load('')).map(entry => entry.id)).toEqual(['test']);
+    expect((await load('test')).map(entry => entry.id)).toEqual(['test/hh']);
+    expect(await load('test/hh')).toEqual([]);
+  });
+  it('excludes selected folders and descendants from local move destinations', async () => {
+    handlers.cloud_local_entries = () => [...contents(), { path: 'docs/sub', name: 'sub', isDir: true, size: 0 }];
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    await wrapper.find('[data-path="docs"]').trigger('click');
+    await click(wrapper, '[data-test="local-move"]');
+    const dialog = wrapper.findComponent({ name: 'ElDialog' });
+    expect(dialog.props('modelValue')).toBe(true);
+    const tree = dialog.findComponent({ name: 'DirectoryTreePicker' });
+    expect(await tree.props('loadChildren')('')).toEqual([]);
+  });
+  it('opens the local move dialog outside the clipped browser and moves locally before syncing', async () => {
+    handlers.cloud_local_mutate = () => null;
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    await wrapper.find('[data-path="done.txt"]').trigger('click');
+    await click(wrapper, '[data-test="local-move"]');
+    const moveDialog = wrapper.findComponent({ name: 'ElDialog' });
+    expect(moveDialog.props('modelValue')).toBe(true);
+    expect(moveDialog.props('appendToBody')).toBe(true);
+    expect(document.body.querySelector('.el-overlay')?.closest('.local-browser-pane')).toBeNull();
+    moveDialog.findComponent({ name: 'DirectoryTreePicker' }).vm.$emit('update:modelValue', 'docs');
+    await flushPromises();
+    await new DOMWrapper(document.body.querySelector('.el-dialog__footer button:last-child')).trigger('click'); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_mutate', { mappingId: 'm1', path: 'done.txt', destination: 'docs', confirmed: true });
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_preview', { mappingId: 'm1', selection: ['done.txt', 'docs/done.txt'] });
+    const commands = nativeInvoke.mock.calls.map(([command]) => command);
+    expect(commands.indexOf('cloud_local_mutate')).toBeLessThan(commands.indexOf('cloud_preview'));
+  });
+  it('does not cover completed sync status with a slow background comparison', async () => {
+    const comparison = deferred();
+    handlers.cloud_local_status = () => comparison.promise;
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    expect(wrapper.find('.local-statusbar').text()).toBe(t('drive.checkingStatus'));
+    handlers.cloud_status = () => [{ mappingId: 'm1', phase: 'completed', runId: 1 }];
+    await vi.advanceTimersByTimeAsync(1500); await flushPromises();
+    expect(wrapper.find('.local-statusbar').text()).not.toContain(t('drive.checkingStatus'));
+    comparison.resolve(contents()); await flushPromises();
+    expect(wrapper.find('.local-statusbar').text()).not.toContain(t('drive.checkingStatus'));
   });
   it('deletes locally before requesting a selection-scoped sync', async () => {
     handlers.cloud_local_mutate = () => null;
@@ -732,7 +883,9 @@ describe("local sync-drive contents", () => {
   it('navigates local folders and changes modes without requesting S3 listings', async () => {
     const wrapper = await browser('list'); await click(wrapper, '.drive-link');
     const calls = nativeInvoke.mock.calls.filter(([command]) => command === 'cloud_object_list').length;
+    const statusCalls = nativeInvoke.mock.calls.filter(([command]) => command === 'cloud_local_status').length;
     await wrapper.find('[data-path="docs"]').trigger('dblclick'); await flushPromises();
+    expect(nativeInvoke.mock.calls.filter(([command]) => command === 'cloud_local_status')).toHaveLength(statusCalls);
     expect(wrapper.find('[data-path="docs/new.txt"]').exists()).toBe(true);
     await click(wrapper, '[aria-label="Columns"]');
     expect(wrapper.findAll('.column')).toHaveLength(2);
@@ -1795,6 +1948,15 @@ describe("CloudBrowser", () => {
     const wrapper = await browser();
     expect(wrapper.find('.browser-sidebar').text()).not.toContain(t('network.title'));
     expect(wrapper.findComponent({ name: 'NetworkProxySettings' }).exists()).toBe(false);
+  });
+  it.each([false, true])('clears a single remote selection (directory=%s)', async directory => {
+    handlers.cloud_object_list = () => page(directory ? [{ key: 'docs/a.txt', size: 1 }] : [file]);
+    const wrapper = await browser('list');
+    await wrapper.find('[data-path]').trigger('click');
+    expect(wrapper.find('[data-test="clear-selection"]').exists()).toBe(true);
+    await click(wrapper, '[data-test="clear-selection"]');
+    expect(wrapper.find('.selection-bar').exists()).toBe(false);
+    expect(wrapper.findAll('[aria-selected="true"]')).toHaveLength(0);
   });
   it("hides the selection bar in gallery view without a selection and after clearing a multi selection", async () => {
     handlers.cloud_object_list = () => page([file, { key: "b.txt", size: 2 }]);

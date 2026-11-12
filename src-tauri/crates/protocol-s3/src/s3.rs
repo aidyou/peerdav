@@ -773,6 +773,7 @@ impl ObjectStore for S3Store {
             let mut pending = Vec::with_capacity(PART_SIZE);
             let mut size = 0usize;
             let mut parts = 0usize;
+            let mut inflight = Vec::with_capacity(4);
             loop {
                 if cancel.load(Ordering::Acquire) {
                     return Err(abort_multipart(
@@ -831,17 +832,15 @@ impl ObjectStore for S3Store {
                             #[cfg(test)]
                             self.multipart_peak_buffer
                                 .fetch_max(payload.len() + pending.len(), Ordering::SeqCst);
-                            if let Err(source) = upload.put_part(PutPayload::from(payload)).await {
-                                let primary = CloudError::Multipart {
-                                    operation: "upload part",
-                                    source,
-                                };
-                                return Err(abort_multipart(
-                                    &mut upload,
-                                    "abort after part failure",
-                                    primary,
-                                )
-                                .await);
+                            inflight.push(upload.put_part(PutPayload::from(payload)));
+                            #[cfg(test)]
+                            self.multipart_peak_buffer.fetch_max(inflight.len() * PART_SIZE + pending.len(), Ordering::SeqCst);
+                            if inflight.len() == 4 {
+                                let results = futures_util::future::join_all(std::mem::take(&mut inflight)).await;
+                                if let Some(source) = results.into_iter().find_map(Result::err) {
+                                    let primary = CloudError::Multipart { operation: "upload part", source };
+                                    return Err(abort_multipart(&mut upload, "abort after part failure", primary).await);
+                                }
                             }
                             parts += 1;
                         }
@@ -866,21 +865,12 @@ impl ObjectStore for S3Store {
                 #[cfg(test)]
                 self.multipart_peak_buffer
                     .fetch_max(pending.len(), Ordering::SeqCst);
-                if let Err(source) = upload
-                    .put_part(PutPayload::from(Bytes::from(pending)))
-                    .await
-                {
-                    let primary = CloudError::Multipart {
-                        operation: "upload final part",
-                        source,
-                    };
-                    return Err(abort_multipart(
-                        &mut upload,
-                        "abort after final part failure",
-                        primary,
-                    )
-                    .await);
-                }
+                inflight.push(upload.put_part(PutPayload::from(Bytes::from(pending))));
+            }
+            let results = futures_util::future::join_all(inflight).await;
+            if let Some(source) = results.into_iter().find_map(Result::err) {
+                let primary = CloudError::Multipart { operation: "upload part", source };
+                return Err(abort_multipart(&mut upload, "abort after part failure", primary).await);
             }
             if cancel.load(Ordering::Acquire) {
                 return Err(abort_multipart(
@@ -1724,6 +1714,7 @@ mod cfgtest {
                     offset += chunk.len();
                 }
                 calls.verified_bytes.store(offset, Ordering::SeqCst);
+                tokio::task::yield_now().await;
                 if let Some(cancel) = calls.cancel_after_part.lock().expect("cancel").as_ref() {
                     cancel.store(true, Ordering::Release);
                 }
@@ -1942,11 +1933,11 @@ mod cfgtest {
         let sizes = calls.part_sizes.lock().expect("sizes");
         assert_eq!(&sizes[..8], &[PART; 8]);
         assert_eq!(sizes[8], 1024 * 1024 + 1);
-        assert_eq!(calls.peak_inflight.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.peak_inflight.load(Ordering::SeqCst), 4);
         let peak = store.multipart_peak_buffer.load(Ordering::SeqCst);
-        assert!(peak <= 2 * PART);
+        assert!(peak <= 5 * PART);
         eprintln!(
-            "multipart resource: total={total} part_sizes={sizes:?} peak_buffer_and_payload={peak} peak_inflight=1 (excludes producer-owned Bytes and backend/runtime RSS)"
+            "multipart resource: total={total} part_sizes={sizes:?} peak_buffer_and_payload={peak} peak_inflight=4 (excludes producer-owned Bytes and backend/runtime RSS)"
         );
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
             for line in status
@@ -1973,7 +1964,7 @@ mod cfgtest {
             vec![PART, PART, PART, 37]
         );
         assert_eq!(calls.verified_bytes.load(Ordering::SeqCst), total);
-        assert!(store.multipart_peak_buffer.load(Ordering::SeqCst) <= PART);
+        assert!(store.multipart_peak_buffer.load(Ordering::SeqCst) <= 4 * PART);
     }
 
     #[tokio::test]
@@ -2006,7 +1997,7 @@ mod cfgtest {
                 .upload_stream_with_control("cancel-part", generated(total, total.max(1)), cancel)
                 .await;
             assert!(matches!(result, Err(CloudError::UploadCancelled)));
-            assert_eq!(calls.put_parts.load(Ordering::SeqCst), 1);
+            assert!((1..=4).contains(&calls.put_parts.load(Ordering::SeqCst)));
             assert_eq!(calls.abort.load(Ordering::SeqCst), 1);
             assert_eq!(calls.complete.load(Ordering::SeqCst), 0);
             assert_eq!(deletes.load(Ordering::SeqCst), 0);

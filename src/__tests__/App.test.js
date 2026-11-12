@@ -205,7 +205,7 @@ async function signIn(wrapper, password = "secret", tab = "shares") {
   await flushPromises();
   if (tab === "shares" && wrapper.find("#tab-shares").exists()) {
     await wrapper.find("#tab-shares").trigger("click");
-    await flushPromises();
+    await waitForSettingsPaint();
   }
 }
 
@@ -229,8 +229,14 @@ async function clickBarButton(wrapper, label) {
   await flushPromises();
 }
 
+async function waitForSettingsPaint() {
+  await new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
+  await flushPromises();
+}
+
 async function clickButton(wrapper, label) {
   await findButton(wrapper, label).trigger("click");
+  if (label === '客户端' || label === '共享目录') await waitForSettingsPaint();
   await flushPromises();
 }
 
@@ -1251,7 +1257,7 @@ describe("home workspace", () => {
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
     await flushPromises();
     await wrapper.find("#tab-shares").trigger("click");
-    await flushPromises();
+    await waitForSettingsPaint();
     await clickButton(wrapper, "客户端");
 
     await clickButton(wrapper, "手动输入");
@@ -1371,7 +1377,7 @@ describe("home workspace", () => {
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
     await flushPromises();
     await wrapper.find("#tab-shares").trigger("click");
-    await flushPromises();
+    await waitForSettingsPaint();
     await wrapper.find(".rail-home").trigger("click");
     await flushPromises();
     expect(wrapper.text()).toContain("已发送申请，等待对方管理员批准…");
@@ -1389,6 +1395,42 @@ describe("home workspace", () => {
     reloaded.unmount();
   });
 
+  it('does not start hidden service or cloud initialization when opening general settings', async () => {
+    localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, '1');
+    const wrapper = await mountReady({ admin_session: async () => ({ username: 'admin', mustChangePassword: false }) });
+    invoke.mockClear();
+    await wrapper.find('button[aria-label="打开设置"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('#pane-general').exists()).toBe(true);
+    for (const command of ['service_settings', 'local_networks', 'local_addresses']) {
+      expect(invoke.mock.calls.some(([name]) => name === command)).toBe(false);
+    }
+    await wrapper.find('#tab-service').trigger('click'); await flushPromises();
+    expect(invoke.mock.calls.some(([name]) => name === 'service_settings')).toBe(true);
+    wrapper.unmount();
+  });
+  it('paints a selected settings tab and skeleton before starting admin requests', async () => {
+    const frames = [];
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation(callback => { frames.push(callback); return frames.length; });
+    const wrapper = await mountReady({ admin_session: async () => ({ username: 'admin', mustChangePassword: false }) });
+    await wrapper.find('button[aria-label="打开设置"]').trigger('click');
+    await flushPromises();
+    invoke.mockClear();
+    await wrapper.find('#tab-shares').trigger('click');
+    expect(wrapper.find('#tab-shares').attributes('aria-current')).toBe('true');
+    expect(wrapper.find('#pane-shares .list-skeleton').exists()).toBe(true);
+    expect(invoke.mock.calls.some(([name]) => name === 'list_shares')).toBe(false);
+    await wrapper.find('#tab-clients').trigger('click');
+    expect(wrapper.find('#tab-clients').attributes('aria-current')).toBe('true');
+    expect(wrapper.find('#pane-clients .list-skeleton').exists()).toBe(true);
+    expect(invoke.mock.calls.some(([name]) => name === 'list_shares')).toBe(false);
+    await wrapper.find('#tab-general').trigger('click');
+    for (const callback of frames) callback(0);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(invoke.mock.calls.some(([name]) => name === 'list_shares')).toBe(false);
+    wrapper.unmount();
+    vi.restoreAllMocks();
+  });
   it("renders settings without waiting for unrelated backend initialization", async () => {
     localStorage.setItem(SETTINGS_SEEN_STORAGE_KEY, "1");
     const wrapper = await mountReady({ admin_session: async () => ({ username: 'admin', mustChangePassword: false }) });
@@ -1425,7 +1467,7 @@ describe("home workspace", () => {
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
     await flushPromises();
     await wrapper.find("#tab-shares").trigger("click");
-    await flushPromises();
+    await waitForSettingsPaint();
     expect(wrapper.text()).toContain("Docs");
 
     await wrapper.find(".rail-home").trigger("click");
@@ -1433,7 +1475,7 @@ describe("home workspace", () => {
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
     await flushPromises();
     await wrapper.find("#tab-shares").trigger("click");
-    await flushPromises();
+    await waitForSettingsPaint();
 
     // 数据已经缓存在共享上下文里：重新进入时直接渲染旧列表，不再闪骨架屏。
     expect(wrapper.findAll(".list-skeleton")).toHaveLength(0);
@@ -1788,7 +1830,7 @@ describe("settings information architecture", () => {
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
     await flushPromises();
     await wrapper.find("#tab-shares").trigger("click");
-    await flushPromises();
+    await waitForSettingsPaint();
     await clickButton(wrapper, "客户端");
 
     expect(wrapper.text()).toContain("其他设备访问此设备");
@@ -1854,7 +1896,7 @@ describe("settings information architecture", () => {
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
     await flushPromises();
     await wrapper.find("#tab-shares").trigger("click");
-    await flushPromises();
+    await waitForSettingsPaint();
     expect(wrapper.findAll(".list-skeleton")).toHaveLength(1);
     expect(wrapper.find("#pane-shares .share-empty").exists()).toBe(false);
 
@@ -1928,7 +1970,7 @@ describe("settings information architecture", () => {
     await wrapper.find('button[aria-label="打开设置"]').trigger("click");
     await flushPromises();
     await wrapper.find("#tab-shares").trigger("click");
-    await flushPromises();
+    await waitForSettingsPaint();
     await clickButton(wrapper, "客户端");
 
     expect(

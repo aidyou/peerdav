@@ -48,6 +48,7 @@ export const cloud = Object.freeze({
   localEntries: (mappingId, path = '') => invoke("cloud_local_entries", { mappingId, path }),
   localPreview: (mappingId, path) => invoke('cloud_local_preview', { mappingId, path }),
   localOpen: (mappingId, path) => invoke('cloud_local_open', { mappingId, path }),
+  localCreateDirectory: (mappingId, path) => invoke('cloud_local_create_directory', { mappingId, path }),
   localMutate: (mappingId, path, destination = null) => invoke('cloud_local_mutate', { mappingId, path, destination, confirmed: true }),
   localStatus: (mappingId) => invoke("cloud_local_status", { mappingId }),
   preview: (mappingId, selection) => invoke("cloud_preview", { mappingId, ...(selection?.length ? { selection } : {}) }),
@@ -106,9 +107,9 @@ export function objectChildren(objects, prefix) {
 }
 
 export function blankConnection() {
-  return { id: "", name: "", endpoint: "", bucket: "", buckets: [], region: "", prefix: "", pathStyle: false, accessKey: "", secretKey: "", sessionToken: "", allowInsecureHttp: false, proxy: { mode: "client" }, schedule: { enabled: false, interval: 900 }, encrypted: true, clearCredentials: false, clearSessionToken: false, clearProxyAuth: false };
+  return { id: "", name: "", endpoint: "", bucket: "", buckets: [], region: "", prefix: "", pathStyle: false, accessKey: "", secretKey: "", sessionToken: "", allowInsecureHttp: false, proxy: { mode: "client" }, schedule: { enabled: false, interval: 120 }, encrypted: true, clearCredentials: false, clearSessionToken: false, clearProxyAuth: false };
 }
 
 export function blankMapping() {
-  return { connectionId: "", repositoryId: "", localRoot: "", logicalPath: "", schedule: { enabled: false, interval: 900 } };
+  return { connectionId: "", repositoryId: "", localRoot: "", logicalPath: "", schedule: { enabled: false, interval: 120 } };
 }

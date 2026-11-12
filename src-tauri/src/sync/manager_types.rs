@@ -22,6 +22,8 @@ impl RunContext {
 #[serde(rename_all = "camelCase")]
 pub enum SyncPhase {
     Idle,
+    /// Local mutations are blocked while remote state is being validated or repaired.
+    Frozen,
     Scanning,
     Uploading,
     Publishing,

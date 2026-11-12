@@ -1,4 +1,5 @@
 pub(crate) struct GoogleObjectStore {
+    pub parents: tokio::sync::Mutex<()>,
     pub runtime: std::sync::Weak<super::runtime::CloudRuntime>,
     pub connection: String,
     pub revision: u64,

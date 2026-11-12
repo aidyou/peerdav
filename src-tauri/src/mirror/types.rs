@@ -24,7 +24,7 @@ pub const MASS_DELETE_PERCENT: usize = 25;
 /// 镜像同步映射：本地目录与云端目录之间保持目录结构的明文双向镜像。
 ///
 /// 与加密同步盘（内容寻址、分块、历史版本）不同，镜像同步按整文件存储：
-/// 本地 `a/b/c.txt` 对应云端 `_peerdav_mirror/{cloud_prefix}/a/b/c.txt`，
+/// 本地 `a/b/c.txt` 对应云端 `_peerdav_mirror/{cloud_prefix}/files/a/b/c.txt`，
 /// 可直接用网盘自带界面浏览。代价是没有去重、断点续传与历史版本。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -40,6 +40,9 @@ pub struct MirrorMapping {
     pub cloud_prefix: String,
     #[serde(default)]
     pub schedule: ScheduleConfig,
+    /// Opt in to discovering edits made outside PeerDav every ten minutes.
+    #[serde(default)]
+    pub full_check: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,6 +59,9 @@ pub struct SaveMirrorMappingInput {
     pub cloud_prefix: String,
     #[serde(default)]
     pub schedule: ScheduleConfig,
+    /// Opt in to discovering edits made outside PeerDav every ten minutes.
+    #[serde(default)]
+    pub full_check: bool,
 }
 
 /// 上次同步完成时单个文件的共同基线。双向同步以它判断「哪一侧相对基线发生了变化」：
@@ -176,7 +182,7 @@ pub enum MirrorError {
 
 /// 云端对象在基线比较视角下的快照。ETag 是服务商返回的不透明版本标识，
 /// 仅用于与基线比对判断「云端是否变化」，不作为内容哈希解释。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudFile {
     pub etag: Option<String>,
     pub size: u64,
@@ -240,8 +246,12 @@ pub fn normalize_cloud_prefix(prefix: &str) -> Result<String, MirrorError> {
     Ok(parts.join("/"))
 }
 
-/// 镜像映射的完整云端键前缀：`_peerdav_mirror/{cloud_prefix}/`。
+/// Mirror data lives beside its ledger, never inside the metadata directory.
 pub fn cloud_key_prefix(cloud_prefix: &str) -> String {
+    format!("{}files/", mirror_root_prefix(cloud_prefix))
+}
+
+pub(crate) fn mirror_root_prefix(cloud_prefix: &str) -> String {
     if cloud_prefix.is_empty() {
         format!("{MIRROR_ROOT}/")
     } else {
@@ -309,8 +319,8 @@ mod tests {
 
     #[test]
     fn cloud_keys_are_prefixed() {
-        assert_eq!(cloud_key("", "a/b.txt"), "_peerdav_mirror/a/b.txt");
-        assert_eq!(cloud_key("docs", "a.txt"), "_peerdav_mirror/docs/a.txt");
+        assert_eq!(cloud_key("", "a/b.txt"), "_peerdav_mirror/files/a/b.txt");
+        assert_eq!(cloud_key("docs", "a.txt"), "_peerdav_mirror/docs/files/a.txt");
     }
 
     #[test]

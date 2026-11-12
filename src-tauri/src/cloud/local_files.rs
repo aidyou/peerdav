@@ -23,6 +23,16 @@ fn parent(root: &Path, relative: &str) -> Result<(cap_std::fs::Dir, String), App
     Ok((dir, name))
 }
 impl CloudRuntime {
+    pub async fn local_create_directory(&self, mapping_id: &str, path: &str) -> Result<(), AppError> {
+        self.admit()?;
+        let _network = self.network.write().await;
+        self.admit()?;
+        self.admit_sync_idle(mapping_id)?;
+        let mapping = self.mapping(mapping_id)?;
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || create_directory(&mapping.local_root, &path)).await.map_err(super::runtime::append::append_error)?
+    }
+
     pub async fn local_file_preview(&self, mapping_id: &str, path: &str) -> Result<PreviewPayload, AppError> {
         self.admit()?;
         let _network = self.network.read().await;
@@ -67,6 +77,12 @@ impl CloudRuntime {
         tokio::task::spawn_blocking(move || mutate(&root, &path, destination.as_deref())).await.map_err(super::runtime::append::append_error)?
     }
 }
+fn create_directory(root: &Path, path: &str) -> Result<(), AppError> {
+    if path.split('/').any(|part| part.is_empty() || part.contains(['\\', ':', '\0']) || matches!(part, "." | "..")) { return Err(invalid()); }
+    let (folder, name) = parent(root, path)?;
+    folder.create_dir(&name).map_err(|source| io("create local folder", source))
+}
+
 fn mutate(root: &Path, path: &str, destination: Option<&str>) -> Result<(), AppError> {
     let (source, name) = parent(root, path)?;
     let metadata = source.symlink_metadata(&name).map_err(|e| io("inspect local file", e))?;
@@ -94,6 +110,24 @@ fn mutate(root: &Path, path: &str, destination: Option<&str>) -> Result<(), AppE
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_create_directory_rejects_collisions_escape_and_symlinks() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        assert!(create_directory(root, "目录").is_ok());
+        assert!(create_directory(root, "目录/child").is_ok());
+        assert!(root.join("目录/child").is_dir());
+        std::fs::write(root.join("file"), "keep")?;
+        for path in ["", ".", "..", "../outside", "/absolute", "目录/../escape", "目录//empty", "bad\\name", "bad:name", "bad\0name", "目录", "file"] { assert!(create_directory(root, path).is_err(), "{path:?}"); }
+        assert_eq!(std::fs::read_to_string(root.join("file"))?, "keep");
+        #[cfg(unix)] {
+            let outside = tempfile::tempdir()?;
+            std::os::unix::fs::symlink(outside.path(), root.join("link"))?;
+            assert!(create_directory(root, "link/escape").is_err());
+            assert!(!outside.path().join("escape").exists());
+        }
+        Ok(())
+    }
     #[test]
     fn local_move_and_delete_reject_escape_collision_and_descendants() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;

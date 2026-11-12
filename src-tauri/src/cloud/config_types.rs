@@ -39,7 +39,7 @@ impl CachedAppendRepository {
     }
 }
 
-pub const DEFAULT_SCHEDULE_INTERVAL: u64 = 900;
+pub const DEFAULT_SCHEDULE_INTERVAL: u64 = 120;
 pub const MIN_SCHEDULE_INTERVAL: u64 = 60;
 
 #[derive(Debug, Error)]

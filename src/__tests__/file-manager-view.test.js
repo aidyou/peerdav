@@ -16,6 +16,38 @@ function view(props = {}, slots = {}) {
 }
 
 describe("shared FileManagerView", () => {
+  it.each(['icons', 'list', 'columns', 'gallery'])('marks only a valid %s drop target and clears the dashed state through the drag lifecycle', async mode => {
+    const entries = entriesFor('path');
+    entries.push({ path: 'other/', name: 'other', isDir: true }, { path: 'protected/', name: 'protected', isDir: true, protected: true }, { path: 'remote/', name: 'remote', isDir: true, remoteOnly: true });
+    const wrapper = view({ entries, mode, moveEnabled: true, selection: [entries[1]], columns: [{ path: '', entries }] });
+    const rows = wrapper.findAll('[data-path]');
+    const dataTransfer = { setData: vi.fn() };
+    await rows[0].trigger('dragover', { dataTransfer });
+    expect(wrapper.find('.is-drop-target').exists()).toBe(false);
+    await rows[1].trigger('dragstart', { dataTransfer });
+    for (const index of [1, 2, 5, 6]) {
+      await rows[index].trigger('dragover', { dataTransfer });
+      expect(wrapper.find('.is-drop-target').exists()).toBe(false);
+    }
+    await rows[0].trigger('dragover', { dataTransfer });
+    expect(rows[0].classes()).toContain('is-drop-target');
+    expect(rows[0].classes()).not.toContain('is-selected');
+    expect(rows[1].classes()).toContain('is-selected');
+    await rows[0].trigger('dragleave', { relatedTarget: rows[0].element.querySelector('span') });
+    expect(rows[0].classes()).toContain('is-drop-target');
+    await rows[4].trigger('dragover', { dataTransfer });
+    expect(rows[0].classes()).not.toContain('is-drop-target');
+    expect(rows[4].classes()).toContain('is-drop-target');
+    await rows[4].trigger('dragleave');
+    expect(wrapper.find('.is-drop-target').exists()).toBe(false);
+    await rows[0].trigger('dragover', { dataTransfer });
+    await rows[1].trigger('dragend');
+    expect(wrapper.find('.is-drop-target').exists()).toBe(false);
+    await rows[1].trigger('dragstart', { dataTransfer });
+    await rows[0].trigger('dragover', { dataTransfer });
+    await rows[0].trigger('drop', { dataTransfer });
+    expect(wrapper.find('.is-drop-target').exists()).toBe(false);
+  });
   it.each(['icons', 'list', 'columns', 'gallery'])('offers internal %s dragging only to folders with raw identities', async mode => {
     const entries = entriesFor('path');
     const onMove = vi.fn();

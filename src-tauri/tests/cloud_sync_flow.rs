@@ -1051,6 +1051,8 @@ async fn shared_materialize_uses_only_block_reader_and_journal_and_keeps_block_s
     };
     struct Reader {
         fail: bool,
+        active: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
     }
     impl BlockReader for Reader {
         type Error = std::io::Error;
@@ -1069,6 +1071,10 @@ async fn shared_materialize_uses_only_block_reader_and_journal_and_keeps_block_s
                         "original block cause",
                     ));
                 }
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(active, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                self.active.fetch_sub(1, Ordering::SeqCst);
                 assert_eq!(length, 6);
                 Ok(zeroize::Zeroizing::new(b"shared".to_vec()))
             })
@@ -1090,9 +1096,9 @@ async fn shared_materialize_uses_only_block_reader_and_journal_and_keeps_block_s
                     blocks: vec![BlockRef {
                         id: "opaque-id".into(),
                         len: 6,
-                    }],
-                    length: 6,
-                    digest: hex::encode(Sha256::digest(b"shared")),
+                    }; 9],
+                    length: 54,
+                    digest: hex::encode(Sha256::digest(b"shared".repeat(9))),
                 }),
             },
             conflict: false,
@@ -1119,7 +1125,7 @@ async fn shared_materialize_uses_only_block_reader_and_journal_and_keeps_block_s
     };
     let error = materialize::materialize(
         &request,
-        &Reader { fail: true },
+        &Reader { fail: true, active: 0.into(), peak: 0.into() },
         &mut journal,
         Arc::new(AtomicBool::new(false)),
         &|| Ok(()),
@@ -1135,9 +1141,10 @@ async fn shared_materialize_uses_only_block_reader_and_journal_and_keeps_block_s
         "original block cause"
     );
     assert!(!d._root.path().join("file").exists());
+    let reader = Reader { fail: false, active: 0.into(), peak: 0.into() };
     let result = materialize::materialize(
         &request,
-        &Reader { fail: false },
+        &reader,
         &mut journal,
         Arc::new(AtomicBool::new(false)),
         &|| Ok(()),
@@ -1148,7 +1155,8 @@ async fn shared_materialize_uses_only_block_reader_and_journal_and_keeps_block_s
     assert!(result.verified_scan.complete);
     assert_eq!(
         std::fs::read(d._root.path().join("file")).unwrap(),
-        b"shared"
+        b"shared".repeat(9)
     );
+    assert_eq!(reader.peak.load(Ordering::SeqCst), 4);
     assert_eq!(intents.len(), 3);
 }

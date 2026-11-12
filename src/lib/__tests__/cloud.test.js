@@ -118,7 +118,7 @@ describe("cloud API wrappers", () => {
       "protocols", "beginOfficialAuthorization", "beginLoopbackAuthorization", "waitLoopbackAuthorization", "cancelOfficialAuthorization", "completeOfficialAuthorization", "driveProxy", "updateOfficialConnection",
       "list", "probeBuckets", "connectionCredentials", "saveConnection", "testConnection", "deleteConnection",
       "createRepository", "joinRepository", "saveMapping", "appendDiscover", "createSyncDrive", "appendCreate", "appendJoin", "appendSaveMapping", "prepareMappingBind", "confirmMappingBind", "cancelMappingBind", "deleteMapping",
-      "localEntries", "localStatus", "preview", "sync", "cancel", "recoveryRecords", "restore", "status",
+      "localEntries", "localPreview", "localOpen", "localCreateDirectory", "localMutate", "localStatus", "preview", "sync", "cancel", "recoveryRecords", "restore", "status",
       "mirrorFolders", "mirrorSaveMapping", "mirrorDeleteMapping", "mirrorSync", "mirrorCancel",
     ]);
   });
@@ -135,6 +135,6 @@ describe("cloud API wrappers", () => {
     const second = blankMapping();
     first.schedule.interval = 60;
     expect(second).toMatchObject({ connectionId: "", repositoryId: "", localRoot: "", logicalPath: "" });
-    expect(second.schedule).toEqual({ enabled: false, interval: 900 });
+    expect(second.schedule).toEqual({ enabled: false, interval: 120 });
   });
 });

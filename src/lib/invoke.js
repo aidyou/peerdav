@@ -92,6 +92,7 @@ const ERROR_STRATEGIES = Object.freeze({
   CLOUD_DELETE_PLAN_STALE: "retry",
   CLOUD_DELETE_ROOT_FORBIDDEN: "show",
   CLOUD_MOVE_CONFLICT: "show",
+  SYNC_FROZEN: "show",
   CLOUD_SYNC_BUSY: "show",
   CLOUD_CONFIRMATION_REQUIRED: "show",
   CLOUD_CANCELLED: "ignore",

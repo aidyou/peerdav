@@ -623,6 +623,7 @@ impl CloudConfigStore {
             bucket: Some(bucket.clone()),
             local_root,
             cloud_prefix,
+            full_check: input.full_check,
             schedule: input.schedule,
         };
         // 镜像映射会互相接管对方的文件，因此本地根不能在任意映射之间相等或嵌套
@@ -906,6 +907,7 @@ mod tests {
             bucket: None,
             local_root: local_root.to_path_buf(),
             cloud_prefix: cloud_prefix.to_owned(),
+            full_check: false,
             schedule: ScheduleConfig {
                 enabled: false,
                 interval: 900,

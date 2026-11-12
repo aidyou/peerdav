@@ -51,6 +51,11 @@ describe('mounted transfer dialogs', () => {
     expect(w.events.onCancel).toHaveBeenCalledTimes(1);
     expect(w.events.onClose).not.toHaveBeenCalled();
   });
+  it('renders independent progress for concurrently downloading rows', async () => {
+    render(TransferQueueDialog, { open: true, items: [{ relativePath: 'a', status: 'downloading', size: 100, transferred: 25 }, { relativePath: 'b', status: 'downloading', size: 200, transferred: 150 }], queueState: { currentTransferred: 99 } });
+    await nextTick();
+    expect([...document.querySelectorAll('.download-queue li')].map(row => row.dataset.progress)).toEqual(['25', '75']);
+  });
   it('renders a fixed header, highlights the active row with progress, and puts conditional stats in the footer', async () => {
     setLocale('en');
     const items = [
