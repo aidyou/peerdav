@@ -117,13 +117,27 @@ mod tests {
         assert_eq!(delete_revision(crate::cloud::oauth_types::OfficialProvider::OneDrive, &microsoft).expect("etag"), "\"etag\"");
     }
 
+    #[test]
+    fn official_providers_with_move_implementations_advertise_move() {
+        for provider in [
+            crate::cloud::oauth_types::OfficialProvider::GoogleDrive,
+            crate::cloud::oauth_types::OfficialProvider::OneDrive,
+            crate::cloud::oauth_types::OfficialProvider::BaiduNetdisk,
+            crate::cloud::oauth_types::OfficialProvider::Dropbox,
+        ] {
+            let mut backend = backend();
+            backend.provider = provider;
+            assert!(backend.supports_move(), "{provider:?}");
+        }
+    }
+
     #[tokio::test]
     async fn upload_selection_follows_advertised_provider_capabilities() {
         use crate::cloud::oauth_types::OfficialProvider;
         for (provider, allowed) in [
             (OfficialProvider::Dropbox, true),
             (OfficialProvider::BaiduNetdisk, true),
-            (OfficialProvider::OneDrive, false),
+            (OfficialProvider::OneDrive, true),
         ] {
             let data = tempfile::tempdir().expect("data");
             let vault = Arc::new(crate::Vault::open(&data.path().join("vault.pd")).expect("vault"));
@@ -373,7 +387,7 @@ impl BrowserBackend for OfficialBrowserBackend {
     fn upload_resolve<'a>(&'a self, peers: &'a Arc<PeerManager>, cloud: &'a Arc<CloudRuntime>, id: &'a str, conflict_id: &'a str, decision: crate::cloud::directory_types::DirectoryConflictPolicy, apply_to_remaining: bool) -> BoxFuture<'a, Result<(), AppError>> {
         Box::pin(async move { self.admit(peers, cloud).await?; crate::traits::UploadQueueAdapter::resolve(&OfficialUploadAdapter { backend: self, cloud }, id, conflict_id, decision, apply_to_remaining).await })
     }
-    fn supports_move(&self) -> bool { self.provider != crate::cloud::oauth_types::OfficialProvider::BaiduNetdisk }
+    fn supports_move(&self) -> bool { true }
     fn move_entry<'a>(&'a self, peers: &'a PeerManager, cloud: &'a CloudRuntime, id: &'a str, destination: &'a str) -> BoxFuture<'a, Result<(), AppError>> {
         Box::pin(async move {
             self.admit_write(peers, cloud, id).await?;
@@ -465,7 +479,7 @@ impl BrowserBackend for OfficialBrowserBackend {
     }
     fn capabilities(&self) -> FileCapabilities {
         FileCapabilities { delete_confirmation: DeleteConfirmation::Entry, list: true, preview: true,
-            upload: matches!(self.provider, crate::cloud::oauth_types::OfficialProvider::GoogleDrive | crate::cloud::oauth_types::OfficialProvider::Dropbox | crate::cloud::oauth_types::OfficialProvider::BaiduNetdisk),
+            upload: matches!(self.provider, crate::cloud::oauth_types::OfficialProvider::GoogleDrive | crate::cloud::oauth_types::OfficialProvider::Dropbox | crate::cloud::oauth_types::OfficialProvider::BaiduNetdisk | crate::cloud::oauth_types::OfficialProvider::OneDrive),
             download: true, download_directory: true,
             delete: true, create_dir: true,
             rename: false, external_edit: true,

@@ -150,6 +150,54 @@ impl OfficialApi {
         Ok(self.client.post("https://www.googleapis.com/upload/drive/v3/files").query(&[("uploadType", "multipart"), ("supportsAllDrives", "true")]).bearer_auth(self.access_token.as_str()).header(reqwest::header::CONTENT_TYPE, format!("multipart/related; boundary={boundary}")).header(reqwest::header::CONTENT_LENGTH, length).body(reqwest::Body::wrap_stream(stream)))
     }
 
+    fn stream_body(file: std::fs::File, progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>) -> reqwest::Body {
+        use futures_util::StreamExt;
+        let stream = tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file))
+            .inspect(move |chunk| {
+                if let (Some(counter), Ok(bytes)) = (&progress, chunk) {
+                    counter.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        reqwest::Body::wrap_stream(stream)
+    }
+
+    fn encode_path_segment(value: &str) -> Result<String, OfficialApiError> {
+        let mut url = url::Url::parse("https://example.invalid/").map_err(|_| OfficialApiError::InvalidInput)?;
+        url.path_segments_mut().map_err(|_| OfficialApiError::InvalidInput)?.push(value);
+        Ok(url.path().trim_start_matches('/').to_owned())
+    }
+
+    /// OneDrive content endpoints:
+    /// new file: `/items/{parent}:/{name}:/content`
+    /// replace:  `/items/{id}/content`
+    fn onedrive_upload_url(&self, id: &str, name: Option<&str>) -> Result<url::Url, OfficialApiError> {
+        let mut url = self.item_url(id)?;
+        match name {
+            Some(name) => {
+                if name.trim().is_empty() || name.contains(['/', '\\', '\0']) || matches!(name, "." | "..") { return Err(OfficialApiError::InvalidInput); }
+                let encoded = Self::encode_path_segment(name)?;
+                let path = format!("{}:/{encoded}:/content", url.path().trim_end_matches('/'));
+                url.set_path(&path);
+            }
+            None => { url.path_segments_mut().map_err(|_| OfficialApiError::InvalidInput)?.push("content"); }
+        }
+        Ok(url)
+    }
+
+    async fn onedrive_upload(&self, id: &str, name: Option<&str>, file: std::fs::File, size: u64, expected: Option<&str>, progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>) -> Result<Value, OfficialApiError> {
+        if self.provider != OfficialProvider::OneDrive { return Err(OfficialApiError::InvalidInput); }
+        let url = self.onedrive_upload_url(id, name)?;
+        let mut request = self.client.put(url).bearer_auth(self.access_token.as_str())
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .header(reqwest::header::CONTENT_LENGTH, size)
+            .body(Self::stream_body(file, progress));
+        if let Some(expected) = expected {
+            if expected.is_empty() { return Err(OfficialApiError::InvalidInput); }
+            request = request.header(reqwest::header::IF_MATCH, expected);
+        }
+        self.mutation_response(request).await
+    }
+
     #[cfg(test)]
     pub(crate) async fn upload_new(&self, parent: &str, name: &str, file: std::fs::File, size: u64) -> Result<(), OfficialApiError> {
         self.mutation_response(self.upload_request(parent, name, file, size, None)?).await?;
@@ -159,6 +207,10 @@ impl OfficialApi {
     pub(crate) async fn upload_new_progress(&self, parent: &str, name: &str, file: std::fs::File, size: u64, progress: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Result<(), OfficialApiError> {
         if let Some(drive) = &self.drive {
             drive.upload_new(parent, name, file, size, Some(progress)).await?;
+            return Ok(());
+        }
+        if self.provider == OfficialProvider::OneDrive {
+            self.onedrive_upload(parent, Some(name), file, size, None, Some(progress)).await?;
             return Ok(());
         }
         self.mutation_response(self.upload_request(parent, name, file, size, Some(progress))?).await?;
@@ -171,6 +223,10 @@ impl OfficialApi {
 
     pub(crate) async fn replace_file_stream_progress(&self, id: &str, file: std::fs::File, size: u64, expected: Option<&str>, progress: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>) -> Result<(), OfficialApiError> {
         if let Some(drive) = &self.drive { return drive.replace_file_stream(id, file, size, expected, progress).await; }
+        if self.provider == OfficialProvider::OneDrive {
+            self.onedrive_upload(id, None, file, size, expected, progress).await?;
+            return Ok(());
+        }
         use futures_util::StreamExt;
         if self.provider != OfficialProvider::GoogleDrive { return Err(OfficialApiError::InvalidInput); }
         if let Some(expected) = expected {
@@ -189,12 +245,17 @@ impl OfficialApi {
 
     pub(crate) async fn upload_object(&self, parent: &str, name: &str, file: std::fs::File, size: u64) -> Result<String, OfficialApiError> {
         if let Some(drive) = &self.drive { return drive.upload_new(parent, name, file, size, None).await; }
-        let value = self.mutation_response(self.upload_request(parent, name, file, size, None)?).await?;
+        let value = if self.provider == OfficialProvider::OneDrive {
+            self.onedrive_upload(parent, Some(name), file, size, None, None).await?
+        } else {
+            self.mutation_response(self.upload_request(parent, name, file, size, None)?).await?
+        };
         value.get("id").and_then(Value::as_str).map(str::to_owned).ok_or(OfficialApiError::InvalidResponse)
     }
 
     pub(crate) async fn create_folder_id(&self, parent: &str, name: &str) -> Result<String, OfficialApiError> {
         if let Some(drive) = &self.drive { return drive.create_folder_id(parent, name).await; }
+        if self.provider == OfficialProvider::OneDrive { return self.create_folder(parent, name).await; }
         if self.provider != OfficialProvider::GoogleDrive { return Err(OfficialApiError::InvalidInput); }
         let value = self.mutation_response(self.client.post("https://www.googleapis.com/drive/v3/files").query(&[("supportsAllDrives", "true")]).bearer_auth(self.access_token.as_str()).json(&serde_json::json!({"name":name,"mimeType":"application/vnd.google-apps.folder","parents":[parent]}))).await?;
         value.get("id").and_then(Value::as_str).map(str::to_owned).ok_or(OfficialApiError::InvalidResponse)
@@ -637,6 +698,18 @@ mod tests {
         assert!(content_redirect("https://tenant.sharepoint.com/download?token=signed").is_ok());
         for location in ["http://tenant.sharepoint.com/download", "https://evil.invalid/download", "https://tenant.sharepoint.com.evil.invalid/", "https://user:password@tenant.sharepoint.com/", "https://127.0.0.1/", "https://tenant.sharepoint.com:8443/", "https://tenant.sharepoint.com/#fragment"] {
             assert!(content_redirect(location).is_err(), "{location}");
+        }
+    }
+
+    #[test]
+    fn onedrive_upload_urls_encode_names_and_replace_content() {
+        let api = OfficialApi::new(OfficialProvider::OneDrive, Zeroizing::new("secret".into())).expect("api");
+        let created = api.onedrive_upload_url("parent", Some("a b 文.txt")).expect("create url");
+        assert_eq!(created.path(), "/v1.0/me/drive/items/parent:/a%20b%20%E6%96%87.txt:/content");
+        let replaced = api.onedrive_upload_url("item", None).expect("replace url");
+        assert_eq!(replaced.path(), "/v1.0/me/drive/items/item/content");
+        for name in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
+            assert!(api.onedrive_upload_url("parent", Some(name)).is_err(), "{name:?}");
         }
     }
 
