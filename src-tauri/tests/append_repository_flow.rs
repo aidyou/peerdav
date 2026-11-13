@@ -83,7 +83,7 @@ fn tree_and_commit_roundtrip_canonicalize_and_preserve_history() {
     for mode in [AppendMode::Encrypted, AppendMode::AuthenticatedPlain] {
         let (_remote, repo) = repository(mode.clone());
         let (_key, block) = repo.seal_block(b"tree payload").unwrap();
-        let env: Envelope = serde_json::from_slice(&block).unwrap();
+        let env: Envelope = Envelope::from_wire(&block).unwrap();
         let binding = BlockBinding {
             block_id: env.logical_id,
             len: env.plaintext_len,
@@ -136,7 +136,7 @@ fn tree_and_commit_roundtrip_canonicalize_and_preserve_history() {
 fn metadata_rejects_missing_binding_wrong_binding_and_len_mutation() {
     let (_remote, repo) = repository(AppendMode::AuthenticatedPlain);
     let (_key, block) = repo.seal_block(b"bound").unwrap();
-    let env: Envelope = serde_json::from_slice(&block).unwrap();
+    let env: Envelope = Envelope::from_wire(&block).unwrap();
     let good = BlockBinding {
         block_id: env.logical_id.clone(),
         len: env.plaintext_len,
@@ -154,9 +154,9 @@ fn metadata_rejects_missing_binding_wrong_binding_and_len_mutation() {
     let mut wrong = good.clone();
     wrong.block_id = "00".repeat(32);
     assert!(repo.open_block_with_ref(&block, Some(&wrong)).is_err());
-    let mut changed: serde_json::Value = serde_json::from_slice(&block).unwrap();
-    changed["plaintext_len"] = serde_json::Value::from(env.plaintext_len + 1);
-    let changed = serde_json::to_vec(&changed).unwrap();
+    let mut changed = Envelope::from_wire(&block).unwrap();
+    changed.plaintext_len = env.plaintext_len + 1;
+    let changed = changed.to_wire().unwrap();
     assert!(repo.open_block(&changed).is_err());
 }
 
@@ -166,7 +166,7 @@ fn metadata_rejects_cross_repository_mode_and_digest_or_len_tampering() {
     let (_other_remote, other) = repository(AppendMode::AuthenticatedPlain);
     let (_key, block) = repo.seal_block(b"cross repo").unwrap();
     assert!(other.open_block(&block).is_err());
-    let env: Envelope = serde_json::from_slice(&block).unwrap();
+    let env: Envelope = Envelope::from_wire(&block).unwrap();
     let binding = BlockBinding {
         block_id: env.logical_id,
         len: env.plaintext_len,
@@ -187,10 +187,10 @@ fn metadata_rejects_cross_repository_mode_and_digest_or_len_tampering() {
         repo.open_metadata::<Tree>(&tree_wire, &bad_ref, "tree")
             .is_err()
     );
-    let mut bad_wire: serde_json::Value = serde_json::from_slice(&tree_wire).unwrap();
-    bad_wire["plaintext_len"] = serde_json::Value::from(1u64);
+    let mut bad_wire = Envelope::from_wire(&tree_wire).unwrap();
+    bad_wire.plaintext_len = 1;
     assert!(
-        repo.open_metadata::<Tree>(&serde_json::to_vec(&bad_wire).unwrap(), &tree_ref, "tree")
+        repo.open_metadata::<Tree>(&bad_wire.to_wire().unwrap(), &tree_ref, "tree")
             .is_err()
     );
 }
@@ -233,7 +233,7 @@ async fn blocks_roundtrip_binding_and_wire_mutations() {
         )
         .unwrap();
         let (key, bytes) = repo.seal_block(b"small block").unwrap();
-        let env: Envelope = serde_json::from_slice(&bytes).unwrap();
+        let env: Envelope = Envelope::from_wire(&bytes).unwrap();
         let binding = BlockBinding {
             block_id: env.logical_id.clone(),
             len: env.plaintext_len,
@@ -250,9 +250,9 @@ async fn blocks_roundtrip_binding_and_wire_mutations() {
             b"small block"
         );
         assert!(repo.open_block(&bytes).is_ok());
-        let mut changed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        changed["payload"] = serde_json::Value::String("00".into());
-        let changed = serde_json::to_vec(&changed).unwrap();
+        let mut changed = Envelope::from_wire(&bytes).unwrap();
+        changed.payload[0] ^= 1;
+        let changed = changed.to_wire().unwrap();
         assert!(repo.open_block(&changed).is_err());
         let mut bad_binding = binding.clone();
         bad_binding.len += 1;
@@ -260,10 +260,10 @@ async fn blocks_roundtrip_binding_and_wire_mutations() {
             repo.open_block_with_ref(&bytes, Some(&bad_binding))
                 .is_err()
         );
-        let mut bad_nonce = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
-        bad_nonce["nonce"] = serde_json::Value::String("00".into());
+        let mut bad_nonce = Envelope::from_wire(&bytes).unwrap();
+        bad_nonce.nonce = Some("00".into());
         assert!(
-            repo.open_block(&serde_json::to_vec(&bad_nonce).unwrap())
+            repo.open_block(&bad_nonce.to_wire().unwrap())
                 .is_err()
         );
     }
@@ -562,8 +562,8 @@ async fn encrypted_same_block_has_same_id_and_distinct_locator() {
     .unwrap();
     let (key_a, wire_a) = repo.seal_block(b"same").unwrap();
     let (key_b, wire_b) = repo.seal_block(b"same").unwrap();
-    let a: Envelope = serde_json::from_slice(&wire_a).unwrap();
-    let b: Envelope = serde_json::from_slice(&wire_b).unwrap();
+    let a: Envelope = Envelope::from_wire(&wire_a).unwrap();
+    let b: Envelope = Envelope::from_wire(&wire_b).unwrap();
     assert_eq!(a.logical_id, b.logical_id);
     assert_ne!(key_a, key_b);
     assert_ne!(wire_a, wire_b);
@@ -594,8 +594,8 @@ async fn plain_same_block_has_same_logical_id_key_and_wire() {
     let (remote, repo) = repository(AppendMode::AuthenticatedPlain);
     let a = repo.prepare_block(b"same").await.unwrap();
     let b = repo.prepare_block(b"same").await.unwrap();
-    let env_a: Envelope = serde_json::from_slice(a.bytes()).unwrap();
-    let env_b: Envelope = serde_json::from_slice(b.bytes()).unwrap();
+    let env_a: Envelope = Envelope::from_wire(a.bytes()).unwrap();
+    let env_b: Envelope = Envelope::from_wire(b.bytes()).unwrap();
     assert_eq!(env_a.logical_id, env_b.logical_id);
     assert_eq!(a.key(), b.key());
     assert_eq!(a.bytes(), b.bytes());
@@ -609,7 +609,7 @@ fn tree_accepts_multiple_authenticated_locators_and_repeated_file_references() {
     let mut bindings = Vec::new();
     for _ in 0..2 {
         let (_, wire) = repo.seal_block(b"shared").unwrap();
-        let env: Envelope = serde_json::from_slice(&wire).unwrap();
+        let env: Envelope = Envelope::from_wire(&wire).unwrap();
         let binding = BlockBinding {
             block_id: env.logical_id,
             len: env.plaintext_len,
@@ -674,7 +674,7 @@ fn unchanged_tree_reuses_authenticated_reference_and_frozen_metadata_bytes() {
     for mode in [AppendMode::Encrypted, AppendMode::AuthenticatedPlain] {
         let (remote, repo) = repository(mode.clone());
         let (_, block) = repo.seal_block(b"unchanged").unwrap();
-        let env: Envelope = serde_json::from_slice(&block).unwrap();
+        let env: Envelope = Envelope::from_wire(&block).unwrap();
         let binding = BlockBinding {
             block_id: env.logical_id,
             len: env.plaintext_len,

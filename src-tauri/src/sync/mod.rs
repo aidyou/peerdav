@@ -21,6 +21,7 @@ pub mod materialize_types;
 pub mod merge;
 pub mod merge_types;
 pub mod namespace;
+pub mod object_wire;
 pub mod paths;
 pub mod publisher;
 pub mod publisher_types;

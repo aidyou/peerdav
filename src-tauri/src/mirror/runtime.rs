@@ -127,26 +127,52 @@ async fn upload_file(
         return Err(CloudError::Precondition.into());
     }
     let mut file = tokio::fs::File::from_std(file.into_std());
-    // Snapshot and validate before exposing any bytes to a mutating request.
-    let mut data = Vec::new();
+    // Preserve preflight validation without keeping entire concurrent files in
+    // RAM. The anonymous snapshot is removed when the upload stream is dropped.
+    let mut snapshot = tokio::fs::File::from_std(tempfile::tempfile()?);
+    let mut length = 0u64;
+    let mut chunk = vec![0; READ_CHUNK];
     loop {
         canceled(&cancel)?;
-        let mut chunk = vec![0; READ_CHUNK];
         let count = file.read(&mut chunk).await?;
         if count == 0 {
             break;
         }
-        if data.len().saturating_add(count) > crate::cloud::types::MAX_PUT_BYTES {
+        length = length
+            .checked_add(count as u64)
+            .ok_or(CloudError::PayloadTooLarge)?;
+        if length > crate::cloud::types::MAX_PUT_BYTES as u64 {
             return Err(CloudError::PayloadTooLarge.into());
         }
-        data.extend_from_slice(&chunk[..count]);
+        snapshot.write_all(&chunk[..count]).await?;
     }
-    if data.len() as u64 != scanned.size || !local_state_matches(path, scanned) {
+    if length != scanned.size || !local_state_matches(path, scanned) {
         return Err(CloudError::Precondition.into());
     }
+    use tokio::io::AsyncSeekExt;
+    snapshot.rewind().await?;
     verify_remote_snapshot(store, key, expected).await?;
     canceled(&cancel)?;
-    let body = stream::once(async move { Ok(data.into()) });
+    let body = stream::try_unfold((snapshot, cancel), |(mut snapshot, cancel)| async move {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CloudError::UploadCancelled);
+        }
+        let mut chunk = vec![0; READ_CHUNK];
+        let count = snapshot
+            .read(&mut chunk)
+            .await
+            .map_err(|source| CloudError::Storage {
+                source: object_store::Error::Generic {
+                    store: "mirror snapshot",
+                    source: Box::new(source),
+                },
+            })?;
+        if count == 0 {
+            return Ok(None);
+        }
+        chunk.truncate(count);
+        Ok(Some((chunk.into(), (snapshot, cancel))))
+    });
     store
         .put(key, Box::pin(body), PutCondition::Any)
         .await
@@ -161,8 +187,15 @@ async fn verify_remote_snapshot(
     match (store.stat(key).await, expected) {
         (Err(CloudError::NotFound), None) => Ok(()),
         (Ok(current), Some(expected))
-            if expected.etag.as_deref().is_some_and(|etag| !etag.is_empty())
-                && current.etag == expected.etag && current.size == expected.size => Ok(()),
+            if expected
+                .etag
+                .as_deref()
+                .is_some_and(|etag| !etag.is_empty())
+                && current.etag == expected.etag
+                && current.size == expected.size =>
+        {
+            Ok(())
+        }
         (Err(CloudError::NotFound), Some(_)) | (Ok(_), _) => Err(CloudError::Precondition),
         (Err(error), _) => Err(error),
     }
@@ -442,21 +475,37 @@ pub(crate) async fn run_sync_mode(
     for (path, reason) in skipped {
         result.failures.push(MirrorFailure { path, reason });
     }
-    let scope = format!("{}|{}|{}", context.endpoint, context.bucket, mapping.cloud_prefix);
-    let ledger_root = format!("{}ledger/", types::mirror_root_prefix(&mapping.cloud_prefix));
+    let scope = format!(
+        "{}|{}|{}",
+        context.endpoint, context.bucket, mapping.cloud_prefix
+    );
+    let ledger_root = format!(
+        "{}ledger/",
+        types::mirror_root_prefix(&mapping.cloud_prefix)
+    );
     let writer_prefix = format!("{ledger_root}writers/");
-    let writer = hex::encode(sha2::Sha256::digest(format!("{}|{}", data_dir.display(), mapping.id)));
+    let writer = hex::encode(sha2::Sha256::digest(format!(
+        "{}|{}",
+        data_dir.display(),
+        mapping.id
+    )));
     let writer_key = format!("{writer_prefix}{writer}.json");
     let snapshot_key = format!("{ledger_root}snapshots/{writer}.json");
     let mut cache = super::ledger::load(data_dir, &mapping.id, &scope)?;
-    let (markers, mut healthy) = super::ledger::markers(store.as_ref(), &writer_prefix, &cancel).await?;
+    let (markers, mut healthy) =
+        super::ledger::markers(store.as_ref(), &writer_prefix, &cancel).await?;
     // Only validate our own snapshot; another active writer may be publishing its own.
     // Stream size is bounded, and this is ledger I/O, never a full data listing.
     let own_snapshot_valid = super::ledger::snapshot_valid(store.as_ref(), &snapshot_key).await?;
     healthy &= own_snapshot_valid;
-    let full = manual || !healthy || markers.is_empty() || cache.scope != scope
+    let full = manual
+        || !healthy
+        || markers.is_empty()
+        || cache.scope != scope
         || markers != cache.markers
-        || (mapping.full_check && now_secs().saturating_sub(cache.checked_at) >= super::ledger_types::FULL_CHECK_SECONDS);
+        || (mapping.full_check
+            && now_secs().saturating_sub(cache.checked_at)
+                >= super::ledger_types::FULL_CHECK_SECONDS);
     let listed = if full {
         list_cloud(store.as_ref(), &mapping.cloud_prefix, &cancel).await?
     } else {
@@ -479,7 +528,10 @@ pub(crate) async fn run_sync_mode(
     }
     // Repair is a read-only reconciliation round: never apply file changes while
     // rebuilding an absent or damaged ledger. The next tick plans from repaired state.
-    if baseline.initialized && (!own_snapshot_valid || markers.get(&writer_key).is_none_or(String::is_empty)) && complete {
+    if baseline.initialized
+        && (!own_snapshot_valid || markers.get(&writer_key).is_none_or(String::is_empty))
+        && complete
+    {
         let mut nonce = [0u8; 16];
         rand::RngCore::try_fill_bytes(&mut rand::rngs::OsRng, &mut nonce)
             .map_err(|error| MirrorError::Baseline(error.to_string()))?;
@@ -487,13 +539,23 @@ pub(crate) async fn run_sync_mode(
         super::ledger::mark(store.as_ref(), &writer_key, &token, true).await?;
         super::ledger::snapshot(store.as_ref(), &snapshot_key, &cloud).await?;
         super::ledger::mark(store.as_ref(), &writer_key, &token, false).await?;
-        let (after, valid) = super::ledger::markers(store.as_ref(), &writer_prefix, &cancel).await?;
-        let stable = markers.iter().filter(|(key, _)| *key != &writer_key)
+        let (after, valid) =
+            super::ledger::markers(store.as_ref(), &writer_prefix, &cancel).await?;
+        let stable = markers
+            .iter()
+            .filter(|(key, _)| *key != &writer_key)
             .eq(after.iter().filter(|(key, _)| *key != &writer_key));
         if valid && stable {
-            super::ledger::save(data_dir, &mapping.id, &super::ledger_types::RemoteCache {
-                scope, markers: after, files: cloud, checked_at: now_secs(),
-            })?;
+            super::ledger::save(
+                data_dir,
+                &mapping.id,
+                &super::ledger_types::RemoteCache {
+                    scope,
+                    markers: after,
+                    files: cloud,
+                    checked_at: now_secs(),
+                },
+            )?;
         }
         return Ok(result);
     }
@@ -587,7 +649,8 @@ pub(crate) async fn run_sync_mode(
     let machine = machine_label();
     let stamp = types::utc_stamp(now_secs());
 
-    for action in actions {
+    let mut actions = actions.into_iter().peekable();
+    while let Some(action) = actions.next() {
         canceled(&cancel)?;
         let current_root = scan::open_root_nofollow(&mapping.local_root)?;
         #[cfg(unix)]
@@ -605,44 +668,62 @@ pub(crate) async fn run_sync_mode(
         let path = action_path(&action).clone();
         match action {
             MirrorAction::Upload(_) => {
-                let Some(scanned) = local.get(&path) else {
-                    continue;
-                };
-                let abs = mapping.local_root.join(&path);
-                if !local_state_matches(&abs, scanned) {
-                    result.failures.push(MirrorFailure {
-                        path: path.clone(),
-                        reason:
-                            "本地文件在同步期间发生了变化，已跳过 / local file changed during sync"
-                                .into(),
-                    });
-                    continue;
-                }
-                let key = types::cloud_key(&mapping.cloud_prefix, &path);
-                match upload_file(
-                    store.as_ref(),
-                    &abs,
-                    &key,
-                    cloud.get(&path),
-                    scanned,
-                    Arc::clone(&cancel),
-                )
-                .await
-                {
-                    Ok(meta) => {
-                        baseline.record_upload(
-                            &path,
-                            scanned.mtime_ns,
-                            scanned.size,
-                            meta.etag,
-                            meta.size,
-                        );
-                        result.uploaded += 1;
+                // Only adjacent independent uploads overlap. Deletes and conflict
+                // copies retain their original ordering and confirmation guards.
+                let mut paths = vec![path];
+                while paths.len() < 4 {
+                    if let Some(MirrorAction::Upload(path)) = actions.peek() {
+                        paths.push(path.clone());
+                        actions.next();
+                    } else {
+                        break;
                     }
-                    Err(error) => result.failures.push(MirrorFailure {
-                        path: path.clone(),
-                        reason: error.to_string(),
-                    }),
+                }
+                let uploads = paths.iter().map(|path| {
+                    let store = store.as_ref();
+                    let local = &local;
+                    let cloud = &cloud;
+                    let cancel = Arc::clone(&cancel);
+                    async move {
+                        let scanned = local.get(path).ok_or(CloudError::Precondition)?;
+                        canceled(&cancel)?;
+                        let abs = mapping.local_root.join(path);
+                        if !local_state_matches(&abs, scanned) {
+                            return Err(MirrorError::Cloud(CloudError::Precondition));
+                        }
+                        let key = types::cloud_key(&mapping.cloud_prefix, path);
+                        upload_file(store, &abs, &key, cloud.get(path), scanned, cancel).await
+                    }
+                });
+                // Drain every dispatched upload before recording results or
+                // returning cancellation; no detached writes may outlive the run.
+                let completed = futures_util::future::join_all(uploads).await;
+                for (path, outcome) in paths.into_iter().zip(completed) {
+                    match outcome {
+                        Ok(meta) => {
+                            if let Some(scanned) = local.get(&path) {
+                                cloud.insert(
+                                    path.clone(),
+                                    CloudFile {
+                                        etag: meta.etag.clone(),
+                                        size: meta.size,
+                                    },
+                                );
+                                baseline.record_upload(
+                                    &path,
+                                    scanned.mtime_ns,
+                                    scanned.size,
+                                    meta.etag,
+                                    meta.size,
+                                );
+                                result.uploaded += 1;
+                            }
+                        }
+                        Err(error) => result.failures.push(MirrorFailure {
+                            path,
+                            reason: error.to_string(),
+                        }),
+                    }
                 }
             }
             MirrorAction::Download(_) | MirrorAction::Restore(_) => {
@@ -687,19 +768,21 @@ pub(crate) async fn run_sync_mode(
                     continue;
                 }
                 let key = types::cloud_key(&mapping.cloud_prefix, &path);
-                let deletion = match verify_remote_snapshot(store.as_ref(), &key, cloud.get(&path)).await {
-                    Ok(()) => {
-                        canceled(&cancel)?;
-                        if mapping.local_root.join(&path).try_exists()? {
-                            Err(CloudError::Precondition)
-                        } else {
-                            store.delete(&key).await
+                let deletion =
+                    match verify_remote_snapshot(store.as_ref(), &key, cloud.get(&path)).await {
+                        Ok(()) => {
+                            canceled(&cancel)?;
+                            if mapping.local_root.join(&path).try_exists()? {
+                                Err(CloudError::Precondition)
+                            } else {
+                                store.delete(&key).await
+                            }
                         }
-                    }
-                    Err(error) => Err(error),
-                };
+                        Err(error) => Err(error),
+                    };
                 match deletion {
                     Ok(()) => {
+                        cloud.remove(&path);
                         baseline.remove(&path);
                         result.deleted_cloud += 1;
                     }
@@ -800,6 +883,13 @@ pub(crate) async fn run_sync_mode(
                 .await
                 {
                     Ok(meta) => {
+                        cloud.insert(
+                            path.clone(),
+                            CloudFile {
+                                etag: meta.etag.clone(),
+                                size: meta.size,
+                            },
+                        );
                         baseline.record_upload(
                             &path,
                             scanned.mtime_ns,
@@ -825,14 +915,31 @@ pub(crate) async fn run_sync_mode(
     }
     baseline::save(data_dir, &mapping.id, &baseline)?;
     if (mutating || full) && result.failures.is_empty() {
-        let files = if mutating { list_cloud(store.as_ref(), &mapping.cloud_prefix, &cancel).await? } else { cloud };
-        super::ledger::snapshot(store.as_ref(), &format!("{ledger_root}snapshots/{writer}.json"), &files).await?;
+        // Each successful mutation already returned verified metadata. Reuse
+        // this snapshot; writer-marker stability below still detects concurrent
+        // PeerDAV writers, and manual/full checks detect external edits.
+        let files = cloud;
+        super::ledger::snapshot(
+            store.as_ref(),
+            &format!("{ledger_root}snapshots/{writer}.json"),
+            &files,
+        )
+        .await?;
         super::ledger::mark(store.as_ref(), &writer_key, &token, false).await?;
-        let (after, healthy) = super::ledger::markers(store.as_ref(), &writer_prefix, &cancel).await?;
-        let stable = markers.iter().filter(|(key, _)| *key != &writer_key).eq(after.iter().filter(|(key, _)| *key != &writer_key));
+        let (after, healthy) =
+            super::ledger::markers(store.as_ref(), &writer_prefix, &cancel).await?;
+        let stable = markers
+            .iter()
+            .filter(|(key, _)| *key != &writer_key)
+            .eq(after.iter().filter(|(key, _)| *key != &writer_key));
         if healthy && stable {
             let checked_at = if full { now_secs() } else { cache.checked_at };
-            cache = super::ledger_types::RemoteCache { scope, markers: after, files, checked_at };
+            cache = super::ledger_types::RemoteCache {
+                scope,
+                markers: after,
+                files,
+                checked_at,
+            };
             super::ledger::save(data_dir, &mapping.id, &cache)?;
         }
     }
@@ -854,6 +961,11 @@ mod tests {
         listings: Mutex<Vec<String>>,
         conditional_delete: bool,
         truncated_read: bool,
+        delayed_transfers: AtomicBool,
+        active_transfers: std::sync::atomic::AtomicUsize,
+        peak_transfers: std::sync::atomic::AtomicUsize,
+        largest_chunk: std::sync::atomic::AtomicUsize,
+        fail_upload: Mutex<Option<String>>,
     }
 
     impl MemoryStore {
@@ -871,6 +983,11 @@ mod tests {
                 listings: Mutex::new(Vec::new()),
                 conditional_delete: true,
                 truncated_read: false,
+                delayed_transfers: AtomicBool::new(false),
+                active_transfers: std::sync::atomic::AtomicUsize::new(0),
+                peak_transfers: std::sync::atomic::AtomicUsize::new(0),
+                largest_chunk: std::sync::atomic::AtomicUsize::new(0),
+                fail_upload: Mutex::new(None),
             }
         }
 
@@ -976,9 +1093,22 @@ mod tests {
         ) -> BoxFuture<'a, Result<ObjectMetadata, CloudError>> {
             Box::pin(async move {
                 use sha2::Digest;
+                let delayed =
+                    self.delayed_transfers.load(Ordering::Relaxed) && key.contains("/files/");
+                if delayed {
+                    let active = self.active_transfers.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.peak_transfers.fetch_max(active, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    self.active_transfers.fetch_sub(1, Ordering::SeqCst);
+                }
+                if self.fail_upload.lock().unwrap().as_deref() == Some(key) {
+                    return Err(CloudError::Precondition);
+                }
                 let mut data = Vec::new();
                 while let Some(chunk) = body.next().await {
-                    data.extend_from_slice(&chunk?);
+                    let chunk = chunk?;
+                    self.largest_chunk.fetch_max(chunk.len(), Ordering::SeqCst);
+                    data.extend_from_slice(&chunk);
                 }
                 let etag = hex::encode(sha2::Sha256::digest(&data));
                 let mut objects = self.objects.lock().unwrap();
@@ -1057,46 +1187,308 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn independent_uploads_overlap_with_a_bounded_working_set_and_reach_steady_state() {
+        let (root, data) = test_dirs();
+        let mapping = mapping(&root, "docs");
+        for i in 0..9 {
+            write(&root, &format!("nested/{i}.txt"), "data");
+        }
+        let store = Arc::new(MemoryStore::new(vec![]));
+        store.delayed_transfers.store(true, Ordering::Relaxed);
+        let result = run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        assert_eq!(result.uploaded, 9);
+        let peak = store.peak_transfers.load(Ordering::SeqCst);
+        assert!(
+            (2..=4).contains(&peak),
+            "independent uploads must overlap, bounded at four; peak={peak}"
+        );
+        assert_eq!(store.active_transfers.load(Ordering::SeqCst), 0);
+        assert_eq!(baseline::load(&data, &mapping.id).unwrap().entries.len(), 9);
+        let next = run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next.uploaded + next.downloaded, 0);
+        assert!(next.failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parallel_upload_failure_drains_siblings_and_retry_preserves_baseline() {
+        let (root, data) = test_dirs();
+        let mapping = mapping(&root, "docs");
+        for i in 0..4 {
+            write(&root, &format!("{i}.txt"), &"x".repeat(READ_CHUNK * 2 + 1));
+        }
+        let store = Arc::new(MemoryStore::new(vec![]));
+        store.delayed_transfers.store(true, Ordering::Relaxed);
+        *store.fail_upload.lock().unwrap() = Some(types::cloud_key("docs", "1.txt"));
+        let result = run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.uploaded, 3);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(store.active_transfers.load(Ordering::SeqCst), 0);
+        assert!(store.largest_chunk.load(Ordering::SeqCst) <= READ_CHUNK);
+        assert_eq!(baseline::load(&data, &mapping.id).unwrap().entries.len(), 3);
+        *store.fail_upload.lock().unwrap() = None;
+        // Failed writer markers require one read-only reconciliation first.
+        run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        let retry = run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert!(retry.failures.is_empty());
+        assert_eq!(baseline::load(&data, &mapping.id).unwrap().entries.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn successful_upload_batch_lists_remote_data_only_once_before_publication() {
+        let (root, data) = test_dirs();
+        let mapping = mapping(&root, "docs");
+        write(&root, "a.txt", "a");
+        write(&root, "nested/b.txt", "b");
+        let store = Arc::new(MemoryStore::new(vec![]));
+        run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        store.listings.lock().unwrap().clear();
+        write(&root, "a.txt", "updated a");
+        write(&root, "nested/b.txt", "updated b");
+        let result = run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.uploaded, 2);
+        assert_eq!(
+            store
+                .listings
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|prefix| prefix.ends_with("/files/"))
+                .count(),
+            1,
+            "publish the verified action results rather than enumerate all files again"
+        );
+        let next = super::run_sync_mode(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(next.uploaded + next.downloaded, 0);
+    }
+
+    #[tokio::test]
     async fn ledger_fast_tick_repairs_missing_markers_and_manual_check_finds_external_edits() {
         let (root, data) = test_dirs();
         let mapping = mapping(&root, "docs");
         write(&root, "a.txt", "local");
         let store = Arc::new(MemoryStore::new(vec![]));
-        run_sync(store.clone(), &mapping, &data, &context(), Arc::new(AtomicBool::new(false))).await.unwrap();
+        run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
         let ctx = context();
-        store.insert("_peerdav_mirror/docs/files/external.txt", b"external".to_vec(), "external-v1");
+        store.insert(
+            "_peerdav_mirror/docs/files/external.txt",
+            b"external".to_vec(),
+            "external-v1",
+        );
         store.listings.lock().unwrap().clear();
-        let result = super::run_sync_mode(store.clone(), &mapping, &data, &ctx, Arc::new(AtomicBool::new(false)), false).await.unwrap();
-        assert!(store.listings.lock().unwrap().iter().all(|prefix| !prefix.ends_with("/files/")), "steady tick must not enumerate remote files");
-        assert_eq!(result.downloaded, 0, "external edits require the optional full check");
+        let result = super::run_sync_mode(
+            store.clone(),
+            &mapping,
+            &data,
+            &ctx,
+            Arc::new(AtomicBool::new(false)),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            store
+                .listings
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|prefix| !prefix.ends_with("/files/")),
+            "steady tick must not enumerate remote files"
+        );
+        assert_eq!(
+            result.downloaded, 0,
+            "external edits require the optional full check"
+        );
         assert!(!root.join("external.txt").exists());
-        let result = run_sync(store.clone(), &mapping, &data, &ctx, Arc::new(AtomicBool::new(false))).await.unwrap();
+        let result = run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &ctx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.downloaded, 1);
-        store.objects.lock().unwrap().retain(|key, _| !key.contains("/ledger/"));
-        super::run_sync_mode(store.clone(), &mapping, &data, &ctx, Arc::new(AtomicBool::new(false)), false).await.unwrap();
-        assert!(store.objects.lock().unwrap().keys().any(|key| key.contains("/ledger/writers/")));
-        let key = store.objects.lock().unwrap().keys().find(|key| key.contains("/ledger/writers/")).cloned().unwrap();
+        store
+            .objects
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.contains("/ledger/"));
+        super::run_sync_mode(
+            store.clone(),
+            &mapping,
+            &data,
+            &ctx,
+            Arc::new(AtomicBool::new(false)),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            store
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|key| key.contains("/ledger/writers/"))
+        );
+        let key = store
+            .objects
+            .lock()
+            .unwrap()
+            .keys()
+            .find(|key| key.contains("/ledger/writers/"))
+            .cloned()
+            .unwrap();
         store.insert(&key, b"corrupt".to_vec(), "broken");
-        super::run_sync_mode(store.clone(), &mapping, &data, &ctx, Arc::new(AtomicBool::new(false)), false).await.unwrap();
-        let state: super::super::ledger_types::WriterState = serde_json::from_slice(&store.get_value(&key)).unwrap();
+        super::run_sync_mode(
+            store.clone(),
+            &mapping,
+            &data,
+            &ctx,
+            Arc::new(AtomicBool::new(false)),
+            false,
+        )
+        .await
+        .unwrap();
+        let state: super::super::ledger_types::WriterState =
+            serde_json::from_slice(&store.get_value(&key)).unwrap();
         assert!(!state.pending);
         let snapshot = key.replacen("/writers/", "/snapshots/", 1);
         store.insert(&snapshot, b"corrupt snapshot".to_vec(), "broken-snapshot");
         write(&root, "a.txt", "deferred local change");
-        let repair = super::run_sync_mode(store.clone(), &mapping, &data, &ctx, Arc::new(AtomicBool::new(false)), false).await.unwrap();
+        let repair = super::run_sync_mode(
+            store.clone(),
+            &mapping,
+            &data,
+            &ctx,
+            Arc::new(AtomicBool::new(false)),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(repair.uploaded, 0, "repair round freezes file mutations");
-        assert_eq!(store.get_value("_peerdav_mirror/docs/files/a.txt"), b"local");
-        super::run_sync_mode(store.clone(), &mapping, &data, &ctx, Arc::new(AtomicBool::new(false)), false).await.unwrap();
-        assert_eq!(store.get_value("_peerdav_mirror/docs/files/a.txt"), b"deferred local change");
-        let mut enabled = mapping.clone(); enabled.full_check = true;
+        assert_eq!(
+            store.get_value("_peerdav_mirror/docs/files/a.txt"),
+            b"local"
+        );
+        super::run_sync_mode(
+            store.clone(),
+            &mapping,
+            &data,
+            &ctx,
+            Arc::new(AtomicBool::new(false)),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.get_value("_peerdav_mirror/docs/files/a.txt"),
+            b"deferred local change"
+        );
+        let mut enabled = mapping.clone();
+        enabled.full_check = true;
         let scope = format!("{}|{}|{}", ctx.endpoint, ctx.bucket, mapping.cloud_prefix);
         let mut cache = super::super::ledger::load(&data, &mapping.id, &scope).unwrap();
         cache.checked_at = now_secs().saturating_sub(600);
         super::super::ledger::save(&data, &mapping.id, &cache).unwrap();
-        store.insert("_peerdav_mirror/docs/files/timed.txt", b"timed".to_vec(), "timed-v1");
-        let result = super::run_sync_mode(store.clone(), &enabled, &data, &ctx, Arc::new(AtomicBool::new(false)), false).await.unwrap();
-        assert_eq!(result.downloaded, 1, "opt-in full check runs at the ten-minute boundary");
-        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"deferred local change");
+        store.insert(
+            "_peerdav_mirror/docs/files/timed.txt",
+            b"timed".to_vec(),
+            "timed-v1",
+        );
+        let result = super::run_sync_mode(
+            store.clone(),
+            &enabled,
+            &data,
+            &ctx,
+            Arc::new(AtomicBool::new(false)),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.downloaded, 1,
+            "opt-in full check runs at the ten-minute boundary"
+        );
+        assert_eq!(
+            std::fs::read(root.join("a.txt")).unwrap(),
+            b"deferred local change"
+        );
     }
 
     #[tokio::test]
@@ -1105,17 +1497,58 @@ mod tests {
         let mapping = mapping(&root, "docs");
         write(&root, "a.txt", "local");
         let store = Arc::new(MemoryStore::new(vec![]));
-        run_sync(store.clone(), &mapping, &data, &context(), Arc::new(AtomicBool::new(false))).await.unwrap();
+        run_sync(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
         let other = "_peerdav_mirror/docs/ledger/writers/other.json";
-        super::super::ledger::mark(store.as_ref(), other, "interrupted", true).await.unwrap();
+        super::super::ledger::mark(store.as_ref(), other, "interrupted", true)
+            .await
+            .unwrap();
         let before = store.get_value(other);
-        store.insert("_peerdav_mirror/docs/files/other.txt", b"remote".to_vec(), "remote-v1");
-        let result = super::run_sync_mode(store.clone(), &mapping, &data, &context(), Arc::new(AtomicBool::new(false)), false).await.unwrap();
-        assert_eq!(result.downloaded, 1, "another offline writer must not freeze this client's sync indefinitely");
-        assert_eq!(store.get_value(other), before, "never replace another writer's live marker");
+        store.insert(
+            "_peerdav_mirror/docs/files/other.txt",
+            b"remote".to_vec(),
+            "remote-v1",
+        );
+        let result = super::run_sync_mode(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.downloaded, 1,
+            "another offline writer must not freeze this client's sync indefinitely"
+        );
+        assert_eq!(
+            store.get_value(other),
+            before,
+            "never replace another writer's live marker"
+        );
         assert!(root.join("other.txt").exists());
-        super::super::ledger::mark(store.as_ref(), other, "committed", false).await.unwrap();
-        let result = super::run_sync_mode(store.clone(), &mapping, &data, &context(), Arc::new(AtomicBool::new(false)), false).await.unwrap();
+        super::super::ledger::mark(store.as_ref(), other, "committed", false)
+            .await
+            .unwrap();
+        let result = super::run_sync_mode(
+            store.clone(),
+            &mapping,
+            &data,
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.downloaded, 0);
         assert_eq!(std::fs::read(root.join("other.txt")).unwrap(), b"remote");
     }
@@ -1191,7 +1624,15 @@ mod tests {
         write(local.path(), "keep.txt", "keep");
         let mapping = mapping(local.path(), "docs");
         let store = Arc::new(MemoryStore::new(vec![]));
-        run_sync(store.clone(), &mapping, data.path(), &context(), Arc::new(AtomicBool::new(false))).await.unwrap();
+        run_sync(
+            store.clone(),
+            &mapping,
+            data.path(),
+            &context(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap();
         write(local.path(), ".notes.swp", "editor");
         write(local.path(), "local.tmp", "temporary local");
         write(local.path(), "folder.part/inside.txt", "temporary subtree");
@@ -1202,19 +1643,55 @@ mod tests {
             old.record_upload(name, 0, 5, Some("old".into()), 5);
         }
         baseline::save(data.path(), &mapping.id, &old).unwrap();
-        store.objects.lock().unwrap().insert("_peerdav_mirror/docs/files/remote.part".into(), (b"remote".to_vec(), "old".into()));
+        store.objects.lock().unwrap().insert(
+            "_peerdav_mirror/docs/files/remote.part".into(),
+            (b"remote".to_vec(), "old".into()),
+        );
         for _ in 0..2 {
-            let result = super::run_sync(store.clone(), &mapping, data.path(), &context(), Arc::new(AtomicBool::new(false))).await.unwrap();
+            let result = super::run_sync(
+                store.clone(),
+                &mapping,
+                data.path(),
+                &context(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
             assert!(result.failures.is_empty(), "{:?}", result.failures);
-            assert_eq!((result.deleted_local, result.deleted_cloud, result.downloaded), (0, 0, 0));
+            assert_eq!(
+                (
+                    result.deleted_local,
+                    result.deleted_cloud,
+                    result.downloaded
+                ),
+                (0, 0, 0)
+            );
             assert!(result.conflicts.is_empty());
         }
-        assert_eq!(store.get_value("_peerdav_mirror/docs/files/remote.part"), b"remote");
-        assert!(!store.keys().contains(&"_peerdav_mirror/docs/files/local.tmp".into()));
-        assert!(!store.keys().iter().any(|key| key.contains("folder.part") || key.ends_with(".swp")));
+        assert_eq!(
+            store.get_value("_peerdav_mirror/docs/files/remote.part"),
+            b"remote"
+        );
+        assert!(
+            !store
+                .keys()
+                .contains(&"_peerdav_mirror/docs/files/local.tmp".into())
+        );
+        assert!(
+            !store
+                .keys()
+                .iter()
+                .any(|key| key.contains("folder.part") || key.ends_with(".swp"))
+        );
         assert!(!local.path().join("remote.part").exists());
-        assert_eq!(std::fs::read(local.path().join("local.tmp")).unwrap(), b"temporary local");
-        assert_eq!(store.get_value("_peerdav_mirror/docs/files/report.tmp.txt"), b"normal");
+        assert_eq!(
+            std::fs::read(local.path().join("local.tmp")).unwrap(),
+            b"temporary local"
+        );
+        assert_eq!(
+            store.get_value("_peerdav_mirror/docs/files/report.tmp.txt"),
+            b"normal"
+        );
     }
 
     #[tokio::test]
@@ -1240,8 +1717,14 @@ mod tests {
         .unwrap();
         assert_eq!(result.uploaded, 2);
         assert_eq!(result.downloaded, 1);
-        assert_eq!(store.get_value("_peerdav_mirror/docs/files/a.txt"), b"hello");
-        assert_eq!(store.get_value("_peerdav_mirror/docs/files/sub/b.txt"), b"world");
+        assert_eq!(
+            store.get_value("_peerdav_mirror/docs/files/a.txt"),
+            b"hello"
+        );
+        assert_eq!(
+            store.get_value("_peerdav_mirror/docs/files/sub/b.txt"),
+            b"world"
+        );
         assert_eq!(std::fs::read(local.join("remote.txt")).unwrap(), b"remote");
 
         // 第二轮：两侧均未变，不再有任何动作。
@@ -1389,7 +1872,10 @@ mod tests {
             schedule.stop_and_join().await.unwrap();
             if empty_side {
                 assert_eq!(outcome, (0, Some("MIRROR_MASS_DELETE".into())));
-                assert_eq!(store.get_value("_peerdav_mirror/docs/files/gone.txt"), b"gone");
+                assert_eq!(
+                    store.get_value("_peerdav_mirror/docs/files/gone.txt"),
+                    b"gone"
+                );
             } else {
                 assert_eq!(outcome, (1, None));
                 assert!(
@@ -1599,7 +2085,10 @@ mod tests {
         assert_eq!(result.conflicts, vec!["a.txt".to_owned()]);
         // 本地版本接管原路径，云端版本另存为本地冲突副本，两侧都保留且基线一致。
         assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"local-v2!");
-        assert_eq!(store.get_value("_peerdav_mirror/docs/files/a.txt"), b"local-v2!");
+        assert_eq!(
+            store.get_value("_peerdav_mirror/docs/files/a.txt"),
+            b"local-v2!"
+        );
         let conflict = std::fs::read_dir(&local)
             .unwrap()
             .filter_map(|item| item.ok())
@@ -1706,7 +2195,10 @@ mod tests {
         .unwrap();
         assert_eq!(result.conflicts, Vec::<String>::new());
         assert_eq!(result.uploaded, 1);
-        assert_eq!(store.get_value("_peerdav_mirror/docs/files/a.txt"), b"v2-local");
+        assert_eq!(
+            store.get_value("_peerdav_mirror/docs/files/a.txt"),
+            b"v2-local"
+        );
         assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"v2-local");
         let _ = std::fs::remove_dir_all(local.parent().unwrap());
     }
@@ -1733,7 +2225,10 @@ mod tests {
         assert_eq!(result.downloaded, 0);
         assert_eq!(result.conflicts, vec!["a.txt"]);
         assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"local");
-        assert_eq!(store.get_value("_peerdav_mirror/docs/files/a.txt"), b"local");
+        assert_eq!(
+            store.get_value("_peerdav_mirror/docs/files/a.txt"),
+            b"local"
+        );
         let copies: Vec<_> = std::fs::read_dir(&local)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -1754,8 +2249,14 @@ mod tests {
         let (local, data) = test_dirs();
         let base = local.parent().unwrap().to_path_buf();
         let store = Arc::new(MemoryStore::new(vec![
-            ("_peerdav_mirror/docs/files/../escape.txt", b"escaped".to_vec()),
-            ("_peerdav_mirror/docs/files//absolute.txt", b"absolute".to_vec()),
+            (
+                "_peerdav_mirror/docs/files/../escape.txt",
+                b"escaped".to_vec(),
+            ),
+            (
+                "_peerdav_mirror/docs/files//absolute.txt",
+                b"absolute".to_vec(),
+            ),
             ("_peerdav_mirror/docs/files/valid.txt", b"valid".to_vec()),
         ]));
         let mapping = mapping(&local, "docs");
@@ -1838,7 +2339,10 @@ mod tests {
         .unwrap();
         assert_eq!(result.uploaded, 1);
         assert_eq!(result.deleted_local + result.deleted_cloud, 0);
-        assert_eq!(store.get_value("_peerdav_mirror/docs/files/a.txt"), b"keep me");
+        assert_eq!(
+            store.get_value("_peerdav_mirror/docs/files/a.txt"),
+            b"keep me"
+        );
         let _ = std::fs::remove_dir_all(local.parent().unwrap());
     }
 
@@ -2009,7 +2513,10 @@ mod tests {
             super::run_sync(store.clone(), &mapping, &data, &stale, cancel).await,
             Err(MirrorError::MassDelete { .. })
         ));
-        assert_eq!(store.get_value("_peerdav_mirror/docs/files/a.txt"), b"precious");
+        assert_eq!(
+            store.get_value("_peerdav_mirror/docs/files/a.txt"),
+            b"precious"
+        );
         assert!(
             !store
                 .keys()
@@ -2046,7 +2553,10 @@ mod tests {
             super::run_sync(store.clone(), &mapping, &data, &stale, cancel).await,
             Err(MirrorError::MassDelete { .. })
         ));
-        assert_eq!(store.get_value("_peerdav_mirror/docs/files/a.txt"), b"precious");
+        assert_eq!(
+            store.get_value("_peerdav_mirror/docs/files/a.txt"),
+            b"precious"
+        );
         std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
     }
 
@@ -2153,20 +2663,51 @@ mod tests {
         write(&local, "a.txt", "local");
         let scanned = scan::scan(&local, &AtomicBool::new(false)).unwrap();
         let store = MemoryStore::new(vec![("a", b"remote".to_vec())]);
-        let expected = CloudFile { etag: Some("stale".into()), size: 6 };
+        let expected = CloudFile {
+            etag: Some("stale".into()),
+            size: 6,
+        };
         for expected in [None, Some(&expected)] {
-            assert!(matches!(upload_file(&store, &local.join("a.txt"), "a", expected,
-                &scanned.files["a.txt"], Arc::new(AtomicBool::new(false))).await,
-                Err(MirrorError::Cloud(CloudError::Precondition))));
+            assert!(matches!(
+                upload_file(
+                    &store,
+                    &local.join("a.txt"),
+                    "a",
+                    expected,
+                    &scanned.files["a.txt"],
+                    Arc::new(AtomicBool::new(false))
+                )
+                .await,
+                Err(MirrorError::Cloud(CloudError::Precondition))
+            ));
             assert_eq!(store.get_value("a"), b"remote");
         }
-        assert!(matches!(verify_remote_snapshot(&store, "missing", Some(&expected)).await, Err(CloudError::Precondition)));
-        let missing_revision = CloudFile { etag: None, size: 6 };
-        assert!(matches!(verify_remote_snapshot(&store, "a", Some(&missing_revision)).await, Err(CloudError::Precondition)));
+        assert!(matches!(
+            verify_remote_snapshot(&store, "missing", Some(&expected)).await,
+            Err(CloudError::Precondition)
+        ));
+        let missing_revision = CloudFile {
+            etag: None,
+            size: 6,
+        };
+        assert!(matches!(
+            verify_remote_snapshot(&store, "a", Some(&missing_revision)).await,
+            Err(CloudError::Precondition)
+        ));
         let mut oversized = scanned.files["a.txt"].clone();
         oversized.size = crate::cloud::types::MAX_PUT_BYTES as u64 + 1;
-        assert!(matches!(upload_file(&store, &local.join("a.txt"), "new", None, &oversized,
-            Arc::new(AtomicBool::new(false))).await, Err(MirrorError::Cloud(CloudError::PayloadTooLarge))));
+        assert!(matches!(
+            upload_file(
+                &store,
+                &local.join("a.txt"),
+                "new",
+                None,
+                &oversized,
+                Arc::new(AtomicBool::new(false))
+            )
+            .await,
+            Err(MirrorError::Cloud(CloudError::PayloadTooLarge))
+        ));
         std::fs::remove_dir_all(local.parent().unwrap()).unwrap();
     }
 
@@ -2244,7 +2785,11 @@ mod tests {
 
         // 本地删除，同时云端被另一台设备修改。
         std::fs::remove_file(local.join("a.txt")).unwrap();
-        store.insert("_peerdav_mirror/docs/files/a.txt", b"v2".to_vec(), "etag-v2");
+        store.insert(
+            "_peerdav_mirror/docs/files/a.txt",
+            b"v2".to_vec(),
+            "etag-v2",
+        );
 
         let result = run_sync(store.clone(), &mapping, &data, &context(), cancel)
             .await

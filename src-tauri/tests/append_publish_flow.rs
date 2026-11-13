@@ -48,7 +48,7 @@ pub(crate) fn fixture() -> (
         entries: vec![],
         children: vec![],
         bindings: vec![{
-            let envelope: Envelope = serde_json::from_slice(&block).unwrap();
+            let envelope: Envelope = Envelope::from_wire(&block).unwrap();
             BlockBinding {
                 block_id: envelope.logical_id,
                 len: envelope.plaintext_len,
@@ -90,11 +90,11 @@ async fn bounded_parallel_blocks_preserve_commit_order_and_retry() {
     let mut bindings = Vec::new();
     for n in 0..8u8 {
         let (key, bytes) = repo.seal_block(&[n; 32]).unwrap();
-        let envelope: Envelope = serde_json::from_slice(&bytes).unwrap();
+        let envelope: Envelope = Envelope::from_wire(&bytes).unwrap();
         bindings.push(BlockBinding { block_id: envelope.logical_id, len: envelope.plaintext_len, object: ObjectRef { kind: "block".into(), digest: key.rsplit('/').next().unwrap().into() } });
         blocks.push(PreparedObject::new(key, bytes));
     }
-    let envelope: Envelope = serde_json::from_slice(blocks[0].bytes()).unwrap();
+    let envelope: Envelope = Envelope::from_wire(blocks[0].bytes()).unwrap();
     bindings.push(BlockBinding { block_id: envelope.logical_id, len: envelope.plaintext_len, object: ObjectRef { kind: "block".into(), digest: blocks[0].key().rsplit('/').next().unwrap().into() } });
     let (root, bytes) = repo.seal_tree(&Tree { version: 2, repo_id: repo.repo_id().into(), directory: "root".into(), entries: vec![], children: vec![], bindings }).unwrap();
     blocks.push(PreparedObject::new(format!("{APPEND_ROOT}/{}/trees/{}", repo.repo_id(), root.digest), bytes));

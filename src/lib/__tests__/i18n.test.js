@@ -188,6 +188,13 @@ describe("error mapping", () => {
     initLocale();
   });
 
+  it("adds one operation context to an explicit mapping conflict", () => {
+    const error = { code: "CLOUD_LOCAL_MAPPING_CONFLICT", message: "technical fallback", detail: "private diagnostic", context: { drive: "GoogleDrive", userOperationKey: "errorOperation.createSyncDrive" } };
+    expect(toUserMessage(error)).toBe("创建同步盘失败：所选本地文件夹已被 GoogleDrive 同步盘绑定。请选择其他文件夹，或先解除原绑定。");
+    expect(toUserMessage(error)).not.toContain(error.code);
+    expect(error.detail).toBe("private diagnostic");
+  });
+
   it("maps stable error codes to UI strategies", () => {
     const error = (code) => ({ code, message: "message" });
     expect(errorStrategy(error("VAULT_LOCKED"))).toBe("unlock");
@@ -212,10 +219,10 @@ describe("error mapping", () => {
   it("renders structured causes through i18n without stacking backend messages", () => {
     const error = { code: "PEER_REQUEST_FAILED", message: "outer: nested: ignored", detail: "full diagnostics",
       context: { reason: "upstream rejected: maintenance window", status: 503 } };
-    expect(toUserMessage(error)).toBe("发送请求失败：HTTP 503 (upstream rejected: maintenance window)");
+    expect(toUserMessage(error)).toBe("存储服务暂时不可用。请稍后重试。");
     expect(toUserMessage({ ...error, code: "PEER_IDENTITY_MISMATCH" })).toBe("发送请求失败：服务器端指纹不匹配");
     setLocale("en");
-    expect(toUserMessage(error)).toBe("Request failed: HTTP 503 (upstream rejected: maintenance window)");
+    expect(toUserMessage(error)).toBe("The storage service is temporarily unavailable. Try again later.");
     expect(error.detail).toBe("full diagnostics");
   });
 

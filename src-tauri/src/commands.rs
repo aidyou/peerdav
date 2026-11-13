@@ -73,6 +73,10 @@ impl ServerEvents for AppEvents {
 }
 
 impl SyncEvents for AppEvents {
+    fn capability_progress(&self, status: crate::cloud::runtime_types::CapabilityProgress) -> Result<(), BoxError> {
+        self.app.emit("app://cloud-capability-progress", status).map_err(|error| Box::new(error) as BoxError)
+    }
+
     fn progress(&self, status: SyncStatus) -> Result<(), BoxError> {
         if let Err(error) = self.app.emit("app://cloud-progress", status) {
             log::error!("failed to emit app://cloud-progress: {error}");

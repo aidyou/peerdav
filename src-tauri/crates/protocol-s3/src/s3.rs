@@ -58,6 +58,8 @@ pub struct S3Store {
     paginated: Option<Arc<object_store::aws::AmazonS3>>,
     verified: Arc<AtomicBool>,
     delete_verified: Arc<tokio::sync::Mutex<Option<bool>>>,
+    pub(crate) probe_lock: Arc<tokio::sync::Mutex<()>>,
+    observer: Option<Arc<dyn crate::traits::CapabilityObserver>>,
     transport: ConnectionTransport,
     #[cfg(test)]
     multipart_factory: Option<MultipartFactory>,
@@ -83,6 +85,37 @@ impl std::fmt::Debug for S3Store {
 }
 
 impl S3Store {
+    pub fn with_capability_observer(mut self, observer: Arc<dyn crate::traits::CapabilityObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    pub(crate) fn cached_probe(&self, capability: &str) -> Result<Option<bool>, CloudError> {
+        let state = match &self.observer { Some(observer) => observer.load()?, None => return Ok(None) };
+        Ok(match capability { "cas" => state.cas, "delete" => state.conditional_delete, _ => state.move_create })
+    }
+
+    pub(crate) fn probe_progress(&self, capability: &'static str, stage: &'static str) -> Result<(), CloudError> {
+        match &self.observer { Some(observer) => observer.progress(capability, stage), None => Ok(()) }
+    }
+
+    pub(crate) fn remember_probe<T>(&self, capability: &'static str, result: &Result<T, CloudError>) -> Result<(), CloudError> {
+        if let Some(observer) = &self.observer {
+            let saved = (|| {
+                if result.is_ok() || matches!(result, Err(CloudError::Unsupported)) {
+                    let mut state = observer.load()?;
+                    let value = Some(result.is_ok());
+                    match capability { "cas" => state.cas = value, "delete" => state.conditional_delete = value, _ => state.move_create = value }
+                    observer.save(state)?;
+                }
+                Ok::<(), CloudError>(())
+            })();
+            observer.progress(capability, if result.is_ok() && saved.is_ok() { "completed" } else { "failed" })?;
+            saved?;
+        }
+        Ok(())
+    }
+
     pub fn new(mut config: S3Config) -> Result<Self, CloudError> {
         let url = url::Url::parse(&config.endpoint)
             .map_err(|_| CloudError::InvalidConfig("invalid endpoint URL".into()))?;
@@ -146,6 +179,8 @@ impl S3Store {
             transport,
             verified: Arc::new(AtomicBool::new(false)),
             delete_verified: Arc::new(tokio::sync::Mutex::new(None)),
+            probe_lock: Arc::new(tokio::sync::Mutex::new(())),
+            observer: None,
             #[cfg(test)]
             multipart_factory: None,
             #[cfg(test)]
@@ -176,6 +211,8 @@ impl S3Store {
             transport: ConnectionTransport::new(&super::types::ProxyMode::Direct).expect("test transport"),
             verified: Arc::new(AtomicBool::new(false)),
             delete_verified: Arc::new(tokio::sync::Mutex::new(None)),
+            probe_lock: Arc::new(tokio::sync::Mutex::new(())),
+            observer: None,
             multipart_factory: Some(factory),
             multipart_budget: None,
             multipart_peak_buffer: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -267,39 +304,49 @@ impl S3Store {
 
     async fn verify_delete_precondition(&self) -> Result<(), CloudError> {
         let mut verified = self.delete_verified.lock().await;
+        if verified.is_none() { *verified = self.cached_probe("delete")?; }
         if let Some(supported) = *verified {
             return if supported { Ok(()) } else { Err(CloudError::Unsupported) };
         }
+        self.probe_progress("delete", "checking")?;
         let mut random = [0; 16];
         rand::rngs::OsRng.try_fill_bytes(&mut random).map_err(|source| CloudError::Random { source })?;
         let key = format!("probes/{}/conditional-delete", hex::encode(random));
-        let original = self.put(&key, body(b"delete-probe"), PutCondition::CreateOnly).await?;
-        let revision = original.etag.as_deref().filter(|etag| !etag.is_empty()).ok_or(CloudError::Unsupported)?;
-        // A provider that ignores If-Match may delete this isolated random probe,
-        // but must never be allowed to delete any user object.
-        match self.delete_revision_request(&key, "\"peerdav-impossible-revision\"").await {
-            Err(CloudError::Precondition) => {}
-            Err(error) => return Err(error),
-            Ok(()) => {
-                // Do not create another probe for every item in this folder.
+        let result = async {
+            let original = self.put(&key, body(b"delete-probe"), PutCondition::CreateOnly).await?;
+            let revision = original.etag.as_deref().filter(|etag| !etag.is_empty()).ok_or(CloudError::Unsupported)?;
+            // A provider that ignores If-Match may delete this isolated random probe,
+            // but must never be allowed to delete any user object.
+            match self.delete_revision_request(&key, "\"peerdav-impossible-revision\"").await {
+                Err(CloudError::Precondition) => {}
+                Err(error) => return Err(error),
+                Ok(()) => {
+                    // Do not create another probe for every item in this folder.
+                    *verified = Some(false);
+                    return Err(CloudError::Unsupported);
+                }
+            }
+            let retained = self.stat(&key).await?;
+            if retained.etag.as_deref() != Some(revision) || retained.size != original.size {
                 *verified = Some(false);
                 return Err(CloudError::Unsupported);
             }
-        }
-        let retained = self.stat(&key).await?;
-        if retained.etag.as_deref() != Some(revision) || retained.size != original.size {
-            *verified = Some(false);
-            return Err(CloudError::Unsupported);
-        }
-        self.delete_revision_request(&key, revision).await?;
-        match self.stat(&key).await {
-            Err(CloudError::NotFound) => {}
-            Err(error) => return Err(error),
-            Ok(_) => {
-                *verified = Some(false);
-                return Err(CloudError::Unsupported);
+            self.delete_revision_request(&key, revision).await?;
+            match self.stat(&key).await {
+                Err(CloudError::NotFound) => {}
+                Err(error) => return Err(error),
+                Ok(_) => {
+                    *verified = Some(false);
+                    return Err(CloudError::Unsupported);
+                }
             }
-        }
+            Ok(())
+        }.await;
+        // The successful probe already verified deletion with a subsequent HEAD.
+        self.probe_progress("delete", "cleaning")?;
+        let result = if result.is_err() { self.finish_probe(&[&key], result).await } else { result };
+        self.remember_probe("delete", &result)?;
+        result?;
         *verified = Some(true);
         Ok(())
     }
@@ -339,52 +386,71 @@ impl S3Store {
         }
     }
 
-    /// Probes only random isolated objects. Never deletes repository objects.
-    /// A caller must refuse repository writes unless this succeeds. Probe
-    /// artifacts are retained for diagnostics, consistent with no automatic GC.
+    /// Cleanup is restricted to the exact random keys allocated by this probe.
+    /// Unconditional deletion here must never be used for user objects.
+    pub(crate) async fn finish_probe<T>(&self, keys: &[&str], result: Result<T, CloudError>) -> Result<T, CloudError> {
+        let mut outcome = result;
+        for key in keys {
+            if let Err(cleanup) = self.delete(key).await {
+                if matches!(cleanup, CloudError::NotFound) { continue; }
+                outcome = Err(CloudError::Storage {
+                    source: object_store::Error::Generic {
+                        store: "probe cleanup",
+                        source: Box::new(crate::types::ProbeCleanupError {
+                            primary: outcome.err(), cleanup,
+                        }),
+                    },
+                });
+            }
+        }
+        outcome
+    }
+
+    /// Probes only random isolated objects and removes them on success or failure.
+    /// A caller must refuse repository writes unless this succeeds.
     pub async fn verify_capabilities(&self) -> Result<StorageCapabilities, CloudError> {
+        let _probe = self.probe_lock.lock().await;
+        if let Some(supported) = self.cached_probe("cas")? {
+            self.verified.store(supported, Ordering::Release);
+            return if supported { Ok(self.capabilities()) } else { Err(CloudError::Unsupported) };
+        }
+        self.probe_progress("cas", "checking")?;
         self.verified.store(false, Ordering::Release);
         let mut random = [0_u8; 16];
         rand::rngs::OsRng
             .try_fill_bytes(&mut random)
             .map_err(|source| CloudError::Random { source })?;
         let key = format!("probes/{}/cas", hex::encode(random));
-        let first = self
-            .put(&key, body(b"first"), PutCondition::CreateOnly)
-            .await?;
-        match self.put(&key, body(b"bad"), PutCondition::CreateOnly).await {
-            Err(CloudError::Precondition) => {}
-            Err(error) => return Err(error),
-            Ok(_) => return Err(CloudError::Unsupported),
-        }
-        let revision = first.etag.ok_or(CloudError::Unsupported)?;
-        let (left, right) = tokio::join!(
-            self.put(
-                &key,
-                body(b"left"),
-                PutCondition::MatchEtag(revision.clone())
-            ),
-            self.put(
-                &key,
-                body(b"right"),
-                PutCondition::MatchEtag(revision.clone())
-            ),
-        );
-        verify_single_winner(left, right)?;
-        match self
-            .put(&key, body(b"stale"), PutCondition::MatchEtag(revision))
-            .await
-        {
-            Err(CloudError::Precondition) => {}
-            Err(error) => return Err(error),
-            Ok(_) => return Err(CloudError::Unsupported),
-        }
         let create_key = format!("{key}-create");
-        let (left, right) = tokio::join!(
-            self.put(&create_key, body(b"left"), PutCondition::CreateOnly),
-            self.put(&create_key, body(b"right"), PutCondition::CreateOnly),
-        );
-        verify_single_winner(left, right)?;
+        let result = async {
+            let first = self.put(&key, body(b"first"), PutCondition::CreateOnly).await?;
+            match self.put(&key, body(b"bad"), PutCondition::CreateOnly).await {
+                Err(CloudError::Precondition) => {}
+                Err(error) => return Err(error),
+                Ok(_) => return Err(CloudError::Unsupported),
+            }
+            let revision = first.etag.ok_or(CloudError::Unsupported)?;
+            let (left, right) = tokio::join!(
+                self.put(&key, body(b"left"), PutCondition::MatchEtag(revision.clone())),
+                self.put(&key, body(b"right"), PutCondition::MatchEtag(revision.clone())),
+            );
+            verify_single_winner(left, right)?;
+            match self.put(&key, body(b"stale"), PutCondition::MatchEtag(revision)).await {
+                Err(CloudError::Precondition) => {}
+                Err(error) => return Err(error),
+                Ok(_) => return Err(CloudError::Unsupported),
+            }
+            let (left, right) = tokio::join!(
+                self.put(&create_key, body(b"left"), PutCondition::CreateOnly),
+                self.put(&create_key, body(b"right"), PutCondition::CreateOnly),
+            );
+            verify_single_winner(left, right)?;
+            Ok(())
+        }.await;
+        self.probe_progress("cas", "cleaning")?;
+        let result = self.finish_probe(&[&key, &create_key], result).await;
+        self.remember_probe("cas", &result)?;
+        result?;
         self.verified.store(true, Ordering::Release);
         Ok(self.capabilities())
     }
@@ -971,6 +1037,97 @@ mod cfgtest {
         for endpoint in ["https://s3.us-east-1.amazonaws.com", "https://minio.example.com"] {
             assert!(!requires_path_style(&parse(endpoint)), "{endpoint}");
         }
+    }
+
+    #[tokio::test]
+    async fn capability_cache_skips_network_and_reports_only_real_probes() {
+        #[derive(Default)]
+        struct Cache {
+            state: std::sync::Mutex<crate::ProbeCapabilities>,
+            progress: std::sync::Mutex<Vec<(&'static str, &'static str)>>,
+        }
+        impl crate::traits::CapabilityObserver for Cache {
+            fn load(&self) -> Result<crate::ProbeCapabilities, CloudError> { Ok(*self.state.lock().expect("state")) }
+            fn save(&self, state: crate::ProbeCapabilities) -> Result<(), CloudError> { *self.state.lock().expect("state") = state; Ok(()) }
+            fn progress(&self, capability: &'static str, stage: &'static str) -> Result<(), CloudError> { self.progress.lock().expect("progress").push((capability, stage)); Ok(()) }
+        }
+        let cache = Arc::new(Cache::default());
+        let low = store().with_capability_observer(cache.clone());
+        let (left, right) = tokio::join!(low.verify_capabilities(), low.verify_capabilities());
+        left.expect("first"); right.expect("deduplicated");
+        assert_eq!(cache.progress.lock().expect("progress").len(), 3);
+        let rebuilt = store().with_capability_observer(cache.clone());
+        rebuilt.verify_capabilities().await.expect("restored cache");
+        assert!(rebuilt.capabilities().conditional_writes_verified);
+        assert_eq!(cache.progress.lock().expect("progress").len(), 3, "cached probes emit no progress");
+        cache.state.lock().expect("state").cas = Some(false);
+        assert!(matches!(rebuilt.verify_capabilities().await, Err(CloudError::Unsupported)));
+        assert!(!rebuilt.capabilities().conditional_writes_verified);
+        assert_eq!(cache.progress.lock().expect("progress").len(), 3);
+        low.remember_probe::<()>("move", &Err(CloudError::Service { status: 503, detail: "retry".into() })).expect("transient failure");
+        assert_eq!(cache.state.lock().expect("state").move_create, None);
+    }
+
+    #[tokio::test]
+    async fn probes_are_cleaned_after_cas_success_and_move_failure() {
+        let low = Arc::new(store());
+        low.put("keep.txt", body(b"user data"), PutCondition::CreateOnly).await.expect("user object");
+        low.verify_capabilities().await.expect("CAS probe");
+        let keys: Vec<_> = low.list("").map_ok(|item| item.key).try_collect().await.expect("list");
+        assert_eq!(keys, vec!["keep.txt"], "successful CAS probes must be removed");
+        let bridge = crate::CoreS3ReadBridge(
+            crate::CoreS3Backend::new(low.clone(), 1).expect("backend"),
+        );
+        // The in-memory backend cannot sign conditional DELETE requests.
+        assert!(matches!(bridge.verify_move_capabilities().await, Err(CloudError::Unsupported)));
+        let keys: Vec<_> = low.list("").map_ok(|item| item.key).try_collect().await.expect("list");
+        assert_eq!(keys, vec!["keep.txt"], "failed move probes must also be removed");
+    }
+
+    #[tokio::test]
+    async fn probe_cleanup_failure_preserves_both_errors_and_continues() {
+        let low = store();
+        low.put("probes/test/owned", body(b"probe"), PutCondition::CreateOnly).await.expect("probe");
+        let error = low.finish_probe::<()>(
+            &["../invalid", "probes/test/owned"],
+            Err(CloudError::Service { status: 403, detail: "original denial".into() }),
+        ).await.expect_err("cleanup failed");
+        let CloudError::Storage { source: object_store::Error::Generic { source, .. } } = error else {
+            panic!("cleanup error must retain sources");
+        };
+        let combined = source.downcast_ref::<crate::types::ProbeCleanupError>().expect("combined error");
+        assert!(matches!(&combined.primary, Some(CloudError::Service { status: 403, detail }) if detail == "original denial"));
+        assert!(matches!(combined.cleanup, CloudError::InvalidConfig(_)));
+        assert!(matches!(low.stat("probes/test/owned").await, Err(CloudError::NotFound)));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicitly authorized local MinIO and environment credentials"]
+    async fn local_minio_probe_cleanup_lifecycle() {
+        let prefix = format!("peerdav-probe-test-{:032x}/", rand::random::<u128>());
+        let low = Arc::new(S3Store::new(S3Config {
+            endpoint: "http://127.0.0.1:9000".into(), bucket: "peerdav".into(),
+            region: "us-east-1".into(), prefix, path_style: true,
+            access_key: std::env::var("PEERDAV_MINIO_ACCESS_KEY").expect("authorized access key"),
+            secret_key: std::env::var("PEERDAV_MINIO_SECRET_KEY").expect("authorized secret key"),
+            session_token: None, buckets: vec![], allow_insecure_http: true,
+            proxy: crate::ProxyMode::Direct,
+        }).expect("local store"));
+        low.put("keep.txt", body(b"user data"), PutCondition::CreateOnly).await.expect("sentinel");
+        low.put("probes/historical/keep", body(b"old probe"), PutCondition::CreateOnly).await.expect("historical sentinel");
+        let result = async {
+            for _ in 0..2 {
+                low.verify_capabilities().await.expect("CAS probe");
+                let bridge = crate::CoreS3ReadBridge(crate::CoreS3Backend::new(low.clone(), 1).expect("bridge"));
+                let moved = bridge.verify_move_capabilities().await;
+                assert!(moved.is_ok() || matches!(moved, Err(CloudError::Unsupported)), "{moved:?}");
+                let keys: Vec<_> = low.list("").map_ok(|item| item.key).try_collect().await.expect("list");
+                assert_eq!(keys, vec!["keep.txt", "probes/historical/keep"], "only test sentinels may remain");
+            }
+            Ok(())
+        }.await;
+        low.finish_probe(&["keep.txt", "probes/historical/keep"], result).await.expect("cleanup test sentinels");
+        assert!(low.list("").next().await.is_none());
     }
 
     #[tokio::test]

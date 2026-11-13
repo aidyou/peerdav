@@ -79,11 +79,6 @@ pub(crate) enum DiscoveryVisit {
 
 pub(crate) struct CountingWriter(pub usize);
 
-#[derive(Deserialize)]
-pub(crate) struct DiscoveryEnvelopeHeader {
-    pub plaintext_len: usize,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoveryState {
@@ -268,7 +263,8 @@ pub struct Envelope {
     pub logical_id: String,
     pub plaintext_len: u64,
     pub nonce: Option<String>,
-    pub payload: String,
+    #[serde(skip)]
+    pub payload: Vec<u8>,
     pub auth: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,13 +335,13 @@ pub struct PublishLimits {
 impl Default for PublishLimits {
     fn default() -> Self {
         Self {
-            max_objects: MAX_PUBLISH_OBJECTS,
+            max_objects: usize::MAX,
             max_staging: MAX_PUBLISH_STAGING,
         }
     }
 }
 
-pub const MAX_PUBLISH_OBJECTS: usize = 100_000;
+pub const MAX_PUBLISH_DESCRIPTOR_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_PUBLISH_STAGING: u64 = 8 * 1024 * 1024 * 1024;
 pub const MAX_PUBLISH_WRITE: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_PUBLISH_REQUESTS: u64 = 20_000;
@@ -413,6 +409,8 @@ pub enum AppendError {
     Storage(#[from] crate::cloud::types::CloudError),
     #[error("append index failed: {0}")]
     Index(#[from] crate::sync::index_types::IndexError),
+    #[error("append object wire failed: {0}")]
+    Wire(#[from] super::repository_types::WireError),
     #[error("append encoding failed: {0}")]
     Encoding(#[from] serde_json::Error),
     #[error("append random generation failed: {0}")]

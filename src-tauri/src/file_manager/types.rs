@@ -71,6 +71,8 @@ pub(crate) struct OfficialUploadJob {
     pub page: crate::local_upload_types::DirectoryPageDto,
     pub parent: String,
     pub files: Vec<crate::local_upload_types::DirectoryFile>,
+    pub walk: Option<crate::local_upload_types::DirectoryWalk>,
+    pub browser: Option<crate::local_upload_types::DirectoryBrowser>,
     pub status: crate::cloud::directory_types::ObjectUploadDirectoryDto,
     pub cancel: tokio_util::sync::CancellationToken,
     pub handle: Option<tokio::task::JoinHandle<()>>,

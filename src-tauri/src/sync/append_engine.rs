@@ -244,7 +244,7 @@ mod budget_tests {
             zeroize::Zeroizing::new([7; 32]),
             "budget-test".into(),
         )?;
-        let limit = 2 * (MAX_BLOCK_SIZE + 16) + 4096;
+        let limit = MAX_BLOCK_SIZE + crate::sync::repository_types::OBJECT_WIRE_OVERHEAD;
         for (operation, requests, bytes) in [
             ("requests", MAX_DISCOVERY_REQUESTS, 0),
             ("bytes", 0, MAX_DISCOVERY_READ_BYTES - limit + 1),
@@ -339,17 +339,39 @@ fn matches_projection(scan: &ScanReport, projection: &Projection) -> bool {
 }
 
 fn selected_path(path: &str, selection: &[String]) -> bool {
-    selection.is_empty() || selection.iter().any(|selected| path == selected || path.strip_prefix(selected).is_some_and(|suffix| suffix.starts_with('/')))
+    selection.is_empty()
+        || selection.iter().any(|selected| {
+            path == selected
+                || path
+                    .strip_prefix(selected)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
 }
 
 fn selected_projection(full: &Projection, selection: &[String]) -> Projection {
-    Projection { entries: full.entries.iter().filter(|entry| selected_path(&entry.logical_path.join("/"), selection) || selected_path(&entry.projection_path.join("/"), selection)).cloned().collect() }
+    Projection {
+        entries: full
+            .entries
+            .iter()
+            .filter(|entry| {
+                selected_path(&entry.logical_path.join("/"), selection)
+                    || selected_path(&entry.projection_path.join("/"), selection)
+            })
+            .cloned()
+            .collect(),
+    }
 }
 
 fn selected_scan(full: &ScanReport, selection: &[String]) -> ScanReport {
     let mut scan = full.clone();
-    scan.files.retain(|file| selected_path(&file.path, selection));
-    scan.directories.retain(|path| selected_path(path, selection) || selection.iter().any(|selected| selected.starts_with(&format!("{path}/"))));
+    scan.files
+        .retain(|file| selected_path(&file.path, selection));
+    scan.directories.retain(|path| {
+        selected_path(path, selection)
+            || selection
+                .iter()
+                .any(|selected| selected.starts_with(&format!("{path}/")))
+    });
     scan
 }
 
@@ -368,11 +390,9 @@ fn local_revision(
     operation: &str,
     frontier: &BTreeMap<super::merge_types::EntityId, Vec<super::merge_types::RevisionId>>,
     history: &mut RevisionMap,
+    remaining: &mut usize,
 ) -> Result<(), AppendEngineError> {
     use super::merge_types::{Baseline, ChangeId};
-    if history.len() >= super::merge_types::MAX_REVISIONS {
-        return Err(AppendError::ResourceLimit("revisions").into());
-    }
     let baseline = frontier
         .get(&entity)
         .map_or(Baseline::Unknown, |parents| Baseline::Known {
@@ -386,6 +406,11 @@ fn local_revision(
         history,
         true,
     )?)?;
+    if !history.contains_key(&revision.revision_id) {
+        *remaining = remaining
+            .checked_sub(merge::revision_working_bytes(&revision))
+            .ok_or(AppendError::ResourceLimit("revision workspace bytes"))?;
+    }
     history.insert(revision.revision_id.clone(), revision);
     Ok(())
 }
@@ -396,9 +421,12 @@ fn cache_object(
     count: &mut usize,
     object: PreparedObject,
 ) -> Result<(), AppendEngineError> {
-    if *count >= MAX_PUBLISH_OBJECTS {
-        return Err(AppendError::ResourceLimit("publish objects").into());
-    }
+    let descriptor_bytes = object.key().len().saturating_add(256) as u64;
+    index.reserve(
+        &format!("engine-descriptors:{operation}"),
+        descriptor_bytes,
+        MAX_PUBLISH_DESCRIPTOR_BYTES as u64,
+    )?;
     index.reserve(
         &format!("engine-staging:{operation}"),
         object.bytes().len() as u64,
@@ -406,6 +434,33 @@ fn cache_object(
     )?;
     index.cache_engine_object(operation, *count, &object)?;
     *count += 1;
+    Ok(())
+}
+
+fn stage_tree_shard(
+    repository: &AppendRepository,
+    index: &mut AppendIndex,
+    operation: &str,
+    count: &mut usize,
+    children: &mut Vec<DirectoryRef>,
+    tree: Tree,
+) -> Result<(), AppendEngineError> {
+    let directory = tree.directory.clone();
+    let (object, bytes) = repository.seal_tree_owned(tree)?;
+    cache_object(
+        index,
+        operation,
+        count,
+        PreparedObject::new(
+            format!(
+                "{APPEND_ROOT}/{}/trees/{}",
+                repository.repo_id(),
+                object.digest
+            ),
+            bytes,
+        ),
+    )?;
+    children.push(DirectoryRef { directory, object });
     Ok(())
 }
 
@@ -432,6 +487,15 @@ async fn prepare_local<S: ObjectStore + ?Sized>(
         .map_err(|_| AppendError::Input("operation randomness"))?;
     let operation = hex::encode(random);
     let frontier = merge::frontier(base)?;
+    let used = history
+        .values()
+        .try_fold(0usize, |sum, revision| {
+            sum.checked_add(merge::revision_working_bytes(revision))
+        })
+        .ok_or(AppendError::ResourceLimit("revision workspace bytes"))?;
+    let mut revision_remaining = super::merge_types::MAX_MERGE_WORKING_BYTES
+        .checked_sub(used)
+        .ok_or(AppendError::ResourceLimit("revision workspace bytes"))?;
     let known: BTreeMap<_, _> = base_projection
         .entries
         .iter()
@@ -492,6 +556,7 @@ async fn prepare_local<S: ObjectStore + ?Sized>(
                 &operation,
                 &frontier,
                 history,
+                &mut revision_remaining,
             )?;
         }
         directories.insert(path, entity);
@@ -579,6 +644,7 @@ async fn prepare_local<S: ObjectStore + ?Sized>(
             &operation,
             &frontier,
             history,
+            &mut revision_remaining,
         )?;
     }
     for entry in &base_projection.entries {
@@ -589,6 +655,7 @@ async fn prepare_local<S: ObjectStore + ?Sized>(
                 &operation,
                 &frontier,
                 history,
+                &mut revision_remaining,
             )?;
         }
     }
@@ -632,13 +699,86 @@ async fn prepare_local<S: ObjectStore + ?Sized>(
             PreparedObject::new(key, bytes),
         )?;
     }
+    let mut groups =
+        BTreeMap::<super::merge_types::EntityId, Vec<&super::merge_types::Revision>>::new();
+    for revision in history.values() {
+        groups
+            .entry(revision.entity.clone())
+            .or_default()
+            .push(revision);
+    }
+    let mut children = Vec::new();
+    let mut shard = Tree {
+        version: APPEND_VERSION,
+        repo_id: repository.repo_id().into(),
+        directory: "shard-0".into(),
+        entries: vec![],
+        children: vec![],
+        bindings: vec![],
+    };
+    let mut shard_size = 0usize;
+    for revisions in groups.values() {
+        let size = revisions
+            .iter()
+            .try_fold(0usize, |size, revision| {
+                size.checked_add(merge::revision_working_bytes(revision))
+            })
+            .ok_or(AppendError::ResourceLimit("entity history bytes"))?;
+        if !shard.entries.is_empty() && shard_size.saturating_add(size) > 1024 * 1024 {
+            stage_tree_shard(
+                repository,
+                index,
+                &operation,
+                &mut count,
+                &mut children,
+                shard,
+            )?;
+            shard = Tree {
+                version: APPEND_VERSION,
+                repo_id: repository.repo_id().into(),
+                directory: format!("shard-{}", children.len()),
+                entries: vec![],
+                children: vec![],
+                bindings: vec![],
+            };
+            shard_size = 0;
+        }
+        shard_size = shard_size.saturating_add(size);
+        for revision in revisions {
+            if let RevisionValue::Live {
+                node: Node::File(file),
+                ..
+            } = &revision.value
+            {
+                for block in &file.blocks {
+                    shard.bindings.push(
+                        bindings
+                            .get(&(block.id.clone(), block.len))
+                            .ok_or(AppendError::Invalid("shard block binding"))?
+                            .clone(),
+                    );
+                }
+            }
+            shard.entries.push((*revision).clone());
+        }
+    }
+    if !shard.entries.is_empty() {
+        stage_tree_shard(
+            repository,
+            index,
+            &operation,
+            &mut count,
+            &mut children,
+            shard,
+        )?;
+    }
     let tree = Tree {
         version: APPEND_VERSION,
         repo_id: repository.repo_id().into(),
         directory: "root".into(),
-        entries: history.values().cloned().collect(),
-        children: vec![],
-        bindings: bindings.values().cloned().collect(),
+        entries: vec![],
+        children,
+        bindings: vec![],
     };
     let (root, wire) = repository.seal_tree_owned(tree)?;
     cache_object(
@@ -727,7 +867,15 @@ pub async fn pull<S: ObjectStore + ?Sized>(
     cancel: Arc<AtomicBool>,
 ) -> Result<AppendEngineReport, AppendEngineError> {
     pull_or_run(
-        store, binding, password, index, request, cancel, false, false, &[],
+        store,
+        binding,
+        password,
+        index,
+        request,
+        cancel,
+        false,
+        false,
+        &[],
     )
     .await
 }
@@ -754,18 +902,38 @@ pub async fn run_with_deletion_policy<S: ObjectStore + ?Sized>(
     automatic: bool,
 ) -> Result<AppendEngineReport, AppendEngineError> {
     pull_or_run(
-        store, binding, password, index, request, cancel, true, automatic, &[],
+        store,
+        binding,
+        password,
+        index,
+        request,
+        cancel,
+        true,
+        automatic,
+        &[],
     )
     .await
 }
 
 pub async fn run_selected<S: ObjectStore + ?Sized>(
-    store: Arc<S>, binding: &TrustBinding, password: &[u8], index: &mut AppendIndex,
-    request: &AppendPullRequest<'_>, cancel: Arc<AtomicBool>, selection: &[String],
+    store: Arc<S>,
+    binding: &TrustBinding,
+    password: &[u8],
+    index: &mut AppendIndex,
+    request: &AppendPullRequest<'_>,
+    cancel: Arc<AtomicBool>,
+    selection: &[String],
 ) -> Result<AppendEngineReport, AppendEngineError> {
-    if selection.is_empty() || selection.len() > 1000 { return Err(AppendError::Input("selection").into()); }
-    for path in selection { super::namespace::components(path)?; }
-    pull_or_run(store, binding, password, index, request, cancel, true, false, selection).await
+    if selection.is_empty() || selection.len() > 1000 {
+        return Err(AppendError::Input("selection").into());
+    }
+    for path in selection {
+        super::namespace::components(path)?;
+    }
+    pull_or_run(
+        store, binding, password, index, request, cancel, true, false, selection,
+    )
+    .await
 }
 
 async fn pull_or_run<S: ObjectStore + ?Sized>(
@@ -814,9 +982,16 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
     };
     let base_projection = projection(&base, request.mapping)?;
     let pending = index.pending_epoch()?;
-    let resumed_selection = if selection.is_empty() { pending.as_ref().map(|epoch| epoch.selection.clone()) } else { None };
+    let resumed_selection = if selection.is_empty() {
+        pending.as_ref().map(|epoch| epoch.selection.clone())
+    } else {
+        None
+    };
     let selection = resumed_selection.as_deref().unwrap_or(selection);
-    if pending.as_ref().is_some_and(|epoch| epoch.selection != selection) {
+    if pending
+        .as_ref()
+        .is_some_and(|epoch| epoch.selection != selection)
+    {
         return Err(AppendEngineError::RecoveryPaused);
     }
     if automatic && pending.is_some() {
@@ -875,15 +1050,8 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
                     }
                     continue;
                 }
-                if revisions.len() >= super::merge_types::MAX_REVISIONS {
-                    return Err(AppendError::ResourceLimit("revisions").into());
-                }
                 revision_bytes = revision_bytes
-                    .checked_add(
-                        serde_json::to_vec(revision)
-                            .map_err(AppendError::from)?
-                            .len(),
-                    )
+                    .checked_add(merge::revision_working_bytes(revision))
                     .ok_or(AppendError::ResourceLimit("revision bytes"))?;
                 if revision_bytes > MAX_DISCOVERY_ALLOCATION {
                     return Err(AppendError::ResourceLimit("revision bytes").into());
@@ -942,9 +1110,10 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
                     return Err(AppendError::Invalid("revision body mismatch").into());
                 }
             } else {
-                if revisions.len() >= super::merge_types::MAX_REVISIONS {
-                    return Err(AppendError::ResourceLimit("revisions").into());
-                }
+                revision_bytes = revision_bytes
+                    .checked_add(merge::revision_working_bytes(revision))
+                    .filter(|bytes| *bytes <= super::merge_types::MAX_MERGE_WORKING_BYTES)
+                    .ok_or(AppendError::ResourceLimit("revision workspace bytes"))?;
                 revisions.insert(id.clone(), revision.clone());
             }
         }
@@ -1013,23 +1182,67 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
         })?;
         if !selection.is_empty() {
             let full = projection(&revisions, request.mapping)?;
-            let chosen = full.entries.iter().chain(base_projection.entries.iter()).filter(|entry| selected_path(&entry.logical_path.join("/"), selection) || selected_path(&entry.projection_path.join("/"), selection)).map(|entry| entry.entity.clone()).collect::<BTreeSet<_>>();
-            let ancestor_paths = selection.iter().flat_map(|path| {
-                let parts = path.split('/').collect::<Vec<_>>();
-                (1..parts.len()).map(move |n| parts[..n].join("/"))
-            }).collect::<BTreeSet<_>>();
-            let ancestors = full.entries.iter().filter(|entry| ancestor_paths.contains(&entry.logical_path.join("/"))).map(|entry| entry.entity.clone()).collect::<BTreeSet<_>>();
+            let chosen = full
+                .entries
+                .iter()
+                .chain(base_projection.entries.iter())
+                .filter(|entry| {
+                    selected_path(&entry.logical_path.join("/"), selection)
+                        || selected_path(&entry.projection_path.join("/"), selection)
+                })
+                .map(|entry| entry.entity.clone())
+                .collect::<BTreeSet<_>>();
+            let ancestor_paths = selection
+                .iter()
+                .flat_map(|path| {
+                    let parts = path.split('/').collect::<Vec<_>>();
+                    (1..parts.len()).map(move |n| parts[..n].join("/"))
+                })
+                .collect::<BTreeSet<_>>();
+            let ancestors = full
+                .entries
+                .iter()
+                .filter(|entry| ancestor_paths.contains(&entry.logical_path.join("/")))
+                .map(|entry| entry.entity.clone())
+                .collect::<BTreeSet<_>>();
             let prefix = super::namespace::components(request.mapping)?;
-            let anchors = (1..=prefix.len()).map(|n| super::namespace::entity(&prefix[..n])).collect::<BTreeSet<_>>();
-            let mut retained = chosen.union(&ancestors).cloned().chain(anchors).chain(base.values().map(|revision| revision.entity.clone())).collect::<BTreeSet<_>>();
+            let anchors = (1..=prefix.len())
+                .map(|n| super::namespace::entity(&prefix[..n]))
+                .collect::<BTreeSet<_>>();
+            let mut retained = chosen
+                .union(&ancestors)
+                .cloned()
+                .chain(anchors)
+                .chain(base.values().map(|revision| revision.entity.clone()))
+                .collect::<BTreeSet<_>>();
             loop {
-                let parents = revisions.values().filter(|revision| retained.contains(&revision.entity)).filter_map(|revision| match &revision.value { RevisionValue::Live { parent_dir, .. } if parent_dir.0 != "root" => Some(parent_dir.clone()), _ => None }).collect::<Vec<_>>();
+                let parents = revisions
+                    .values()
+                    .filter(|revision| retained.contains(&revision.entity))
+                    .filter_map(|revision| match &revision.value {
+                        RevisionValue::Live { parent_dir, .. } if parent_dir.0 != "root" => {
+                            Some(parent_dir.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
                 let before = retained.len();
                 retained.extend(parents);
-                if retained.len() == before { break; }
+                if retained.len() == before {
+                    break;
+                }
             }
-            let known_entities = base.values().map(|revision| revision.entity.clone()).collect::<BTreeSet<_>>();
-            revisions.retain(|id, revision| base.contains_key(id) || retained.contains(&revision.entity) && !known_entities.contains(&revision.entity) || chosen.contains(&revision.entity) || ancestors.contains(&revision.entity));
+            let known_entities = base
+                .values()
+                .map(|revision| revision.entity.clone())
+                .collect::<BTreeSet<_>>();
+            revisions.retain(|id, revision| {
+                base.contains_key(id)
+                    || retained.contains(&revision.entity)
+                        && !known_entities.contains(&revision.entity)
+                    || chosen.contains(&revision.entity)
+                    || ancestors.contains(&revision.entity)
+            });
             merge::validate(&revisions)?;
         }
         let epoch = LocalEpoch {
@@ -1066,12 +1279,46 @@ async fn pull_or_run<S: ObjectStore + ?Sized>(
     if !selection.is_empty() {
         // Unselected local paths participate only in strict verification, never
         // in remote history or publication. Existing bytes must remain intact.
-        use super::merge_types::{EntityId, RevisionId, ProjectionEntry, FileNode};
-        for file in current_scan.files.iter().filter(|file| !selected_path(&file.path, selection)) {
-            apply_target.entries.push(ProjectionEntry { entity: EntityId(format!("local:{}", file.path)), version: RevisionId("local-only".into()), logical_path: file.path.split('/').map(str::to_owned).collect(), projection_path: file.path.split('/').map(str::to_owned).collect(), value: RevisionValue::Live { parent_dir: EntityId("root".into()), name: file.path.clone(), node: Node::File(FileNode { blocks: vec![], length: file.size, digest: file.whole_file_hash.clone() }) }, conflict: false });
+        use super::merge_types::{EntityId, FileNode, ProjectionEntry, RevisionId};
+        for file in current_scan
+            .files
+            .iter()
+            .filter(|file| !selected_path(&file.path, selection))
+        {
+            apply_target.entries.push(ProjectionEntry {
+                entity: EntityId(format!("local:{}", file.path)),
+                version: RevisionId("local-only".into()),
+                logical_path: file.path.split('/').map(str::to_owned).collect(),
+                projection_path: file.path.split('/').map(str::to_owned).collect(),
+                value: RevisionValue::Live {
+                    parent_dir: EntityId("root".into()),
+                    name: file.path.clone(),
+                    node: Node::File(FileNode {
+                        blocks: vec![],
+                        length: file.size,
+                        digest: file.whole_file_hash.clone(),
+                    }),
+                },
+                conflict: false,
+            });
         }
-        for path in current_scan.directories.iter().filter(|path| !path.is_empty() && !selected_path(path, selection)) {
-            apply_target.entries.push(ProjectionEntry { entity: EntityId(format!("local:{path}")), version: RevisionId("local-only".into()), logical_path: path.split('/').map(str::to_owned).collect(), projection_path: path.split('/').map(str::to_owned).collect(), value: RevisionValue::Live { parent_dir: EntityId("root".into()), name: path.clone(), node: Node::Dir }, conflict: false });
+        for path in current_scan
+            .directories
+            .iter()
+            .filter(|path| !path.is_empty() && !selected_path(path, selection))
+        {
+            apply_target.entries.push(ProjectionEntry {
+                entity: EntityId(format!("local:{path}")),
+                version: RevisionId("local-only".into()),
+                logical_path: path.split('/').map(str::to_owned).collect(),
+                projection_path: path.split('/').map(str::to_owned).collect(),
+                value: RevisionValue::Live {
+                    parent_dir: EntityId("root".into()),
+                    name: path.clone(),
+                    node: Node::Dir,
+                },
+                conflict: false,
+            });
         }
     }
     let records = index.engine_apply_records(&epoch.id)?;

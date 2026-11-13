@@ -8,8 +8,17 @@ use std::{
 };
 use tokio::sync::{Mutex, Notify};
 
-pub const MAX_DOWNLOAD_ITEMS: usize = 10_000;
+pub const DOWNLOAD_WORKING_SET: usize = 128;
 pub const MAX_DOWNLOAD_DEPTH: usize = 64;
+
+/// Private disk spool: task cardinality is not a resident-memory budget.
+/// The temporary directory owns the database and is removed on queue release.
+pub struct DownloadSpool {
+    pub(crate) connection: rusqlite::Connection,
+    pub(crate) count: usize,
+    pub(crate) key: zeroize::Zeroizing<[u8; 32]>,
+    pub(crate) _directory: tempfile::TempDir,
+}
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum ConflictResolution {
@@ -41,7 +50,7 @@ pub enum DownloadSelection {
     Files { #[serde(rename = "ids")] paths: Vec<String> },
     Folder { #[serde(rename = "id")] path: String },
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadItem {
     pub is_dir: bool,
@@ -85,7 +94,9 @@ pub struct DownloadPage {
 }
 pub(crate) struct DownloadQueue {
     pub status: DownloadStatus,
+    pub spool: DownloadSpool,
     pub items: Vec<DownloadItem>,
+    pub offset: usize,
     pub root: Arc<crate::cloud::PhysicalRoot>,
     pub adapter: Arc<dyn crate::traits::TransferQueueAdapter>,
     /// 当前文件已传输字节。同步进度回调只能原子写入，`status()` 读取时再落到 DTO。

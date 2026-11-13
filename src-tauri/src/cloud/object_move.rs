@@ -321,7 +321,7 @@ mod tests {
             bucket: Some(bucket.into()), connection_id: connection.id.clone(),
             mode: crate::sync::append_types::AppendMode::Encrypted,
             password: "password 123".into(), password_confirmation: "password 123".into(),
-            local_root: Some(local.path().to_string_lossy().into_owned()), logical_path: Some("documents".into()),
+            local_root: Some(local.path().to_string_lossy().into_owned()), logical_path: Some("documents".into()), schedule: Default::default(),
         }).await.expect_err("overlap must be rejected before the remote anchor");
         assert!(overlap.message.contains("mapping overlaps"), "{overlap:?}");
         assert_eq!(runtime.config.snapshot().expect("snapshot").append_repositories.len(), before, "no orphan repository");
@@ -330,7 +330,7 @@ mod tests {
             bucket: Some(bucket.into()), connection_id: connection.id,
             mode: crate::sync::append_types::AppendMode::Encrypted,
             password: "password 123".into(), password_confirmation: "password 123".into(),
-            local_root: Some(fresh.path().to_string_lossy().into_owned()), logical_path: Some("fresh".into()),
+            local_root: Some(fresh.path().to_string_lossy().into_owned()), logical_path: Some("fresh".into()), schedule: Default::default(),
         }).await.expect("create non-overlapping sync drive");
         assert!(!created_drive.binding.repo_id.is_empty());
         assert!(runtime.config.snapshot().expect("snapshot").append_repositories.len() > before);

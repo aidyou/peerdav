@@ -191,6 +191,20 @@ mod tests {
         let reserved = backend.select_upload(&peers, &runtime, String::new(), vec![reserved_folder], UploadMode::Folder, Default::default()).await.expect_err("ordinary upload cannot create sync namespace");
         assert_eq!(reserved.code, "FILE_CAPABILITY_UNAVAILABLE");
         assert!(backend.uploads.lock().await.is_empty());
+        let folder = data.path().join("large-upload");
+        std::fs::create_dir(&folder).expect("folder");
+        for i in 0..300 { std::fs::write(folder.join(format!("file-{i}")), b"x").expect("file"); }
+        let FileUploadDto::Cloud(streamed) = backend.select_upload(&peers, &runtime, String::new(), vec![folder], UploadMode::Folder, Default::default()).await.expect("folder beyond old 256 file limit") else { panic!("cloud queue") };
+        assert_eq!(streamed.total_files, 0, "total grows as traversal discovers files");
+        {
+            let jobs = backend.uploads.lock().await;
+            let job = &jobs[&streamed.batch_id];
+            assert!(job.files.is_empty() && job.walk.is_some(), "do not retain all file handles");
+        }
+        let page = backend.upload_page(&peers, &runtime, &streamed.batch_id, None, None, Some(100)).await.expect("bounded folder page");
+        assert_eq!(page.entries.len(), 100);
+        assert!(page.next_cursor.is_some());
+        backend.release_upload(&peers, &runtime, &streamed.batch_id).await.expect("release streaming selection");
         let file = data.path().join("a.txt"); std::fs::write(&file, "abc").expect("file");
         let FileUploadDto::Cloud(selected) = backend.select_upload(&peers, &runtime, String::new(), vec![file], UploadMode::Files, Default::default()).await.expect("select offline") else { panic!("cloud queue") };
         assert_eq!(selected.phase, "selected");
@@ -223,11 +237,11 @@ mod tests {
         std::fs::create_dir(tree.join("empty")).expect("empty directory");
         std::fs::write(tree.join("nested/b.txt"), "payload").expect("nested file");
         let FileUploadDto::Cloud(folder) = backend.select_upload(&peers, &runtime, String::new(), vec![tree], UploadMode::Folder, Default::default()).await.expect("folder selection") else { panic!("cloud queue") };
-        assert_eq!(folder.skipped_empty_directories, 1);
+        assert_eq!(folder.skipped_empty_directories, 0, "not scanned until start");
         let page = backend.upload_page(&peers, &runtime, &folder.batch_id, None, None, None).await.expect("folder page");
-        assert_eq!(page.entries.len(), 1);
-        assert_eq!(page.entries[0].relative_path, "tree/nested");
-        assert_eq!(page.entries[0].kind, "directory");
+        assert_eq!(page.entries.len(), 2);
+        assert!(page.entries.iter().any(|entry| entry.relative_path == "tree/nested" && entry.kind == "directory"));
+        assert!(page.entries.iter().any(|entry| entry.relative_path == "tree/empty" && entry.kind == "directory"));
         backend.release_upload(&peers, &runtime, &folder.batch_id).await.expect("release folder");
         let file = data.path().join("a.txt");
         let FileUploadDto::Cloud(pending) = backend.select_upload(&peers, &runtime, String::new(), vec![file], UploadMode::Files, Default::default()).await.expect("select before sync") else { panic!("cloud queue") };
@@ -586,21 +600,14 @@ impl BrowserBackend for OfficialBrowserBackend {
             if self.uploads.lock().await.len() >= 4 { return Err(listing_limit()); }
             let parent = if path.is_empty() { self.root_id.clone() } else { self.directories.lock().await.get(&path).cloned().ok_or_else(super::service::invalid)? };
             let folder = matches!(mode, UploadMode::Folder);
-            let (files, root_name, skipped_symlinks, skipped_empty_directories) = tokio::task::spawn_blocking(move || {
-                if !folder { return crate::local_upload::open_selected_files(paths).map(|(files, _)| (files, String::new(), 0, 0)); }
+            let (files, root_name, walk, browser) = tokio::task::spawn_blocking(move || {
+                if !folder { return crate::local_upload::open_selected_files(paths).map(|(files, _)| (files, String::new(), None, None)); }
                 if paths.len() != 1 { return Err(super::service::invalid()); }
                 let name = paths[0].file_name().and_then(|n| n.to_str()).ok_or_else(super::service::invalid)?.to_owned();
                 let root = crate::cloud::PhysicalRoot::open(&paths[0]).map_err(|e| AppError::from(crate::DomainError::from(e)))?;
-                let mut walk = crate::local_upload_types::DirectoryWalk::with_options(root.upload_directory_handle().map_err(|e| AppError::from(crate::DomainError::from(e)))?, name.clone(), Some(options))?;
-                let mut files = Vec::new();
-                let mut scans = 0usize;
-                while !walk.stack.is_empty() {
-                    scans += 1;
-                    if scans > 10_000 { return Err(listing_limit()); }
-                    if let Some(file) = walk.next_chunk()? { files.push(file); }
-                    if files.len() > 256 { return Err(super::service::invalid()); }
-                }
-                Ok((files, name, walk.skipped_symlinks, walk.skipped_empty_directories))
+                let walk = crate::local_upload_types::DirectoryWalk::with_options(root.upload_directory_handle().map_err(|e| AppError::from(crate::DomainError::from(e)))?, name.clone(), Some(options))?;
+                let browser = crate::local_upload_types::DirectoryBrowser::new(root.upload_directory_handle().map_err(|e| AppError::from(crate::DomainError::from(e)))?, name.clone())?;
+                Ok((Vec::new(), name, Some(walk), Some(browser)))
             }).await.map_err(|e| AppError::from(crate::DomainError::Internal { detail: e.to_string() }))??;
             self.admit(peers, cloud).await?;
             if matches!(root_name.as_str(), "_peerdav_encrypt" | "_peerdav_mirror") || files.iter().any(|file| matches!(file.relative.split('/').next(), Some("_peerdav_encrypt" | "_peerdav_mirror"))) { return Err(super::service::unavailable()); }
@@ -609,7 +616,7 @@ impl BrowserBackend for OfficialBrowserBackend {
                 if file.size > crate::types::MAX_TRANSFER_BYTES { return Err(crate::DomainError::TransferTooLarge { size: file.size, limit: crate::types::MAX_TRANSFER_BYTES }.into()); }
             }
             let id = crate::local_upload::token()?;
-            let status = crate::cloud::directory_types::ObjectUploadDirectoryDto { batch_id: id.clone(), queue_id: id.clone(), connection_id: self.connection_id.clone(), connection_revision: self.revision, bucket: self.root_id.clone(), prefix: path, root_name, phase: "selected".into(), current_relative_path: None, completed_files: 0, completed_bytes: 0, total_files: files.len() as u64, skipped_files: 0, skipped_symlinks, skipped_empty_directories, conflict: None, error: None, recovery_required: false };
+            let status = crate::cloud::directory_types::ObjectUploadDirectoryDto { batch_id: id.clone(), queue_id: id.clone(), connection_id: self.connection_id.clone(), connection_revision: self.revision, bucket: self.root_id.clone(), prefix: path, root_name, phase: "selected".into(), current_relative_path: None, completed_files: 0, completed_bytes: 0, total_files: files.len() as u64, skipped_files: 0, skipped_symlinks: 0, skipped_empty_directories: 0, conflict: None, error: None, recovery_required: false };
             let mut jobs = self.uploads.lock().await;
             if jobs.len() >= 4 { return Err(super::service::invalid()); }
             let mut listed = std::collections::BTreeMap::new();
@@ -622,7 +629,7 @@ impl BrowserBackend for OfficialBrowserBackend {
             }
             let page = crate::local_upload_types::DirectoryPageDto { directory_token: id.clone(), parent_token: None, relative_path: status.root_name.clone(), entries: listed.into_values().collect(), next_cursor: None };
             let entry_states = files.iter().map(|file| (file.relative.clone(), ("selected".into(), 0, file.size))).collect();
-            jobs.insert(id, OfficialUploadJob { entry_states, progress: Default::default(), decision: Default::default(), resolution: None, page, parent, files, status: status.clone(), cancel: cloud.vault.transfer_cancellation().map_err(AppError::from)?.child_token(), handle: None });
+            jobs.insert(id, OfficialUploadJob { entry_states, progress: Default::default(), decision: Default::default(), resolution: None, page, parent, files, walk, browser, status: status.clone(), cancel: cloud.vault.transfer_cancellation().map_err(AppError::from)?.child_token(), handle: None });
             Ok(FileUploadDto::Cloud(status))
         })
     }

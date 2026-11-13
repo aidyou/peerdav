@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 use super::crypto::{CryptoError, RepositoryKeys};
 use super::repository_types::{
     Head, MAX_BLOCK_SIZE, MAX_HEAD_SIZE, MAX_METADATA_SIZE, RepoDescriptor, RepositoryMode,
-    WireError, WrappedMaster, decode, decode_head, encode, encode_head, hex_exact,
+    WireError, WrappedMaster, decode_head, encode_head, hex_exact,
 };
 use crate::cloud::traits::ObjectStore;
 use crate::cloud::types::{CloudError, ObjectStream, PutCondition, StorageCapabilities};
@@ -18,8 +18,8 @@ const PROBE_PREFIX: &str = "probes/";
 const BLOCK_PREFIX: &str = "blocks/";
 const TREE_PREFIX: &str = "trees/";
 const COMMIT_PREFIX: &str = "commits/";
-const BLOCK_WIRE_LIMIT: usize = 2 * (MAX_BLOCK_SIZE + 16) + 4096;
-const METADATA_WIRE_LIMIT: usize = 2 * (MAX_METADATA_SIZE + 16) + 4096;
+const BLOCK_WIRE_LIMIT: usize = MAX_BLOCK_SIZE + super::repository_types::OBJECT_WIRE_OVERHEAD;
+const METADATA_WIRE_LIMIT: usize = MAX_METADATA_SIZE + super::repository_types::OBJECT_WIRE_OVERHEAD;
 
 #[derive(Debug, Error)]
 pub enum RepositoryError {
@@ -363,13 +363,13 @@ impl Repository {
     }
     fn encode_block(&self, p: &[u8]) -> Result<Vec<u8>, RepositoryError> {
         match self.keys.as_ref() {
-            Some(k) => Ok(encode(&k.seal_block(p)?, BLOCK_WIRE_LIMIT)?),
+            Some(k) => Ok(k.seal_block(p)?.to_wire()?),
             None => Ok(p.to_vec()),
         }
     }
     fn decode_block(&self, b: &[u8], id: &[u8; 32]) -> Result<Zeroizing<Vec<u8>>, RepositoryError> {
         match self.keys.as_ref() {
-            Some(k) => Ok(k.open_block(&decode(b, BLOCK_WIRE_LIMIT)?)?),
+            Some(k) => Ok(k.open_block(&super::repository_types::Envelope::from_wire(b)?)?),
             None => {
                 if b.len() > MAX_BLOCK_SIZE {
                     return Err(RepositoryError::Corrupt("block too large"));
@@ -383,13 +383,13 @@ impl Repository {
     }
     fn encode_metadata(&self, kind: &str, p: &[u8]) -> Result<Vec<u8>, RepositoryError> {
         match self.keys.as_ref() {
-            Some(k) => Ok(encode(&k.seal_metadata(kind, p)?, METADATA_WIRE_LIMIT)?),
+            Some(k) => Ok(k.seal_metadata(kind, p)?.to_wire()?),
             None => Ok(p.to_vec()),
         }
     }
     fn decode_metadata(&self, kind: &str, b: &[u8]) -> Result<Zeroizing<Vec<u8>>, RepositoryError> {
         match self.keys.as_ref() {
-            Some(k) => Ok(k.open_metadata(&decode(b, METADATA_WIRE_LIMIT)?, kind)?),
+            Some(k) => Ok(k.open_metadata(&super::repository_types::Envelope::from_wire(b)?, kind)?),
             None => {
                 if b.len() > MAX_METADATA_SIZE {
                     Err(RepositoryError::Corrupt("metadata too large"))

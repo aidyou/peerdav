@@ -382,18 +382,31 @@ mod tests {
             for response in [
                 "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"probe\"\r\nConnection: close\r\n\r\n",
                 "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n<DeleteResult/>",
             ] {
                 let (mut socket, _) = listener.accept().await.expect("accept");
                 let mut bytes = Vec::new();
                 while !bytes.ends_with(b"\r\n\r\n") { bytes.push(socket.read_u8().await.expect("header")); }
                 let request = String::from_utf8(bytes).expect("request");
-                assert!(request.lines().next().expect("line").contains("/owned/probes/"));
+                let cleanup = request.starts_with("POST /fixture?delete ");
+                assert!(cleanup || request.lines().next().expect("line").contains("/owned/probes/"), "{request}");
                 let length = request.lines().find_map(|line| {
                     let (name, value) = line.split_once(':')?;
                     name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().expect("length"))
                 }).unwrap_or(0);
-                socket.read_exact(&mut vec![0; length]).await.expect("body");
-                socket.write_all(response.as_bytes()).await.expect("response");
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.expect("body");
+                if cleanup {
+                    let body = String::from_utf8(body).expect("cleanup XML");
+                    assert!(body.contains("owned/probes/") && body.contains("conditional-delete"), "{body}");
+                    assert!(!body.contains("keep.png") && !body.contains("keep2.png"));
+                    let key = body.split("<Key>").nth(1).expect("key").split("</Key>").next().expect("key end");
+                    let xml = format!("<DeleteResult><Deleted><Key>{key}</Key></Deleted></DeleteResult>");
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}", xml.len());
+                    socket.write_all(response.as_bytes()).await.expect("cleanup response");
+                } else {
+                    socket.write_all(response.as_bytes()).await.expect("response");
+                }
             }
             assert!(timeout(Duration::from_millis(100), listener.accept()).await.is_err(), "must not delete user object");
         });
@@ -403,7 +416,8 @@ mod tests {
             buckets: vec![], allow_insecure_http: true, proxy: ProxyMode::Direct,
         }).expect("store");
         for key in ["图片/keep.png", "图片/keep2.png"] {
-            assert!(matches!(store.delete_if_match(key, "\"revision\"").await, Err(CloudError::Unsupported)));
+            let result = store.delete_if_match(key, "\"revision\"").await;
+            assert!(matches!(result, Err(CloudError::Unsupported)), "{result:?}");
         }
         timeout(Duration::from_secs(5), server).await.expect("timeout").expect("server");
     }

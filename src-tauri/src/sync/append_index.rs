@@ -20,11 +20,15 @@ mod run_budget_tests {
     use super::*;
 
     #[test]
-    fn engine_binary_chunks_reopen_at_legal_block_limit_and_read_legacy() -> Result<(), Box<dyn std::error::Error>> {
+    fn engine_binary_chunks_reopen_at_legal_block_limit_and_read_legacy()
+    -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("index");
         let mut index = AppendIndex::open(&path, Zeroizing::new([7; 32]), "binary-test".into())?;
-        let object = PreparedObject::new("block/key".into(), vec![255; super::super::append_types::MAX_BLOCK_SIZE + 1024]);
+        let object = PreparedObject::new(
+            "block/key".into(),
+            vec![255; super::super::append_types::MAX_BLOCK_SIZE + 1024],
+        );
         index.cache_engine_object("run", 0, &object)?;
         let old = PreparedObject::new("old/key".into(), vec![1, 2, 3]);
         let tx = Transaction::new_unchecked(&index.connection, TransactionBehavior::Immediate)?;
@@ -56,8 +60,14 @@ mod run_budget_tests {
         assert_eq!(index.discovery_budget(&metadata)?.allocation_bytes, 0);
         index.save_discovery_budget(&metadata, &exhausted)?;
         assert_eq!(index.begin_run("preview-metadata-v1", "retry")?, metadata);
-        assert_eq!(index.discovery_budget(&metadata)?.allocation_bytes, exhausted.allocation_bytes);
-        assert_eq!(index.discovery_budget(&legacy)?.allocation_bytes, exhausted.allocation_bytes);
+        assert_eq!(
+            index.discovery_budget(&metadata)?.allocation_bytes,
+            exhausted.allocation_bytes
+        );
+        assert_eq!(
+            index.discovery_budget(&legacy)?.allocation_bytes,
+            exhausted.allocation_bytes
+        );
         Ok(())
     }
 
@@ -73,15 +83,29 @@ mod run_budget_tests {
             "allocation_bytes": super::super::append_types::MAX_DISCOVERY_ALLOCATION
         });
         let tx = Transaction::new_unchecked(&index.connection, TransactionBehavior::Immediate)?;
-        index.write_raw_tx(&tx, "discovery-budget", "operation", &serde_json::to_vec(&old)?)?;
-        tx.execute("INSERT INTO append_ledger(scope,name,used,reserved) VALUES(?1,?2,?3,?3)",
-            params![&index.scope, "discover:9:operation:staging", super::super::append_types::MAX_DISCOVERY_ALLOCATION as i64])?;
+        index.write_raw_tx(
+            &tx,
+            "discovery-budget",
+            "operation",
+            &serde_json::to_vec(&old)?,
+        )?;
+        tx.execute(
+            "INSERT INTO append_ledger(scope,name,used,reserved) VALUES(?1,?2,?3,?3)",
+            params![
+                &index.scope,
+                "discover:9:operation:staging",
+                super::super::append_types::MAX_DISCOVERY_ALLOCATION as i64
+            ],
+        )?;
         tx.commit()?;
         assert_eq!(index.begin_run("engine", "operation")?, "operation");
         let mut migrated = index.discovery_budget("operation")?;
         assert_eq!(migrated.accounting_version, 2);
         assert_eq!(migrated.allocation_bytes, 0);
-        assert_eq!(migrated.legacy_allocation_bytes, super::super::append_types::MAX_DISCOVERY_ALLOCATION);
+        assert_eq!(
+            migrated.legacy_allocation_bytes,
+            super::super::append_types::MAX_DISCOVERY_ALLOCATION
+        );
         assert_eq!(migrated.requests, 23);
         assert_eq!(migrated.bytes_read, 123456);
         assert_eq!(migrated.tree_plaintext, 4567);
@@ -93,10 +117,18 @@ mod run_budget_tests {
         assert_eq!(index.begin_run("engine", "new-attempt")?, "operation");
         let legacy_ledger: i64 = index.connection.query_row(
             "SELECT used FROM append_ledger WHERE scope=?1 AND name=?2",
-            params![&index.scope, "discover:9:operation:staging"], |row| row.get(0))?;
-        assert_eq!(legacy_ledger, super::super::append_types::MAX_DISCOVERY_ALLOCATION as i64);
+            params![&index.scope, "discover:9:operation:staging"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            legacy_ledger,
+            super::super::append_types::MAX_DISCOVERY_ALLOCATION as i64
+        );
         assert_eq!(retried.allocation_bytes, 4096);
-        assert_eq!(retried.legacy_allocation_bytes, migrated.legacy_allocation_bytes);
+        assert_eq!(
+            retried.legacy_allocation_bytes,
+            migrated.legacy_allocation_bytes
+        );
         assert_eq!(retried.requests, 23);
         retried.allocation_bytes = 4095;
         assert!(index.save_discovery_budget("operation", &retried).is_err());
@@ -484,7 +516,8 @@ impl AppendIndex {
     }
 
     pub fn discovery_budget(&self, operation: &str) -> Result<DiscoveryBudget, IndexError> {
-        let mut budget: DiscoveryBudget = self.read_raw("discovery-budget", operation)?
+        let mut budget: DiscoveryBudget = self
+            .read_raw("discovery-budget", operation)?
             .map(|b| serde_json::from_slice(&b).map_err(IndexError::Serialization))
             .transpose()?
             .unwrap_or_default();
@@ -666,7 +699,10 @@ impl AppendIndex {
         objects: &[PreparedObject],
     ) -> Result<(), IndexError> {
         self.freeze_publication_source(frozen, |_, i| {
-            objects.get(i).cloned().ok_or_else(|| IndexError::invalid_record())
+            objects
+                .get(i)
+                .cloned()
+                .ok_or_else(|| IndexError::invalid_record())
         })
     }
 
@@ -733,8 +769,12 @@ impl AppendIndex {
         ordinal: usize,
     ) -> Result<Vec<u8>, IndexError> {
         use sha2::Digest;
-        let object = op.objects.get(ordinal).ok_or_else(|| IndexError::invalid_record())?;
-        if object.len > 2 * (super::append_types::MAX_METADATA_SIZE + 16) + 4096
+        let object = op
+            .objects
+            .get(ordinal)
+            .ok_or_else(|| IndexError::invalid_record())?;
+        if object.len
+            > super::append_types::MAX_METADATA_SIZE + super::repository_types::OBJECT_WIRE_OVERHEAD
             || object.chunks != object.len.div_ceil(MAX_CHUNK)
         {
             return Err(IndexError::invalid_record());
@@ -840,14 +880,15 @@ impl AppendIndex {
         &self,
         epoch: &super::append_engine_types::LocalEpoch,
     ) -> Result<super::merge_types::RevisionMap, IndexError> {
-        if epoch.revision_count > super::merge_types::MAX_REVISIONS {
-            return Err(IndexError::invalid_record());
-        }
+        let mut remaining = super::merge_types::MAX_MERGE_WORKING_BYTES;
         let mut out = super::merge_types::RevisionMap::new();
         for i in 0..epoch.revision_count {
             let revision: super::merge_types::Revision = self
                 .engine_record("revision", &format!("{}:{i}", epoch.id))?
                 .ok_or_else(|| IndexError::invalid_record())?;
+            remaining = remaining
+                .checked_sub(super::merge::revision_working_bytes(&revision))
+                .ok_or_else(IndexError::invalid_record)?;
             if out.insert(revision.revision_id.clone(), revision).is_some() {
                 return Err(IndexError::invalid_record());
             }
@@ -921,7 +962,9 @@ impl AppendIndex {
         intent: &super::apply_types::ApplyIntent,
     ) -> Result<(), IndexError> {
         use sha2::Digest;
-        let pending = self.pending_epoch()?.ok_or_else(|| IndexError::invalid_record())?;
+        let pending = self
+            .pending_epoch()?
+            .ok_or_else(|| IndexError::invalid_record())?;
         if pending.id != operation {
             return Err(IndexError::invalid_record());
         }
@@ -946,7 +989,7 @@ impl AppendIndex {
         after: &str,
         limit: usize,
     ) -> Result<Vec<String>, IndexError> {
-        if limit == 0 || limit > super::merge_types::MAX_ENTITIES {
+        if limit == 0 || limit > super::merge_types::MAX_RECOVERY_PAGE {
             return Err(IndexError::invalid_record());
         }
         let mut query = self.connection.prepare("SELECT name FROM append_records WHERE scope=?1 AND (kind='engine-apply' OR kind='engine-apply-completed') AND name>?2 ORDER BY name LIMIT ?3")?;
@@ -1013,14 +1056,22 @@ impl AppendIndex {
             row.get::<_, String>(0)
         })?;
         let mut out = Vec::new();
+        let mut remaining = super::merge_types::MAX_MERGE_WORKING_BYTES;
         for row in rows {
-            if out.len() >= super::merge_types::MAX_ENTITIES {
-                return Err(IndexError::invalid_record());
-            }
             let id = row?;
-            let intent = self
+            let intent: super::apply_types::ApplyIntent = self
                 .engine_record("apply", &id)?
                 .ok_or_else(|| IndexError::invalid_record())?;
+            let bytes = std::mem::size_of::<super::apply_types::ApplyIntent>()
+                .saturating_add(id.len())
+                .saturating_add(intent.op_id.len())
+                .saturating_add(intent.relative_target.as_os_str().len())
+                .saturating_add(intent.recovery_path.as_os_str().len())
+                .saturating_add(intent.staging_path.as_os_str().len())
+                .saturating_add(256);
+            remaining = remaining
+                .checked_sub(bytes)
+                .ok_or_else(IndexError::invalid_record)?;
             out.push((id, intent));
         }
         Ok(out)
@@ -1032,7 +1083,9 @@ impl AppendIndex {
         &mut self,
         epoch: &super::append_engine_types::LocalEpoch,
     ) -> Result<(), IndexError> {
-        let pending = self.pending_epoch()?.ok_or_else(|| IndexError::invalid_record())?;
+        let pending = self
+            .pending_epoch()?
+            .ok_or_else(|| IndexError::invalid_record())?;
         if pending.id != epoch.id
             || pending.sequence != epoch.sequence
             || pending.frontier != epoch.frontier
@@ -1078,8 +1131,12 @@ impl AppendIndex {
         for (part, bytes) in object.bytes().chunks(MAX_CHUNK).enumerate() {
             self.write_raw_tx(&tx, "engine-object-part", &format!("{name}:{part}"), bytes)?;
         }
-        self.write_raw_tx(&tx, "engine-object-v2", &name,
-            &serde_json::to_vec(&(object.key(), object.bytes().len(), chunks))?)?;
+        self.write_raw_tx(
+            &tx,
+            "engine-object-v2",
+            &name,
+            &serde_json::to_vec(&(object.key(), object.bytes().len(), chunks))?,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1092,18 +1149,31 @@ impl AppendIndex {
         let name = format!("{run}:{ordinal}");
         if let Some(record) = self.read_raw("engine-object-v2", &name)? {
             let (key, len, chunks): (String, usize, usize) = serde_json::from_slice(&record)?;
-            if len > 2 * (super::append_types::MAX_METADATA_SIZE + 16) + 4096 || chunks != len.div_ceil(MAX_CHUNK) { return Err(IndexError::invalid_record()); }
+            if len
+                > super::append_types::MAX_METADATA_SIZE
+                    + super::repository_types::OBJECT_WIRE_OVERHEAD
+                || chunks != len.div_ceil(MAX_CHUNK)
+            {
+                return Err(IndexError::invalid_record());
+            }
             let mut bytes = Vec::with_capacity(len);
             for part in 0..chunks {
-                let data = self.read_raw("engine-object-part", &format!("{name}:{part}"))?.ok_or_else(|| IndexError::invalid_record())?;
-                if data.len() > MAX_CHUNK || bytes.len().saturating_add(data.len()) > len { return Err(IndexError::invalid_record()); }
+                let data = self
+                    .read_raw("engine-object-part", &format!("{name}:{part}"))?
+                    .ok_or_else(|| IndexError::invalid_record())?;
+                if data.len() > MAX_CHUNK || bytes.len().saturating_add(data.len()) > len {
+                    return Err(IndexError::invalid_record());
+                }
                 bytes.extend_from_slice(&data);
             }
-            if bytes.len() != len { return Err(IndexError::invalid_record()); }
+            if bytes.len() != len {
+                return Err(IndexError::invalid_record());
+            }
             return Ok(PreparedObject::new(key, bytes));
         }
         // Frozen/retry operations created by older versions remain readable.
-        self.engine_record("object", &name)?.ok_or_else(|| IndexError::invalid_record())
+        self.engine_record("object", &name)?
+            .ok_or_else(|| IndexError::invalid_record())
     }
 
     pub fn reserve(&mut self, name: &str, amount: u64, limit: u64) -> Result<(), IndexError> {
@@ -1120,7 +1190,9 @@ impl AppendIndex {
         if used < 0 || reserved < 0 {
             return Err(IndexError::invalid_record());
         }
-        let next_used = used.checked_add(amount).ok_or_else(|| IndexError::invalid_record())?;
+        let next_used = used
+            .checked_add(amount)
+            .ok_or_else(|| IndexError::invalid_record())?;
         let next_reserved = reserved
             .checked_add(amount)
             .ok_or_else(|| IndexError::invalid_record())?;

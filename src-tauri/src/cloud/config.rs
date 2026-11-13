@@ -378,13 +378,13 @@ impl CloudConfigStore {
         protected: &[&Path],
         append: Option<AppendRepositoryBinding>,
     ) -> Result<CloudMapping, ConfigError> {
-        self.mapping_inner(id, input, protected, append, true, false)
+        self.mapping_inner(id, input, protected, append, true, false, None)
     }
 
     pub(crate) fn prepare_mapping(
         &self, input: AddMappingInput, protected: &[&Path], append: Option<AppendRepositoryBinding>,
     ) -> Result<CloudMapping, ConfigError> {
-        let mut mapping = self.mapping_inner(None, input, protected, append, false, false)?;
+        let mut mapping = self.mapping_inner(None, input, protected, append, false, false, None)?;
         // Stable prebinding identity preserves failed discovery reservations across
         // cancel/retry/restart; it is never the executable mapping identity.
         use sha2::{Digest, Sha256};
@@ -397,12 +397,20 @@ impl CloudConfigStore {
         let input = AddMappingInput { connection_id: mapping.connection_id.clone(), repository_id: mapping.repository_id.clone(), local_root: mapping.local_root.clone(), logical_path: mapping.logical_path.clone(), schedule: mapping.schedule.clone() };
         // Revalidate overlaps and the physical root immediately before publishing.
         let id = random_id()?;
-        self.mapping_inner(Some(&id), input, protected, mapping.append_binding.clone(), true, true)
+        self.mapping_inner(Some(&id), input, protected, mapping.append_binding.clone(), true, true, None)
+    }
+
+    /// Publish the new repository and its first mapping in one catalog write.
+    pub(crate) fn commit_created_drive(
+        &self, input: AddMappingInput, protected: &[&Path], cached: &CachedAppendRepository,
+    ) -> Result<CloudMapping, ConfigError> {
+        self.mapping_inner(None, input, protected, Some(cached.binding.clone()), true, false, Some(cached))
     }
 
     fn mapping_inner(
         &self, id: Option<&str>, input: AddMappingInput, protected: &[&Path],
         append: Option<AppendRepositoryBinding>, persist: bool, prepared: bool,
+        created: Option<&CachedAppendRepository>,
     ) -> Result<CloudMapping, ConfigError> {
         let _guard = self.guard()?;
         let mut snapshot = self.load_locked()?;
@@ -450,21 +458,16 @@ impl CloudConfigStore {
             let name = snapshot.connections.iter().find(|c| c.id == conflict.connection_id).map(|c| c.name.clone())
                 .or_else(|| snapshot.official_connections.iter().find(|c| c.id == conflict.connection_id).map(|c| c.name.clone()))
                 .unwrap_or_else(|| conflict.connection_id.clone());
-            return Err(ConfigError::Validation(format!(
-                "mapping overlaps an existing mapping: {name} / {} -> {}",
-                conflict.local_root.display(),
-                conflict.logical_path
-            )));
+            let local_conflict = conflict.local_root.starts_with(&root) || root.starts_with(&conflict.local_root);
+            return Err(ConfigError::MappingConflict {
+                kind: if local_conflict { "local" } else { "remote" },
+                requested: if local_conflict { root.display().to_string() } else { logical.clone() },
+                existing: if local_conflict { conflict.local_root.display().to_string() } else { conflict.logical_path.clone() },
+                drive: name, mapping_id: conflict.id.clone(),
+            });
         }
-        if snapshot
-            .mirror_mappings
-            .iter()
-            .any(|m| m.local_root.starts_with(&root) || root.starts_with(&m.local_root))
-        {
-            return Err(ConfigError::Validation(
-                "本地目录与已有镜像映射重叠 / Local root overlaps an existing mirror mapping"
-                    .into(),
-            ));
+        if let Some(conflict) = snapshot.mirror_mappings.iter().find(|m| m.local_root.starts_with(&root) || root.starts_with(&m.local_root)) {
+            return Err(mapping_conflict(&snapshot, "local", &root.display().to_string(), &conflict.local_root.display().to_string(), &conflict.connection_id, &conflict.id));
         }
         let existing = snapshot.mappings.iter().find(|m| Some(m.id.as_str()) == id);
         if let Some(mapping) = existing {
@@ -501,6 +504,11 @@ impl CloudConfigStore {
             *slot = mapping.clone();
         } else {
             snapshot.mappings.push(mapping.clone());
+        }
+        if let Some(cached) = created {
+            let name = format!("cloud.append.{}.{}", cached.connection_id, cached.binding.repo_id);
+            self.vault.store_secret(&name, &Zeroizing::new(serde_json::to_vec(cached)?))?;
+            snapshot.append_repositories.push(cached.redacted());
         }
         if persist { self.save_locked(&snapshot)?; }
         Ok(mapping)
@@ -603,14 +611,8 @@ impl CloudConfigStore {
         crate::sync::root_state::bind_initial(local_root.clone())?;
         let local_root =
             std::fs::canonicalize(&local_root).map_err(crate::sync::root_types::RootError::Io)?;
-        if snapshot
-            .mappings
-            .iter()
-            .any(|m| m.local_root.starts_with(&local_root) || local_root.starts_with(&m.local_root))
-        {
-            return Err(ConfigError::Validation(
-                "本地目录与已有同步映射重叠 / Local root overlaps an existing sync mapping".into(),
-            ));
+        if let Some(conflict) = snapshot.mappings.iter().find(|m| m.local_root.starts_with(&local_root) || local_root.starts_with(&m.local_root)) {
+            return Err(mapping_conflict(&snapshot, "local", &local_root.display().to_string(), &conflict.local_root.display().to_string(), &conflict.connection_id, &conflict.id));
         }
         let id = match input.id.as_deref() {
             Some(id) => {
@@ -644,19 +646,13 @@ impl CloudConfigStore {
             if existing.local_root.starts_with(&mapping.local_root)
                 || mapping.local_root.starts_with(&existing.local_root)
             {
-                return Err(ConfigError::Validation(
-                    "本地目录与已有镜像映射重叠 / Local root overlaps an existing mirror mapping"
-                        .into(),
-                ));
+                return Err(mapping_conflict(&snapshot, "local", &mapping.local_root.display().to_string(), &existing.local_root.display().to_string(), &existing.connection_id, &existing.id));
             }
             if existing.connection_id == mapping.connection_id
                 && existing.bucket.as_deref().unwrap_or(default_bucket) == bucket
                 && mirror_prefix_overlap(&existing.cloud_prefix, &mapping.cloud_prefix)
             {
-                return Err(ConfigError::Validation(
-                    "云端目录与已有镜像映射重叠 / Cloud prefix overlaps an existing mirror mapping"
-                        .into(),
-                ));
+                return Err(mapping_conflict(&snapshot, "remote", &mapping.cloud_prefix, &existing.cloud_prefix, &existing.connection_id, &existing.id));
             }
         }
         snapshot.mirror_mappings.retain(|m| m.id != id);
@@ -797,6 +793,13 @@ fn validate_mapping_protocol(mapping: &CloudMapping) -> Result<(), ConfigError> 
             "storage protocol and binding disagree".into(),
         )),
     }
+}
+
+fn mapping_conflict(snapshot: &CloudConfigSnapshot, kind: &'static str, requested: &str, existing: &str, connection: &str, mapping_id: &str) -> ConfigError {
+    let drive = snapshot.connections.iter().find(|c| c.id == connection).map(|c| c.name.clone())
+        .or_else(|| snapshot.official_connections.iter().find(|c| c.id == connection).map(|c| c.name.clone()))
+        .unwrap_or_else(|| connection.to_owned());
+    ConfigError::MappingConflict { kind, requested: requested.into(), existing: existing.into(), drive, mapping_id: mapping_id.into() }
 }
 
 fn logical_overlap(a: &str, b: &str) -> bool {
@@ -950,6 +953,20 @@ mod tests {
     }
 
     #[test]
+    fn mapping_conflicts_have_readable_messages_and_diagnostic_context() {
+        for kind in ["local", "remote"] {
+            let error = crate::cloud::runtime::config_error(ConfigError::MappingConflict {
+                kind, requested: "/private/request".into(), existing: "/private/existing".into(),
+                drive: "GoogleDrive".into(), mapping_id: "mapping-a".into(),
+            });
+            assert!(error.message.contains("GoogleDrive") && error.message.contains("解除原绑定"));
+            assert!(!error.message.contains("/private/") && !error.message.contains("mapping conflict"));
+            assert_eq!(error.context.as_ref().unwrap()["conflictKind"], kind);
+            assert!(error.detail.as_ref().unwrap().contains("/private/existing"));
+        }
+    }
+
+    #[test]
     fn overlapping_mapping_error_identifies_the_existing_binding() {
         let (dir, store) = store();
         let connection = store.save_connection(connection_input()).unwrap();
@@ -966,8 +983,8 @@ mod tests {
             connection_id: connection.id, repository_id: "repo-b".into(),
             local_root: nested, logical_path: "child".into(), schedule,
         }, &[], None).unwrap_err().to_string();
-        assert!(error.contains("mapping overlaps an existing mapping"), "{error}");
-        assert!(error.contains("main") && error.contains("mapped") && error.contains("docs"), "{error}");
+        assert!(error.contains("mapping conflict (local)"), "{error}");
+        assert!(error.contains("main") && error.contains("mapped") && error.contains("child"), "{error}");
     }
 
     #[test]

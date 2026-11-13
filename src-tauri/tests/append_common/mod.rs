@@ -90,6 +90,9 @@ impl Remote {
         FakeStore(self.clone())
     }
 }
+#[cfg(test)]
+mod parallelism;
+
 #[derive(Clone)]
 pub struct FakeStore(Remote);
 fn storage(message: String) -> CloudError {

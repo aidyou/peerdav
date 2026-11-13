@@ -11,7 +11,8 @@ use super::repository_types::WireError;
 pub const TREE_SCHEMA_VERSION: u32 = 1;
 pub const TREE_OBJECT_LIMIT: usize = super::repository_types::MAX_METADATA_SIZE;
 pub const TREE_TOTAL_LIMIT: usize = 512 * 1024 * 1024;
-pub const TREE_NODE_LIMIT: usize = super::merge_types::MAX_ENTITIES + 2;
+/// Derived from the bounded merge workspace, not a file-count quota.
+pub const TREE_NODE_LIMIT: usize = super::merge_types::MAX_MERGE_WORKING_BYTES / 512 + 2;
 
 #[derive(Debug, Error)]
 pub enum TreeError {

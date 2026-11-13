@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use thiserror::Error;
 
-pub const MAX_ENTITIES: usize = 100_000;
-pub const MAX_REVISIONS: usize = 200_000;
+pub const MAX_MERGE_WORKING_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_RECOVERY_PAGE: usize = 100_000;
 pub const MAX_FRONTIER: usize = 64;
 pub const MAX_PARENTS: usize = 64;
 

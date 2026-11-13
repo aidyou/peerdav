@@ -1,5 +1,5 @@
 .cs/
-dev_data/
+dev_data/*
 
 # Logs
 logs

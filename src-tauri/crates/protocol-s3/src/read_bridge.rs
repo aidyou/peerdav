@@ -72,16 +72,27 @@ impl ObjectStore for CoreS3ReadBridge {
     }
     fn verify_move_capabilities(&self) -> BoxFuture<'_, Result<StorageCapabilities, CloudError>> {
         Box::pin(async {
+            let _probe = self.0.store.probe_lock.lock().await;
+            if let Some(supported) = self.0.store.cached_probe("move")? {
+                return if supported { Ok(StorageCapabilities { create_only: true, conditional_replace: false, range_read: true, conditional_writes_verified: true }) } else { Err(CloudError::Unsupported) };
+            }
+            self.0.store.probe_progress("move", "checking")?;
             let key = format!("probes/{}/move-create", rand::random::<u128>());
-            let first = self.0.store.put(&key, futures_util::stream::once(async { Ok(bytes::Bytes::from_static(b"move probe")) }).boxed(), PutCondition::CreateOnly).await?;
-            let duplicate = self.0.store.put(&key, futures_util::stream::once(async { Ok(bytes::Bytes::from_static(b"must not replace")) }).boxed(), PutCondition::CreateOnly).await;
-            if !matches!(duplicate, Err(CloudError::Precondition)) {
-                return Err(CloudError::Unsupported);
-            }
-            if let Err(error) = self.0.store.delete_if_match(&key, first.etag.as_deref().ok_or(CloudError::Unsupported)?).await {
-                return Err(error);
-            }
-            Ok(StorageCapabilities { create_only: true, conditional_replace: false, range_read: true, conditional_writes_verified: true })
+            let result = async {
+                let first = self.0.store.put(&key, futures_util::stream::once(async { Ok(bytes::Bytes::from_static(b"move probe")) }).boxed(), PutCondition::CreateOnly).await?;
+                let duplicate = self.0.store.put(&key, futures_util::stream::once(async { Ok(bytes::Bytes::from_static(b"must not replace")) }).boxed(), PutCondition::CreateOnly).await;
+                match duplicate {
+                    Err(CloudError::Precondition) => {}
+                    Err(error) => return Err(error),
+                    Ok(_) => return Err(CloudError::Unsupported),
+                }
+                self.0.store.delete_if_match(&key, first.etag.as_deref().ok_or(CloudError::Unsupported)?).await?;
+                Ok(StorageCapabilities { create_only: true, conditional_replace: false, range_read: true, conditional_writes_verified: true })
+            }.await;
+            self.0.store.probe_progress("move", "cleaning")?;
+            let result = self.0.store.finish_probe(&[&key], result).await;
+            self.0.store.remember_probe("move", &result)?;
+            result
         })
     }
     fn capabilities(&self) -> StorageCapabilities {

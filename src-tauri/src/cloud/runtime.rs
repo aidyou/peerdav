@@ -373,6 +373,7 @@ pub struct CloudRuntime {
     /// Metadata previews share durable run slots; serialize their budget snapshots.
     pub(super) append_metadata: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub(crate) objects: tokio::sync::Mutex<super::object_runtime_types::ObjectState>,
+    pub(crate) capability_stores: Mutex<HashMap<String, S3Store>>,
     pub(crate) object_events: Arc<dyn SyncEvents>,
     pub(crate) object_lifecycle: tokio::sync::Mutex<()>,
     pub(crate) official_authorizations: super::oauth_types::OAuthAuthorizations,
@@ -394,6 +395,7 @@ impl CloudRuntime {
             weak_self: weak_self.clone(),
             config: CloudConfigStore::new(Arc::clone(&vault)),
             manager: SyncManager::new(Arc::clone(&events)),
+            capability_stores: Mutex::new(HashMap::new()),
             object_events: events,
             object_lifecycle: tokio::sync::Mutex::new(()),
             official_authorizations: super::oauth_types::OAuthAuthorizations::default(),
@@ -436,6 +438,7 @@ impl CloudRuntime {
         }
         let _p = self.network.write().await;
         crate::sync::scan_ledger::clear().map_err(|error| runtime_error("CLOUD_SCAN_FAILED", &error.to_string()))?;
+        self.capability_stores.lock().map_err(|_| runtime_error("INTERNAL_ERROR", "无法清理存储连接 / Unable to clear storage connections"))?.clear();
         self.pending_mappings.lock().await.clear();
         self.official_authorizations.clear().map_err(super::official_runtime::oauth_error)?;
         self.official_refresh.lock().await.clear();
@@ -853,7 +856,7 @@ impl CloudRuntime {
             .into_iter()
             .find(|r| r.connection_id == m.connection_id && r.descriptor.repo_id == m.repository_id)
             .ok_or_else(|| config_error(ConfigError::NotFound("repository".into())))?;
-        let store_impl = S3Store::new(c.config).map_err(cloud_error)?;
+        let store_impl = self.capability_store(&m.connection_id, c.config)?;
         store_impl
             .verify_capabilities()
             .await
@@ -1278,7 +1281,7 @@ impl CloudRuntime {
             )));
         }
         let cfg = self.connection(&input.connection_id)?;
-        let s = S3Store::new(cfg.config).map_err(cloud_error)?;
+        let s = self.capability_store(&input.connection_id, cfg.config)?;
         s.verify_capabilities().await.map_err(cloud_error)?;
         let store: Arc<dyn ObjectStore> = Arc::new(s);
         let id = input
@@ -1324,7 +1327,7 @@ impl CloudRuntime {
         let _p = self.network.read().await;
         self.admit()?;
         let cfg = self.connection(&input.connection_id)?;
-        let s = S3Store::new(cfg.config).map_err(cloud_error)?;
+        let s = self.capability_store(&input.connection_id, cfg.config)?;
         s.verify_capabilities().await.map_err(cloud_error)?;
         let store: Arc<dyn ObjectStore> = Arc::new(s);
         let password = Zeroizing::new(input.password);
@@ -1386,6 +1389,18 @@ fn runtime_error(code: &str, msg: &str) -> AppError {
     }
 }
 pub(crate) fn config_error(e: ConfigError) -> AppError {
+    if let ConfigError::MappingConflict { kind, requested, existing, drive, mapping_id } = &e {
+        let local = *kind == "local";
+        let subject = if local { "本地目录" } else { "云端目标" };
+        let message = format!("{subject}已被 {drive} 同步盘绑定。请选择其他目录，或先解除原绑定。 / {} is already bound to {drive}. Choose another folder or remove the existing binding first.", if local { "The local folder" } else { "The cloud target" });
+        let error = AppError {
+            code: if local { "CLOUD_LOCAL_MAPPING_CONFLICT" } else { "CLOUD_REMOTE_MAPPING_CONFLICT" }.into(),
+            message, detail: Some(e.to_string()),
+            context: Some(serde_json::json!({ "operation": "bind_mapping", "conflictKind": kind, "requested": requested, "existing": existing, "drive": drive, "mappingId": mapping_id })),
+        };
+        log::warn!("mapping conflict: {error:?}");
+        return error;
+    }
     let code = match &e {
         ConfigError::NotFound(_) => "CLOUD_CONFIG_NOT_FOUND",
         _ => "CLOUD_CONFIG_INVALID",

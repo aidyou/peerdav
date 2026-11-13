@@ -496,7 +496,7 @@ mod tests {
         f.store.extra_objects.lock().await.extend(["empty/".into(), "empty/nested/".into()]);
         let session = f.runtime.object_session("connection").await?;
         let adapter = Arc::new(crate::download_types::S3DownloadAdapter { runtime: Arc::clone(&f.runtime), connection: "connection".into(), session });
-        let plan = adapter.plan(DownloadSelection::Folder { path: "empty".into() }).await?;
+        let plan = adapter.plan(DownloadSelection::Folder { path: "empty".into() }).await?.page(0, 100)?;
         assert_eq!(plan.len(), 2);
         assert!(plan.iter().all(|item| item.is_dir));
         assert_eq!(plan.iter().map(|item| item.relative_path.as_str()).collect::<Vec<_>>(), ["empty", "empty/nested"]);
@@ -528,9 +528,9 @@ mod tests {
         let f = fixture().await?; f.runtime.resume()?;
         let session = f.runtime.object_session("connection").await?;
         let adapter = Arc::new(crate::download_types::S3DownloadAdapter { runtime: Arc::clone(&f.runtime), connection: "connection".into(), session });
-        let plan = adapter.plan(DownloadSelection::Folder { path: "docs".into() }).await?;
+        let plan = adapter.plan(DownloadSelection::Folder { path: "docs".into() }).await?.page(0, 100)?;
         assert_eq!(plan.len(), 2); assert!(plan.iter().all(|i| i.remote_path.starts_with("docs/")));
-        let mixed = adapter.plan(DownloadSelection::Files { paths: vec!["docs/a".into(), "docs/nested/".into()] }).await?;
+        let mixed = adapter.plan(DownloadSelection::Files { paths: vec!["docs/a".into(), "docs/nested/".into()] }).await?.page(0, 100)?;
         assert_eq!(mixed.iter().map(|i| i.relative_path.as_str()).collect::<Vec<_>>(), vec!["a", "nested/b"]);
         assert!(adapter.plan(DownloadSelection::Single { path: "docs/".into() }).await.is_err());
         assert!(adapter.plan(DownloadSelection::Files { paths: vec!["docs/a".into(), "docs/a".into()] }).await.is_err());
@@ -2694,7 +2694,7 @@ impl CloudRuntime {
         };
         // Deliberately no verify_capabilities, repository join, or encrypted tree reads.
         let production_store = || -> Result<Arc<dyn ObjectStore>, AppError> {
-            let raw = Arc::new(super::S3Store::new(config).map_err(app)?);
+            let raw = Arc::new(self.capability_store(connection_id, config)?);
             let backend = peerdav_protocol_s3::CoreS3Backend::new(raw, connection.revision)
                 .map_err(|source| {
                     app(super::types::CloudError::Storage {

@@ -84,7 +84,7 @@ async fn google_sync_roundtrip(mode: crate::sync::append_types::AppendMode, choi
     assert!(store.put(key, crate::cloud::bytes_stream(bytes::Bytes::from_static(b"changed")), PutCondition::Any).await.is_err());
     assert!(store.put(key, crate::cloud::bytes_stream(bytes::Bytes::new()), PutCondition::CreateOnly).await.is_err());
     assert!(store.delete("/").await.is_err());
-    let created = runtime.create_sync_drive(crate::cloud::runtime_types::CreateAppendRepositoryInput { bucket: Some("root".into()), connection_id: connection.id.clone(), mode, password: "password 123".into(), password_confirmation: "password 123".into(), local_root: None, logical_path: None }).await.expect("create Google sync repository");
+    let created = runtime.create_sync_drive(crate::cloud::runtime_types::CreateAppendRepositoryInput { bucket: Some("root".into()), connection_id: connection.id.clone(), mode, password: "password 123".into(), password_confirmation: "password 123".into(), local_root: None, logical_path: None, schedule: Default::default() }).await.expect("create Google sync repository");
     assert!(!created.binding.repo_id.is_empty());
     let discovered = runtime.discover_append_in_bucket(&connection.id, Some("root")).await.expect("discover Google repository");
     assert_eq!(discovered.len(), 1);
@@ -314,6 +314,7 @@ async fn google_sync_roundtrip(mode: crate::sync::append_types::AppendMode, choi
     let nested_id = api.create_folder_id(&tree_id, "nested").await.expect("existing nested");
     let folder = session.backend.select_upload(&peers, &runtime, String::new(), vec![folder_path], crate::file_manager::types::UploadMode::Folder, Default::default()).await.expect("select folder");
     let crate::file_manager::types::FileUploadDto::Cloud(folder) = folder else { panic!("folder queue") };
+    assert_eq!(folder.total_files, 0, "directory traversal is deferred until queue start");
     session.backend.upload_action(&peers, &runtime, &folder.batch_id, crate::file_manager::types::UploadAction::Start).await.expect("start folder");
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {

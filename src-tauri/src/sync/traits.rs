@@ -25,6 +25,7 @@ pub trait SyncWorkerFactory: Send + Sync + 'static {
     fn create(&self, mapping_id: &str) -> Arc<dyn SyncWorker>;
 }
 pub trait SyncEvents: Send + Sync + 'static {
+    fn capability_progress(&self, _: crate::cloud::runtime_types::CapabilityProgress) -> Result<(), BoxError> { Ok(()) }
     fn progress(&self, status: SyncStatus) -> Result<(), BoxError>;
     fn error(&self, error: AppError) -> Result<(), BoxError>;
 }

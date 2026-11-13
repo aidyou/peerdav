@@ -22,7 +22,7 @@ import {
   MAX_PREVIEW_BYTES,
   previewFormat as detectPreviewFormat,
 } from "../lib/textPreview";
-import { errorStrategy, normalizeAppError } from "../lib/invoke";
+import { errorStrategy, normalizeAppError, toUserMessage } from "../lib/invoke";
 import CloudSyncDrives from "./CloudSyncDrives.vue";
 import SharedFileBrowser from "./FileBrowser.vue";
 import { cloudBrowserAdapter } from '../lib/fileBrowserAdapter';
@@ -265,10 +265,12 @@ const localRunId = ref(null);
 const localRunning = computed(() => ["frozen", "scanning", "uploading", "publishing", "applying"].includes(localPhase.value));
 let localVersion = 0;
 let localRequest = 0;
+let localStatusRequest = 0;
+const localDirectoryCache = new Map();
 let localPolling = false;
 function resetLocalScope() {
   resetLocalModifiers(); localMouseUp({}); clearLocalSelection();
-  localVersion++; localRequest++;
+  localVersion++; localRequest++; localStatusRequest++; localDirectoryCache.clear();
   localQuickOpen.value = false; localMoveOpen.value = false; localQuickTarget.value = null;
   localBusy.value = false; localLoading.value = false; localPreview.value = null; localError.value = null;
   localPhase.value = ""; localRunId.value = null;
@@ -280,12 +282,13 @@ const localEntries = computed(() => localChildren(localPath.value));
 const localColumns = computed(() => localCrumbs.value.map(crumb => ({ path: crumb.id, entries: localChildren(crumb.id), complete: !localError.value, failed: Boolean(localError.value) })));
 const localCrumbs = ref([]);
 let restoreLocalNavigation = true;
-async function loadLocal() {
+async function loadLocal({ compare = true } = {}) {
   const id = localDrive.value?.mappingId;
   if (!id) return;
   const version = localVersion;
   const request = ++localRequest;
-  localLoading.value = true; localError.value = null; localStatusKnown.value = false;
+  localLoading.value = true; localError.value = null;
+  if (compare) localStatusKnown.value = false;
   try {
     const rememberedPath = restoreLocalNavigation && savedScope?.connectionId === props.connectionId && savedScope?.activeDriveId === activeDriveId.value ? savedScope.localPath : null;
     const target = typeof rememberedPath === 'string' ? rememberedPath : localPath.value;
@@ -294,32 +297,43 @@ async function loadLocal() {
     catch (cause) { if (!target || cause.code !== 'CLOUD_PATH_INVALID') throw cause; listing = await cloud.localEntries(id, ''); }
     if (!currentLocal(version) || request !== localRequest) return;
     const result = listing.entries;
-    localFiles.value = result;
+    const openedPath = listing.breadcrumbs.at(-1)?.id ?? '';
+    localDirectoryCache.set(openedPath, result);
+    // Keep only the visible ancestor chain; this is not a full-drive cache.
+    const ancestors = new Set(listing.breadcrumbs.map(crumb => crumb.id));
+    for (const path of localDirectoryCache.keys()) if (!ancestors.has(path)) localDirectoryCache.delete(path);
+    localFiles.value = [...localDirectoryCache.values()].flat();
     localCrumbs.value = listing.breadcrumbs;
-    localPath.value = listing.breadcrumbs.at(-1)?.id ?? '';
+    localPath.value = openedPath;
     restoreLocalNavigation = false;
     localSelection.value = localSelection.value.map(old => result.find(entry => entry.path === old.path)).filter(Boolean);
     localLoading.value = false;
-    void compareLocalStatus(id, version, request);
+    if (compare) void compareLocalStatus(id, version, ++localStatusRequest);
   } catch (cause) { if (currentLocal(version) && request === localRequest) { localError.value = normalizeAppError(cause); app.handleFailure(cause); } }
   finally { if (currentLocal(version) && request === localRequest) localLoading.value = false; }
 }
 async function compareLocalStatus(id, version, request) {
   localStatusLoading.value = true;
   try {
-    const entries = await cloud.localStatus(id);
-    if (!currentLocal(version) || request !== localRequest) return;
+    const path = localPath.value;
+    const entries = await cloud.localStatus(id, path);
+    if (!currentLocal(version) || request !== localStatusRequest) return;
     const states = new Map(entries.map(entry => [entry.path, entry]));
-    const localPaths = new Set(localFiles.value.map(entry => entry.path));
-    localFiles.value = [
-      ...localFiles.value.map(entry => ({ ...entry, synced: states.get(entry.path)?.synced === true, remoteOnly: false })),
-      ...entries.filter(entry => entry.remoteOnly === true && !localPaths.has(entry.path)),
-    ];
+    for (const [directory, files] of localDirectoryCache) {
+      if (directory !== path) continue;
+      const localPaths = new Set(files.map(entry => entry.path));
+      localDirectoryCache.set(directory, [
+        ...files.map(entry => ({ ...entry, synced: states.get(entry.path)?.synced === true, statusKnown: states.has(entry.path), remoteOnly: false })),
+        ...entries.filter(entry => entry.remoteOnly === true && !localPaths.has(entry.path)
+          && (entry.path.includes('/') ? entry.path.slice(0, entry.path.lastIndexOf('/')) : '') === path),
+      ]);
+    }
+    localFiles.value = [...localDirectoryCache.values()].flat();
     localStatusKnown.value = true;
   } catch (cause) {
-    if (currentLocal(version) && request === localRequest) app.handleFailure(cause);
+    if (currentLocal(version) && request === localStatusRequest) app.handleFailure(cause);
   } finally {
-    if (currentLocal(version) && request === localRequest) localStatusLoading.value = false;
+    if (currentLocal(version) && request === localStatusRequest) localStatusLoading.value = false;
   }
 }
 async function openLocal(drive) {
@@ -353,16 +367,9 @@ function selectLocal(entry, event) {
 }
 function navigateLocal(path) {
   resetLocalModifiers(); localMouseUp({}); clearLocalSelection();
-  // localFiles already holds the entire drive. Navigation must not rescan it
-  // or restart the remote comparison (including one already in flight).
-  const crumbs = localCrumbs.value.slice(0, 1);
-  let current = '';
-  for (const name of path.split('/').filter(Boolean)) {
-    current = current ? `${current}/${name}` : name;
-    crumbs.push({ id: current, name });
-  }
   localPath.value = path;
-  localCrumbs.value = crumbs;
+  // Directory metadata and status requests have independent generations.
+  void loadLocal();
 }
 function activateLocal(entry) { selectLocal(entry); if (entry.isDir) navigateLocal(entry.path); else void quickLookLocal(entry); }
 const localFile = computed(() => localSelection.value.length === 1 && !localSelection.value[0].isDir && !localSelection.value[0].remoteOnly ? localSelection.value[0] : null);
@@ -488,11 +495,16 @@ async function pollLocalSync() {
     const statuses = await cloud.status();
     if (disposed || connection !== props.connectionId) return;
     driveStatuses.value = statuses;
-    if (!currentLocal(version) || localDrive.value?.mappingId !== id) return;
+    if (version !== localVersion || localDrive.value?.mappingId !== id
+      || !(view.value === 'local' || (view.value === 'files' && localDrive.value?.mirror))) return;
     const status = statuses.find(item => item.mappingId === id);
     if (status?.phase && (status.phase !== localPhase.value || status.runId !== localRunId.value)) {
       localPhase.value = status.phase; localRunId.value = status.runId;
-      if (["completed", "failed", "cancelled"].includes(status.phase)) { localPreview.value = null; void loadLocal(); }
+      if (["completed", "failed", "cancelled"].includes(status.phase)) {
+        localPreview.value = null;
+        if (localDrive.value?.mirror) void load();
+        else void loadLocal();
+      }
     }
   } catch (cause) { if (currentLocal(version)) { localError.value = normalizeAppError(cause); } }
   finally { localPolling = false; }
@@ -562,7 +574,7 @@ async function refreshCatalog() {
       }),
       ...(catalog.repositories || []).filter((item) => item.connectionId === connectionId && !(catalog.mappings || []).some(m => m.repositoryId === item.id)),
       ...(catalog.appendRepositories || []).filter((item) => item.connectionId === connectionId && !(catalog.mappings || []).some(m => m.repositoryId === item.binding.repoId)).map((item) => ({ id: item.binding.repoId })),
-      ...(catalog.mirrorMappings || []).filter((item) => item.connectionId === connectionId).map((item) => ({ ...item, mirror: true, driveKind: 'mirror-drive' })),
+      ...(catalog.mirrorMappings || []).filter((item) => item.connectionId === connectionId).map((item) => ({ ...item, mappingId: item.id, mirror: true, driveKind: 'mirror-drive' })),
     ];
     if (activeDriveId.value && !catalogDrives.value.some((item) => item.id === activeDriveId.value)) {
       activeDriveId.value = ""; view.value = "files";
@@ -1360,7 +1372,7 @@ onBeforeUnmount(() => {
           <div ref="localFileView" class="file-view local-file-view" tabindex="0" @mousedown="localMouseDown" @keydown="localKeydown">
             <div v-if="localMarquee" class="local-marquee" :style="{ left: `${localMarquee.left}px`, top: `${localMarquee.top}px`, width: `${localMarquee.width}px`, height: `${localMarquee.height}px` }"></div>
             <FileManagerView :move-enabled="!localBusy && !localRunning" @move="dropLocal" :entries="localEntries" :mode="viewMode" :selection="localSelection" :columns="localColumns" :loading="localLoading" :error="localError"
-              :entry-kind="entryKind" :format-size="formatSize" :entry-status="entry => !localStatusKnown || entry.synced ? '' : t(entry.remoteOnly ? 'drive.cloudOnly' : 'drive.pendingSync')"
+              :entry-kind="entryKind" :format-size="formatSize" :entry-status="entry => !localStatusKnown || entry.statusKnown === false || entry.synced ? '' : t(entry.remoteOnly ? 'drive.cloudOnly' : 'drive.pendingSync')"
               @select="selectLocal" @activate="activateLocal" @column-select="(entry, event) => event?.ctrlKey || event?.metaKey || event?.altKey || event?.shiftKey || localHeld.Control || localHeld.Meta || localHeld.Alt || localHeld.Shift ? selectLocal(entry, event) : activateLocal(entry)" @preview="activateLocal" @status-action="previewLocalSync">
               <template #gallery-preview><div v-if="localSelection[0]" class="gallery-placeholder"><FileGlyph :entry="localSelection[0]" size="xl" /><strong>{{ localSelection[0].name }}</strong><span>{{ formatSize(localSelection[0]) }}</span></div><p v-else>{{ t('peer.selectPreview') }}</p></template>
             </FileManagerView>
@@ -1515,10 +1527,10 @@ onBeforeUnmount(() => {
               </el-tooltip>
             </div>
           </div>
-          <ul v-if="transfers.length" class="cloud-tree cloud-transfers" :aria-label="t('cloudBrowser.transfers')"><li v-for="item in transfers" :key="item.transferId"><span>{{ item.key == null ? t('cloudBrowser.unknownTarget') : JSON.stringify(item.key) }}<span v-if="item.sizeHint != null"> · {{ t('cloudBrowser.bytes', { size: item.sizeHint }) }}</span> · {{ t(`cloudBrowser.${item.direction}`) }} · {{ t(`cloudBrowser.phase.${item.phase}`) }}<strong v-if="item.recoveryRequired || item.phase === 'unknown'"> · {{ t('cloudBrowser.recovery') }}</strong><span v-if="item.error"> · {{ item.error.message }}</span></span><p v-if="item.phase === 'acknowledged'">{{ t('cloudBrowser.acknowledgedNotice') }}</p><el-button v-if="item.phase === 'unknown'" :disabled="busy" @click="acknowledge(item)">{{ t('cloudBrowser.acknowledge') }}</el-button><el-button v-if="item.phase === 'running'" :disabled="busy" @click="cancel(item)">{{ t('cloudBrowser.cancel') }}</el-button></li></ul>
+          <ul v-if="transfers.length" class="cloud-tree cloud-transfers" :aria-label="t('cloudBrowser.transfers')"><li v-for="item in transfers" :key="item.transferId"><span>{{ item.key == null ? t('cloudBrowser.unknownTarget') : JSON.stringify(item.key) }}<span v-if="item.sizeHint != null"> · {{ t('cloudBrowser.bytes', { size: item.sizeHint }) }}</span> · {{ t(`cloudBrowser.${item.direction}`) }} · {{ t(`cloudBrowser.phase.${item.phase}`) }}<strong v-if="item.recoveryRequired || item.phase === 'unknown'"> · {{ t('cloudBrowser.recovery') }}</strong><span v-if="item.error"> · {{ toUserMessage(item.error) }}</span></span><p v-if="item.phase === 'acknowledged'">{{ t('cloudBrowser.acknowledgedNotice') }}</p><el-button v-if="item.phase === 'unknown'" :disabled="busy" @click="acknowledge(item)">{{ t('cloudBrowser.acknowledge') }}</el-button><el-button v-if="item.phase === 'running'" :disabled="busy" @click="cancel(item)">{{ t('cloudBrowser.cancel') }}</el-button></li></ul>
         </template>
         <OperationErrorDialog v-if="view === 'files' && !root" :error="visibleError" :retryable="!!retryOperation" @close="closeOperationError" @retry="retryFailedOperation" />
-        <ul v-if="view === 'files' && !root && transfers.length" class="cloud-tree cloud-transfers" :aria-label="t('cloudBrowser.transfers')"><li v-for="item in transfers" :key="item.transferId"><span>{{ item.key == null ? t('cloudBrowser.unknownTarget') : JSON.stringify(item.key) }} · {{ t(`cloudBrowser.phase.${item.phase}`) }}<span v-if="item.phase === 'acknowledged'"> · {{ t('cloudBrowser.acknowledgedNotice') }}</span><strong v-if="item.recoveryRequired || item.phase === 'unknown'"> · {{ t('cloudBrowser.recovery') }}</strong><span v-if="item.error"> · {{ item.error.message }}</span></span><el-button v-if="item.phase === 'unknown'" :disabled="busy" @click="acknowledge(item)">{{ t('cloudBrowser.acknowledge') }}</el-button><el-button v-if="item.phase === 'running'" :disabled="busy" @click="cancel(item)">{{ t('cloudBrowser.cancel') }}</el-button></li></ul>
+        <ul v-if="view === 'files' && !root && transfers.length" class="cloud-tree cloud-transfers" :aria-label="t('cloudBrowser.transfers')"><li v-for="item in transfers" :key="item.transferId"><span>{{ item.key == null ? t('cloudBrowser.unknownTarget') : JSON.stringify(item.key) }} · {{ t(`cloudBrowser.phase.${item.phase}`) }}<span v-if="item.phase === 'acknowledged'"> · {{ t('cloudBrowser.acknowledgedNotice') }}</span><strong v-if="item.recoveryRequired || item.phase === 'unknown'"> · {{ t('cloudBrowser.recovery') }}</strong><span v-if="item.error"> · {{ toUserMessage(item.error) }}</span></span><el-button v-if="item.phase === 'unknown'" :disabled="busy" @click="acknowledge(item)">{{ t('cloudBrowser.acknowledge') }}</el-button><el-button v-if="item.phase === 'running'" :disabled="busy" @click="cancel(item)">{{ t('cloudBrowser.cancel') }}</el-button></li></ul>
       </main>
     </div>
     <FilePreviewDialog

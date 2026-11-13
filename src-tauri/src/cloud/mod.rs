@@ -18,6 +18,7 @@ pub use object_types::{
     BrowsePage, DeletePlan, ObjectGuardError, ObjectRef, ProtectedIdentity, ProtectedMapping,
     ProtectionState, StorageIdentityAssociation,
 };
+mod capability_cache;
 pub mod config;
 pub mod config_types;
 pub mod protocol_types;

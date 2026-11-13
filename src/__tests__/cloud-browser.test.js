@@ -15,7 +15,7 @@ import CloudBrowser from "../components/CloudBrowser.vue";
 import OperationErrorDialog from "../components/OperationErrorDialog.vue";
 import operationErrorSource from "../components/OperationErrorDialog.vue?raw";
 import { cloudObjects, objectChildren } from "../lib/cloud";
-import { errorStrategy } from "../lib/invoke";
+import { errorStrategy, toUserMessage } from "../lib/invoke";
 import { setLocale, t } from "../lib/i18n";
 import en from "../locales/en";
 import zh from "../locales/zh-CN";
@@ -104,7 +104,7 @@ beforeEach(() => {
       const path = args.path || '';
       if (path && !result.some(entry => entry.path === path && entry.isDir)) throw error('CLOUD_PATH_INVALID', 'Directory not found');
       let current = '';
-      return { entries: result, breadcrumbs: [{ id: '', name: 'Drive' }, ...path.split('/').filter(Boolean).map(name => { current = current ? `${current}/${name}` : name; return { id: current, name }; })] };
+      return { entries: result.filter(entry => (entry.path.includes('/') ? entry.path.slice(0, entry.path.lastIndexOf('/')) : '') === path), breadcrumbs: [{ id: '', name: 'Drive' }, ...path.split('/').filter(Boolean).map(name => { current = current ? `${current}/${name}` : name; return { id: current, name }; })] };
     }
     if (command !== 'file_list') return result;
     // Legacy object fixtures are adapted here, not in the production browser.
@@ -131,7 +131,8 @@ describe('operation error actions', () => {
     expect(actions.exists()).toBe(true);
     expect(actions.findAll('button').map(item => item.text())).toEqual([t('common.close'), t('cloudBrowser.retry')]);
     expect(document.querySelector('.cloud-error__message').textContent).toBe(cause.message);
-    expect(document.querySelector('.error-code').textContent).toBe(cause.code);
+    expect(document.querySelector('.error-code')).toBeNull();
+    expect(document.body.textContent).not.toContain(cause.detail);
     expect(operationErrorSource).toMatch(/\.operation-error__actions\s*\{[^}]*gap:\s*12px/);
     await actions.findAll('button')[0].trigger('click');
     await actions.findAll('button')[1].trigger('click');
@@ -792,6 +793,22 @@ describe("local sync-drive contents", () => {
     await vi.advanceTimersByTimeAsync(1500); await flushPromises();
     expect(wrapper.find('.drive-sync-status').exists()).toBe(false);
   });
+  it('refreshes the visible mirror folder once when background sync completes', async () => {
+    handlers.cloud_list = () => ({ ...catalog(), mirrorMappings: [{ id: 'mirror1', connectionId: 'c1', bucket: 'photos', localRoot: '/local/Mirror', cloudPrefix: 'pictures' }], statuses: [{ mappingId: 'mirror1', phase: 'uploading', runId: null }] });
+    handlers.cloud_status = () => [{ mappingId: 'mirror1', phase: 'uploading', runId: null }];
+    const wrapper = await browser('list');
+    await wrapper.findAll('.drive-link').at(-1).trigger('click'); await flushPromises();
+    await vi.advanceTimersByTimeAsync(1500); await flushPromises();
+    expect(wrapper.findAll('.drive-link').at(-1).find('.drive-sync-status').exists()).toBe(true);
+    const lists = () => nativeInvoke.mock.calls.filter(([command, args]) => command === 'cloud_object_list' && args.prefix === '_peerdav_mirror/pictures/').length;
+    const before = lists();
+    handlers.cloud_status = () => [{ mappingId: 'mirror1', phase: 'completed', runId: null }];
+    await vi.advanceTimersByTimeAsync(1500); await flushPromises();
+    expect(lists()).toBe(before + 1);
+    expect(nativeInvoke.mock.calls.some(([command, args]) => command === 'cloud_local_entries' && args.mappingId === 'mirror1')).toBe(false);
+    await vi.advanceTimersByTimeAsync(1500); await flushPromises();
+    expect(lists()).toBe(before + 1);
+  });
   it('opens a mirror drive in its bucket and remote folder instead of management', async () => {
     handlers.cloud_list = () => ({ ...catalog(), mirrorMappings: [{ id: 'mirror1', connectionId: 'c1', bucket: 'photos', localRoot: '/local/Mirror', cloudPrefix: 'pictures' }] });
     const wrapper = await browser('list');
@@ -811,7 +828,7 @@ describe("local sync-drive contents", () => {
     handlers.cloud_local_status = () => comparison.promise;
     const wrapper = await browser('list'); await click(wrapper, '.drive-link');
     expect(wrapper.find('[data-path="done.txt"]').exists()).toBe(true);
-    expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_status', { mappingId: 'm1' });
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_status', { mappingId: 'm1', path: '' });
     comparison.resolve(contents().map(entry => ({ ...entry, synced: true }))); await flushPromises();
     expect(wrapper.find('.entry-status').exists()).toBe(false);
   });
@@ -880,12 +897,30 @@ describe("local sync-drive contents", () => {
     await wrapper.findAll('.drive-link')[1].trigger('click'); await flushPromises();
     expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_entries', { mappingId: 'm2', path: '' });
   });
+  it('loads only the opened local directory and ignores stale directory responses', async () => {
+    const crumbs = path => [{ id: '', name: 'Drive' }, ...(path ? [{ id: path, name: path }] : [])];
+    const pending = deferred();
+    handlers.cloud_local_entries = ({ path = '' }) => path === 'docs' ? pending.promise : ({
+      entries: contents().filter(entry => !entry.path.includes('/')),
+      breadcrumbs: crumbs(''),
+    });
+    const wrapper = await browser('list'); await click(wrapper, '.drive-link');
+    expect(wrapper.find('[data-path="docs/new.txt"]').exists()).toBe(false);
+    await wrapper.find('[data-path="docs"]').trigger('dblclick'); await flushPromises();
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_entries', { mappingId: 'm1', path: 'docs' });
+    await click(wrapper, '.breadcrumb');
+    pending.resolve({ entries: contents().filter(entry => entry.path.startsWith('docs/')), breadcrumbs: crumbs('docs') });
+    await flushPromises();
+    expect(wrapper.find('[data-path="done.txt"]').exists()).toBe(true);
+    expect(wrapper.find('[data-path="docs/new.txt"]').exists()).toBe(false);
+  });
   it('navigates local folders and changes modes without requesting S3 listings', async () => {
     const wrapper = await browser('list'); await click(wrapper, '.drive-link');
     const calls = nativeInvoke.mock.calls.filter(([command]) => command === 'cloud_object_list').length;
     const statusCalls = nativeInvoke.mock.calls.filter(([command]) => command === 'cloud_local_status').length;
     await wrapper.find('[data-path="docs"]').trigger('dblclick'); await flushPromises();
-    expect(nativeInvoke.mock.calls.filter(([command]) => command === 'cloud_local_status')).toHaveLength(statusCalls);
+    expect(nativeInvoke.mock.calls.filter(([command]) => command === 'cloud_local_status')).toHaveLength(statusCalls + 1);
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_local_status', { mappingId: 'm1', path: 'docs' });
     expect(wrapper.find('[data-path="docs/new.txt"]').exists()).toBe(true);
     await click(wrapper, '[aria-label="Columns"]');
     expect(wrapper.findAll('.column')).toHaveLength(2);
@@ -1359,6 +1394,25 @@ describe("CloudBrowser", () => {
     await wrapper.findAll('.drive-link')[0].trigger('click'); await flushPromises();
     expect(wrapper.findComponent('[data-test="sync-manager"]').props('focusId')).toBe('cas');
   });
+  it('opens a newly created named drive in its file browser while first sync is running', async () => {
+    const catalog = { connections: [{ id: 'c1', name: 'Main', bucket: 'main' }], mappings: [], appendRepositories: [], statuses: [] };
+    handlers.cloud_list = () => structuredClone(catalog);
+    handlers.cloud_local_browse = () => ({ entries: [], breadcrumbs: [] });
+    handlers.cloud_local_status = () => [];
+    const wrapper = await browser();
+    await click(wrapper, '.sidebar-section-manage');
+    catalog.appendRepositories.push({ connectionId: 'c1', binding: { repoId: 'new' } });
+    catalog.mappings.push({ id: 'new-mapping', connectionId: 'c1', repositoryId: 'new', localRoot: '/projects/php-project', logicalPath: 'php-project', protocol: 'append_v2' });
+    catalog.statuses.push({ mappingId: 'new-mapping', phase: 'scanning', runId: 1 });
+    await click(wrapper, '[data-test="catalog-changed"]');
+    expect(wrapper.findAll('.drive-link')).toHaveLength(1);
+    expect(wrapper.find('.drive-link').text()).toContain('php-project');
+    expect(wrapper.find('.drive-link').text()).not.toContain('Sync drive 1');
+    await click(wrapper, '.drive-link');
+    expect(wrapper.find('.local-browser-pane').exists()).toBe(true);
+    expect(wrapper.find('[data-test="sync-manager"]').exists()).toBe(false);
+    expect(wrapper.find('.drive-sync-status').exists()).toBe(true);
+  });
   it('refreshes sidebar after manager changes and drops a removed active drive', async () => {
     const catalog = { connections: [{ id: 'c1', name: 'Main', bucket: 'main', buckets: ['main'] }], repositories: [], appendRepositories: [] };
     handlers.cloud_list = () => structuredClone(catalog);
@@ -1452,7 +1506,7 @@ describe("CloudBrowser", () => {
     handlers.cloud_object_prepare = () => { throw error('CLOUD_STORAGE', 'Storage permission denied'); };
     const wrapper = await browser();
     expect(wrapper.find('.cloud-error__message').text()).toBe('Storage permission denied');
-    expect(wrapper.text()).toContain('CLOUD_STORAGE');
+    expect(wrapper.text()).not.toContain('CLOUD_STORAGE');
     expect(wrapper.find('[data-test=upload]').attributes('disabled')).toBeDefined();
     expect(wrapper.find('[data-test=delete-prefix]').attributes('disabled')).toBeDefined();
     await click(wrapper, '[data-test=file-row]');
@@ -1665,7 +1719,7 @@ describe("CloudBrowser", () => {
     handlers.cloud_object_status = () => [transfer("unknown")]; await vi.advanceTimersByTimeAsync(1500); const answer = deferred(); confirmAction.mockImplementation(() => answer.promise); await textButton(wrapper, t("cloudBrowser.acknowledge")).trigger("click"); await flushPromises(); await wrapper.setProps({ connectionId: "c2" }); await flushPromises(); answer.resolve(true); await flushPromises(); expect(nativeInvoke.mock.calls.filter(([name]) => name === "cloud_object_recovery_acknowledge")).toHaveLength(1);
   });
   it("shows stop timeout guidance without hiding the original error", async () => {
-    handlers.cloud_object_status = () => [transfer()]; handlers.cloud_object_cancel = () => { throw error("CLOUD_OBJECT_STOP_TIMEOUT"); }; const wrapper = await browser(); await textButton(wrapper, t("cloudBrowser.cancel")).trigger("click"); await flushPromises(); expect(wrapper.text()).toContain("Original backend reason"); expect(wrapper.find('.cloud-error__message').text()).toBe('Original backend reason'); expect(wrapper.text()).toContain('CLOUD_OBJECT_STOP_TIMEOUT'); expect(errorStrategy(error("CLOUD_OBJECT_STOP_TIMEOUT"))).toBe("show");
+    handlers.cloud_object_status = () => [transfer()]; handlers.cloud_object_cancel = () => { throw error("CLOUD_OBJECT_STOP_TIMEOUT"); }; const wrapper = await browser(); await textButton(wrapper, t("cloudBrowser.cancel")).trigger("click"); await flushPromises(); expect(wrapper.text()).toContain("Original backend reason"); expect(wrapper.find('.cloud-error__message').text()).toBe('Original backend reason'); expect(wrapper.text()).not.toContain('CLOUD_OBJECT_STOP_TIMEOUT'); expect(errorStrategy(error("CLOUD_OBJECT_STOP_TIMEOUT"))).toBe("show");
   });
   // IPC contract guard only: backend prefix validation is covered by Rust tests.
   it.each([false, true])("keeps docs/ through folder deletion and waits for confirmation (%s)", async (accepted) => {
@@ -1737,7 +1791,7 @@ describe("CloudBrowser", () => {
     expect(wrapper.findAll("[data-test=file-row]")).toHaveLength(1);
     handlers.cloud_object_list = () => { throw error("CLOUD_TRANSPORT"); };
     await click(wrapper, "[data-test=refresh]");
-    expect(wrapper.text()).toContain("Original backend reason");
+    expect(wrapper.text()).toContain(toUserMessage(error("CLOUD_TRANSPORT")));
     expect(wrapper.findAll("[data-test=file-row]")).toHaveLength(1);
     expect(wrapper.find("[data-test=retry-load]").exists()).toBe(true);
     handlers.cloud_object_list = () => page([file, { key: "b.txt", size: 2 }]);
@@ -1836,7 +1890,7 @@ describe("CloudBrowser", () => {
   it.each(['CLOUD_PRECONDITION', 'TRANSFER_CONFLICT'])('keeps a terminal %s failure distinct from an actionable queue conflict', async (code) => {
     handlers.transfer_start_download = () => queueSummary('failed', { error: error(code) });
     const wrapper = await browser(); await click(wrapper, '[data-test=file-row]'); await click(wrapper, '[data-test=download]');
-    expect(wrapper.find('[data-test=download-dialog]').text()).toContain('Original backend reason');
+    expect(wrapper.find('[data-test=download-dialog]').text()).toContain(toUserMessage(error(code)));
     expect(wrapper.find('[data-test=download-overwrite]').exists()).toBe(false);
     expect(wrapper.find('[data-test=retry-load]').exists()).toBe(false);
     expect(confirmAction).not.toHaveBeenCalled();
@@ -1853,7 +1907,7 @@ describe("CloudBrowser", () => {
     await wrapper.findAll('[data-test=file-row]')[1].trigger('click', { ctrlKey: true });
     await click(wrapper, '[data-test=download]');
     expect(app.handleFailure).toHaveBeenCalledWith(failure);
-    expect(wrapper.find('[data-test=download-dialog]').text()).toContain(failure.message);
+    expect(wrapper.find('[data-test=download-dialog]').text()).toContain(toUserMessage(failure));
   });
   it("shows the download queue and reveals the finished destination", async () => {
     handlers.cloud_object_list = () => page([file, { key: 'b.txt', size: 2 }]);

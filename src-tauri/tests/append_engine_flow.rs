@@ -123,11 +123,55 @@ fn index(path: &Path, binding: &TrustBinding) -> AppendIndex {
     )
     .unwrap()
 }
+#[tokio::test]
+async fn local_history_is_published_in_bounded_shards_and_reopens() {
+    let (remote, repo, binding, _) = fixture().await;
+    let device = Device::new();
+    let mut index = device.index(&binding);
+    sync(&remote, &binding, &device, &mut index, "initial").await;
+    for i in 0..1400 {
+        std::fs::create_dir(device.root.path().join(format!("dir-{i:04}"))).unwrap();
+    }
+    sync(&remote, &binding, &device, &mut index, "sharded").await;
+    let trees: Vec<_> = remote
+        .bytes_for("put")
+        .into_iter()
+        .filter_map(|bytes| {
+            let envelope = Envelope::from_wire(&bytes).ok()?;
+            (envelope.kind == "tree").then(|| {
+                let reference = ObjectRef {
+                    kind: "tree".into(),
+                    digest: hex::encode(Sha256::digest(&bytes)),
+                };
+                repo.open_tree(&bytes, &reference).unwrap()
+            })
+        })
+        .collect();
+    assert!(
+        trees
+            .iter()
+            .any(|tree| tree.directory == "root" && tree.children.len() > 1),
+        "history must not be one aggregate manifest"
+    );
+    assert!(
+        trees
+            .iter()
+            .any(|tree| tree.directory.starts_with("shard-"))
+    );
+    drop(index);
+    let mut index = device.index(&binding);
+    sync(&remote, &binding, &device, &mut index, "reopen").await;
+    assert!(device.root.path().join("dir-1399").is_dir());
+}
+
 async fn fixture() -> (Remote, AppendRepository, TrustBinding, String) {
     named_fixture("hello.txt", AppendMode::Encrypted).await
 }
 
-async fn named_fixture(name: &str, mode: AppendMode) -> (Remote, AppendRepository, TrustBinding, String) {
+async fn named_fixture(
+    name: &str,
+    mode: AppendMode,
+) -> (Remote, AppendRepository, TrustBinding, String) {
     let remote = Remote::new(1);
     let descriptor = Descriptor {
         version: 2,
@@ -569,23 +613,56 @@ async fn temporary_files_are_excluded_across_remote_history_local_publish_and_re
         let mut idx = device.index(&binding);
         std::fs::write(device.root.path().join("normal.tmp.txt"), b"final").unwrap();
         sync(&remote, &binding, &device, &mut idx, "new-local").await;
-        let closure = peerdav_lib::sync::append_discovery::discover(store(&remote), &binding, b"p", &mut idx, "inspect-temporary").await.unwrap();
-        let revisions: Vec<_> = closure.trees().values().flat_map(|tree| tree.entries.iter()).collect();
-        assert!(revisions.iter().all(|r| !matches!(r.value, RevisionValue::Tombstone)));
-        assert!(revisions.iter().any(|r| matches!(&r.value, RevisionValue::Live { name, .. } if name == "old.part")));
+        let closure = peerdav_lib::sync::append_discovery::discover(
+            store(&remote),
+            &binding,
+            b"p",
+            &mut idx,
+            "inspect-temporary",
+        )
+        .await
+        .unwrap();
+        let revisions: Vec<_> = closure
+            .trees()
+            .values()
+            .flat_map(|tree| tree.entries.iter())
+            .collect();
+        assert!(
+            revisions
+                .iter()
+                .all(|r| !matches!(r.value, RevisionValue::Tombstone))
+        );
+        assert!(
+            revisions.iter().any(
+                |r| matches!(&r.value, RevisionValue::Live { name, .. } if name == "old.part")
+            )
+        );
         assert!(!revisions.iter().any(|r| matches!(&r.value, RevisionValue::Live { name, .. } if name == ".notes.swp" || name == "cache.tmp")));
         // Promotion to a final name is a new ordinary upload, not lost forever.
         std::fs::write(device.root.path().join("video.part"), b"finished").unwrap();
-        std::fs::rename(device.root.path().join("video.part"), device.root.path().join("video.mp4")).unwrap();
+        std::fs::rename(
+            device.root.path().join("video.part"),
+            device.root.path().join("video.mp4"),
+        )
+        .unwrap();
         sync(&remote, &binding, &device, &mut idx, "promoted").await;
         let other = Device::new();
         let mut other_index = other.index(&binding);
         sync(&remote, &binding, &other, &mut other_index, "other-device").await;
         assert!(!other.root.path().join("old.part").exists());
         assert!(!other.root.path().join(".notes.swp").exists());
-        assert_eq!(std::fs::read(other.root.path().join("video.mp4")).unwrap(), b"finished");
-        assert_eq!(std::fs::read(other.root.path().join("normal.tmp.txt")).unwrap(), b"final");
-        assert_eq!(std::fs::read(device.root.path().join(".notes.swp")).unwrap(), b"editor");
+        assert_eq!(
+            std::fs::read(other.root.path().join("video.mp4")).unwrap(),
+            b"finished"
+        );
+        assert_eq!(
+            std::fs::read(other.root.path().join("normal.tmp.txt")).unwrap(),
+            b"final"
+        );
+        assert_eq!(
+            std::fs::read(device.root.path().join(".notes.swp")).unwrap(),
+            b"editor"
+        );
     }
 }
 
@@ -656,21 +733,49 @@ async fn selected_sync_reopens_frozen_scope_without_touching_siblings() {
     std::fs::write(device.root.path().join("sibling.txt"), b"private").unwrap();
     let db = rusqlite::Connection::open(device.db.path().join("index")).unwrap();
     db.execute_batch("CREATE TRIGGER selected_fault BEFORE UPDATE ON append_records WHEN NEW.kind='engine-apply' BEGIN SELECT RAISE(FAIL,'selected fault'); END;").unwrap();
-    assert!(peerdav_lib::sync::append_engine::run_selected(
-        Arc::new(Paged(remote.store(), true, None)), &binding, b"p", &mut index, &device.request("selected-fault"),
-        Arc::new(AtomicBool::new(false)), &["hello.txt".to_owned()],
-    ).await.is_err());
+    assert!(
+        peerdav_lib::sync::append_engine::run_selected(
+            Arc::new(Paged(remote.store(), true, None)),
+            &binding,
+            b"p",
+            &mut index,
+            &device.request("selected-fault"),
+            Arc::new(AtomicBool::new(false)),
+            &["hello.txt".to_owned()],
+        )
+        .await
+        .is_err()
+    );
     assert!(index.active_epoch().unwrap().is_none());
     assert!(!index.recovery_record_ids("", 10).unwrap().is_empty());
     db.execute_batch("DROP TRIGGER selected_fault").unwrap();
     drop(index);
     let mut index = device.index(&binding);
-    let result = run(Arc::new(Paged(remote.store(), true, None)), &binding, b"p", &mut index, &device.request("resume-selected"), Arc::new(AtomicBool::new(false))).await.unwrap();
+    let result = run(
+        Arc::new(Paged(remote.store(), true, None)),
+        &binding,
+        b"p",
+        &mut index,
+        &device.request("resume-selected"),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+    .unwrap();
     assert!(result.resumed);
-    assert_eq!(index.active_epoch().unwrap().unwrap().selection, vec!["hello.txt"]);
-    assert_eq!(std::fs::read(device.root.path().join("hello.txt")).unwrap(), b"hello");
-    assert_eq!(std::fs::read(device.root.path().join("sibling.txt")).unwrap(), b"private");
-    let observer = Device::new(); let mut other = observer.index(&binding);
+    assert_eq!(
+        index.active_epoch().unwrap().unwrap().selection,
+        vec!["hello.txt"]
+    );
+    assert_eq!(
+        std::fs::read(device.root.path().join("hello.txt")).unwrap(),
+        b"hello"
+    );
+    assert_eq!(
+        std::fs::read(device.root.path().join("sibling.txt")).unwrap(),
+        b"private"
+    );
+    let observer = Device::new();
+    let mut other = observer.index(&binding);
     sync(&remote, &binding, &observer, &mut other, "observe-resume").await;
     assert!(!observer.root.path().join("sibling.txt").exists());
 }
@@ -681,59 +786,178 @@ async fn selected_sync_never_uploads_or_downloads_unselected_siblings() {
     let device = Device::new();
     let mut index = device.index(&binding);
     std::fs::write(device.root.path().join("selected.txt"), b"selected").unwrap();
-    std::fs::write(device.root.path().join("unselected.txt"), b"private sibling").unwrap();
+    std::fs::write(
+        device.root.path().join("unselected.txt"),
+        b"private sibling",
+    )
+    .unwrap();
     peerdav_lib::sync::append_engine::run_selected(
-        Arc::new(Paged(remote.store(), true, None)), &binding, b"p", &mut index, &device.request("selected-first"),
-        Arc::new(AtomicBool::new(false)), &["selected.txt".to_owned()],
-    ).await.unwrap();
-    assert!(!device.root.path().join("hello.txt").exists(), "unselected remote file must not be downloaded");
+        Arc::new(Paged(remote.store(), true, None)),
+        &binding,
+        b"p",
+        &mut index,
+        &device.request("selected-first"),
+        Arc::new(AtomicBool::new(false)),
+        &["selected.txt".to_owned()],
+    )
+    .await
+    .unwrap();
+    assert!(
+        !device.root.path().join("hello.txt").exists(),
+        "unselected remote file must not be downloaded"
+    );
     let observer = Device::new();
     let mut observer_index = observer.index(&binding);
-    sync(&remote, &binding, &observer, &mut observer_index, "observer").await;
-    assert_eq!(std::fs::read(observer.root.path().join("selected.txt")).unwrap(), b"selected");
-    assert!(!observer.root.path().join("unselected.txt").exists(), "unselected local file must not be published");
-    assert_eq!(std::fs::read(device.root.path().join("unselected.txt")).unwrap(), b"private sibling");
+    sync(
+        &remote,
+        &binding,
+        &observer,
+        &mut observer_index,
+        "observer",
+    )
+    .await;
+    assert_eq!(
+        std::fs::read(observer.root.path().join("selected.txt")).unwrap(),
+        b"selected"
+    );
+    assert!(
+        !observer.root.path().join("unselected.txt").exists(),
+        "unselected local file must not be published"
+    );
+    assert_eq!(
+        std::fs::read(device.root.path().join("unselected.txt")).unwrap(),
+        b"private sibling"
+    );
     std::fs::write(observer.root.path().join("hello.txt"), b"remote edit").unwrap();
-    sync(&remote, &binding, &observer, &mut observer_index, "observer-edit").await;
+    sync(
+        &remote,
+        &binding,
+        &observer,
+        &mut observer_index,
+        "observer-edit",
+    )
+    .await;
     peerdav_lib::sync::append_engine::run_selected(
-        Arc::new(Paged(remote.store(), true, None)), &binding, b"p", &mut index, &device.request("selected-second"),
-        Arc::new(AtomicBool::new(false)), &["selected.txt".to_owned()],
-    ).await.unwrap();
+        Arc::new(Paged(remote.store(), true, None)),
+        &binding,
+        b"p",
+        &mut index,
+        &device.request("selected-second"),
+        Arc::new(AtomicBool::new(false)),
+        &["selected.txt".to_owned()],
+    )
+    .await
+    .unwrap();
     assert!(!device.root.path().join("hello.txt").exists());
-    sync(&remote, &binding, &device, &mut index, "whole-after-selected").await;
-    assert_eq!(std::fs::read(device.root.path().join("hello.txt")).unwrap(), b"remote edit");
+    sync(
+        &remote,
+        &binding,
+        &device,
+        &mut index,
+        "whole-after-selected",
+    )
+    .await;
+    assert_eq!(
+        std::fs::read(device.root.path().join("hello.txt")).unwrap(),
+        b"remote edit"
+    );
     std::fs::remove_file(observer.root.path().join("selected.txt")).unwrap();
     std::fs::write(observer.root.path().join("hello.txt"), b"unselected later").unwrap();
-    sync(&remote, &binding, &observer, &mut observer_index, "observer-delete").await;
+    sync(
+        &remote,
+        &binding,
+        &observer,
+        &mut observer_index,
+        "observer-delete",
+    )
+    .await;
     peerdav_lib::sync::append_engine::run_selected(
-        Arc::new(Paged(remote.store(), true, None)), &binding, b"p", &mut index, &device.request("selected-delete"),
-        Arc::new(AtomicBool::new(false)), &["selected.txt".to_owned()],
-    ).await.unwrap();
+        Arc::new(Paged(remote.store(), true, None)),
+        &binding,
+        b"p",
+        &mut index,
+        &device.request("selected-delete"),
+        Arc::new(AtomicBool::new(false)),
+        &["selected.txt".to_owned()],
+    )
+    .await
+    .unwrap();
     assert!(!device.root.path().join("selected.txt").exists());
-    assert_eq!(std::fs::read(device.root.path().join("hello.txt")).unwrap(), b"remote edit");
+    assert_eq!(
+        std::fs::read(device.root.path().join("hello.txt")).unwrap(),
+        b"remote edit"
+    );
     sync(&remote, &binding, &device, &mut index, "whole-final").await;
-    assert_eq!(std::fs::read(device.root.path().join("hello.txt")).unwrap(), b"unselected later");
+    assert_eq!(
+        std::fs::read(device.root.path().join("hello.txt")).unwrap(),
+        b"unselected later"
+    );
     std::fs::create_dir_all(device.root.path().join("folder")).unwrap();
     std::fs::write(device.root.path().join("folder/chosen.txt"), b"nested").unwrap();
     std::fs::write(device.root.path().join("folder/sibling.txt"), b"sibling").unwrap();
     peerdav_lib::sync::append_engine::run_selected(
-        Arc::new(Paged(remote.store(), true, None)), &binding, b"p", &mut index, &device.request("nested-selected"),
-        Arc::new(AtomicBool::new(false)), &["folder/chosen.txt".to_owned()],
-    ).await.unwrap();
-    sync(&remote, &binding, &observer, &mut observer_index, "nested-observer").await;
-    assert_eq!(std::fs::read(observer.root.path().join("folder/chosen.txt")).unwrap(), b"nested");
+        Arc::new(Paged(remote.store(), true, None)),
+        &binding,
+        b"p",
+        &mut index,
+        &device.request("nested-selected"),
+        Arc::new(AtomicBool::new(false)),
+        &["folder/chosen.txt".to_owned()],
+    )
+    .await
+    .unwrap();
+    sync(
+        &remote,
+        &binding,
+        &observer,
+        &mut observer_index,
+        "nested-observer",
+    )
+    .await;
+    assert_eq!(
+        std::fs::read(observer.root.path().join("folder/chosen.txt")).unwrap(),
+        b"nested"
+    );
     assert!(!observer.root.path().join("folder/sibling.txt").exists());
-    std::fs::write(device.root.path().join("folder/chosen.txt"), b"local conflict").unwrap();
-    std::fs::write(observer.root.path().join("folder/chosen.txt"), b"remote conflict").unwrap();
-    sync(&remote, &binding, &observer, &mut observer_index, "remote-conflict").await;
+    std::fs::write(
+        device.root.path().join("folder/chosen.txt"),
+        b"local conflict",
+    )
+    .unwrap();
+    std::fs::write(
+        observer.root.path().join("folder/chosen.txt"),
+        b"remote conflict",
+    )
+    .unwrap();
+    sync(
+        &remote,
+        &binding,
+        &observer,
+        &mut observer_index,
+        "remote-conflict",
+    )
+    .await;
     peerdav_lib::sync::append_engine::run_selected(
-        Arc::new(Paged(remote.store(), true, None)), &binding, b"p", &mut index, &device.request("selected-conflict"),
-        Arc::new(AtomicBool::new(false)), &["folder/chosen.txt".to_owned()],
-    ).await.unwrap();
-    let files = std::fs::read_dir(device.root.path().join("folder")).unwrap().map(|entry| std::fs::read(entry.unwrap().path()).unwrap()).collect::<Vec<_>>();
+        Arc::new(Paged(remote.store(), true, None)),
+        &binding,
+        b"p",
+        &mut index,
+        &device.request("selected-conflict"),
+        Arc::new(AtomicBool::new(false)),
+        &["folder/chosen.txt".to_owned()],
+    )
+    .await
+    .unwrap();
+    let files = std::fs::read_dir(device.root.path().join("folder"))
+        .unwrap()
+        .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
     assert!(files.iter().any(|bytes| bytes == b"local conflict"));
     assert!(files.iter().any(|bytes| bytes == b"remote conflict"));
-    assert_eq!(std::fs::read(device.root.path().join("folder/sibling.txt")).unwrap(), b"sibling");
+    assert_eq!(
+        std::fs::read(device.root.path().join("folder/sibling.txt")).unwrap(),
+        b"sibling"
+    );
 }
 
 #[tokio::test]
@@ -1567,23 +1791,39 @@ async fn local_edit_reuses_existing_encrypted_block_and_steady_save_puts_nothing
     std::fs::write(device.root.path().join("copy.txt"), b"hello").unwrap();
     sync(&remote, &binding, &device, &mut index, "same-content").await;
     let requests = remote.requests();
-    assert!(requests[before..].iter().all(|r| r.operation != "put" || !r.key.contains("/blocks/")));
+    assert!(
+        requests[before..]
+            .iter()
+            .all(|r| r.operation != "put" || !r.key.contains("/blocks/"))
+    );
     std::fs::write(device.root.path().join("copy.txt"), b"changed content").unwrap();
     let before = requests.len();
     sync(&remote, &binding, &device, &mut index, "changed-content").await;
     let requests = remote.requests();
-    let blocks: Vec<_> = requests[before..].iter().filter(|r| r.operation == "put" && r.key.contains("/blocks/")).collect();
+    let blocks: Vec<_> = requests[before..]
+        .iter()
+        .filter(|r| r.operation == "put" && r.key.contains("/blocks/"))
+        .collect();
     assert_eq!(blocks.len(), 1);
     assert_ne!(blocks[0].key, block_key);
     // A large single file retains all but its changed final CDC block.
     let mut large = vec![0u8; 9 * 1024 * 1024];
     let mut seed = 0x12345678u32;
-    for byte in &mut large { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; *byte = seed as u8; }
+    for byte in &mut large {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        *byte = seed as u8;
+    }
     std::fs::write(device.root.path().join("large.txt"), &large).unwrap();
     let before = requests.len();
     sync(&remote, &binding, &device, &mut index, "large-initial").await;
     let requests = remote.requests();
-    let initial_blocks: Vec<_> = requests[before..].iter().filter(|r| r.operation == "put" && r.key.contains("/blocks/")).map(|r| r.key.clone()).collect();
+    let initial_blocks: Vec<_> = requests[before..]
+        .iter()
+        .filter(|r| r.operation == "put" && r.key.contains("/blocks/"))
+        .map(|r| r.key.clone())
+        .collect();
     assert!(initial_blocks.len() > 1);
     let last = large.len() - 1;
     large[last] ^= 1;
@@ -1591,14 +1831,21 @@ async fn local_edit_reuses_existing_encrypted_block_and_steady_save_puts_nothing
     let before = requests.len();
     sync(&remote, &binding, &device, &mut index, "large-local-edit").await;
     let requests = remote.requests();
-    let changed_blocks: Vec<_> = requests[before..].iter().filter(|r| r.operation == "put" && r.key.contains("/blocks/")).collect();
+    let changed_blocks: Vec<_> = requests[before..]
+        .iter()
+        .filter(|r| r.operation == "put" && r.key.contains("/blocks/"))
+        .collect();
     assert_eq!(changed_blocks.len(), 1);
     assert!(!initial_blocks.contains(&changed_blocks[0].key));
     let before = requests.len();
     drop(index);
     let mut index = device.index(&binding);
     sync(&remote, &binding, &device, &mut index, "steady-reopen").await;
-    assert!(remote.requests()[before..].iter().all(|r| r.operation != "put"));
+    assert!(
+        remote.requests()[before..]
+            .iter()
+            .all(|r| r.operation != "put")
+    );
 }
 
 #[tokio::test]

@@ -40,7 +40,7 @@ mod publish {
         )
         .unwrap();
         let (key, bytes) = repo.seal_block(b"publication payload").unwrap();
-        let envelope: Envelope = serde_json::from_slice(&bytes).unwrap();
+        let envelope: Envelope = Envelope::from_wire(&bytes).unwrap();
         let tree = Tree {
             version: 2,
             repo_id: repo.repo_id().into(),

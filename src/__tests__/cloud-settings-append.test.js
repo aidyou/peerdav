@@ -220,17 +220,17 @@ describe("append settings through unified invoke", () => {
     await fillPasswords(w); expect(w.find(".append-create").attributes("disabled")).toBeUndefined();
     await w.find(".append-create").trigger("click"); await flushPromises();
     expect(nativeInvoke).toHaveBeenCalledWith("cloud_create_sync_drive", { input: { connectionId: "c1", mode, password: "password-123", passwordConfirmation: "password-123", localRoot: "/local/Documents", logicalPath: "Documents" } });
-    expect(nativeInvoke).toHaveBeenCalledWith("cloud_prepare_mapping_bind", { input: { mappingId: null, mapping: { connectionId: "c1", repositoryId: "new-repo", localRoot: "/local/Documents", logicalPath: "Documents", schedule: { enabled: false, interval: 120 } }, selectedRoot: "Documents" } });
+    expect(nativeInvoke.mock.calls.some(([command]) => command === "cloud_prepare_mapping_bind")).toBe(false);
     await flushPromises();
     expect(app.handleFailure.mock.calls).toEqual([]);
-    expect(w.find('.append-state').text()).toBe('Sync drive saved.');
+    expect(w.find('.append-state').text()).toBe('Sync drive created. Initial sync is running in the background; open the drive to view its status.');
     expect(changed).toHaveBeenCalledTimes(1);
     expect(w.find('[data-test=create-drive-dialog]').exists()).toBe(false); expect(nativeInvoke.mock.calls.some(([c]) => c === "cloud_test_connection")).toBe(false); w.unmount();
   });
   it('binds an empty new drive directly and preserves the selected schedule', async () => {
     const original = nativeInvoke.getMockImplementation();
     nativeInvoke.mockImplementation(async (command, args) => {
-      if (command === 'cloud_prepare_mapping_bind') { const item = { ...args.input.mapping, id: 'scheduled' }; rows.mappings.push(item); return { mapping: item, runId: 1, planId: null, entries: [] }; }
+      if (command === 'cloud_create_sync_drive') { const item = { ...args.input, id: 'scheduled' }; rows.mappings.push(item); return { binding: { repoId: 'new-repo' } }; }
       return original(command, args);
     });
     const w = await mountSettings(); await w.setProps({ bucket: 'photos' });
@@ -238,7 +238,7 @@ describe("append settings through unified invoke", () => {
     await w.find('.create-schedule input[type=checkbox]').setValue(true);
     expect(w.find('.create-schedule input[type=number]').exists()).toBe(false);
     await w.find('.append-create').trigger('click'); await flushPromises();
-    expect(nativeInvoke).toHaveBeenCalledWith('cloud_create_sync_drive', { input: { connectionId: 'c1', bucket: 'photos', mode: 'encrypted', password: 'password-123', passwordConfirmation: 'password-123', localRoot: '/local/Documents', logicalPath: 'Documents' } });
+    expect(nativeInvoke).toHaveBeenCalledWith('cloud_create_sync_drive', { input: { connectionId: 'c1', bucket: 'photos', mode: 'encrypted', password: 'password-123', passwordConfirmation: 'password-123', localRoot: '/local/Documents', logicalPath: 'Documents', schedule: { enabled: true, interval: 120 } } });
     expect(rows.mappings[0].schedule).toEqual({ enabled: true, interval: 120 });
     expect(confirmAction).not.toHaveBeenCalled();
     expect(nativeInvoke.mock.calls.some(([command]) => command === 'cloud_preview' || command === 'cloud_sync')).toBe(false);
@@ -534,7 +534,7 @@ describe("append settings through unified invoke", () => {
     if (command === "cloud_create_sync_drive") { await w.find(".new-drive-local").setValue("/local/Documents"); await fillPasswords(w); }
     if (command === "cloud_append_join") { await w.find(".append-discover").trigger("click"); await flushPromises(); await w.find(".append-candidate").setValue("one"); await fillPasswords(w); await fillLinkLocalRoot(w); }
     const failure = { code: "CLOUD_APPEND_AUTHENTICATION", message: "Wrong password", detail: null, context: null }; const log = vi.spyOn(console, "error").mockImplementation(() => {}); nativeInvoke.mockRejectedValueOnce(failure);
-    await w.find(command === "cloud_create_sync_drive" ? ".append-create" : ".append-join").trigger("click"); await flushPromises(); expect(app.handleFailure).toHaveBeenCalledWith(failure); expect(w.text()).toContain("Sync drive operation failed"); const retained = w.find(".append-password").exists() ? w.find(".append-password") : w.find(".append-join-password"); expect(retained.element.value).toBe("password-123"); log.mockRestore(); w.unmount();
+    await w.find(command === "cloud_create_sync_drive" ? ".append-create" : ".append-join").trigger("click"); await flushPromises(); expect(app.handleFailure).toHaveBeenCalledWith(expect.objectContaining({ ...failure, context: command === "cloud_create_sync_drive" ? { userOperationKey: "errorOperation.createSyncDrive" } : null })); expect(w.text()).toContain("Sync drive operation failed"); const retained = w.find(".append-password").exists() ? w.find(".append-password") : w.find(".append-join-password"); expect(retained.element.value).toBe("password-123"); log.mockRestore(); w.unmount();
   });
   it('selects a local directory and edits an existing append mapping using its configured protocol', async () => {
     rows.mappings = [{ id: 'a1', connectionId: 'c1', repositoryId: 'append-repo', localRoot: '/old', logicalPath: 'photos', schedule: { enabled: true, interval: 120 } }];
@@ -555,7 +555,7 @@ describe("append settings through unified invoke", () => {
   it("has matching bilingual keys and stable append error strategies", () => {
     expect(Object.keys(en).filter((k) => k.startsWith("cloudAppend.") || k.startsWith("errors.CLOUD_APPEND")).sort()).toEqual(Object.keys(zh).filter((k) => k.startsWith("cloudAppend.") || k.startsWith("errors.CLOUD_APPEND")).sort());
     for (const [code, strategy] of Object.entries({ CLOUD_APPEND_PASSWORD: "edit", CLOUD_APPEND_ROOT_SELECTION: "edit", CLOUD_APPEND_TRUST_REQUIRED: "edit", CLOUD_APPEND_FINGERPRINT: "edit", CLOUD_APPEND_AUTHENTICATION: "retry", CLOUD_APPEND_DEPENDENCY: "support", CLOUD_APPEND: "show" })) {
-      expect(errorStrategy({ code, message: "reason" })).toBe(strategy); expect(toUserMessage({ code, message: "original reason" })).toContain("original reason");
+      expect(errorStrategy({ code, message: "reason" })).toBe(strategy); expect(toUserMessage({ code, message: "original reason" })).not.toContain("original reason");
     }
   });
 });

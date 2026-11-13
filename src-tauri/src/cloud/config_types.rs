@@ -52,6 +52,8 @@ pub enum ConfigError {
     Root(#[from] RootError),
     #[error("cloud configuration validation failed: {0}")]
     Validation(String),
+    #[error("mapping conflict ({kind}): requested={requested}, existing={existing}, drive={drive}, mapping={mapping_id}")]
+    MappingConflict { kind: &'static str, requested: String, existing: String, drive: String, mapping_id: String },
     #[error("cloud configuration item was not found: {0}")]
     NotFound(String),
     #[error("secure random generation failed: {0}")]

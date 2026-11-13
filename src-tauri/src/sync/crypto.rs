@@ -299,7 +299,7 @@ impl RepositoryKeys {
             kind: kind.into(),
             block_id: id.map(hex::encode),
             nonce: hex::encode(n),
-            ciphertext: hex::encode(ct),
+            ciphertext: ct,
         })
     }
     fn open_kind(&self, e: &Envelope, id: &[u8; 32]) -> Result<Vec<u8>, CryptoError> {
@@ -313,16 +313,10 @@ impl RepositoryKeys {
             "commit" => (MAX_METADATA_SIZE, b"commit-aead"),
             _ => return Err(CryptoError::Input("object kind")),
         };
-        if e.ciphertext.len() < 32
-            || e.ciphertext.len() > 2 * (limit + 16)
-            || !e
-                .ciphertext
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err(CryptoError::Input("ciphertext length or encoding"));
+        if e.ciphertext.len() < 16 || e.ciphertext.len() > limit + 16 {
+            return Err(CryptoError::Input("ciphertext length"));
         }
-        let ct = hex::decode(&e.ciphertext).map_err(|_| CryptoError::Input("ciphertext"))?;
+        let ct = &e.ciphertext;
         let k = expand(&self.master, &self.repo_id, purpose)?;
         let c = XChaCha20Poly1305::new_from_slice(&*k).map_err(|_| CryptoError::Auth)?;
         let aad = if e.kind == "block" {

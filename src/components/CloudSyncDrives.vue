@@ -220,24 +220,12 @@ async function create() {
   await run(async (scope) => {
     state.value = "loading";
     const logicalPath = newDrive.value.logicalPath.trim() || folderName(newDrive.value.localRoot);
-    const redacted = await cloud.createSyncDrive({ connectionId: props.connectionId, bucket: selectedBucket.value, mode: createMode.value, password: newDrive.value.password, passwordConfirmation: newDrive.value.confirmation, localRoot: newDrive.value.localRoot, logicalPath });
-    if (scope !== generation || disposed) return;
-    // Bind the first local folder in the same step so a new drive always has
-    // something to sync instead of looking like a no-op. The drive already
-    // exists at this point, so surface a binding failure without leaving the
-    // form filled (retrying create would otherwise duplicate the drive).
-    let bindingError = null;
-    try {
-      await prepareBinding({ connectionId: props.connectionId, repositoryId: redacted.binding.repoId, localRoot: newDrive.value.localRoot, logicalPath, schedule: { enabled: createSchedule.value.enabled, interval: 120 } }, logicalPath, scope);
-    } catch (error) {
-      bindingError = error;
-    }
+    await cloud.createSyncDrive({ connectionId: props.connectionId, bucket: selectedBucket.value, mode: createMode.value, password: newDrive.value.password, passwordConfirmation: newDrive.value.confirmation, localRoot: newDrive.value.localRoot, logicalPath, ...(createSchedule.value.enabled ? { schedule: { enabled: true, interval: 120 } } : {}) });
     if (scope !== generation || disposed) return;
     resetNewDrive(); resetMirror(); resetCreateMode(); createDialogOpen.value = false; await refresh(scope);
     if (scope !== generation || disposed) return;
     emit("changed");
-    if (bindingError) throw bindingError;
-    state.value = "saved";
+    state.value = "created";
   });
 }
 function editMirror(item) {

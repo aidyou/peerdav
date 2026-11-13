@@ -8,6 +8,12 @@ use super::types::{
     PutCondition, StorageCapabilities,
 };
 
+pub trait CapabilityObserver: Send + Sync {
+    fn load(&self) -> Result<super::types::ProbeCapabilities, CloudError>;
+    fn save(&self, state: super::types::ProbeCapabilities) -> Result<(), CloudError>;
+    fn progress(&self, capability: &'static str, stage: &'static str) -> Result<(), CloudError>;
+}
+
 /// Provider-neutral primitives. Missing optional capabilities must fail closed.
 pub trait ObjectStore: Send + Sync {
     /// All operation keys are relative to this physical namespace. Unknown

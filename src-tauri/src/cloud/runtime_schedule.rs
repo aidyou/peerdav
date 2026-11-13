@@ -116,10 +116,14 @@ fn spawn_schedule(
                         .await;
                     match result {
                         Ok(Ok(())) => {}
+                        Ok(Err(error)) if error.code == "CLOUD_SCHEDULE_PAUSED" => {
+                            // Expected lifecycle state, not an operational failure.
+                            // Root validation publishes the paused status; retry
+                            // next tick without repeatedly opening an error dialog.
+                            log::debug!("scheduled sync paused: mapping={mapping_id} code={}", error.code);
+                        }
                         Ok(Err(error)) => {
-                            // A missing first baseline or a paused root must not
-                            // permanently kill an enabled schedule. Every later
-                            // tick still revalidates the durable safety guard.
+                            // Real failures still use the unified background exit.
                             (report_error)(error);
                         }
                         Err(_) => (report_error)(schedule_error(
@@ -360,6 +364,11 @@ impl CloudSchedules {
             return Ok(());
         }
         let mut first_error = None;
+        for mapping in mappings.iter().filter(|mapping| mapping.protocol == super::config_types::StorageProtocol::AppendV2) {
+            if let Err(error) = runtime.resume_initial_sync(mapping).await {
+                runtime.report_initial_sync_failure(&mapping.id, error);
+            }
+        }
         for mapping in mappings.iter().filter(|mapping| mapping.schedule.enabled) {
             if !runtime.is_open() { break; }
             match runtime.start_change_watch(mapping) {
@@ -424,6 +433,34 @@ impl CloudSchedules {
             return Err(error);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn paused_schedule_retries_without_error_dialog_but_reports_real_failures() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let source: TickSource = Arc::new(move |_| {
+            let observed = observed.clone();
+            Box::pin(async move {
+                let n = observed.fetch_add(1, Ordering::SeqCst);
+                Err(schedule_error(if n < 2 { "CLOUD_SCHEDULE_PAUSED" } else { "CLOUD_NETWORK" }, "test"))
+            })
+        });
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let reported = errors.clone();
+        let handle = spawn_schedule("mapping".into(), Duration::from_millis(10), source,
+            Arc::new(move |error| reported.lock().expect("reports").push(error.code)));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while errors.lock().expect("reports").is_empty() { time::sleep(Duration::from_millis(5)).await; }
+        }).await.expect("real error reported");
+        handle.stop_and_join().await.expect("stop");
+        assert!(calls.load(Ordering::SeqCst) >= 3);
+        assert!(errors.lock().expect("reports").iter().all(|code| code == "CLOUD_NETWORK"));
     }
 }
 

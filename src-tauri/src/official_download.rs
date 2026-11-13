@@ -36,7 +36,7 @@ impl TransferQueueAdapter for OfficialDownloadAdapter {
             else { Err(crate::file_manager::service::invalid()) }
         })
     }
-    fn plan(&self, selection: DownloadSelection) -> BoxFuture<'_, Result<Vec<DownloadItem>, AppError>> {
+    fn plan(&self, selection: DownloadSelection) -> BoxFuture<'_, Result<DownloadSpool, AppError>> {
         Box::pin(async move {
             self.validate().await?;
             let paths = match selection {
@@ -44,9 +44,9 @@ impl TransferQueueAdapter for OfficialDownloadAdapter {
                 DownloadSelection::Files { paths } => paths,
                 DownloadSelection::Folder { path } => vec![path],
             };
-            if paths.is_empty() || paths.len() > MAX_DOWNLOAD_ITEMS { return Err(crate::file_manager::service::invalid()); }
+            if paths.is_empty() { return Err(crate::file_manager::service::invalid()); }
             let mut names = std::collections::HashSet::new();
-            let mut items = Vec::new();
+            let mut items = DownloadSpool::new()?;
             let mut files = self.files.lock().await.clone();
             let mut content_types = self.content_types.lock().await.clone();
             let mut selected = std::collections::HashSet::new();
@@ -60,8 +60,6 @@ impl TransferQueueAdapter for OfficialDownloadAdapter {
                 true
             }).cloned().collect();
             let cancel = self.cancellation()?;
-            let mut pages = 0usize;
-            let mut entries = 0usize;
             for path in paths {
                 if !selected.insert(path.clone()) { continue; }
                 if cancel.is_cancelled() { return Err(DomainError::TransferCanceled.into()); }
@@ -75,22 +73,19 @@ impl TransferQueueAdapter for OfficialDownloadAdapter {
                     while let Some((parent, relative, depth)) = stack.pop() {
                         if depth >= MAX_DOWNLOAD_DEPTH || !visited.insert(parent.clone()) { return Err(crate::file_manager::service::invalid()); }
                         let mut cursor = None;
-                        let first_item = items.len();
+                        let first_item = items.count;
                         let mut child_count = 0usize;
                         let mut cursors = std::collections::HashSet::new();
                         let mut siblings = std::collections::HashSet::new();
                         let mut ids = std::collections::HashSet::new();
                         loop {
-                            pages += 1;
-                            if pages > MAX_DOWNLOAD_ITEMS || cancel.is_cancelled() { return Err(crate::file_manager::service::invalid()); }
+                            if cancel.is_cancelled() { return Err(DomainError::TransferCanceled.into()); }
                             let page = tokio::select! {
                                 _ = cancel.cancelled() => return Err(DomainError::TransferCanceled.into()),
                                 page = self.list_page(&parent, cursor.as_deref()) => page?,
                             };
                             self.validate().await?;
-                            entries += page.entries.len();
                             child_count += page.entries.len();
-                            if entries > MAX_DOWNLOAD_ITEMS { return Err(crate::file_manager::service::invalid()); }
                             for entry in page.entries {
                                 if !ids.insert(entry.id.clone()) { return Err(crate::file_manager::service::invalid()); }
                                 let format = crate::cloud::official_api::OfficialApi::export_format(entry.content_type.as_deref()).map_err(crate::cloud::official_runtime::api_error)?;
@@ -103,7 +98,7 @@ impl TransferQueueAdapter for OfficialDownloadAdapter {
                                     let token = crate::local_upload::token()?;
                                     if let Some(kind) = entry.content_type { content_types.insert(token.clone(), kind); }
                                     files.insert(token.clone(), (entry.id, entry.size));
-                                    items.push(crate::download::item(token, local, entry.size)?);
+                                    items.push(crate::download::item(token, local, entry.size)?)?;
                                 }
                             }
                             match page.next {
@@ -113,17 +108,16 @@ impl TransferQueueAdapter for OfficialDownloadAdapter {
                                 None => return Err(crate::file_manager::service::invalid()),
                             }
                         }
-                        if child_count == 0 && items.len() == first_item {
+                        if child_count == 0 && items.count == first_item {
                             let mut item = crate::download::item(String::new(), relative, 0)?;
                             item.is_dir = true;
-                            items.push(item);
+                            items.push(item)?;
                         }
                     }
                 } else {
                     let (_, size) = files.get(&path).ok_or_else(crate::file_manager::service::invalid)?;
-                    items.push(crate::download::item(path, name, *size)?);
+                    items.push(crate::download::item(path, name, *size)?)?;
                 }
-                if items.len() > MAX_DOWNLOAD_ITEMS { return Err(crate::file_manager::service::invalid()); }
             }
             self.validate().await?;
             *self.files.lock().await = files;
@@ -203,15 +197,15 @@ mod tests {
             names: std::collections::HashMap::from([("docs/a.txt".into(), "a.txt".into()), ("other/a.txt".into(), "a.txt".into())]),
             directories: Default::default(),
             files: tokio::sync::Mutex::new(std::collections::HashMap::from([("docs/a.txt".into(), ("id-a".into(), 12)), ("other/a.txt".into(), ("id-b".into(), 13))])) };
-        let plan = adapter.plan(DownloadSelection::Single { path: "docs/a.txt".into() }).await.expect("listed file");
+        let plan = adapter.plan(DownloadSelection::Single { path: "docs/a.txt".into() }).await.expect("listed file").page(0, 100).expect("page");
         assert_eq!(plan[0].relative_path, "a.txt");
         adapter.content_types.lock().await.insert("docs/a.txt".into(), "application/vnd.google-apps.document".into());
-        let exported = adapter.plan(DownloadSelection::Single { path: "docs/a.txt".into() }).await.expect("Docs export plan");
+        let exported = adapter.plan(DownloadSelection::Single { path: "docs/a.txt".into() }).await.expect("Docs export plan").page(0, 100).expect("page");
         assert_eq!(exported[0].relative_path, "a.txt.docx");
         adapter.content_types.lock().await.clear();
         assert!(adapter.plan(DownloadSelection::Single { path: "forged".into() }).await.is_err());
         assert!(adapter.plan(DownloadSelection::Folder { path: "docs/".into() }).await.is_err());
-        let duplicates = adapter.plan(DownloadSelection::Files { paths: vec!["docs/a.txt".into(), "other/a.txt".into()] }).await.expect("same-name files");
+        let duplicates = adapter.plan(DownloadSelection::Files { paths: vec!["docs/a.txt".into(), "other/a.txt".into()] }).await.expect("same-name files").page(0, 100).expect("page");
         assert_eq!(duplicates[0].relative_path, "a.txt");
         assert_eq!(duplicates[1].relative_path, "a (2).txt");
         assert_eq!(duplicates[1].remote_path, "other/a.txt");
@@ -224,19 +218,19 @@ mod tests {
             (("folder".into(), Some("next".into())), OfficialPage { entries: vec![entry("two", "a.txt", false)], next: None, complete: true }),
             (("nested".into(), None), OfficialPage { entries: vec![entry("three", "b.txt", false)], next: None, complete: true }),
         ]));
-        let folder = adapter.plan(DownloadSelection::Folder { path: "docs/".into() }).await.expect("folder recursion");
+        let folder = adapter.plan(DownloadSelection::Folder { path: "docs/".into() }).await.expect("folder recursion").page(0, 100).expect("page");
         assert_eq!(folder.iter().map(|i| i.relative_path.as_str()).collect::<Vec<_>>(), ["Documents/a.txt", "Documents/a (2).txt", "Documents/nested/b.txt"]);
-        let mixed = adapter.plan(DownloadSelection::Files { paths: vec!["docs/".into(), "docs/a.txt".into(), "other/a.txt".into()] }).await.expect("mixed and overlapping selections");
+        let mixed = adapter.plan(DownloadSelection::Files { paths: vec!["docs/".into(), "docs/a.txt".into(), "other/a.txt".into()] }).await.expect("mixed and overlapping selections").page(0, 100).expect("page");
         assert_eq!(mixed.len(), 4);
         assert_eq!(mixed[3].relative_path, "a.txt");
         adapter.names.insert("docs/unrelated".into(), "independent.txt".into());
         adapter.files.lock().await.insert("docs/unrelated".into(), ("independent-id".into(), 1));
         adapter.parents.insert("docs/unrelated".into(), "different-parent".into());
-        let independent = adapter.plan(DownloadSelection::Files { paths: vec!["docs/".into(), "docs/unrelated".into()] }).await.expect("ID prefix is not ancestry");
+        let independent = adapter.plan(DownloadSelection::Files { paths: vec!["docs/".into(), "docs/unrelated".into()] }).await.expect("ID prefix is not ancestry").page(0, 100).expect("page");
         assert_eq!(independent.len(), 4);
         assert!(independent.iter().any(|item| item.remote_path == "docs/unrelated"));
         adapter.pages.as_mut().expect("pages").get_mut(&("nested".into(), None)).expect("nested").entries.clear();
-        let empty = adapter.plan(DownloadSelection::Folder { path: "docs/".into() }).await.expect("empty child directory");
+        let empty = adapter.plan(DownloadSelection::Folder { path: "docs/".into() }).await.expect("empty child directory").page(0, 100).expect("page");
         assert!(empty.iter().any(|item| item.is_dir && item.relative_path == "Documents/nested"));
         adapter.pages.as_mut().expect("pages").get_mut(&("nested".into(), None)).expect("nested").entries = vec![entry("escape", "../escape", false)];
         assert!(adapter.plan(DownloadSelection::Folder { path: "docs/".into() }).await.is_err());

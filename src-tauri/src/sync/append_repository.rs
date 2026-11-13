@@ -14,8 +14,8 @@ use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-const BLOCK_WIRE_LIMIT: usize = 2 * (MAX_BLOCK_SIZE + 16) + 4096;
-const METADATA_WIRE_LIMIT: usize = 2 * (MAX_METADATA_SIZE + 16) + 4096;
+const BLOCK_WIRE_LIMIT: usize = MAX_BLOCK_SIZE + super::repository_types::OBJECT_WIRE_OVERHEAD;
+const METADATA_WIRE_LIMIT: usize = MAX_METADATA_SIZE + super::repository_types::OBJECT_WIRE_OVERHEAD;
 const ANCHOR_WIRE_LIMIT: usize = 64 * 1024;
 type HmacSha256 = Hmac<Sha256>;
 fn frame(label: &[u8], fields: &[&[u8]]) -> Vec<u8> {
@@ -429,13 +429,13 @@ impl AppendRepository {
                         },
                     )
                     .map_err(|_| AppendError::Authentication)?;
-                (Some(hex::encode(n)), hex::encode(p), None)
+                (Some(hex::encode(n)), p, None)
             }
             AppendMode::AuthenticatedPlain => {
                 let k = derive(&self.master, &self.repo, b"authentication")?;
                 (
                     None,
-                    hex::encode(plain),
+                    plain.to_vec(),
                     Some(hex::encode(hmac(&k, b"plain", &[&aad, plain])?)),
                 )
             }
@@ -451,7 +451,7 @@ impl AppendRepository {
             payload,
             auth,
         };
-        let bytes = json(&e)?;
+        let bytes = e.to_wire()?;
         let digest = hex::encode(Sha256::digest(&bytes));
         Ok((
             format!("{APPEND_ROOT}/{}/{kind}s/{digest}", self.anchor.descriptor.repo_id),
@@ -469,10 +469,7 @@ impl AppendRepository {
         if bytes.len() > BLOCK_WIRE_LIMIT {
             return Err(AppendError::Input("object too large"));
         }
-        let e: Envelope = serde_json::from_slice(bytes)?;
-        if serde_json::to_vec(&e)? != bytes {
-            return Err(AppendError::Invalid("non-canonical envelope"));
-        }
+        let e = Envelope::from_wire(bytes)?;
         let wire_digest = hex::encode(Sha256::digest(bytes));
         if let Some(binding) = expected {
             validate_binding(binding)?;
@@ -520,14 +517,14 @@ impl AppendRepository {
                 c.decrypt(
                     XNonce::from_slice(&n),
                     Payload {
-                        msg: &hex_bytes(&e.payload, e.payload.len() / 2)?,
+                        msg: &e.payload,
                         aad: &aad,
                     },
                 )
                 .map_err(|_| AppendError::Authentication)?
             }
             AppendMode::AuthenticatedPlain => {
-                let p = hex_bytes(&e.payload, e.payload.len() / 2)?;
+                let p = e.payload.clone();
                 let got = hmac(
                     &derive(&self.master, &self.repo, b"authentication")?,
                     b"plain",
@@ -619,8 +616,8 @@ impl AppendRepository {
         {
             return Err(AppendError::Invalid("metadata digest"));
         }
-        let e: Envelope = serde_json::from_slice(bytes)?;
-        if serde_json::to_vec(&e)? != bytes || e.kind != kind {
+        let e = Envelope::from_wire(bytes)?;
+        if e.kind != kind {
             return Err(AppendError::Invalid("non-canonical metadata envelope"));
         }
         let p = self.open_envelope(bytes, &e)?;
@@ -661,15 +658,7 @@ impl AppendRepository {
         let id: [u8; 32] = raw_id
             .try_into()
             .map_err(|_| AppendError::Invalid("metadata id"))?;
-        let payload_len = e
-            .payload
-            .len()
-            .checked_div(2)
-            .ok_or(AppendError::Invalid("payload encoding"))?;
-        if e.payload.len() % 2 != 0
-            || payload_len > MAX_METADATA_SIZE + 16
-            || e.plaintext_len > MAX_METADATA_SIZE as u64
-        {
+        if e.payload.len() > MAX_METADATA_SIZE + 16 {
             return Err(AppendError::Invalid("metadata payload length"));
         }
         let plain_len = usize::try_from(e.plaintext_len)
@@ -684,7 +673,7 @@ impl AppendRepository {
                     return Err(AppendError::Invalid("encrypted envelope shape"));
                 }
                 let n = hex_bytes(e.nonce.as_deref().ok_or(AppendError::Invalid("nonce"))?, 24)?;
-                let payload = hex_bytes(&e.payload, payload_len)?;
+                let payload = &e.payload;
                 XChaCha20Poly1305::new_from_slice(&derive(&self.master, &self.repo, b"encryption")?)
                     .map_err(|_| AppendError::Authentication)?
                     .decrypt(
@@ -700,7 +689,7 @@ impl AppendRepository {
                 if e.auth.is_none() || e.nonce.is_some() {
                     return Err(AppendError::Invalid("plain envelope shape"));
                 }
-                let p = hex_bytes(&e.payload, payload_len)?;
+                let p = e.payload.clone();
                 let a = hex_bytes(e.auth.as_deref().ok_or(AppendError::Invalid("auth"))?, 32)?;
                 let got = hmac(
                     &derive(&self.master, &self.repo, b"authentication")?,
@@ -830,16 +819,39 @@ mod tests {
     }
 
     #[test]
+    fn compact_block_wire_has_constant_overhead() -> Result<(), AppendError> {
+        for mode in [AppendMode::AuthenticatedPlain, AppendMode::Encrypted] {
+            let mut repo = vector_repository();
+            repo.anchor.descriptor.mode = mode;
+            for size in [0, 1024 * 1024, MAX_BLOCK_SIZE] {
+                let plain = vec![0x93; size];
+                let (_, wire) = repo.seal_block(&plain)?;
+                assert!(wire.len() <= plain.len() + 1024, "payload must not be hex-expanded");
+                assert_eq!(repo.open_block(&wire)?.as_slice(), plain);
+                let mut trailing = wire.clone(); trailing.push(0);
+                assert!(repo.open_block(&trailing).is_err());
+                assert!(repo.open_block(&wire[..wire.len() - 1]).is_err());
+            }
+            assert!(repo.seal_block(&vec![0; MAX_BLOCK_SIZE + 1]).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn v2_authenticated_plain_envelope_independent_golden() -> Result<(), AppendError> {
         let repo = vector_repository();
-        let golden = br#"{"version":2,"repo_id":"00112233445566778899aabbccddeeff","kind":"block","mode":"authenticated_plain","logical_id":"edd1f428c0adf21b1dcb56e7e735158db52353e5ad7fa5eebfe28e7c33c40697","plaintext_len":11,"nonce":null,"payload":"00617070656e642d76320a","auth":"ec97c1f49e963bd5667230a4d3d380f9ddd5f405a190196fa4ce7711e723d057"}"#;
+        let header = br#"{"version":2,"repo_id":"00112233445566778899aabbccddeeff","kind":"block","mode":"authenticated_plain","logical_id":"edd1f428c0adf21b1dcb56e7e735158db52353e5ad7fa5eebfe28e7c33c40697","plaintext_len":11,"nonce":null,"auth":"ec97c1f49e963bd5667230a4d3d380f9ddd5f405a190196fa4ce7711e723d057"}"#;
+        // Independent Python struct.pack(">I", 288) + canonical header + raw payload.
+        let mut golden = b"PDAVOBJ\0\0\0\x01\x20".to_vec();
+        golden.extend_from_slice(header);
+        golden.extend_from_slice(b"\0append-v2\n");
         let (key, wire) = repo.seal_block(b"\0append-v2\n")?;
         assert_eq!(wire, golden);
         assert_eq!(
             key,
-            "_peerdav_encrypt/00112233445566778899aabbccddeeff/blocks/c9ab99aff13090d572fe7d6c9815f36968e6c929c696b35019e0eba196281aa1"
+            "_peerdav_encrypt/00112233445566778899aabbccddeeff/blocks/9d826fa353a8797760ffee13748e6063c6853a68bf503b01f461b5a382368f1f"
         );
-        assert_eq!(repo.open_block(golden)?.as_slice(), b"\0append-v2\n");
+        assert_eq!(repo.open_block(&golden)?.as_slice(), b"\0append-v2\n");
         Ok(())
     }
 
@@ -860,13 +872,13 @@ mod tests {
             "5c34238f180d8782ba470e4fb07da977a366251cf2415342930d7d37b11e94b6"
         );
         let (reference, wire) = repo.seal_tree(&unsorted)?;
-        let envelope: Envelope = serde_json::from_slice(&wire)?;
+        let envelope = Envelope::from_wire(&wire)?;
         assert_eq!(
             envelope.logical_id,
             "4f5de3f3d1289b1cd52160fbb3e5447b83c25ff5535f9ad4db4e2f63baa7e81b"
         );
         assert_eq!(
-            hex::decode(&envelope.payload).map_err(|_| AppendError::Input("golden payload"))?,
+            envelope.payload,
             golden
         );
         assert_eq!(repo.open_tree(&wire, &reference)?, canonical);

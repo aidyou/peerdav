@@ -30,26 +30,23 @@ impl TransferQueueAdapter for PeerDownloadAdapter {
     fn plan(
         &self,
         selection: DownloadSelection,
-    ) -> BoxFuture<'_, Result<Vec<DownloadItem>, AppError>> {
+    ) -> BoxFuture<'_, Result<DownloadSpool, AppError>> {
         Box::pin(async move {
             self.validate().await?;
-            let mut result = Vec::new();
+            let mut result = DownloadSpool::new()?;
             let (paths, required_kind) = match selection {
                 DownloadSelection::Single { path } => (vec![path], Some(EntryKind::File)),
                 DownloadSelection::Files { paths } => (paths, None),
                 DownloadSelection::Folder { path } => (vec![path], Some(EntryKind::Directory)),
             };
-            if paths.len() > MAX_DOWNLOAD_ITEMS { return Err(crate::local_upload::invalid()); }
             let backend = self.manager.read_backend(&self.peer, &self.share).map_err(AppError::from)?;
             let mut pending = Vec::new();
             let mut targets = std::collections::HashSet::new();
-            let mut scanned = 0usize;
             for path in paths {
                 self.validate().await?;
                 let (path, _, name) = remote_file_target(&self.share, &path).map_err(AppError::from)?;
                 let entry = backend.stat(read_context(wire::LISTING_BODY_LIMIT, NonZeroUsize::MIN), backend.scope().entry(path.clone()))
                     .await.map_err(|source| AppError::from(DomainError::PeerFile { operation: "inspect download selection", source }))?;
-                scanned += 1;
                 if entry.id.opaque() != path || required_kind.as_ref().is_some_and(|kind| *kind != entry.kind) {
                     return Err(crate::local_upload::invalid());
                 }
@@ -57,7 +54,7 @@ impl TransferQueueAdapter for PeerDownloadAdapter {
                     EntryKind::Directory => pending.push((path, name, 0usize)),
                     EntryKind::File => {
                         if !targets.insert(name.clone()) { return Err(crate::local_upload::invalid()); }
-                        result.push(crate::download::item(path, name, entry.size.unwrap_or(0))?);
+                        result.push(crate::download::item(path, name, entry.size.unwrap_or(0))?)?;
                     }
                 }
             }
@@ -68,8 +65,7 @@ impl TransferQueueAdapter for PeerDownloadAdapter {
                     return Err(crate::local_upload::invalid());
                 }
                 let listing = self.manager.list_dir(&self.peer, &self.share, &path).await.map_err(AppError::from)?;
-                scanned += listing.entries.len() + 1;
-                if listing.truncated || scanned > MAX_DOWNLOAD_ITEMS { return Err(crate::local_upload::invalid()); }
+                if listing.truncated { return Err(crate::local_upload::invalid()); }
                 for entry in listing.entries {
                     let name = sanitize_file_name(&entry.name).map_err(AppError::from)?;
                     let expected = format!("{}/{}", path.trim_end_matches('/'), name);
@@ -78,7 +74,7 @@ impl TransferQueueAdapter for PeerDownloadAdapter {
                     if entry.is_dir { pending.push((entry.path, target, depth + 1)); }
                     else {
                         if !targets.insert(target.clone()) { return Err(crate::local_upload::invalid()); }
-                        result.push(crate::download::item(entry.path, target, entry.size)?);
+                        result.push(crate::download::item(entry.path, target, entry.size)?)?;
                     }
                 }
             }
@@ -234,7 +230,7 @@ mod tests {
             peer: "abcd".into(),
             share: "share".into(),
         });
-        let mixed = adapter.plan(DownloadSelection::Files { paths: vec!["/a".into(), "/tree".into()] }).await.unwrap();
+        let mixed = adapter.plan(DownloadSelection::Files { paths: vec!["/a".into(), "/tree".into()] }).await.unwrap().page(0, 100).unwrap();
         assert_eq!(mixed.iter().map(|i| i.relative_path.as_str()).collect::<Vec<_>>(), vec!["a", "tree/nested.txt"]);
         assert!(adapter.plan(DownloadSelection::Single { path: "/tree".into() }).await.is_err());
         assert!(adapter.plan(DownloadSelection::Files { paths: vec!["/a".into(), "/a".into()] }).await.is_err());

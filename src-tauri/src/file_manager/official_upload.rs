@@ -8,8 +8,23 @@ impl crate::traits::UploadQueueAdapter for OfficialUploadAdapter<'_> {
     fn page<'a>(&'a self, id: &'a str, directory_token: Option<String>, cursor: Option<String>, limit: Option<usize>) -> futures_util::future::BoxFuture<'a, Result<crate::local_upload_types::DirectoryPageDto, AppError>> {
         Box::pin(async move {
             validate(self.cloud, &self.backend.connection_id, self.backend.revision)?;
-            let jobs = self.backend.uploads.lock().await;
-            let job = jobs.get(id).ok_or_else(super::service::invalid)?;
+            let mut jobs = self.backend.uploads.lock().await;
+            let job = jobs.get_mut(id).ok_or_else(super::service::invalid)?;
+            if let Some(browser) = job.browser.as_mut() {
+                let active = job.status.current_relative_path.clone();
+                let completed = job.status.phase == "completed";
+                let mut page = browser.page(directory_token, cursor, limit, active.clone(), completed)?;
+                for entry in &mut page.entries {
+                    if completed && entry.kind == "directory" { entry.phase = "completed".into(); }
+                    if let Some((phase, bytes, _)) = job.entry_states.get(&entry.relative_path) {
+                        entry.phase = phase.clone(); entry.transferred = Some(*bytes);
+                    }
+                    if active.as_deref() == Some(entry.relative_path.as_str()) {
+                        entry.transferred = Some(job.progress.load(std::sync::atomic::Ordering::Relaxed).min(entry.size));
+                    }
+                }
+                return Ok(page);
+            }
             if directory_token.as_deref().is_some_and(|token| token != id) { return Err(super::service::invalid()); }
             let start = cursor.as_deref().map(str::parse::<usize>).transpose().map_err(|_| super::service::invalid())?.unwrap_or(0);
             if start > job.page.entries.len() { return Err(super::service::invalid()); }
@@ -100,6 +115,8 @@ pub(crate) async fn action(backend: &OfficialBrowserBackend, cloud: &Arc<CloudRu
     if action == "start" {
         if job.status.phase != "selected" || job.cancel.is_cancelled() { return Err(super::service::invalid()); }
         let files = std::mem::take(&mut job.files);
+        let mut walk = job.walk.take();
+        let streaming = walk.is_some();
         let parent = job.parent.clone();
         let root_name = job.status.root_name.clone();
         let decision = job.decision.clone();
@@ -122,7 +139,28 @@ pub(crate) async fn action(backend: &OfficialBrowserBackend, cloud: &Arc<CloudRu
                     folders.insert(root_name, root);
                 }
                 let mut policy = crate::types::QueueConflictPolicy::default();
-                for file in files {
+                let mut files = files.into_iter();
+                loop {
+                    if cancel.is_cancelled() { return Err(crate::DomainError::TransferCanceled.into()); }
+                    let file = if let Some(file) = files.next() { Some(file) }
+                    else if let Some(current) = walk.take() {
+                        let (current, next) = tokio::task::spawn_blocking(move || {
+                            let mut current = current;
+                            let next = current.next_chunk();
+                            (current, next)
+                        }).await.map_err(|error| AppError::from(crate::DomainError::Internal { detail: error.to_string() }))?;
+                        let mut jobs = jobs.lock().await;
+                        let job = jobs.get_mut(&id).ok_or_else(super::service::invalid)?;
+                        job.status.skipped_symlinks = current.skipped_symlinks;
+                        job.status.skipped_empty_directories = current.skipped_empty_directories;
+                        if !current.stack.is_empty() { walk = Some(current); }
+                        match next? { Some(file) => Some(file), None if walk.is_some() => continue, None => None }
+                    } else { None };
+                    let Some(file) = file else { break; };
+                    if streaming {
+                        jobs.lock().await.get_mut(&id).ok_or_else(super::service::invalid)?.status.total_files += 1;
+                    }
+                    if file.size > crate::types::MAX_TRANSFER_BYTES { return Err(crate::DomainError::TransferTooLarge { size: file.size, limit: crate::types::MAX_TRANSFER_BYTES }.into()); }
                     validate(&cloud, &connection, revision)?;
                     let (_, api) = cloud.official_api(&connection).await?;
                     let mut parts: Vec<_> = file.relative.split('/').collect();
@@ -140,6 +178,9 @@ pub(crate) async fn action(backend: &OfficialBrowserBackend, cloud: &Arc<CloudRu
                     let progress = {
                         let mut jobs = jobs.lock().await;
                         let job = jobs.get_mut(&id).ok_or_else(super::service::invalid)?;
+                        if job.entry_states.len() >= crate::local_upload_types::MAX_UPLOAD_ENTRY_STATES {
+                            job.entry_states.retain(|_, (phase, _, _)| phase == "active");
+                        }
                         job.status.current_relative_path = Some(file.relative.clone());
                         job.progress.store(0, std::sync::atomic::Ordering::Relaxed);
                         job.entry_states.insert(file.relative.clone(), ("active".into(), 0, file.size));

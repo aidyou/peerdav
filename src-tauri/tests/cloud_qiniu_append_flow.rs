@@ -406,7 +406,7 @@ async fn exercise(remote: Arc<Remote>, mode: AppendMode, budget: &Arc<Mutex<Budg
     let payload = b"Qiniu AppendV2 publication payload / encrypted and authenticated plain";
     let (block_key, block) = checked(repo.seal_block(payload), "seal block");
     assert!(checked(repo.open_block(&block), "open sealed block").as_slice() == payload);
-    let envelope: Envelope = checked(serde_json::from_slice(&block), "decode block envelope");
+    let envelope: Envelope = checked(Envelope::from_wire(&block), "decode block envelope");
     let binding_block = BlockBinding {
         block_id: envelope.logical_id,
         len: envelope.plaintext_len,

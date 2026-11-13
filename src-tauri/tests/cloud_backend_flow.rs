@@ -82,7 +82,7 @@ async fn qiniu_production_crud_mirror_append_acceptance() {
         let repo = runtime.create_sync_drive(CreateAppendRepositoryInput {
             connection_id: connection.id.clone(), bucket: Some("peerdav".into()), mode: AppendMode::Encrypted,
             password: "acceptance-only-password".into(), password_confirmation: "acceptance-only-password".into(),
-            local_root: None, logical_path: None,
+            local_root: None, logical_path: None, schedule: Default::default(),
         }).await.map_err(|_| "create append")?;
         let mapping = runtime.save_append_mapping(SaveAppendMappingInput {
             mapping_id: None, selected_root: "docs".into(), mapping: AddMappingInput {
@@ -979,6 +979,54 @@ async fn mirror_runtime_works_without_conditional_writes_and_recovers_baseline()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_drive_creation_persists_binding_before_background_scan() {
+    use peerdav_lib::cloud::runtime_types::CreateAppendRepositoryInput;
+    let fixture = Fixture::start(false).await;
+    let data = tempfile::tempdir().expect("data");
+    let root = tempfile::tempdir().expect("root");
+    // An unsafe child must fail in background, not prevent creating the drive.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("missing-target", root.path().join("link")).expect("link");
+    let runtime = runtime_for(&data);
+    runtime.resume().expect("resume");
+    let connection = runtime.save_connection(runtime_connection(&fixture)).expect("connection");
+    let created = runtime.create_sync_drive(serde_json::from_value::<CreateAppendRepositoryInput>(serde_json::json!({
+        "connectionId": connection.id, "mode": "encrypted", "password": "password-123",
+        "passwordConfirmation": "password-123", "localRoot": root.path(), "logicalPath": "php-project"
+    })).expect("input")).await.expect("creation does not scan project children");
+    let snapshot = runtime.snapshot().expect("snapshot");
+    let mapping = snapshot.mappings.iter().find(|mapping| mapping.repository_id == created.binding.repo_id).expect("creation includes a durable browseable mapping");
+    assert_eq!(mapping.logical_path, "php-project");
+    assert_eq!(mapping.local_root, root.path());
+    assert_eq!(mapping.append_binding.as_ref().expect("binding").selected_root.as_deref(), Some("php-project"));
+    #[cfg(unix)]
+    {
+        for _ in 0..400 {
+            if runtime.snapshot().expect("status snapshot").statuses.iter().any(|status| status.mapping_id == mapping.id && status.phase == peerdav_lib::sync::manager_types::SyncPhase::Failed) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(runtime.snapshot().expect("status snapshot").statuses.iter().any(|status| status.mapping_id == mapping.id && status.phase == peerdav_lib::sync::manager_types::SyncPhase::Failed));
+        assert!(runtime.snapshot().expect("snapshot after failure").mappings.iter().any(|saved| saved.id == mapping.id));
+        let failed_run = runtime.snapshot().expect("statuses").statuses;
+        runtime.refresh_schedules().await.expect("refresh does not retry failed run");
+        assert_eq!(runtime.snapshot().expect("statuses").statuses[0].run_id, failed_run[0].run_id);
+        std::fs::remove_file(root.path().join("link")).expect("remove unsafe child");
+        std::fs::write(root.path().join("index.php"), b"<?php echo 'hello';").expect("project file");
+    }
+    let mapping_id = mapping.id.clone();
+    runtime.stop_and_clear().await.expect("shutdown");
+    drop(runtime);
+    let vault = Arc::new(Vault::open(&data.path().join("vault.pd")).expect("reopen vault"));
+    let restarted = CloudRuntime::new(vault, Arc::new(NoopSyncEvents), data.path().to_owned());
+    restarted.resume().expect("resume after restart");
+    restarted.refresh_schedules().await.expect("resume initial sync without enabled schedule");
+    wait_completed(&restarted, &mapping_id).await;
+    assert_eq!(restarted.snapshot().expect("persisted mapping").mappings.len(), 1);
+    restarted.stop_and_clear().await.expect("shutdown restarted runtime");
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sync_drive_defaults_to_append_preserves_cas_and_deletes_only_local_associations() {
     use peerdav_lib::cloud::config_types::StorageProtocol;
     use peerdav_lib::cloud::runtime_types::{CreateAppendRepositoryInput, SaveAppendMappingInput};
@@ -1155,6 +1203,7 @@ async fn sync_drive_create_join_sync_both_modes_without_cas_probe_or_control_hea
                 password_confirmation: "append password".into(),
                 local_root: None,
                 logical_path: None,
+                schedule: Default::default(),
             })
             .await
             .unwrap();
@@ -1378,6 +1427,63 @@ async fn sync_drive_create_join_sync_both_modes_without_cas_probe_or_control_hea
     }
 }
 
+#[tokio::test]
+async fn local_browse_reads_only_requested_directory_without_a_sync_baseline() {
+    use peerdav_lib::cloud::runtime_types::{CreateAppendRepositoryInput, SaveAppendMappingInput};
+    use peerdav_lib::sync::append_types::AppendMode;
+    let fixture = Fixture::start(true).await;
+    let data = tempfile::tempdir().expect("data");
+    let runtime = runtime_for(&data);
+    runtime.resume().expect("resume");
+    let connection = runtime.save_connection(runtime_connection(&fixture)).expect("connection");
+    let created = runtime.create_sync_drive(CreateAppendRepositoryInput {
+        connection_id: connection.id.clone(), bucket: None, mode: AppendMode::Encrypted,
+        password: "browse password".into(), password_confirmation: "browse password".into(),
+        local_root: None, logical_path: None, schedule: Default::default(),
+    }).await.expect("repository");
+    let local = tempfile::tempdir().expect("local");
+    std::fs::create_dir(local.path().join("docs")).expect("docs");
+    std::fs::write(local.path().join("docs/file.txt"), b"content").expect("file");
+    std::fs::write(local.path().join("root.txt"), b"root").expect("root file");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(data.path(), local.path().join("outside")).expect("link");
+    let mapping = runtime.save_append_mapping(SaveAppendMappingInput {
+        mapping_id: None, selected_root: "files".into(), mapping: AddMappingInput {
+            connection_id: connection.id, repository_id: created.binding.repo_id,
+            local_root: local.path().into(), logical_path: "files".into(), schedule: Default::default(),
+        },
+    }).await.expect("mapping without sync");
+    fixture.state.requests.lock().expect("requests").clear();
+    let root = runtime.local_directory_listing(&mapping.id, "").await.expect("root listing");
+    assert_eq!(root.entries.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), vec!["docs", "root.txt"]);
+    let docs = runtime.local_directory_listing(&mapping.id, "docs").await.expect("child listing");
+    assert_eq!(docs.entries.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), vec!["docs/file.txt"]);
+    for path in ["../outside", "/tmp", "docs/../../outside", "missing", "root.txt", "outside"] {
+        assert!(runtime.local_directory_listing(&mapping.id, path).await.is_err(), "{path}");
+    }
+    let status = runtime.local_directory_status(&mapping.id, "").await.expect("status without baseline");
+    assert!(status.is_empty(), "unverified entries must remain unknown, not force a full scan");
+    assert!(fixture.state.requests.lock().expect("requests").is_empty(), "browsing must not access the remote");
+    #[cfg(unix)]
+    std::fs::remove_file(local.path().join("outside")).expect("remove link before sync");
+    let preview = runtime.preview(&mapping.id).await.expect("first preview");
+    runtime.manual_sync(&mapping.id, &preview.preview_id).await.expect("first sync");
+    wait_completed(&runtime, &mapping.id).await;
+    fixture.state.requests.lock().expect("requests").clear();
+    let status = runtime.local_directory_status(&mapping.id, "docs").await.expect("cached status");
+    assert_eq!(status.len(), 1);
+    assert!(status[0].synced);
+    std::fs::write(local.path().join("docs/file.txt"), b"changed").expect("change file");
+    let status = runtime.local_directory_status(&mapping.id, "docs").await.expect("changed metadata");
+    assert!(!status[0].synced);
+    std::fs::remove_file(local.path().join("docs/file.txt")).expect("delete file");
+    let status = runtime.local_directory_status(&mapping.id, "docs").await.expect("baseline-only row");
+    assert!(status[0].remote_only && !status[0].synced);
+    assert!(fixture.state.requests.lock().expect("requests").is_empty(), "status painting must not rediscover remote metadata");
+    runtime.stop_and_clear().await.expect("stop");
+    fixture.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sync_drive_storage_stays_bound_after_connection_changes() {
     use peerdav_lib::cloud::runtime_types::{CreateAppendRepositoryInput, SaveAppendMappingInput};
@@ -1394,7 +1500,7 @@ async fn sync_drive_storage_stays_bound_after_connection_changes() {
         connection_id: connection.id.clone(), bucket: Some("fixture".into()),
         mode: AppendMode::Encrypted, password: "bound password".into(),
         password_confirmation: "bound password".into(),
-        local_root: None, logical_path: None,
+        local_root: None, logical_path: None, schedule: Default::default(),
     }).await.expect("create in selected bucket");
     let storage = created.binding.storage.as_ref().expect("durable binding");
     assert_eq!(storage.bucket, "fixture");

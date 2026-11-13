@@ -4,6 +4,7 @@ import TransferConflictControls from "./TransferConflictControls.vue";
 import { formatBytes } from "../lib/format";
 import { statusTagTone } from "../lib/tagTone";
 import { t } from "../lib/i18n";
+import { toUserMessage } from "../lib/invoke";
 const props = defineProps({ open: Boolean, items: { type: Array, default: () => [] }, running: Boolean, canceling: Boolean,
   summary: { type: String, default: "" }, root: { type: String, default: "" },
   note: { type: String, default: "" }, queueState: { type: Object, default: null }, applyRemaining: Boolean, resolving: Boolean,
@@ -49,7 +50,7 @@ const progressFor = (item) => {
     <div class="queue-dialog">
       <p class="sr-only" role="status">{{ summary }}</p>
       <p v-if="queueState?.currentRelativePath" class="queue-meta" :title="queueState.currentRelativePath">{{ queueState.currentRelativePath }}</p>
-      <p v-if="queueState?.error" role="alert" class="queue-error">{{ queueState.error.message }}</p>
+      <p v-if="queueState?.error" role="alert" class="queue-error">{{ toUserMessage(queueState.error) }}</p>
       <TransferConflictControls v-if="open && queueState?.conflict" :key="`${queueState.queueId}:${queueState.conflict.conflictId}`" direction="download" :conflict="queueState.conflict" :apply-remaining="applyRemaining" :resolving="resolving || canceling" overwrite-allowed
         @update:apply-remaining="emit('update:applyRemaining', $event)" @resolve="emit('resolve', $event)" @cancel="emit('cancel')" />
 

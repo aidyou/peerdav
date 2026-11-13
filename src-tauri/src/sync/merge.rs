@@ -185,6 +185,14 @@ pub fn revision(change: LocalChange) -> Result<Revision, MergeError> {
 }
 
 pub fn join(a: &MergeSet, b: &MergeSet) -> Result<MergeSet, MergeError> {
+    let mut used = a
+        .revisions
+        .values()
+        .try_fold(0usize, |sum, revision| {
+            sum.checked_add(revision_working_bytes(revision))
+        })
+        .filter(|size| *size <= MAX_MERGE_WORKING_BYTES)
+        .ok_or_else(|| MergeError::Limit("revision workspace bytes".into()))?;
     let mut out = a.revisions.clone();
     for (id, r) in &b.revisions {
         if let Some(old) = out.get(id) {
@@ -192,21 +200,68 @@ pub fn join(a: &MergeSet, b: &MergeSet) -> Result<MergeSet, MergeError> {
                 return Err(MergeError::Corrupt(id.clone()));
             }
         } else {
+            used = used
+                .checked_add(revision_working_bytes(r))
+                .filter(|size| *size <= MAX_MERGE_WORKING_BYTES)
+                .ok_or_else(|| MergeError::Limit("revision workspace bytes".into()))?;
             out.insert(id.clone(), r.clone());
         }
-    }
-    if out.len() > MAX_REVISIONS {
-        return Err(MergeError::Limit("revisions".into()));
     }
     validate(&out)?;
     Ok(MergeSet { revisions: out })
 }
 
-pub fn validate(revisions: &RevisionMap) -> Result<(), MergeError> {
-    if revisions.len() > MAX_REVISIONS {
-        return Err(MergeError::Limit("revisions".into()));
+/// Conservative resident record accounting, including map keys and graph work.
+/// This is a bounded work-set estimate, not a measurement of process RSS.
+pub fn revision_working_bytes(revision: &Revision) -> usize {
+    let base = 512usize
+        .saturating_add(revision.entity.0.capacity())
+        .saturating_add(revision.change_id.0.capacity())
+        .saturating_add(revision.revision_id.0.capacity().saturating_mul(4))
+        .saturating_add(
+            revision
+                .parents
+                .iter()
+                .map(|parent| parent.0.capacity().saturating_add(96))
+                .sum::<usize>(),
+        );
+    match &revision.value {
+        RevisionValue::Tombstone => base,
+        RevisionValue::Live {
+            parent_dir,
+            name,
+            node,
+        } => {
+            let base = base
+                .saturating_add(parent_dir.0.capacity())
+                .saturating_add(name.capacity());
+            match node {
+                Node::Dir => base,
+                Node::File(file) => base
+                    .saturating_add(file.digest.capacity())
+                    .saturating_add(
+                        file.blocks
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<BlockRef>()),
+                    )
+                    .saturating_add(
+                        file.blocks
+                            .iter()
+                            .map(|block| block.id.capacity())
+                            .sum::<usize>(),
+                    ),
+            }
+        }
     }
-    let mut entities = BTreeSet::new();
+}
+
+pub fn validate(revisions: &RevisionMap) -> Result<(), MergeError> {
+    let mut remaining = MAX_MERGE_WORKING_BYTES;
+    for revision in revisions.values() {
+        remaining = remaining
+            .checked_sub(revision_working_bytes(revision))
+            .ok_or_else(|| MergeError::Limit("revision workspace bytes".into()))?;
+    }
     for (id, r) in revisions {
         check_id(&r.entity.0)?;
         check_id(&r.change_id.0)?;
@@ -219,7 +274,6 @@ pub fn validate(revisions: &RevisionMap) -> Result<(), MergeError> {
             return Err(MergeError::Corrupt(id.clone()));
         }
         check_value(&r.value)?;
-        entities.insert(r.entity.clone());
         for p in &r.parents {
             let parent = revisions
                 .get(p)
@@ -228,9 +282,6 @@ pub fn validate(revisions: &RevisionMap) -> Result<(), MergeError> {
                 return Err(MergeError::ParentEntity(id.clone(), p.clone()));
             }
         }
-    }
-    if entities.len() > MAX_ENTITIES {
-        return Err(MergeError::Limit("entities".into()));
     }
     let mut indegree: BTreeMap<RevisionId, usize> =
         revisions.keys().map(|id| (id.clone(), 0)).collect();
@@ -498,4 +549,29 @@ pub fn project(revisions: &RevisionMap) -> Result<Projection, MergeError> {
         entry.projection_path = path;
     }
     Ok(Projection { entries })
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[test]
+    fn merge_accepts_more_than_old_entity_total_within_byte_workspace() {
+        let mut history = RevisionMap::new();
+        for i in 0..100_001 {
+            let revision = revision(LocalChange {
+                entity: EntityId(format!("e{i}")),
+                change_id: ChangeId("new".into()),
+                parents: vec![],
+                value: RevisionValue::Live {
+                    parent_dir: EntityId("root".into()),
+                    name: format!("d{i}"),
+                    node: Node::Dir,
+                },
+            })
+            .expect("revision");
+            history.insert(revision.revision_id.clone(), revision);
+        }
+        validate(&history).expect("more than 100k entities within byte workspace");
+    }
 }

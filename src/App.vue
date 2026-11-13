@@ -25,6 +25,7 @@ import HomeView from "./components/HomeView.vue";
 import PeerBrowser from "./components/FileBrowser.vue";
 import CloudBrowser from "./components/CloudBrowser.vue";
 import SettingsView from "./components/SettingsView.vue";
+import CapabilityProgressDialog from "./components/CapabilityProgressDialog.vue";
 import TitleBarMenu from "./components/TitleBarMenu.vue";
 
 const loading = ref(true);
@@ -1233,6 +1234,7 @@ provide(
       </footer>
     </main>
 
+    <CapabilityProgressDialog v-if="loggedIn && !interfaceLocked" />
     <el-dialog
       v-model="showQuitDialog"
       :title="t('quit.title')"

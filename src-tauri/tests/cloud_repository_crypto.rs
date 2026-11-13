@@ -49,7 +49,7 @@ fn metadata_blocks_and_head_reject_tampering_and_cross_purpose() {
     );
     let mut broken = block.clone();
     for length in [0, 1, 16, 30] {
-        broken.ciphertext = "0".repeat(length);
+        broken.ciphertext = vec![0; length];
         assert!(keys.open_block(&broken).is_err());
     }
     for field in [
@@ -63,14 +63,7 @@ fn metadata_blocks_and_head_reject_tampering_and_cross_purpose() {
         let mut broken = block.clone();
         match field {
             "nonce" => broken.nonce = "00".repeat(24),
-            "ciphertext" => broken.ciphertext.replace_range(
-                ..2,
-                if block.ciphertext.starts_with("00") {
-                    "01"
-                } else {
-                    "00"
-                },
-            ),
+            "ciphertext" => broken.ciphertext[0] ^= 1,
             "repo_id" => broken.repo_id = "ff".repeat(16),
             "block_id" => broken.block_id = Some("ff".repeat(32)),
             "kind" => broken.kind = "tree".into(),
@@ -98,12 +91,10 @@ fn metadata_blocks_and_head_reject_tampering_and_cross_purpose() {
         let mut changed = envelope.clone();
         changed.kind = other.into();
         assert!(keys.open_metadata(&changed, other).is_err());
-        let encoded = repository_types::encode_metadata(&envelope).expect("encode");
-        assert!(
-            !String::from_utf8(encoded)
-                .expect("UTF8")
-                .contains("private-file-name-marker")
-        );
+        let encoded = envelope.to_wire().expect("encode");
+        assert!(!encoded.windows(b"private-file-name-marker".len()).any(|window| window == b"private-file-name-marker"));
+        let decoded = repository_types::Envelope::from_wire(&encoded).expect("wire roundtrip");
+        assert_eq!(keys.open_metadata(&decoded, kind).expect("open wire").as_slice(), b"private-file-name-marker");
     }
     let (other, _) =
         RepositoryKeys::create(&descriptor("ffeeddccbbaa99887766554433221100"), b"password")

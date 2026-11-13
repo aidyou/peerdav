@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool};
 
+pub const MAX_SCAN_WORKING_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct ScanOptions {
     pub ignored: Vec<String>,

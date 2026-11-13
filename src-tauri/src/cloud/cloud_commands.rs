@@ -274,9 +274,10 @@ pub async fn cloud_local_mutate(mapping_id: String, path: String, destination: O
 #[tauri::command]
 pub async fn cloud_local_status(
     mapping_id: String,
+    path: Option<String>,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<Vec<LocalSyncEntry>, AppError> {
-    cloud.0.local_sync_entries(&mapping_id).await
+    cloud.0.local_directory_status(&mapping_id, path.as_deref().unwrap_or("")).await
 }
 
 #[tauri::command]
@@ -357,7 +358,9 @@ pub async fn cloud_create_sync_drive(
     input: CreateAppendRepositoryInput,
     cloud: tauri::State<'_, SharedCloud>,
 ) -> Result<super::config_types::AppendRepositoryRedacted, AppError> {
-    cloud.0.create_sync_drive(input).await
+    let created = cloud.0.create_sync_drive(input).await?;
+    if let Err(error) = cloud.0.refresh_schedules().await { cloud.0.manager.report_background(error); }
+    Ok(created)
 }
 #[tauri::command]
 pub async fn cloud_append_create(

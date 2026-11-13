@@ -91,6 +91,22 @@ pub enum CloudError {
     },
 }
 
+#[derive(Debug, Error)]
+#[error("probe cleanup failed: {cleanup}; probe error: {primary:?}")]
+pub(crate) struct ProbeCleanupError {
+    pub primary: Option<CloudError>,
+    #[source]
+    pub cleanup: CloudError,
+}
+
+/// A definite capability result; transient transport failures are never cached.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProbeCapabilities {
+    pub cas: Option<bool>,
+    pub conditional_delete: Option<bool>,
+    pub move_create: Option<bool>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ObjectMetadata {
     pub key: String,

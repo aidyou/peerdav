@@ -27,6 +27,64 @@ pub(crate) fn item(
         progress: Arc::new(AtomicU64::new(0)),
     })
 }
+fn spool_error(error: impl std::fmt::Display) -> AppError {
+    DomainError::Internal { detail: error.to_string() }.into()
+}
+
+impl DownloadSpool {
+    pub(crate) fn new() -> Result<Self, AppError> {
+        let directory = tempfile::tempdir().map_err(crate::local_upload::io)?;
+        let connection = rusqlite::Connection::open(directory.path().join("queue.sqlite")).map_err(spool_error)?;
+        connection.execute_batch("PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; CREATE TABLE items (ordinal INTEGER PRIMARY KEY, target BLOB UNIQUE NOT NULL, nonce BLOB NOT NULL, payload BLOB NOT NULL);").map_err(spool_error)?;
+        Ok(Self { _directory: directory, connection, count: 0, key: zeroize::Zeroizing::new(rand::random()) })
+    }
+
+    pub(crate) fn push(&mut self, item: DownloadItem) -> Result<(), AppError> {
+        use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::{Aead, KeyInit}};
+        use hmac::Mac;
+        let mut mac = <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(&*self.key).map_err(spool_error)?;
+        mac.update(item.relative_path.as_bytes());
+        let target = mac.finalize().into_bytes();
+        let nonce: [u8; 24] = rand::random();
+        let bytes = serde_json::to_vec(&item).map_err(spool_error)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(&*self.key).map_err(spool_error)?;
+        let payload = cipher.encrypt(XNonce::from_slice(&nonce), bytes.as_slice()).map_err(spool_error)?;
+        if self.count.is_multiple_of(DOWNLOAD_WORKING_SET) { self.connection.execute_batch("BEGIN IMMEDIATE").map_err(spool_error)?; }
+        self.connection.execute("INSERT INTO items(ordinal,target,nonce,payload) VALUES(?1,?2,?3,?4)", rusqlite::params![self.count as i64, target.as_slice(), nonce.as_slice(), payload]).map_err(spool_error)?;
+        if (self.count + 1).is_multiple_of(DOWNLOAD_WORKING_SET) { self.connection.execute_batch("COMMIT").map_err(spool_error)?; }
+        self.count = self.count.checked_add(1).ok_or_else(invalid)?;
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<(), AppError> {
+        if !self.connection.is_autocommit() { self.connection.execute_batch("COMMIT").map_err(spool_error)?; }
+        Ok(())
+    }
+
+    fn update(&self, ordinal: usize, item: &DownloadItem) -> Result<(), AppError> {
+        use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::{Aead, KeyInit}};
+        let nonce: [u8; 24] = rand::random();
+        let bytes = serde_json::to_vec(item).map_err(spool_error)?;
+        let cipher = XChaCha20Poly1305::new_from_slice(&*self.key).map_err(spool_error)?;
+        let payload = cipher.encrypt(XNonce::from_slice(&nonce), bytes.as_slice()).map_err(spool_error)?;
+        self.connection.execute("UPDATE items SET nonce=?1,payload=?2 WHERE ordinal=?3", rusqlite::params![nonce.as_slice(), payload, ordinal as i64]).map_err(spool_error)?;
+        Ok(())
+    }
+
+    pub(crate) fn page(&self, offset: usize, limit: usize) -> Result<Vec<DownloadItem>, AppError> {
+        use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::{Aead, KeyInit}};
+        let cipher = XChaCha20Poly1305::new_from_slice(&*self.key).map_err(spool_error)?;
+        let mut statement = self.connection.prepare("SELECT nonce,payload FROM items WHERE ordinal>=?1 ORDER BY ordinal LIMIT ?2").map_err(spool_error)?;
+        let rows = statement.query_map(rusqlite::params![offset as i64, limit as i64], |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))).map_err(spool_error)?;
+        rows.map(|row| {
+            let (nonce, payload) = row.map_err(spool_error)?;
+            if nonce.len() != 24 { return Err(invalid()); }
+            let bytes = cipher.decrypt(XNonce::from_slice(&nonce), payload.as_slice()).map_err(spool_error)?;
+            serde_json::from_slice(&bytes).map_err(spool_error)
+        }).collect()
+    }
+}
+
 impl DownloadQueues {
     pub(crate) async fn select(
         &self,
@@ -39,19 +97,14 @@ impl DownloadQueues {
             return Err(invalid());
         }
         let lifecycle = adapter.cancellation()?;
-        let items = adapter.plan(selection).await?;
-        let mut names = std::collections::HashSet::new();
-        if items.len() > MAX_DOWNLOAD_ITEMS
-            || items.iter().any(|i| !names.insert(i.relative_path.clone()))
-        {
-            return Err(invalid());
-        }
+        let spool = adapter.plan(selection).await?;
+        spool.finish()?;
         adapter.validate().await?;
         let status = DownloadStatus {
             queue_id: token()?,
             backend,
             phase: "selected".into(),
-            total_files: items.len(),
+            total_files: spool.count,
             completed_files: 0,
             skipped_files: 0,
             current_relative_path: None,
@@ -67,7 +120,9 @@ impl DownloadQueues {
             status.queue_id.clone(),
             DownloadQueue {
                 status: status.clone(),
-                items,
+                spool,
+                items: Vec::new(),
+                offset: 0,
                 root: Arc::new(root),
                 adapter,
                 progress: Arc::new(AtomicU64::new(0)),
@@ -105,6 +160,7 @@ impl DownloadQueues {
             let mut map = this.queues.lock().await;
             if let Some(q) = map.get_mut(&queue_id) {
                 q.status.conflict = None;
+                q.status.current_relative_path = None;
                 match outcome {
                     Ok(()) => q.status.phase = "completed".into(),
                     Err(e) => {
@@ -124,6 +180,28 @@ impl DownloadQueues {
         Ok(q.status.clone())
     }
     async fn run(&self, id: &str) -> Result<(), AppError> {
+        let mut policy = crate::types::QueueConflictPolicy::default();
+        loop {
+            {
+                let mut map = self.queues.lock().await;
+                let q = map.get_mut(id).ok_or_else(invalid)?;
+                if q.cancel.is_cancelled() { return Err(DomainError::TransferCanceled.into()); }
+                q.items = q.spool.page(q.offset, DOWNLOAD_WORKING_SET)?;
+                if q.items.is_empty() { break; }
+            }
+            let outcome = self.run_batch(id, &mut policy).await;
+            let mut map = self.queues.lock().await;
+            let q = map.get_mut(id).ok_or_else(invalid)?;
+            q.spool.connection.execute_batch("BEGIN IMMEDIATE").map_err(spool_error)?;
+            for (index, item) in q.items.iter().enumerate() { q.spool.update(q.offset + index, item)?; }
+            q.spool.finish()?;
+            outcome?;
+            q.offset += q.items.len();
+        }
+        Ok(())
+    }
+
+    async fn run_batch(&self, id: &str, policy: &mut crate::types::QueueConflictPolicy) -> Result<(), AppError> {
         let (items, root, adapter, cancel, lifecycle, notify, progress) = {
             let map = self.queues.lock().await;
             let q = map.get(id).ok_or_else(invalid)?;
@@ -172,7 +250,6 @@ impl DownloadQueues {
                 if cancel.is_cancelled() { return Err(AppError::from(DomainError::TransferCanceled)); }
                 return Ok(());
             }
-            let mut policy = crate::types::QueueConflictPolicy::default();
             for (index, item) in items.iter().enumerate() {
                 if cancel.is_cancelled() { return Err(AppError::from(DomainError::TransferCanceled)); }
                 adapter.validate().await?;
@@ -180,6 +257,7 @@ impl DownloadQueues {
                     let mut map = self.queues.lock().await;
                     let q = map.get_mut(id).ok_or_else(invalid)?;
                     q.status.current_relative_path = Some(item.relative_path.clone());
+                    q.items[index].phase = "active".into();
                     progress.store(0, Ordering::Relaxed);
                 }
                 if item.is_dir {
@@ -308,17 +386,26 @@ impl DownloadQueues {
     ) -> Result<DownloadPage, AppError> {
         let map = self.queues.lock().await;
         let q = map.get(id).ok_or_else(invalid)?;
-        if offset > q.items.len() || limit == 0 || limit > 200 {
-            return Err(invalid());
+        if offset > q.spool.count || limit == 0 || limit > 200 { return Err(invalid()); }
+        // While running, show the bounded working set, combining active files
+        // from any directory. History pages are loaded from disk on demand.
+        let start = if offset == 0 && matches!(q.status.phase.as_str(), "running" | "conflict") {
+            q.offset + q.items.iter().position(|item| item.phase == "active").unwrap_or(0)
+        } else { offset };
+        let mut items = q.spool.page(start, limit)?;
+        for (ordinal, item) in items.iter_mut().enumerate() {
+            let ordinal = start + ordinal;
+            if let Some(active) = ordinal.checked_sub(q.offset).and_then(|index| q.items.get(index)) {
+                *item = active.clone();
+                if item.phase == "active" {
+                    item.transferred = Some(if q.status.current_relative_path.as_deref() == Some(item.relative_path.as_str()) {
+                        q.progress.load(Ordering::Relaxed)
+                    } else { item.progress.load(Ordering::Relaxed) });
+                }
+            }
         }
-        let end = (offset + limit).min(q.items.len());
-        Ok(DownloadPage {
-            items: q.items[offset..end].iter().cloned().map(|mut item| {
-                if item.phase == "active" { item.transferred = Some(item.progress.load(Ordering::Relaxed)); }
-                item
-            }).collect(),
-            next_offset: (end < q.items.len()).then_some(end),
-        })
+        let end = start.saturating_add(items.len());
+        Ok(DownloadPage { items, next_offset: (end < q.spool.count).then_some(end) })
     }
     pub(crate) async fn resolve(
         &self,
@@ -377,11 +464,14 @@ impl DownloadQueues {
         Ok(())
     }
     pub(crate) async fn reveal_root(&self, id: &str) -> Result<String, AppError> {
-        let map = self.queues.lock().await;
-        let q = map.get(id).ok_or_else(invalid)?;
-        if q.lifecycle.is_cancelled() { return Err(invalid()); }
-        q.adapter.validate().await?;
-        Ok(q.root
+        let (adapter, root, lifecycle) = {
+            let map = self.queues.lock().await;
+            let q = map.get(id).ok_or_else(invalid)?;
+            (Arc::clone(&q.adapter), Arc::clone(&q.root), q.lifecycle.clone())
+        };
+        if lifecycle.is_cancelled() { return Err(invalid()); }
+        adapter.validate().await?;
+        Ok(root
             .reveal_path()
             .map_err(app)?
             .to_str()
@@ -427,17 +517,18 @@ mod tests {
         fn validate(&self) -> BoxFuture<'_, Result<(), AppError>> {
             Box::pin(async { Ok(()) })
         }
-        fn plan(&self, selection: DownloadSelection) -> BoxFuture<'_, Result<Vec<DownloadItem>, AppError>> {
+        fn plan(&self, selection: DownloadSelection) -> BoxFuture<'_, Result<DownloadSpool, AppError>> {
             Box::pin(async move {
+                let mut spool = DownloadSpool::new()?;
                 if matches!(selection, DownloadSelection::Folder { .. }) {
                     let mut directory = item(String::new(), "empty/nested".into(), 0)?;
                     directory.is_dir = true;
-                    return Ok(vec![directory]);
+                    spool.push(directory)?;
+                    return Ok(spool);
                 }
-                Ok(vec![
-                    item("a".into(), "a".into(), 0)?,
-                    item("b".into(), "b".into(), 0)?,
-                ])
+                spool.push(item("a".into(), "a".into(), 0)?)?;
+                spool.push(item("b".into(), "b".into(), 0)?)?;
+                Ok(spool)
             })
         }
         fn execute<'a>(
@@ -474,6 +565,25 @@ mod tests {
         .await
         .unwrap()
     }
+    #[test]
+    fn disk_spool_exceeds_old_task_limit_with_bounded_pages_and_private_rows() {
+        let mut spool = DownloadSpool::new().expect("spool");
+        for i in 0..10_001 {
+            spool.push(item(format!("remote-{i}"), format!("folder-{}/file-{i}", i % 3), 7).expect("item")).expect("append");
+        }
+        assert_eq!(spool.count, 10_001);
+        assert_eq!(spool.page(9_999, DOWNLOAD_WORKING_SET).expect("last page").len(), 2);
+        assert_eq!(spool.page(10_001, DOWNLOAD_WORKING_SET).expect("end").len(), 0);
+        let page = spool.page(0, DOWNLOAD_WORKING_SET).expect("bounded");
+        assert_eq!(page.len(), DOWNLOAD_WORKING_SET);
+        assert!(spool.push(item("forged".into(), page[0].relative_path.clone(), 7).expect("duplicate")).is_err());
+        let payload: Vec<u8> = spool.connection.query_row("SELECT payload FROM items LIMIT 1", [], |row| row.get(0)).expect("ciphertext");
+        assert!(!payload.windows(b"folder-0".len()).any(|bytes| bytes == b"folder-0"));
+        let path = spool._directory.path().to_path_buf();
+        drop(spool);
+        assert!(!path.exists());
+    }
+
     #[tokio::test]
     async fn fresh_files_download_concurrently_and_join_before_release() {
         PEAK_DOWNLOADS.store(0, Ordering::SeqCst);

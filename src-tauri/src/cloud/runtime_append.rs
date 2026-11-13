@@ -5,6 +5,7 @@ use crate::sync::{
     append_index::AppendIndex, append_repository::AppendRepository, append_types::*,
 };
 use std::collections::BTreeMap;
+use futures_util::StreamExt;
 
 pub(crate) fn append_error<E: std::error::Error + Send + Sync + 'static>(error: E) -> AppError {
     let any = &error as &dyn std::any::Any;
@@ -117,12 +118,39 @@ impl CloudRuntime {
         &self,
         input: CreateAppendRepositoryInput,
     ) -> Result<AppendRepositoryRedacted, AppError> {
-        self.create_append_repository(input).await
+        let first_binding = input.local_root.clone().zip(input.logical_path.clone());
+        let created = self.create_append_repository_inner(input, true).await?;
+        // Repository-only callers retain the historical API. A newly created
+        // first binding has no remote user history to confirm or pre-scan.
+        if first_binding.is_some() {
+            let mapping = self.config.snapshot().map_err(config_error)?.mappings.into_iter()
+                .find(|mapping| mapping.repository_id == created.binding.repo_id
+                    && mapping.connection_id == created.connection_id)
+                .ok_or_else(|| runtime_error("CLOUD_CONFIG_INVALID", "同步盘绑定不可用 / Drive binding unavailable"))?;
+            let result = async {
+                let binding = crate::sync::root_state::bind_initial(mapping.local_root.clone()).map_err(append_error)?;
+                let mut guard = self.root_guard_index(&mapping)?;
+                guard.record_binding(&binding).map_err(append_error)?;
+                guard.save("initial-sync-v1", "pending", &true).map_err(append_error)?;
+                let epoch = Self::root_epoch(&mapping.local_root)?;
+                self.start_append_worker(mapping.clone(), &epoch, false, Vec::new()).await
+            }.await;
+            if let Err(error) = result { self.report_initial_sync_failure(&mapping.id, error); }
+        }
+        Ok(created)
     }
 
     pub async fn create_append_repository(
         &self,
         input: CreateAppendRepositoryInput,
+    ) -> Result<AppendRepositoryRedacted, AppError> {
+        self.create_append_repository_inner(input, false).await
+    }
+
+    async fn create_append_repository_inner(
+        &self,
+        input: CreateAppendRepositoryInput,
+        bind_first: bool,
     ) -> Result<AppendRepositoryRedacted, AppError> {
         self.admit()?;
         let _permit = self.network.read().await;
@@ -153,6 +181,7 @@ impl CloudRuntime {
         };
         match (input.local_root.as_deref(), input.logical_path.as_deref()) {
             (Some(local_root), Some(logical_path)) => {
+                crate::sync::namespace::components(logical_path).map_err(append_error)?;
                 // Reject an overlapping first binding before the remote anchor
                 // exists; otherwise a failed bind leaves an orphan repository.
                 self.config.prepare_mapping(
@@ -161,7 +190,7 @@ impl CloudRuntime {
                         repository_id: repo_id,
                         local_root: std::path::PathBuf::from(local_root),
                         logical_path: logical_path.to_owned(),
-                        schedule: crate::cloud::config_types::ScheduleConfig::default(),
+                        schedule: input.schedule.clone(),
                     },
                     &[self.data_dir.as_path()],
                     None,
@@ -173,9 +202,10 @@ impl CloudRuntime {
                 "本地目录与云端目录必须同时提供 / Local root and logical path must be supplied together",
             )),
         }
-        let (object, mut selected) =
-            AppendRepository::prepare_anchor(descriptor, password.as_bytes())
-                .map_err(append_error)?;
+        let anchor_password = password.clone();
+        let (object, mut selected) = tokio::task::spawn_blocking(move ||
+            AppendRepository::prepare_anchor(descriptor, anchor_password.as_bytes())
+        ).await.map_err(append_error)?.map_err(append_error)?;
         selected.source = TrustSource::AcceptedTofu;
         let storage = Some(self.append_storage(&input.connection_id, input.bucket.as_deref())?);
         let store: Arc<dyn ObjectStore> = if let Some(store) = self.official_store(&input.connection_id)? { store }
@@ -188,10 +218,19 @@ impl CloudRuntime {
             )
             .await
             .map_err(cloud_error)?;
-        AppendRepository::open_selected(store, selected.clone(), password.as_bytes())
-            .await
-            .map_err(append_error)?;
-        let cached = CachedAppendRepository {
+        // The object was constructed and authenticated locally. Verify the
+        // persisted bytes without a second expensive password derivation.
+        let mut readback = store.get(object.key(), None).await.map_err(cloud_error)?;
+        let mut verified = Vec::new();
+        while let Some(part) = readback.next().await {
+            let part = part.map_err(cloud_error)?;
+            if verified.len().saturating_add(part.len()) > object.bytes().len() {
+                return Err(append_error(AppendError::FingerprintMismatch));
+            }
+            verified.extend_from_slice(&part);
+        }
+        if verified != object.bytes() { return Err(append_error(AppendError::FingerprintMismatch)); }
+        let mut cached = CachedAppendRepository {
             connection_id: input.connection_id,
             password: password.to_string(),
             binding: AppendRepositoryBinding {
@@ -205,6 +244,19 @@ impl CloudRuntime {
                 selected_root: None,
             },
         };
+        if bind_first {
+            if let Some((root, logical)) = input.local_root.zip(input.logical_path) {
+                crate::sync::namespace::components(&logical).map_err(append_error)?;
+                cached.binding.root_candidates = vec![logical.clone()];
+                cached.binding.selected_root = Some(logical.clone());
+                self.config.commit_created_drive(crate::cloud::config_types::AddMappingInput {
+                    connection_id: cached.connection_id.clone(), repository_id: cached.binding.repo_id.clone(),
+                    local_root: PathBuf::from(root), logical_path: logical,
+                    schedule: input.schedule.clone(),
+                }, &[self.data_dir.as_path()], &cached).map_err(config_error)?;
+                return Ok(cached.redacted());
+            }
+        }
         let redacted = cached.redacted();
         self.config
             .cache_append_repository(cached)
@@ -498,47 +550,46 @@ impl CloudRuntime {
         }
         Ok(cached)
     }
-    /// Compare local contents with the last acknowledged epoch, without accessing
-    /// the network or treating an in-flight publication as synchronized.
-    /// Metadata-only listing: never reads file contents or opens the sync index.
-    pub async fn local_directory_entries(&self, mapping_id: &str) -> Result<Vec<LocalSyncEntry>, AppError> {
+    /// Metadata-only listing of one directory. Browsing never scans descendants,
+    /// reads file contents, opens a sync index, or contacts remote storage.
+    async fn local_directory_entries(&self, mapping_id: &str, path: &str) -> Result<Vec<LocalSyncEntry>, AppError> {
         self.admit()?;
         let _permit = self.network.read().await;
         self.admit()?;
         let mapping = self.mapping(mapping_id)?;
         let epoch = Self::root_epoch(&mapping.local_root)?;
         let root = mapping.local_root.clone();
+        let relative = path.to_owned();
         let cancel = Arc::clone(&self.cancel);
         let entries = tokio::task::spawn_blocking(move || {
-            fn walk(dir: &cap_std::fs::Dir, prefix: &str, cancel: &std::sync::atomic::AtomicBool, entries: &mut Vec<LocalSyncEntry>, depth: usize) -> Result<(), AppError> {
-                use cap_fs_ext::DirExt;
-                if depth > 128 || entries.len() >= 100_000 {
-                    return Err(runtime_error("CLOUD_LIST_LIMIT", "目录过大，请选择更小的同步目录 / Directory listing limit exceeded"));
+            let invalid = || runtime_error("CLOUD_PATH_INVALID", "目录不存在或不可访问，请刷新 / Directory unavailable; refresh the listing");
+            let mut dir = crate::sync::materialize::open_root(&root).map_err(append_error)?;
+            if !relative.is_empty() {
+                crate::sync::paths::validate_relative(std::path::Path::new(&relative)).map_err(|_| invalid())?;
+                for part in std::path::Path::new(&relative).components() {
+                    let metadata = dir.symlink_metadata(part.as_os_str()).map_err(|_| invalid())?;
+                    if !metadata.is_dir() || metadata.file_type().is_symlink() { return Err(invalid()); }
+                    let name = part.as_os_str().to_str().ok_or_else(invalid)?;
+                    dir = crate::local_upload::open_directory_checked(&dir, name, &metadata)?;
                 }
-                for item in dir.entries().map_err(append_error)? {
-                    if cancel.load(std::sync::atomic::Ordering::Acquire) {
-                        return Err(runtime_error("CLOUD_CANCELLED", "目录读取已取消 / Directory listing cancelled"));
-                    }
-                    let item = item.map_err(append_error)?;
-                    let name = item.file_name().into_string().map_err(|_| runtime_error("CLOUD_PATH_INVALID", "文件名称无效 / Invalid file name"))?;
-                    let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
-                    if crate::ignore_rules::is_sync_temporary_path(&path) { continue; }
-                    let metadata = dir.symlink_metadata(&name).map_err(append_error)?;
-                    if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) { continue; }
-                    if entries.len() >= 100_000 { return Err(runtime_error("CLOUD_LIST_LIMIT", "目录条目过多 / Too many directory entries")); }
-                    entries.push(LocalSyncEntry { path: path.clone(), name: name.clone(), is_dir: metadata.is_dir(), size: metadata.len(), synced: false, remote_only: false });
-                    if metadata.is_dir() {
-                        walk(&dir.open_dir_nofollow(&name).map_err(append_error)?, &path, cancel, entries, depth + 1)?;
-                    }
-                }
-                Ok(())
             }
-            let dir = crate::sync::materialize::open_root(&root).map_err(append_error)?;
             let mut entries = Vec::new();
-            walk(&dir, "", &cancel, &mut entries, 0)?;
+            for item in dir.entries().map_err(append_error)? {
+                if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(runtime_error("CLOUD_CANCELLED", "目录读取已取消 / Directory listing cancelled"));
+                }
+                let item = item.map_err(append_error)?;
+                let name = item.file_name().into_string().map_err(|_| runtime_error("CLOUD_PATH_INVALID", "文件名称无效 / Invalid file name"))?;
+                let path = if relative.is_empty() { name.clone() } else { format!("{relative}/{name}") };
+                if crate::ignore_rules::is_sync_temporary_path(&path) { continue; }
+                let metadata = dir.symlink_metadata(&name).map_err(append_error)?;
+                if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) { continue; }
+                entries.push(LocalSyncEntry { path, name, is_dir: metadata.is_dir(), size: metadata.len(), synced: false, remote_only: false });
+            }
             entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.path.cmp(&b.path)));
             Ok::<_, AppError>(entries)
         }).await.map_err(append_error)??;
+        self.admit()?;
         if Self::root_epoch(&mapping.local_root)? != epoch {
             return Err(runtime_error("CLOUD_ROOT_CHANGED", "本地目录已变化，请刷新 / Local root changed; refresh the listing"));
         }
@@ -546,10 +597,7 @@ impl CloudRuntime {
     }
 
     pub async fn local_directory_listing(&self, mapping_id: &str, path: &str) -> Result<crate::cloud::runtime_types::LocalDirectoryListing, AppError> {
-        let entries = self.local_directory_entries(mapping_id).await?;
-        if !path.is_empty() && !entries.iter().any(|entry| entry.path == path && entry.is_dir) {
-            return Err(runtime_error("CLOUD_PATH_INVALID", "目录不存在 / Directory not found"));
-        }
+        let entries = self.local_directory_entries(mapping_id, path).await?;
         let mapping = self.mapping(mapping_id)?;
         let name = mapping.local_root.file_name().and_then(|name| name.to_str()).unwrap_or("同步盘 / Sync drive").to_owned();
         let mut breadcrumbs = vec![crate::file_manager::types::FileBreadcrumbDto { id: String::new(), name }];
@@ -560,6 +608,75 @@ impl CloudRuntime {
             breadcrumbs.push(crate::file_manager::types::FileBreadcrumbDto { id: current.clone(), name: name.into() });
         }
         Ok(crate::cloud::runtime_types::LocalDirectoryListing { entries, breadcrumbs })
+    }
+
+    /// Browsing status uses only the acknowledged local baseline and cached
+    /// fingerprints. Full hashing/discovery belongs to preview and sync workers.
+    pub async fn local_directory_status(&self, mapping_id: &str, path: &str) -> Result<Vec<LocalSyncEntry>, AppError> {
+        self.admit()?;
+        let mapping = self.mapping(mapping_id)?;
+        let epoch = Self::root_epoch(&mapping.local_root)?;
+        let entries = self.local_directory_entries(mapping_id, path).await?;
+        let local: std::collections::BTreeSet<_> = entries.iter().map(|entry| entry.path.clone()).collect();
+        let revisions = if mapping.protocol == StorageProtocol::AppendV2 {
+            let index = self.open_append_index(&mapping, &epoch)?;
+            match index.active_epoch().map_err(append_error)? {
+                Some(epoch) => index.epoch_revisions(&epoch).map_err(append_error)?,
+                None => return Ok(Vec::new()),
+            }
+        } else {
+            let index = SyncIndex::open(&self.data_dir.join("cloud-sync.sqlite"),
+                self.config.get_or_create_index_key().map_err(config_error)?,
+                mapping.repository_id.clone(), Self::index_scope(&mapping, &epoch)).map_err(append_error)?;
+            match index.load::<MergeSet>("engine", "materialized").map_err(append_error)? {
+                Some(base) => base.revisions,
+                None => return Ok(Vec::new()),
+            }
+        };
+        let projection = crate::sync::namespace::project_scoped(
+            &merge::project(&revisions).map_err(append_error)?, &mapping.logical_path,
+        ).map_err(append_error)?;
+        let base: BTreeMap<_, _> = projection.entries.iter()
+            .map(|entry| (entry.projection_path.join("/"), &entry.value)).collect();
+        let cache_path = self.data_dir.join("cloud-scan.sqlite");
+        let cache = if cache_path.exists() {
+            Some(SyncIndex::open(&cache_path,
+                self.config.get_or_create_index_key().map_err(config_error)?,
+                mapping.repository_id.clone(), Self::index_scope(&mapping, &epoch)).map_err(append_error)?)
+        } else { None };
+        let mut result = Vec::new();
+        for mut entry in entries {
+            // A directory's aggregate state is unknown until its subtree has
+            // been reconciled. Do not scan it merely to paint a status badge.
+            if entry.is_dir { continue; }
+            let previous = cache.as_ref().map(|cache| cache.load::<crate::sync::scan_types::FileScan>("scan-file-v1", &entry.path))
+                .transpose().map_err(append_error)?.flatten();
+            let Some(previous) = previous else { continue; };
+            if !crate::sync::scan::cached_file_matches(&mapping.local_root, &previous).map_err(append_error)? {
+                entry.synced = false;
+            } else {
+                entry.synced = matches!(base.get(&entry.path), Some(RevisionValue::Live { node: Node::File(saved), .. })
+                    if saved.length == previous.size && saved.digest == previous.whole_file_hash);
+            }
+            result.push(entry);
+        }
+        // Cloud-only rows come from the acknowledged baseline, not a network
+        // discovery. This never grants publication or deletion authority.
+        for (name, value) in base {
+            let parent = name.rsplit_once('/').map_or("", |(parent, _)| parent);
+            if parent != path || local.contains(&name) { continue; }
+            let (is_dir, size) = match value {
+                RevisionValue::Live { node: Node::File(file), .. } => (false, file.length),
+                RevisionValue::Live { node: Node::Dir, .. } => (true, 0),
+                RevisionValue::Tombstone => continue,
+            };
+            result.push(LocalSyncEntry { name: name.rsplit('/').next().unwrap_or("").into(), path: name, is_dir, size, synced: false, remote_only: true });
+        }
+        self.admit()?;
+        if Self::root_epoch(&mapping.local_root)? != epoch {
+            return Err(runtime_error("CLOUD_ROOT_CHANGED", "本地目录已变化，请刷新 / Local root changed; refresh the listing"));
+        }
+        Ok(result)
     }
 
     pub async fn local_sync_entries(&self, mapping_id: &str) -> Result<Vec<LocalSyncEntry>, AppError> {
@@ -734,6 +851,34 @@ impl CloudRuntime {
         log::debug!(target: "peerdav::preview", "trace={trace} stage=compare_and_journal elapsed_ms={} append_total_ms={} remote_revisions={}", compare_started.elapsed().as_millis(), started.elapsed().as_millis(), remote.len());
         Ok((counts, signature))
     }
+    pub(crate) fn report_initial_sync_failure(&self, id: &str, error: AppError) {
+        self.manager.report_status(crate::sync::manager_types::SyncStatus {
+            mapping_id: id.into(), run_id: None, phase: crate::sync::manager_types::SyncPhase::Failed,
+            detail: Some(error.message.clone()),
+        });
+        self.manager.report_background(error);
+    }
+
+    pub(crate) async fn resume_initial_sync(&self, mapping: &CloudMapping) -> Result<(), AppError> {
+        // One automatic resume per process/unlock; failures need an explicit
+        // retry, not a reset of discovery budgets on every catalog refresh.
+        if self.manager.status(&mapping.id).phase != crate::sync::manager_types::SyncPhase::Idle { return Ok(()); }
+        let guard = self.root_guard_index(mapping)?;
+        if guard.load::<bool>("initial-sync-v1", "pending").map_err(append_error)? != Some(true) { return Ok(()); }
+        self.validate_scheduled_root(mapping)?;
+        let epoch = Self::root_epoch(&mapping.local_root)?;
+        if self.open_append_index(mapping, &epoch)?.pending_epoch().map_err(append_error)?.is_some() {
+            self.manager.report_status(crate::sync::manager_types::SyncStatus {
+                mapping_id: mapping.id.clone(), run_id: None,
+                phase: crate::sync::manager_types::SyncPhase::PendingRecovery,
+                detail: None,
+            });
+            return Ok(());
+        }
+        self.start_append_worker(mapping.clone(), &epoch, false, Vec::new()).await?;
+        Ok(())
+    }
+
     pub(crate) async fn start_append_worker(
         &self,
         mapping: CloudMapping,
@@ -767,11 +912,12 @@ impl CloudRuntime {
             store: self.bound_append_store(&cached)?,
             index: Mutex::new(Some(self.open_append_index(&mapping, epoch)?)),
             cached,
-            root: mapping.local_root,
+            root: mapping.local_root.clone(),
             private,
-            mapping: mapping.logical_path,
+            mapping: mapping.logical_path.clone(),
             manager: Arc::downgrade(&self.manager),
             automatic,
+            root_guard: Arc::new(Mutex::new(self.root_guard_index(&mapping)?)),
         });
         match self.manager.start(mapping.id, worker)? {
             StartResult::Started(run_id) => Ok(CloudSyncResult { run_id }),
@@ -792,6 +938,7 @@ struct AppendWorker {
     mapping: String,
     manager: std::sync::Weak<SyncManager>,
     automatic: bool,
+    root_guard: Arc<Mutex<crate::sync::index::SyncIndex>>,
 }
 impl SyncWorker for AppendWorker {
     fn run(
@@ -818,7 +965,10 @@ impl SyncWorker for AppendWorker {
         let manager = self.manager.clone();
         let automatic = self.automatic;
         let selection = self.selection.clone();
+        let root_guard = self.root_guard.clone();
+        let runtime_handle = tokio::runtime::Handle::current();
         Box::pin(async move {
+            tokio::task::spawn_blocking(move || runtime_handle.block_on(async move {
             let mut index = index?;
             let run_id = hex::encode(rand::random::<[u8; 16]>());
             let request = AppendPullRequest { root: &root, private: &private, mapping: &mapping, run_id: &run_id };
@@ -828,7 +978,13 @@ impl SyncWorker for AppendWorker {
                 append_engine::run_selected(store, &trust(&cached.binding), cached.password.as_bytes(), &mut index, &request, context.cancel, &selection).await
             };
             match result {
-                Ok(_) => Ok(crate::sync::manager_types::WorkerOutcome::Completed),
+                Ok(_) => {
+                    if selection.is_empty() {
+                        root_guard.lock().map_err(|_| runtime_error("CLOUD_INDEX_LOCK", "索引不可用 / Index unavailable"))?
+                            .save("initial-sync-v1", "pending", &false).map_err(append_error)?;
+                    }
+                    Ok(crate::sync::manager_types::WorkerOutcome::Completed)
+                },
                 Err(error) => {
                     use crate::sync::{
                         append_engine_types::AppendEngineError,
@@ -856,6 +1012,7 @@ impl SyncWorker for AppendWorker {
                     }
                 }
             }
+            })).await.map_err(append_error)?
         })
     }
 }

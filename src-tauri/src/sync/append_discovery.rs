@@ -82,9 +82,13 @@ pub async fn discover_roots<S: ObjectStore + ?Sized>(
     }
     let projection = crate::sync::merge::project(&revisions)
         .map_err(|_| AppendError::Invalid("root projection"))?;
-    Ok(projection.entries.into_iter()
+    Ok(projection
+        .entries
+        .into_iter()
         .filter_map(|entry| entry.logical_path.into_iter().next())
-        .collect::<BTreeSet<_>>().into_iter().collect())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect())
 }
 
 async fn discover_inner<S: ObjectStore + ?Sized>(
@@ -184,7 +188,16 @@ async fn discover_inner<S: ObjectStore + ?Sized>(
         after = key;
     }
     let validation_started = std::time::Instant::now();
-    let result = validate_metered(store, repo.repo_id(), &repo, &roots, &mut meter, &limits, validate_blocks).await;
+    let result = validate_metered(
+        store,
+        repo.repo_id(),
+        &repo,
+        &roots,
+        &mut meter,
+        &limits,
+        validate_blocks,
+    )
+    .await;
     log::debug!(target: "peerdav::preview", "operation={operation} stage=metadata_validation elapsed_ms={} roots={} requests={} validate_blocks={} ok={}", validation_started.elapsed().as_millis(), roots.len(), meter.requests, validate_blocks, result.is_ok());
     if !validate_blocks {
         // Linking only authenticates metadata. Do not persist full-validation
@@ -298,7 +311,11 @@ async fn open_metered<S: ObjectStore + ?Sized>(
     if serde_json::to_vec(&anchor)? != bytes
         || anchor.descriptor.repo_id != binding.repo_id
         || anchor.descriptor.mode != binding.mode
-        || binding.key != format!("{APPEND_ANCHORS}{}-{}", binding.repo_id, binding.fingerprint)
+        || binding.key
+            != format!(
+                "{APPEND_ANCHORS}{}-{}",
+                binding.repo_id, binding.fingerprint
+            )
     {
         return Err(AppendError::Invalid("anchor binding"));
     }
@@ -374,29 +391,24 @@ fn metadata(
     tree: bool,
     limits: &DiscoveryLimits,
 ) -> Result<(), AppendError> {
-    let header: DiscoveryEnvelopeHeader = serde_json::from_slice(bytes)?;
-    if header.plaintext_len > limits.append.max_metadata.min(MAX_METADATA_SIZE) {
+    let (header, _): (Envelope, _) = super::object_wire::decode(
+        bytes,
+        MAX_METADATA_SIZE + super::repository_types::OBJECT_WIRE_OVERHEAD,
+    )?;
+    let plaintext_len = usize::try_from(header.plaintext_len)
+        .map_err(|_| AppendError::ResourceLimit("metadata"))?;
+    if plaintext_len > limits.append.max_metadata.min(MAX_METADATA_SIZE) {
         return Err(AppendError::ResourceLimit("metadata"));
     }
     if tree {
         charge(
             &mut budget.tree_plaintext,
-            header.plaintext_len,
+            plaintext_len,
             limits.append.max_tree_total.min(MAX_TREE_SIZE),
             "tree plaintext",
         )?;
     }
     allocation(budget, expansion(bytes.len())?, limits)
-}
-
-fn snapshot_allocation(snapshot: &Snapshot) -> Result<usize, AppendError> {
-    snapshot.values().try_fold(0usize, |sum, revision| {
-        // Count serialized bytes without allocating a temporary serialization.
-        let mut writer = CountingWriter(0);
-        serde_json::to_writer(&mut writer, revision)?;
-        sum.checked_add(expansion(writer.0)?)
-            .ok_or(AppendError::ResourceLimit("allocation bytes"))
-    })
 }
 
 impl std::io::Write for CountingWriter {
@@ -502,7 +514,9 @@ async fn get<S: ObjectStore + ?Sized>(
         // block. Bound their live decoding workspace, not the sum of historical
         // allocations. Network work remains cumulative and durable above.
         if bytes != 0 && key.contains("/blocks/") {
-            let workspace = bytes.checked_mul(8).and_then(|n| n.checked_add(4096))
+            let workspace = bytes
+                .checked_mul(8)
+                .and_then(|n| n.checked_add(4096))
                 .ok_or(AppendError::ResourceLimit("block workspace"))?;
             if workspace > limits.max_allocation.min(MAX_DISCOVERY_ALLOCATION) {
                 return Err(AppendError::ResourceLimit("block workspace"));
@@ -533,9 +547,9 @@ pub(crate) async fn read_bounded<S: ObjectStore + ?Sized>(
     let wire_limit = if key.starts_with(APPEND_ANCHORS) {
         64 * 1024
     } else if key.contains("/blocks/") {
-        2 * (MAX_BLOCK_SIZE + 16) + 4096
+        MAX_BLOCK_SIZE + super::repository_types::OBJECT_WIRE_OVERHEAD
     } else {
-        2 * (MAX_METADATA_SIZE + 16) + 4096
+        MAX_METADATA_SIZE + super::repository_types::OBJECT_WIRE_OVERHEAD
     };
     reserve(1, 0)?;
     let metadata = store.stat(key).await.map_err(read_error)?;
@@ -679,7 +693,10 @@ async fn validate_metered<S: ObjectStore + ?Sized>(
                 if commits.len() >= MAX_DISCOVERY_NODES {
                     return Err(AppendError::ResourceLimit("nodes"));
                 }
-                let key = format!("{APPEND_ROOT}/{repo_id}/commits/{}-{}", reference.operation_id, digest);
+                let key = format!(
+                    "{APPEND_ROOT}/{repo_id}/commits/{}-{}",
+                    reference.operation_id, digest
+                );
                 let bytes = get(store.as_ref(), &key, budget, limits).await?;
                 let expected = ObjectRef {
                     kind: "commit".into(),
@@ -791,24 +808,25 @@ async fn validate_tree_objects<S: ObjectStore + ?Sized>(
                     let child_snapshot = done
                         .get(&child.object.digest)
                         .ok_or(AppendError::Invalid("tree child ordering"))?;
-                    allocation(
-                        budget,
-                        snapshot_allocation(&snapshot)?
-                            .checked_add(snapshot_allocation(child_snapshot)?)
-                            .ok_or(AppendError::ResourceLimit("allocation bytes"))?,
-                        limits,
-                    )?;
-                    let joined = crate::sync::merge::join(
-                        &crate::sync::merge_types::MergeSet {
-                            revisions: snapshot,
-                        },
-                        &crate::sync::merge_types::MergeSet {
-                            revisions: child_snapshot.clone(),
-                        },
-                    )
-                    .map_err(|_| AppendError::Invalid("tree history"))?;
-                    snapshot = joined.revisions;
+                    // Merge each authenticated child once, without cloning the
+                    // entire accumulated snapshot for every sibling shard.
+                    for (id, revision) in child_snapshot {
+                        if let Some(old) = snapshot.get(id) {
+                            if old != revision {
+                                return Err(AppendError::Invalid("tree history"));
+                            }
+                            continue;
+                        }
+                        allocation(
+                            budget,
+                            crate::sync::merge::revision_working_bytes(revision),
+                            limits,
+                        )?;
+                        snapshot.insert(id.clone(), revision.clone());
+                    }
                 }
+                crate::sync::merge::validate(&snapshot)
+                    .map_err(|_| AppendError::Invalid("tree history"))?;
                 done.insert(digest.clone(), snapshot);
                 trees.insert(digest, tree);
             }

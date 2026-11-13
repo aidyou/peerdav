@@ -192,9 +192,11 @@ describe('mounted transfer dialogs', () => {
     expect(w.events.onRetry).toHaveBeenCalledExactlyOnceWith(item); expect(w.events.onReveal).toHaveBeenCalledTimes(1); expect(w.events.onClose).toHaveBeenCalledTimes(1);
     expect(document.querySelector('[data-test=cancel-download]')).toBeNull();
   });
-  it('keeps operation details folded and retries only when an operation is available', async () => {
+  it('shows a readable operation error without exposing diagnostics and retries only when available', async () => {
     const w = render(OperationErrorDialog, { error: { code: 'CLOUD_TRANSPORT', message: 'Original reason', detail: 'diagnostic' }, retryable: true }); await nextTick();
-    expect(document.querySelector('details').open).toBe(false);
+    expect(document.querySelector('details')).toBeNull();
+    expect(document.body.textContent).not.toContain('diagnostic');
+    expect(document.body.textContent).not.toContain('CLOUD_TRANSPORT');
     await click('[data-test=retry-load]'); expect(w.events.onRetry).toHaveBeenCalledTimes(1);
     await w.setProps({ retryable: false }); expect(document.querySelector('[data-test=retry-load]')).toBeNull();
   });

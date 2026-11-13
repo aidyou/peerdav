@@ -27,6 +27,9 @@ pub struct RepositoryKeys {
 pub const MAX_HEAD_SIZE: usize = 64 * 1024;
 pub const MAX_METADATA_SIZE: usize = 32 * 1024 * 1024;
 pub const MAX_BLOCK_SIZE: usize = 8 * 1024 * 1024;
+pub const OBJECT_WIRE_MAGIC: &[u8; 8] = b"PDAVOBJ\0";
+pub const OBJECT_HEADER_LIMIT: usize = 1024;
+pub const OBJECT_WIRE_OVERHEAD: usize = 12 + OBJECT_HEADER_LIMIT + 16;
 
 #[derive(Debug, Error)]
 pub enum WireError {
@@ -109,7 +112,8 @@ pub struct Envelope {
     pub kind: String,
     pub block_id: Option<String>,
     pub nonce: String,
-    pub ciphertext: String,
+    #[serde(skip)]
+    pub ciphertext: Vec<u8>,
 }
 
 pub fn encode<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, WireError> {

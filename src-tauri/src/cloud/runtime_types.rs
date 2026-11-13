@@ -7,6 +7,24 @@ use crate::cloud::config_types::{
 };
 use crate::sync::manager_types::SyncStatus;
 
+pub(crate) struct CapabilityCache {
+    pub index: std::sync::Mutex<crate::sync::index::SyncIndex>,
+    pub events: Arc<dyn crate::sync::traits::SyncEvents>,
+    pub scope: String,
+    pub connection_id: String,
+    pub connection_name: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityProgress {
+    pub scope: String,
+    pub connection_id: String,
+    pub connection_name: String,
+    pub capability: String,
+    pub stage: String,
+}
+
 #[derive(Clone)]
 pub struct SharedCloud(pub Arc<super::runtime::CloudRuntime>);
 
@@ -176,6 +194,8 @@ pub struct CreateAppendRepositoryInput {
     pub local_root: Option<String>,
     #[serde(default)]
     pub logical_path: Option<String>,
+    #[serde(default)]
+    pub schedule: super::config_types::ScheduleConfig,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

@@ -22,6 +22,11 @@ pub fn canonicalize_tree(tree: &mut Tree) -> Result<(), AppendError> {
         .map(|r| (r.revision_id.clone(), r.clone()))
         .collect();
     crate::sync::merge::validate(&map).map_err(|_| AppendError::Invalid("tree history"))?;
+    let available: std::collections::BTreeSet<_> = tree
+        .bindings
+        .iter()
+        .map(|binding| (binding.block_id.as_str(), binding.len))
+        .collect();
     for r in &tree.entries {
         if let crate::sync::merge_types::RevisionValue::Live {
             node: crate::sync::merge_types::Node::File(f),
@@ -29,11 +34,7 @@ pub fn canonicalize_tree(tree: &mut Tree) -> Result<(), AppendError> {
         } = &r.value
         {
             for b in &f.blocks {
-                if !tree
-                    .bindings
-                    .iter()
-                    .any(|x| x.block_id == b.id && x.len == b.len)
-                {
+                if !available.contains(&(b.id.as_str(), b.len)) {
                     return Err(AppendError::Invalid("missing block binding"));
                 }
             }

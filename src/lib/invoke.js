@@ -101,7 +101,10 @@ const ERROR_STRATEGIES = Object.freeze({
   CLOUD_PRECONDITION: "show",
   CLOUD_UPLOAD_PENDING_RECOVERY: "support",
   CLOUD_ROOT_CHANGED: "refresh",
+  "CLOUD_SERVICE": "show",
   CLOUD_CONFIG_INVALID: "edit",
+  CLOUD_LOCAL_MAPPING_CONFLICT: "edit",
+  CLOUD_REMOTE_MAPPING_CONFLICT: "edit",
   CLOUD_NOT_FOUND: "show",
   CLOUD_UNSUPPORTED: "show",
   CLOUD_TRANSPORT: "retry",
@@ -146,11 +149,24 @@ const ERROR_STRATEGIES = Object.freeze({
 /**
  * Single invoke wrapper. All command calls must go through this function.
  */
+const OPERATION_KEYS = Object.freeze({
+  cloud_create_sync_drive: "errorOperation.createSyncDrive",
+  cloud_append_create: "errorOperation.createSyncDrive",
+  cloud_create_repository: "errorOperation.createSyncDrive",
+  cloud_save_connection: "errorOperation.saveConnection",
+  cloud_test_connection: "errorOperation.testConnection",
+  cloud_prepare_mapping_bind: "errorOperation.bindFolder",
+  cloud_confirm_mapping_bind: "errorOperation.bindFolder",
+  cloud_save_mapping: "errorOperation.bindFolder",
+  mirror_save_mapping: "errorOperation.bindFolder",
+});
+
 export async function invoke(command, args = {}) {
   try {
     return await tauriInvoke(command, args);
   } catch (raw) {
     const error = normalizeAppError(raw);
+    if (OPERATION_KEYS[command]) error.context = { ...error.context, userOperationKey: OPERATION_KEYS[command] };
     const { reason: _reason, ...context } = error.context ?? {};
     console.error(`[peerdav:${error.code}]`, {
       detail: error.detail ?? error.message,
@@ -194,8 +210,17 @@ export function errorStrategy(error) {
  */
 export function toUserMessage(error) {
   const normalized = normalizeAppError(error);
+  const reason = userReason(normalized);
+  const operation = normalized.context?.userOperationKey;
+  return operation && Object.values(OPERATION_KEYS).includes(operation)
+    ? t("errorOperation.failure", { operation: t(operation), reason }) : reason;
+}
+
+function userReason(normalized) {
+  if (["CLOUD_STORAGE", "CLOUD_TRANSPORT", "CLOUD_CONNECTION_FAILED", "CLOUD_OFFICIAL_API", "PEER_REQUEST_FAILED"].includes(normalized.code) && Number(normalized.context?.status) >= 500) return t("errors.reason.serviceUnavailable");
+  if (["CLOUD_STORAGE", "CLOUD_OFFICIAL_API", "PEER_REQUEST_FAILED"].includes(normalized.code) && [401, 403].includes(Number(normalized.context?.status))) return t("errors.reason.permissionDenied");
   const key = `errors.${normalized.code}`;
-  let reason = normalized.context?.reason;
+  let reason = normalized.context?.reason ? localizeMessage(normalized.context.reason) : null;
   if (!reason) {
     const fallback = localizeMessage(normalized.message);
     reason = fallback.split(/：|: /).slice(1).join(": ") || fallback;
@@ -211,8 +236,13 @@ export function toUserMessage(error) {
     if (localized !== reasonKey) reason = localized;
   }
   const params = { ...normalized.context, reason };
-  if (normalized.context?.status) params.reason = `HTTP ${normalized.context.status} (${reason})`;
   const translated = t(key, params);
-  if (translated !== key) return translated;
+  if (translated !== key) {
+    if (normalized.context?.userOperationKey) {
+      const separator = translated.search(/：|: /);
+      return separator >= 0 ? translated.slice(separator + (translated[separator] === "：" ? 1 : 2)) : translated;
+    }
+    return translated;
+  }
   return localizeMessage(normalized.message);
 }

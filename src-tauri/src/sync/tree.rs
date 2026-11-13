@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use super::merge;
-use super::merge_types::{EntityId, MAX_ENTITIES, MAX_REVISIONS, MergeSet, Node, RevisionValue};
+use super::merge_types::{EntityId, MAX_MERGE_WORKING_BYTES, MergeSet, Node, RevisionValue};
 use super::publisher_types::{CommitDto, PublishControl};
 use super::repository::Repository;
 use super::repository_types::{decode_metadata, hex_exact};
@@ -258,6 +258,7 @@ pub async fn load_tree(
     let mut owners = BTreeSet::from([root_owner()]);
     let mut actual = BTreeMap::new();
     let mut revisions = BTreeMap::new();
+    let mut revision_remaining = MAX_MERGE_WORKING_BYTES;
     let mut entities = BTreeSet::new();
     let mut total = 0usize;
     let mut reuse = TreeReuse::default();
@@ -318,10 +319,10 @@ pub async fn load_tree(
                     "empty, duplicate or unsorted entity history",
                 ));
             }
-            if entities.len() > MAX_ENTITIES {
-                return Err(TreeError::ResourceLimit("entities"));
-            }
             for revision in &history.revisions {
+                revision_remaining = revision_remaining
+                    .checked_sub(merge::revision_working_bytes(revision))
+                    .ok_or(TreeError::ResourceLimit("revision workspace bytes"))?;
                 if revision.entity != history.entity
                     || revisions
                         .insert(revision.revision_id.clone(), revision.clone())
@@ -330,9 +331,6 @@ pub async fn load_tree(
                     return Err(TreeError::Invalid(
                         "revision ownership or duplicate revision",
                     ));
-                }
-                if revisions.len() > MAX_REVISIONS {
-                    return Err(TreeError::ResourceLimit("revisions"));
                 }
             }
         }

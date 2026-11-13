@@ -1440,7 +1440,7 @@ async fn missing_tree_and_block_preserve_pending_source_and_failed_get_charge() 
 
     let (_, bytes) = r.seal_block(b"block").unwrap();
     let envelope: peerdav_lib::sync::append_types::Envelope =
-        serde_json::from_slice(&bytes).unwrap();
+        peerdav_lib::sync::append_types::Envelope::from_wire(&bytes).unwrap();
     let block_id = envelope.logical_id;
     use sha2::Digest;
     let digest = hex::encode(sha2::Sha256::digest(&bytes));
@@ -1538,11 +1538,11 @@ async fn same_revision_id_different_content_is_rejected() {
     );
     let key = format!("_peerdav_encrypt/{}/trees/{}", r.repo_id(), good.digest);
     let bytes = f.objects.lock().unwrap().get(&key).cloned().unwrap();
-    let mut envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let mut envelope = peerdav_lib::sync::append_types::Envelope::from_wire(&bytes).unwrap();
     tree.entries[0].change_id = ChangeId("altered".into());
-    envelope["payload"] =
-        serde_json::Value::String(hex::encode(serde_json::to_vec(&tree).unwrap()));
-    let bad_bytes = serde_json::to_vec(&envelope).unwrap();
+    envelope.payload = serde_json::to_vec(&tree).unwrap();
+    envelope.plaintext_len = envelope.payload.len() as u64;
+    let bad_bytes = envelope.to_wire().unwrap();
     use sha2::Digest;
     let bad = ObjectRef {
         kind: "tree".into(),

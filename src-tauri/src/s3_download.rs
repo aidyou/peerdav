@@ -30,7 +30,7 @@ impl TransferQueueAdapter for S3DownloadAdapter {
     fn plan(
         &self,
         selection: DownloadSelection,
-    ) -> BoxFuture<'_, Result<Vec<DownloadItem>, AppError>> {
+    ) -> BoxFuture<'_, Result<DownloadSpool, AppError>> {
         Box::pin(async move {
             self.validate().await?;
             let (paths, single) = match selection {
@@ -38,8 +38,7 @@ impl TransferQueueAdapter for S3DownloadAdapter {
                 DownloadSelection::Files { paths } => (paths, false),
                 DownloadSelection::Folder { path } => (vec![format!("{}/", path.trim_end_matches('/'))], false),
             };
-            if paths.len() > MAX_DOWNLOAD_ITEMS { return Err(crate::local_upload::invalid()); }
-            let mut result = Vec::new();
+            let mut result = DownloadSpool::new()?;
             let mut targets = std::collections::HashSet::new();
             let mut ledger = crate::cloud::object_service::BudgetLedger::default();
             let mut stat_requests = 0usize;
@@ -55,7 +54,7 @@ impl TransferQueueAdapter for S3DownloadAdapter {
                     match self.session.store.stat(&path).await {
                         Ok(metadata) if metadata.key == path => {
                             if !targets.insert(name.to_owned()) { return Err(crate::local_upload::invalid()); }
-                            result.push(crate::download::item(path.clone(), name.to_owned(), metadata.size)?);
+                            result.push(crate::download::item(path.clone(), name.to_owned(), metadata.size)?)?;
                             continue;
                         }
                         Ok(_) => return Err(crate::local_upload::invalid()),
@@ -75,20 +74,19 @@ impl TransferQueueAdapter for S3DownloadAdapter {
                         let tail = object.key.strip_prefix(&prefix).ok_or_else(crate::local_upload::invalid)?;
                         if object.key.ends_with('/') {
                             let relative = if tail.is_empty() { name.to_owned() } else { format!("{name}/{}", tail.trim_end_matches('/')) };
-                            if !targets.contains(&relative) && result.len() >= MAX_DOWNLOAD_ITEMS { return Err(crate::local_upload::invalid()); }
                             if targets.insert(relative.clone()) {
                                 let mut item = crate::download::item(object.key, relative, 0)?;
-                                item.is_dir = true; result.push(item);
+                                item.is_dir = true; result.push(item)?;
                             }
                             continue;
                         }
                         if tail.is_empty() { continue; }
-                        if tail.split('/').count() > MAX_DOWNLOAD_DEPTH || result.len() >= MAX_DOWNLOAD_ITEMS {
+                        if tail.split('/').count() > MAX_DOWNLOAD_DEPTH {
                             return Err(crate::local_upload::invalid());
                         }
                         let relative = format!("{name}/{tail}");
                         if !targets.insert(relative.clone()) { return Err(crate::local_upload::invalid()); }
-                        result.push(crate::download::item(object.key, relative, object.size)?);
+                        result.push(crate::download::item(object.key, relative, object.size)?)?;
                     }
                     match page.next {
                         Some(token) if seen.insert(token.clone()) => next = Some(token),

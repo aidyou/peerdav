@@ -21,6 +21,16 @@ fn cloud(code: &'static str, reason: &'static str, cause: &'static str) -> Domai
 }
 
 #[test]
+fn service_status_is_readable_and_diagnostics_keep_original_response() {
+    let error = AppError::from(DomainError::from(CloudError::Service { status: 503, detail: "upstream maintenance".into() }));
+    assert!(error.message.contains("存储服务暂时不可用"));
+    assert!(!error.message.contains("503"));
+    assert!(error.detail.as_deref().unwrap().contains("503"));
+    assert!(error.detail.as_deref().unwrap().contains("upstream maintenance"));
+    assert_eq!(error.context.as_ref().unwrap()["status"], 503);
+}
+
+#[test]
 fn stable_cloud_code_and_structured_shape() {
     let error = AppError::from(cloud(
         "CLOUD_NOT_FOUND",
@@ -83,7 +93,9 @@ fn status_like_transport_reason_is_not_generic() {
         "云存储传输失败",
         "HTTP 503 Service Unavailable",
     ));
-    assert!(error.message.contains("HTTP 503"));
+    assert!(error.message.contains("存储服务暂时不可用"));
+    assert!(!error.message.contains("HTTP 503"));
+    assert!(error.detail.as_deref().unwrap_or_default().contains("HTTP 503"));
     assert!(!error.message.contains("未知错误"));
 }
 
@@ -214,7 +226,9 @@ fn complete_unknown_maps_to_pending_recovery_not_cancellation() {
     assert_eq!(error.code, "CLOUD_UPLOAD_PENDING_RECOVERY");
     assert_ne!(error.code, "CLOUD_CANCELLED");
     assert!(error.message.contains("未知"));
-    assert!(error.message.contains("HTTP 503"));
+    assert!(error.message.contains("存储服务暂时不可用"));
+    assert!(!error.message.contains("HTTP 503"));
+    assert!(error.detail.as_deref().unwrap_or_default().contains("HTTP 503"));
     assert_eq!(
         error
             .context

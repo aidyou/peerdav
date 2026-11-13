@@ -276,7 +276,7 @@ impl AppError {
         };
         let mut context = error_context(error).unwrap_or_else(|| json!({}));
         if let Some(reason) = frontend_reason(error) {
-            context["reason"] = json!(visible_reason(&reason));
+            context["reason"] = json!(reason.split_once(" / ").map(|(zh, en)| format!("{} / {}", visible_reason(zh), visible_reason(en))).unwrap_or_else(|| visible_reason(&reason)));
         }
         let context = Some(context);
 
@@ -433,6 +433,35 @@ fn append_error_chain(rendered: &mut String, error: &(dyn std::error::Error + 's
         }
         source = cause.source();
     }
+}
+
+fn readable_cloud_reason(error: &(dyn std::error::Error + 'static)) -> String {
+    use crate::cloud::types::CloudError;
+    let mut current = Some(error);
+    while let Some(cause) = current {
+        if let Some(cloud) = cause.downcast_ref::<CloudError>() {
+            match cloud {
+                CloudError::Service { status, .. } if *status >= 500 => return "存储服务暂时不可用，请稍后重试 / The storage service is temporarily unavailable. Try again later.".into(),
+                CloudError::Service { status: 401 | 403, .. } => return "账号没有访问权限，请检查授权和访问权限 / This account cannot access the storage. Check authorization and permissions.".into(),
+                CloudError::NotFound => return "云端文件或目录不存在，请刷新后重试 / The cloud file or folder no longer exists. Refresh and try again.".into(),
+                CloudError::Unsupported => return "存储服务不支持所需的安全操作，请改用受支持的操作 / Storage does not support the required safeguards. Use a supported operation.".into(),
+                CloudError::Storage { source: object_store::Error::Generic { store: "probe cleanup", .. } } => return "临时测试文件未能删除，请检查账号的删除权限后重试 / Temporary test files could not be removed. Check deletion permissions and try again.".into(),
+                CloudError::Storage { source } => match source {
+                    object_store::Error::NotFound { .. } => return "云端文件或目录不存在，请刷新后重试 / The cloud file or folder no longer exists. Refresh and try again.".into(),
+                    object_store::Error::PermissionDenied { .. } | object_store::Error::Unauthenticated { .. } => return "账号授权无效或权限不足，请检查网盘授权 / Account authorization is invalid or insufficient. Check the drive authorization.".into(),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        current = cause.source();
+    }
+    // Unknown reasons stay in diagnostics; never render a nested technical chain.
+    let reason = safe_cloud_reason(error);
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("503") || lower.contains("service unavailable") { return "存储服务暂时不可用，请稍后重试 / The storage service is temporarily unavailable. Try again later.".into(); }
+    if lower.contains("timeout") || lower.contains("timed out") { return "连接超时，请检查网络和代理设置后重试 / The connection timed out. Check the network and proxy settings, then try again.".into(); }
+    "存储服务未能完成请求，请检查连接并查看诊断日志中的具体原因 / Storage could not complete the request. Check the connection and diagnostic logs for the cause.".into()
 }
 
 fn safe_cloud_reason(error: &(dyn std::error::Error + 'static)) -> String {
@@ -804,6 +833,7 @@ pub(crate) fn visible_reason(detail: &str) -> String {
 
 fn frontend_reason(error: &DomainError) -> Option<String> {
     match error {
+        DomainError::Cloud { source, .. } => Some(readable_cloud_reason(source.as_ref())),
         DomainError::PeerFile { source, .. } => std::error::Error::source(source).map(error_chain),
         DomainError::Database { source, .. } | DomainError::DatabaseOpen { source, .. } => {
             Some(source.to_string())
@@ -836,8 +866,8 @@ fn frontend_reason(error: &DomainError) -> Option<String> {
 }
 
 fn failure(chinese: &str, english: &str, reason: &str) -> String {
-    let reason = visible_reason(reason);
-    format!("{chinese}：{reason} / {english}: {reason}")
+    let (zh_reason, en_reason) = reason.split_once(" / ").unwrap_or((reason, reason));
+    format!("{chinese}：{} / {english}: {}", visible_reason(zh_reason), visible_reason(en_reason))
 }
 
 fn user_message(error: &DomainError) -> String {
@@ -1080,8 +1110,20 @@ fn error_reason(error: &DomainError) -> String {
         }
         DomainError::Cloud { source, .. } => {
             use crate::cloud::types::CloudError;
-            let reason = safe_cloud_reason(source.as_ref());
+            let reason = readable_cloud_reason(source.as_ref());
             match source.downcast_ref::<CloudError>() {
+                Some(CloudError::Service { status, .. }) if *status >= 500 =>
+                    "存储服务暂时不可用。请稍后重试。 / The storage service is temporarily unavailable. Try again later.".into(),
+                Some(CloudError::Service { status: 401 | 403, .. }) =>
+                    "账号没有访问此存储范围的权限。请检查授权和访问权限。 / This account cannot access the selected storage scope. Check authorization and access permissions.".into(),
+                Some(CloudError::Transport { .. }) =>
+                    "无法连接存储服务。请检查网络、服务地址和代理设置。 / Cannot connect to storage. Check the network, service address and proxy settings.".into(),
+                Some(CloudError::Unsupported) =>
+                    "存储服务不支持此操作所需的安全保护。请使用其他存储服务或受支持的操作。 / Storage does not support the safeguards required for this operation. Use another service or a supported operation.".into(),
+                Some(CloudError::NotFound) =>
+                    "云端文件或目录已不存在。请刷新后重试。 / The cloud file or folder no longer exists. Refresh and try again.".into(),
+                Some(CloudError::Precondition) =>
+                    "云端文件已发生变化，当前操作未执行。请刷新后重新操作。 / The cloud file has changed and the operation was not applied. Refresh and try again.".into(),
                 Some(CloudError::MultipartAbort { primary, .. }) => {
                     if matches!(primary.as_ref(), CloudError::UploadCancelled) {
                         failure(
@@ -1158,6 +1200,13 @@ fn error_context(error: &DomainError) -> Option<Value> {
                 "pendingRecovery": true,
                 "multipartUploadIdKnown": false
             }))
+        }
+        DomainError::Cloud { source, .. }
+            if matches!(source.downcast_ref::<crate::cloud::types::CloudError>(), Some(crate::cloud::types::CloudError::Service { .. })) =>
+        {
+            if let Some(crate::cloud::types::CloudError::Service { status, .. }) = source.downcast_ref::<crate::cloud::types::CloudError>() {
+                Some(json!({ "status": status }))
+            } else { None }
         }
         DomainError::PeerFile { operation, source } => Some(json!({
             "operation": operation, "status": source.status,

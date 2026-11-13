@@ -98,7 +98,7 @@ impl AppendPublisher {
             }
             return Ok(());
         }
-        if count > limits.max_objects.min(MAX_PUBLISH_OBJECTS)
+        if count > limits.max_objects
             || operation_id.len() != 32
             || index.repository_id() != repository.repo_id().as_bytes()
         {
@@ -106,16 +106,19 @@ impl AppendPublisher {
         }
         // Enforce aggregate and individual wire limits before parsing payloads.
         let mut staged = 0u64;
+        let mut descriptor_bytes = 0usize;
         for ordinal in 0..count {
             let object = object_at(index, ordinal)?;
+            descriptor_bytes = descriptor_bytes
+                .checked_add(object.key().len().saturating_add(256))
+                .filter(|bytes| *bytes <= MAX_PUBLISH_DESCRIPTOR_BYTES)
+                .ok_or(PublishError::Invalid("descriptor bytes"))?;
             let block = object.key().contains("/blocks/");
-            let wire_limit = 2
-                * (if block {
-                    MAX_BLOCK_SIZE
-                } else {
-                    MAX_METADATA_SIZE
-                } + 16)
-                + 4096;
+            let wire_limit = (if block {
+                MAX_BLOCK_SIZE
+            } else {
+                MAX_METADATA_SIZE
+            }) + super::repository_types::OBJECT_WIRE_OVERHEAD;
             staged = staged
                 .checked_add(object.bytes().len() as u64)
                 .ok_or(PublishError::Invalid("staging overflow"))?;
@@ -139,8 +142,7 @@ impl AppendPublisher {
             if total > MAX_PUBLISH_STAGING {
                 return Err(PublishError::Invalid("staging limit"));
             }
-            let envelope: Envelope =
-                serde_json::from_slice(object.bytes()).map_err(AppendError::from)?;
+            let envelope = Envelope::from_wire(object.bytes()).map_err(AppendError::from)?;
             let rank = match envelope.kind.as_str() {
                 "block" => 0,
                 "tree" => 1,
@@ -161,7 +163,11 @@ impl AppendPublisher {
                     repository.repo_id()
                 )
             } else {
-                format!("{APPEND_ROOT}/{}/{}s/{digest}", repository.repo_id(), envelope.kind)
+                format!(
+                    "{APPEND_ROOT}/{}/{}s/{digest}",
+                    repository.repo_id(),
+                    envelope.kind
+                )
             };
             if object.key() != expected {
                 return Err(PublishError::Invalid("object key"));
@@ -352,39 +358,59 @@ impl AppendPublisher {
             let mut live_bytes = 0usize;
             for ordinal in start..op.objects.len().min(start + 4) {
                 let object = &op.objects[ordinal];
-                if !object.key.contains("/blocks/") || live_bytes.saturating_add(object.len) > 32 * 1024 * 1024 { break; }
+                if !object.key.contains("/blocks/")
+                    || live_bytes.saturating_add(object.len) > 32 * 1024 * 1024
+                {
+                    break;
+                }
                 live_bytes += object.len;
                 batch.push((object.clone(), index.frozen_bytes(&op, ordinal)?));
             }
             if batch.len() > 1 {
-                for (_, bytes) in &batch { Self::charge(index, &mut op, 0, bytes.len())?; }
-                let checked = futures_util::future::join_all(batch.into_iter().map(|(object, bytes)| async move {
-                    let exists = match store.get(&object.key, None).await {
-                        Ok(mut body) => {
-                            let mut offset = 0usize;
-                            while let Some(chunk) = body.next().await {
-                                let chunk = chunk?;
-                                let end = offset.checked_add(chunk.len()).ok_or(PublishError::Invalid("remote bytes"))?;
-                                if bytes.get(offset..end) != Some(chunk.as_ref()) { return Err(PublishError::Invalid("remote bytes differ from frozen object")); }
-                                offset = end;
+                for (_, bytes) in &batch {
+                    Self::charge(index, &mut op, 0, bytes.len())?;
+                }
+                let checked = futures_util::future::join_all(batch.into_iter().map(
+                    |(object, bytes)| async move {
+                        let exists = match store.get(&object.key, None).await {
+                            Ok(mut body) => {
+                                let mut offset = 0usize;
+                                while let Some(chunk) = body.next().await {
+                                    let chunk = chunk?;
+                                    let end = offset
+                                        .checked_add(chunk.len())
+                                        .ok_or(PublishError::Invalid("remote bytes"))?;
+                                    if bytes.get(offset..end) != Some(chunk.as_ref()) {
+                                        return Err(PublishError::Invalid(
+                                            "remote bytes differ from frozen object",
+                                        ));
+                                    }
+                                    offset = end;
+                                }
+                                if offset != bytes.len() {
+                                    return Err(PublishError::Invalid("remote object length"));
+                                }
+                                true
                             }
-                            if offset != bytes.len() { return Err(PublishError::Invalid("remote object length")); }
-                            true
-                        }
-                        Err(CloudError::NotFound) => false,
-                        Err(error) => return Err(error.into()),
-                    };
-                    Ok::<_, PublishError>((object, bytes, exists))
-                })).await;
+                            Err(CloudError::NotFound) => false,
+                            Err(error) => return Err(error.into()),
+                        };
+                        Ok::<_, PublishError>((object, bytes, exists))
+                    },
+                ))
+                .await;
                 let checked = checked.into_iter().collect::<Result<Vec<_>, _>>()?;
                 let count = checked.len();
                 let mut writes = Vec::new();
                 for (object, bytes, exists) in checked {
                     if !exists {
-                        if cancel.load(Ordering::Relaxed) { return Err(PublishError::Cancelled); }
+                        if cancel.load(Ordering::Relaxed) {
+                            return Err(PublishError::Cancelled);
+                        }
                         Self::charge(index, &mut op, bytes.len() as u64, 0)?;
                         writes.push(async move {
-                            let body = Box::pin(stream::once(async move { Ok(Bytes::from(bytes)) }));
+                            let body =
+                                Box::pin(stream::once(async move { Ok(Bytes::from(bytes)) }));
                             store.put(&object.key, body, PutCondition::Any).await
                         });
                     }
@@ -392,7 +418,9 @@ impl AppendPublisher {
                 // Drain all dispatched writes even when one fails. A retry starts
                 // at the same frozen batch and authenticates any completed copies.
                 let results = futures_util::future::join_all(writes).await;
-                for result in results { result?; }
+                for result in results {
+                    result?;
+                }
                 op.next_object += count;
                 index.save_publication(&op)?;
                 continue;
